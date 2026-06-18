@@ -63,7 +63,7 @@ func Claim(c *config.Config, issue string, force, openPR bool) error {
 	if openPR {
 		body := fmt.Sprintf("Claimed at %s for multi-window coordination.\n\n- Issue: #%s\n- Worktree: `%s`\n\nThis draft PR signals intent to parallel windows. Others should run `wt status` (or check `gh pr list --draft`) before working on colliding scope. Mark ready when complete, or `wt release %s` to abandon.\n\nRefs #%s",
 			time.Now().UTC().Format(time.RFC3339), issue, wtDir, issue, issue)
-		if url, err := ghx.PRCreate(true, "WIP: #"+issue+" — "+title60, body); err != nil {
+		if url, err := ghx.PRCreate(true, branch, c.Base, "WIP: #"+issue+" — "+title60, body); err != nil {
 			ui.Warn("draft PR creation failed (continuing): %v", err)
 		} else {
 			prURL = url
