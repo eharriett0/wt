@@ -24,11 +24,20 @@ const (
 var enabled = detect()
 
 func detect() bool {
+	// Explicit disable wins over everything.
 	if _, ok := os.LookupEnv("NO_COLOR"); ok {
 		return false
 	}
 	if _, ok := os.LookupEnv("WT_NO_COLOR"); ok {
 		return false
+	}
+	// Force color even when piped (demos, CI logs). CLICOLOR_FORCE is the
+	// de-facto standard; WT_FORCE_COLOR is the tool-specific twin.
+	if v := os.Getenv("CLICOLOR_FORCE"); v != "" && v != "0" {
+		return true
+	}
+	if v := os.Getenv("WT_FORCE_COLOR"); v != "" && v != "0" {
+		return true
 	}
 	fi, err := os.Stdout.Stat()
 	if err != nil {

@@ -10,7 +10,7 @@ func printHelp() {
 	b, c, d, g, y, m := ui.Bold, ui.Cyan, ui.Dim, ui.Green, ui.Yellow, ui.Magenta
 
 	fmt.Println()
-	fmt.Println("  " + m(b("wt")) + b(" — multi-window git coordination") + "  " + d("("+Version+")"))
+	fmt.Println("  " + m(b("wt")) + b(" — multi-window git coordination") + "  " + d("("+version()+")"))
 	fmt.Println("  " + d("Run 3-4 windows on different things without stepping on each other."))
 	fmt.Println()
 

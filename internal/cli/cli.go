@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 
 	"github.com/eharriett0/wt/internal/claim"
@@ -19,8 +20,21 @@ import (
 	"github.com/eharriett0/wt/internal/worktree"
 )
 
-// Version is set via -ldflags at build time.
+// Version may be set via -ldflags at build time; otherwise it's resolved from
+// the module version embedded by `go install module@vX.Y.Z`.
 var Version = "dev"
+
+func version() string {
+	if Version != "dev" && Version != "" {
+		return Version
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		if v := bi.Main.Version; v != "" && v != "(devel)" {
+			return v
+		}
+	}
+	return "dev"
+}
 
 // Main dispatches a subcommand and returns a process exit code.
 func Main(args []string) int {
@@ -35,7 +49,7 @@ func Main(args []string) int {
 		printHelp()
 		return 0
 	case "version", "-v", "--version":
-		fmt.Printf("wt %s\n", Version)
+		fmt.Printf("wt %s\n", version())
 		return 0
 	case "doctor":
 		return doctor.Run(loadConfigOrNil())
