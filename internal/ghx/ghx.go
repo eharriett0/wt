@@ -71,13 +71,23 @@ func IssueRemoveAssignee(n, user string) error {
 
 // --- PRs ---
 
-// PRCreate opens a PR and returns its URL.
-func PRCreate(draft bool, title, body string) (string, error) {
-	args := []string{"pr", "create", "--title", title, "--body", body}
+// PRCreateArgs builds the `gh pr create` argv. head and base are passed
+// EXPLICITLY so PR creation does not depend on the invoking working directory's
+// current branch: `wt claim` runs from the main checkout (sitting on the base
+// branch), and without --head, gh infers head=base and fails "no commits
+// between base and base" — which made the draft PR silently never appear.
+// Pure (no I/O) so the --head/--base contract is unit-testable.
+func PRCreateArgs(draft bool, head, base, title, body string) []string {
+	args := []string{"pr", "create", "--head", head, "--base", base, "--title", title, "--body", body}
 	if draft {
 		args = append(args, "--draft")
 	}
-	return run(args...)
+	return args
+}
+
+// PRCreate opens a PR for head against base and returns its URL.
+func PRCreate(draft bool, head, base, title, body string) (string, error) {
+	return run(PRCreateArgs(draft, head, base, title, body)...)
 }
 
 // PRChangedFileCount returns the number of files in the PR diff vs base, as a
