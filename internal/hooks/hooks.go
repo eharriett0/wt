@@ -159,13 +159,23 @@ func HookPreCommit(c *config.Config) int {
 
 	if len(stagedFiles) > 0 {
 		if conflicts := collide.CheckPaths(ws, root, stagedFiles); len(conflicts) > 0 {
-			ui.Collision("%d staged file(s) are ALSO being edited by another window:", len(conflicts))
-			for _, cf := range conflicts {
-				fmt.Fprintf(os.Stderr, "   %s  %s %s\n", ui.Bold(cf.Path), ui.Dim("← also"), cf.Window)
+			// Suppress collisions against stale branches (merged / no open PR) —
+			// same liveness rule as `wt check`, so the hook doesn't cry wolf on
+			// every commit against long-dead branches that touched the same file.
+			live := collide.ClassifyWindows(ws, c.Base, collide.ConflictWindowSet(conflicts))
+			active, stale := collide.PartitionConflicts(conflicts, live)
+			if len(active) > 0 {
+				ui.Collision("%d staged file(s) are ALSO being edited by an active window:", len(active))
+				for _, cf := range active {
+					fmt.Fprintf(os.Stderr, "   %s  %s %s %s\n", ui.Bold(cf.Path), ui.Dim("← also"), cf.Window, live[cf.Window].Badge())
+				}
+				if len(stale) > 0 {
+					fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("   (+%d on stale branch(es) — merged / no open PR — ignored)", len(stale))))
+				}
+				fmt.Fprintln(os.Stderr, ui.Yellow("   Coordinate before committing to avoid a merge collision."))
+				fmt.Fprintln(os.Stderr, ui.Dim("   (informational — not blocking · HOOK_DISABLE_MULTIWINDOW_CHECK=1 to silence)"))
+				return 0
 			}
-			fmt.Fprintln(os.Stderr, ui.Yellow("   Coordinate before committing to avoid a merge collision."))
-			fmt.Fprintln(os.Stderr, ui.Dim("   (informational — not blocking · HOOK_DISABLE_MULTIWINDOW_CHECK=1 to silence)"))
-			return 0
 		}
 	}
 

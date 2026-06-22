@@ -11,10 +11,13 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/eharriett0/wt/internal/activework"
 	"github.com/eharriett0/wt/internal/config"
+	"github.com/eharriett0/wt/internal/ghx"
 	"github.com/eharriett0/wt/internal/gitx"
+	"github.com/eharriett0/wt/internal/ui"
 )
 
 // Window is one worktree's live state.
@@ -166,4 +169,216 @@ func realPath(p string) string {
 		return a
 	}
 	return p
+}
+
+// Liveness classifies how "alive" a colliding window's branch is. A file
+// collision only matters if the other window can still change that file —
+// a branch whose work is already merged (squash-safe) and whose worktree is
+// clean cannot, so flagging it is noise. Only LiveStale is suppressed; every
+// other level (including LiveUnknown) is surfaced, so we never hide a real
+// collision when the signal is ambiguous.
+type Liveness int
+
+const (
+	LiveUnknown  Liveness = iota // couldn't determine (git error) — treated as active
+	LiveStale                    // clean worktree, no open PR, nothing unshipped vs base — noise
+	LiveUnmerged                 // commits not yet on base, no open PR — latent collision
+	LiveDirty                    // uncommitted changes in the worktree — actively editing
+	LiveOpenPR                   // an open PR exists for the branch — active contention
+)
+
+// IsStale reports whether this level is the definitively-merged/abandoned case
+// that should be suppressed from collision output.
+func (l Liveness) IsStale() bool { return l == LiveStale }
+
+// Tag is a short human label for the level.
+func (l Liveness) Tag() string {
+	switch l {
+	case LiveOpenPR:
+		return "open PR"
+	case LiveDirty:
+		return "uncommitted edits"
+	case LiveUnmerged:
+		return "commits, no PR"
+	case LiveStale:
+		return "stale: merged / no PR"
+	default:
+		return "unknown"
+	}
+}
+
+// WindowLiveness is a window's resolved liveness plus the open-PR number when
+// the level is LiveOpenPR (for display, e.g. "[open PR #747]").
+type WindowLiveness struct {
+	Level Liveness
+	PR    string // open PR number when Level == LiveOpenPR, else ""
+}
+
+// Label is the plain (uncolored) liveness word, e.g. "open PR #747" or
+// "stale: merged / no PR".
+func (wl WindowLiveness) Label() string {
+	if wl.Level == LiveOpenPR && wl.PR != "" {
+		return "open PR #" + wl.PR
+	}
+	return wl.Level.Tag()
+}
+
+// Badge is the colored, bracketed liveness tag for output lines: red for an
+// open PR, yellow for in-progress (dirty / unmerged), dim for stale/unknown.
+func (wl WindowLiveness) Badge() string {
+	tag := "[" + wl.Label() + "]"
+	switch wl.Level {
+	case LiveOpenPR:
+		return ui.Red(tag)
+	case LiveDirty, LiveUnmerged:
+		return ui.Yellow(tag)
+	default: // LiveStale, LiveUnknown
+		return ui.Dim(tag)
+	}
+}
+
+// LiveFacts are the raw observations ClassifyFacts turns into a Liveness. Split
+// out from the I/O so the decision boundary is pure and unit-testable.
+type LiveFacts struct {
+	HasOpenPR bool
+	Dirty     bool
+	Unshipped int // git cherry "+" count; <0 means it could not be computed
+}
+
+// ClassifyFacts maps observations to a Liveness (pure). Precedence is by
+// descending certainty-of-activity: open PR > dirty worktree > unmerged commits
+// > (fully merged ⇒ stale). An uncomputable unshipped count with no other
+// signal is LiveUnknown (surfaced, not suppressed).
+func ClassifyFacts(f LiveFacts) Liveness {
+	switch {
+	case f.HasOpenPR:
+		return LiveOpenPR
+	case f.Dirty:
+		return LiveDirty
+	case f.Unshipped > 0:
+		return LiveUnmerged
+	case f.Unshipped == 0:
+		return LiveStale
+	default:
+		return LiveUnknown
+	}
+}
+
+// Classify resolves one window's liveness via I/O (gh + git). gh is consulted
+// only when present+authed; otherwise classification degrades to git-only
+// signals (a merged clean branch is still correctly LiveStale offline).
+func Classify(w Window, base string) WindowLiveness {
+	var f LiveFacts
+	pr := ""
+	if ghx.Present() && ghx.Authed() {
+		if n, ok := ghx.OpenPRForBranch(w.Branch); ok {
+			f.HasOpenPR, pr = true, n
+		}
+	}
+	f.Dirty = !gitx.IsClean(w.Worktree)
+	if n, err := gitx.CountUnshipped(base, w.Branch); err == nil {
+		f.Unshipped = n
+	} else {
+		f.Unshipped = -1
+	}
+	wl := WindowLiveness{Level: ClassifyFacts(f)}
+	if wl.Level == LiveOpenPR {
+		wl.PR = pr
+	}
+	return wl
+}
+
+// ClassifyWindows resolves liveness, concurrently, for the windows whose label
+// is in `labels` (the small set actually involved in a collision — NOT all
+// windows, which would be one gh call each). Keyed by window label.
+func ClassifyWindows(ws []Window, base string, labels map[string]bool) map[string]WindowLiveness {
+	type job struct {
+		label string
+		w     Window
+	}
+	var jobs []job
+	seen := map[string]bool{}
+	for _, w := range ws {
+		l := w.Label()
+		if labels[l] && !seen[l] {
+			seen[l] = true
+			jobs = append(jobs, job{l, w})
+		}
+	}
+
+	out := make(map[string]WindowLiveness, len(jobs))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8) // bound concurrent gh/git shell-outs
+	for _, j := range jobs {
+		wg.Add(1)
+		go func(j job) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			wl := Classify(j.w, base)
+			mu.Lock()
+			out[j.label] = wl
+			mu.Unlock()
+		}(j)
+	}
+	wg.Wait()
+	return out
+}
+
+// ConflictWindowSet is the set of OTHER-window labels appearing in conflicts —
+// the small set worth classifying for liveness (not all windows).
+func ConflictWindowSet(cs []Conflict) map[string]bool {
+	set := map[string]bool{}
+	for _, c := range cs {
+		set[c.Window] = true
+	}
+	return set
+}
+
+// OverlapWindowSet is the set of window labels appearing across all overlaps.
+func OverlapWindowSet(ov []Overlap) map[string]bool {
+	set := map[string]bool{}
+	for _, o := range ov {
+		for _, w := range o.Windows {
+			set[w] = true
+		}
+	}
+	return set
+}
+
+// PartitionConflicts splits `check` conflicts into active vs stale by the
+// OTHER window's liveness (pure). A conflict against a stale branch is benign:
+// that branch can no longer change the file. Missing/unknown liveness is
+// treated as active (never suppress on ambiguity).
+func PartitionConflicts(cs []Conflict, live map[string]WindowLiveness) (active, stale []Conflict) {
+	for _, c := range cs {
+		if wl, ok := live[c.Window]; ok && wl.Level.IsStale() {
+			stale = append(stale, c)
+		} else {
+			active = append(active, c)
+		}
+	}
+	return active, stale
+}
+
+// PartitionOverlaps splits `status` overlaps into active vs benign (pure). An
+// overlap is a real cross-window collision only when ≥2 of its windows are
+// non-stale — one live editor plus N merged branches cannot conflict. Missing/
+// unknown liveness counts as live (conservative).
+func PartitionOverlaps(ov []Overlap, live map[string]WindowLiveness) (active, benign []Overlap) {
+	for _, o := range ov {
+		liveCount := 0
+		for _, w := range o.Windows {
+			if wl, ok := live[w]; !ok || !wl.Level.IsStale() {
+				liveCount++
+			}
+		}
+		if liveCount >= 2 {
+			active = append(active, o)
+		} else {
+			benign = append(benign, o)
+		}
+	}
+	return active, benign
 }

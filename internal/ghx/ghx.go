@@ -115,6 +115,22 @@ func PRCommitSubjects(pr string) []string {
 	return strings.Split(out, "\n")
 }
 
+// OpenPRForBranch returns the number of an OPEN PR whose head is branch, and
+// whether one exists. Used by collision liveness: a branch with an open PR is
+// active contention; one without is a candidate for "stale" classification.
+// Best-effort — any gh error (offline, unauth) yields ("", false) so callers
+// degrade to git-only signals rather than erroring.
+func OpenPRForBranch(branch string) (string, bool) {
+	if branch == "" || branch == "HEAD" {
+		return "", false
+	}
+	out, err := run("pr", "list", "--head", branch, "--state", "open", "--json", "number", "--jq", ".[0].number // empty")
+	if err != nil || strings.TrimSpace(out) == "" {
+		return "", false
+	}
+	return strings.TrimSpace(out), true
+}
+
 // MergePRSquash runs `gh pr merge <pr> --squash <extra...>`, inheriting stdio.
 func MergePRSquash(pr string, extra []string) error {
 	args := append([]string{"pr", "merge", pr, "--squash"}, extra...)

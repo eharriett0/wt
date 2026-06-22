@@ -194,17 +194,58 @@ func cmdStatus(c *config.Config) int {
 		ui.OK("no file collisions across %d window(s) — all clear", len(ws))
 		return 0
 	}
-	ui.Collision("%d file(s) touched by multiple windows:", len(ov))
-	for _, o := range ov {
-		fmt.Fprintf(os.Stderr, "   %s  %s %s\n", ui.Bold(o.File), ui.Dim("←"), strings.Join(o.Windows, ", "))
+
+	// Classify the windows appearing in overlaps; an overlap is a real
+	// collision only when ≥2 of its windows are non-stale.
+	live := collide.ClassifyWindows(ws, c.Base, collide.OverlapWindowSet(ov))
+	active, benign := collide.PartitionOverlaps(ov, live)
+
+	if len(active) == 0 {
+		ui.OK("no active collisions — %d file-overlap(s) are all on stale branches (merged / no open PR)", len(benign))
+		return 0
 	}
-	fmt.Fprintln(os.Stderr, ui.Yellow("   Coordinate on these before committing."))
+	ui.Collision("%d file(s) with an active multi-window collision:", len(active))
+	for _, o := range active {
+		fmt.Fprintf(os.Stderr, "   %s  %s %s\n", ui.Bold(o.File), ui.Dim("←"), strings.Join(taggedWindows(o.Windows, live), ", "))
+	}
+	if len(benign) > 0 {
+		fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("   +%d file-overlap(s) on stale branches only — not active collisions", len(benign))))
+	}
+	fmt.Fprintln(os.Stderr, ui.Yellow("   Coordinate on the active ones before committing."))
 	return 0
 }
 
+// taggedWindows annotates each window label with a colored liveness badge,
+// dimming stale ones so the live editors stand out.
+func taggedWindows(windows []string, live map[string]collide.WindowLiveness) []string {
+	out := make([]string, 0, len(windows))
+	for _, w := range windows {
+		wl := live[w]
+		if wl.Level.IsStale() {
+			out = append(out, ui.Dim(w+" "+wl.Badge()))
+		} else {
+			out = append(out, w+" "+wl.Badge())
+		}
+	}
+	return out
+}
+
 func cmdCheck(args []string) int {
-	if len(args) == 0 {
-		ui.Err("usage: wt check <path> [path...]")
+	// Manual scan (not flag.FlagSet): paths are positional and the flag may
+	// appear anywhere — flag.Parse would stop at the first positional and miss
+	// a trailing `--include-stale`.
+	includeStale := false
+	var paths []string
+	for _, a := range args {
+		switch a {
+		case "--include-stale", "-include-stale":
+			includeStale = true
+		default:
+			paths = append(paths, a)
+		}
+	}
+	if len(paths) == 0 {
+		ui.Err("usage: wt check [--include-stale] <path> [path...]")
 		return 64
 	}
 	return withConfig(func(c *config.Config) int {
@@ -214,14 +255,35 @@ func cmdCheck(args []string) int {
 			return 1
 		}
 		root, _ := gitx.RepoRoot()
-		conflicts := collide.CheckPaths(ws, root, args)
+		conflicts := collide.CheckPaths(ws, root, paths)
 		if len(conflicts) == 0 {
-			ui.OK("clear — no other window is touching %s", strings.Join(args, ", "))
+			ui.OK("clear — no other window is touching %s", strings.Join(paths, ", "))
 			return 0
 		}
-		ui.Collision("%d path(s) already being edited by another window:", len(conflicts))
-		for _, cf := range conflicts {
-			fmt.Fprintf(os.Stderr, "   %s  %s %s\n", ui.Bold(cf.Path), ui.Dim("←"), cf.Window)
+
+		// Classify only the windows actually in a conflict, then split off the
+		// stale ones (merged / no open PR — they can no longer change the file).
+		live := collide.ClassifyWindows(ws, c.Base, collide.ConflictWindowSet(conflicts))
+		active, stale := collide.PartitionConflicts(conflicts, live)
+		if includeStale {
+			active, stale = conflicts, nil
+		}
+
+		if len(active) == 0 {
+			ui.OK("clear — %d path-overlap(s) are all on stale branches (merged / no open PR)", len(stale))
+			for _, cf := range stale {
+				fmt.Println("   " + ui.Dim(cf.Path+" ← "+cf.Window+" ["+live[cf.Window].Label()+"]"))
+			}
+			return 0
+		}
+
+		ui.Collision("%d path(s) being edited by an active window:", len(active))
+		for _, cf := range active {
+			fmt.Fprintf(os.Stderr, "   %s  %s %s %s\n",
+				ui.Bold(cf.Path), ui.Dim("←"), cf.Window, live[cf.Window].Badge())
+		}
+		if len(stale) > 0 {
+			fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("   +%d more on stale branch(es) (merged / no open PR) — ignored; `--include-stale` to show", len(stale))))
 		}
 		return 3 // distinct exit code so a caller/script can branch on "collision found"
 	})
