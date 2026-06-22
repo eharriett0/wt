@@ -30,6 +30,29 @@ of files touched by more than one window. `wt check` exits **3** when another
 window is already in one of the given paths (so a script — or an agent in one
 window — can branch on "collision found"), **0** when clear.
 
+### Stale branches don't count
+
+A file "collision" only matters if the other window can still *change* that
+file. A branch whose work is already merged (squash-safe, detected via
+`git cherry`) sitting on a clean worktree with no open PR cannot — so by default
+`wt check` and `wt status` **suppress collisions against stale branches** and
+report only the live ones. Each colliding window is classified:
+
+| Signal | Treated as | Shown |
+|---|---|---|
+| Open PR for the branch | **active** | `[open PR #123]` |
+| Uncommitted changes in the worktree | **active** | `[uncommitted edits]` |
+| Commits not yet on base, no PR | **active** (latent) | `[commits, no PR]` |
+| Clean worktree, no PR, nothing unshipped | **stale** → suppressed | `[stale: merged / no PR]` |
+
+Without this, hot shared files (a top-level `CLAUDE.md`, a central policy file)
+light up against every long-dead branch that ever touched them, training you to
+ignore the warning. Now `wt check CLAUDE.md` shows the one window with an open PR
+and notes `+N more on stale branch(es) … ignored`. Pass `--include-stale` to see
+everything (and count stale as a collision for exit 3). Classification is
+conservative: only the *definitively* merged-and-clean case is suppressed —
+anything ambiguous (e.g. gh offline) is surfaced.
+
 A `pre-commit` hook (installed by `wt install-hooks`) runs the same check
 automatically: when files you're committing overlap another window's working
 set, it prints a loud, non-blocking notice naming the files and the window.

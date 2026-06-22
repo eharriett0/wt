@@ -184,6 +184,19 @@ func TouchedFiles(dir, base string) []string {
 	return files
 }
 
+// IsClean reports whether the worktree at dir has NO uncommitted changes
+// (staged, unstaged, or untracked). A dirty worktree means the window is
+// actively editing, which keeps it out of the "stale" collision bucket even
+// when its branch has no open PR. On error (dir gone, not a worktree) it
+// returns false — i.e. treat an unknowable worktree as potentially active.
+func IsClean(dir string) bool {
+	out, err := runRaw(dir, "status", "--porcelain")
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(out) == ""
+}
+
 // CommitEmpty makes an empty commit in dir with the given message.
 func CommitEmpty(dir, msg string) error {
 	_, err := RunDir(dir, "commit", "--allow-empty", "-m", msg)

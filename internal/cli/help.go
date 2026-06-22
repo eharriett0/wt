@@ -17,6 +17,8 @@ func printHelp() {
 	fmt.Println(b(y("  ✦ COLLISION AWARENESS")) + d("  — the core: who's touching what, right now"))
 	fmt.Printf("    %s            %s\n", c("wt status"), "all windows + which files each is touching + overlaps")
 	fmt.Printf("    %s   %s\n", c("wt check <paths…>"), "before you edit: is anyone else in these files? "+d("(exit 3 = collision)"))
+	fmt.Println("    " + d("collisions on stale branches (merged / no open PR) are suppressed by"))
+	fmt.Println("    " + d("default — only live windows count. ") + c("--include-stale") + d(" shows them all."))
 	fmt.Println()
 
 	fmt.Println(b(g("  ✦ WORKTREES")) + d("  — one isolated checkout per window"))
