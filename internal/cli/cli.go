@@ -2,12 +2,15 @@
 package cli
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"time"
 
 	"github.com/eharriett0/wt/internal/claim"
 	"github.com/eharriett0/wt/internal/collide"
@@ -16,6 +19,7 @@ import (
 	"github.com/eharriett0/wt/internal/gitx"
 	"github.com/eharriett0/wt/internal/hooks"
 	"github.com/eharriett0/wt/internal/merge"
+	"github.com/eharriett0/wt/internal/todos"
 	"github.com/eharriett0/wt/internal/ui"
 	"github.com/eharriett0/wt/internal/worktree"
 )
@@ -73,6 +77,8 @@ func Main(args []string) int {
 		return cmdMergePR(rest)
 	case "status":
 		return withConfig(cmdStatus)
+	case "todos":
+		return cmdTodos(rest)
 	case "check":
 		return cmdCheck(rest)
 	case "install-hooks":
@@ -185,6 +191,13 @@ func cmdStatus(c *config.Config) int {
 			fmt.Println("   " + ui.Dim("(no changes)"))
 		} else {
 			fmt.Printf("   %s %s\n", ui.Yellow(fmt.Sprintf("%d file(s):", len(w.Touched))), strings.Join(capList(w.Touched, 10), ", "))
+		}
+		// Task-level awareness: each window's current focus, mirrored from its
+		// Claude Code TODO list by the `wt _hook todo-write` PostToolUse hook.
+		if rec, _ := todos.ForWorktree(w.Worktree); rec != nil {
+			if a, ok := rec.Active(); ok {
+				fmt.Println("   " + ui.Yellow("▶ ") + ui.Dim(a.ActiveForm))
+			}
 		}
 		fmt.Println()
 	}
@@ -308,6 +321,12 @@ func runHook(args []string) int {
 	if len(args) < 1 {
 		return 0 // unknown hook invocation — never block git
 	}
+	// todo-write is a Claude Code PostToolUse hook (not a git hook): it derives
+	// the repo from the cwd in its stdin payload, so it works without a loaded
+	// config and must always exit 0 (never disrupt the editing session).
+	if args[0] == "todo-write" {
+		return hookTodoWrite(os.Stdin)
+	}
 	c, err := config.Load()
 	if err != nil {
 		// Outside a repo somehow — don't block git operations.
@@ -320,6 +339,147 @@ func runHook(args []string) int {
 		return hooks.HookPreCommit(c)
 	default:
 		return 0
+	}
+}
+
+// hookTodoWrite mirrors a Claude Code TodoWrite tool call into the wt todo
+// store. The PostToolUse payload carries the window's cwd and the tool input
+// (the full todo list); we resolve the worktree root + branch from cwd and
+// persist them keyed by worktree. Any failure is swallowed (return 0) — a
+// coordination nicety must never break the user's session.
+func hookTodoWrite(r io.Reader) int {
+	var in struct {
+		CWD       string `json:"cwd"`
+		ToolInput struct {
+			Todos []todos.Todo `json:"todos"`
+		} `json:"tool_input"`
+	}
+	b, err := io.ReadAll(r)
+	if err != nil {
+		return 0
+	}
+	if err := json.Unmarshal(b, &in); err != nil {
+		return 0
+	}
+	cwd := in.CWD
+	if cwd == "" {
+		cwd, _ = os.Getwd()
+	}
+	root, err := gitx.RunDir(cwd, "rev-parse", "--show-toplevel")
+	if err != nil || root == "" {
+		return 0 // not in a git repo — nothing to record
+	}
+	branch, _ := gitx.CurrentBranchIn(cwd)
+	_ = todos.Write(root, branch, time.Now().UTC().Format(time.RFC3339), in.ToolInput.Todos)
+	return 0
+}
+
+// cmdTodos shows what every window is currently working on, by joining each
+// live worktree (collide.Scan) with its mirrored Claude Code TODO list.
+func cmdTodos(args []string) int {
+	fs := flag.NewFlagSet("todos", flag.ContinueOnError)
+	prune := fs.Bool("prune", false, "remove stored todos for worktrees that no longer exist")
+	all := fs.Bool("all", false, "list every window, including those with no recorded TODO list")
+	if err := fs.Parse(args); err != nil {
+		return 64
+	}
+	return withConfig(func(c *config.Config) int {
+		ws, err := collide.Scan(c)
+		if err != nil {
+			ui.Err("scan failed: %v", err)
+			return 1
+		}
+		liveKeys := map[string]bool{}
+		for _, w := range ws {
+			liveKeys[todos.Key(w.Worktree)] = true
+		}
+
+		if *prune {
+			all, _ := todos.All()
+			n := 0
+			for _, r := range all {
+				if !liveKeys[todos.Key(r.Worktree)] {
+					if todos.Remove(r.Worktree) == nil {
+						n++
+					}
+				}
+			}
+			ui.OK("pruned %d orphaned todo record(s)", n)
+			return 0
+		}
+
+		ui.Banner("wt todos — " + filepath.Base(c.Root) + " (" + fmt.Sprintf("%d window(s)", len(ws)) + ")")
+		recorded, idle := 0, 0
+		for _, w := range ws {
+			rec, _ := todos.ForWorktree(w.Worktree)
+			if rec == nil || len(rec.Todos) == 0 {
+				idle++
+				if *all {
+					fmt.Println(ui.Bold(w.Label()) + "  " + ui.Cyan(w.Branch))
+					fmt.Println("   " + ui.Dim("(no todos recorded — hook not installed, or no TODO list yet)"))
+					fmt.Println()
+				}
+				continue
+			}
+			recorded++
+			line := ui.Bold(w.Label()) + "  " + ui.Cyan(w.Branch)
+			if w.Title != "" {
+				line += "  " + ui.Dim(w.Title)
+			}
+			fmt.Println(line)
+			pending, inProgress, done := rec.Counts()
+			if a, ok := rec.Active(); ok {
+				fmt.Println("   " + ui.Yellow("▶ ") + a.ActiveForm)
+			}
+			shown := 0
+			for _, t := range rec.Todos {
+				if t.Status == "pending" {
+					fmt.Println("   " + ui.Dim("• "+t.Content))
+					if shown++; shown >= 5 {
+						break
+					}
+				}
+			}
+			fmt.Println("   " + ui.Dim(fmt.Sprintf("%d done · %d in-progress · %d pending · updated %s",
+				done, inProgress, pending, humanAgo(rec.Updated))))
+			fmt.Println()
+		}
+
+		allRecs, _ := todos.All()
+		orphans := 0
+		for _, r := range allRecs {
+			if !liveKeys[todos.Key(r.Worktree)] {
+				orphans++
+			}
+		}
+		if recorded == 0 {
+			ui.Info("no todos recorded yet — install the Claude Code PostToolUse hook (`wt help`) so each window mirrors its TODO list.")
+		} else if idle > 0 && !*all {
+			ui.Info("+%d window(s) with no recorded TODO list (hidden) — `wt todos --all` to show them", idle)
+		}
+		if orphans > 0 {
+			ui.Info("%d todo record(s) for worktrees no longer present — `wt todos --prune` to clean up", orphans)
+		}
+		return 0
+	})
+}
+
+// humanAgo renders an RFC3339 timestamp as a coarse relative age.
+func humanAgo(rfc string) string {
+	t, err := time.Parse(time.RFC3339, rfc)
+	if err != nil {
+		return rfc
+	}
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
 	}
 }
 
