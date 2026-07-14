@@ -72,3 +72,20 @@ func TestParseBool(t *testing.T) {
 		t.Error("parseBool falls back to default on unknown")
 	}
 }
+
+func TestApplyConf_SharedDocs(t *testing.T) {
+	// Override the default list.
+	c := &Config{SharedDocs: []string{"CLAUDE.md", "MEMORY.md"}}
+	ApplyConf(c, ParseConf("shared_docs=CLAUDE.md, NOTES.md"))
+	if !reflect.DeepEqual(c.SharedDocs, []string{"CLAUDE.md", "NOTES.md"}) {
+		t.Errorf("SharedDocs = %v, want [CLAUDE.md NOTES.md]", c.SharedDocs)
+	}
+
+	// Explicit empty value disables the soft-list (nil), unlike other keys
+	// where empty is ignored — this is intentional so it can be turned off.
+	c2 := &Config{SharedDocs: []string{"CLAUDE.md"}}
+	ApplyConf(c2, ParseConf("shared_docs="))
+	if len(c2.SharedDocs) != 0 {
+		t.Errorf("shared_docs= should disable soft-list, got %v", c2.SharedDocs)
+	}
+}

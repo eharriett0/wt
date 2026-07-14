@@ -16,6 +16,7 @@ import (
 	"github.com/eharriett0/wt/internal/collide"
 	"github.com/eharriett0/wt/internal/config"
 	"github.com/eharriett0/wt/internal/doctor"
+	"github.com/eharriett0/wt/internal/ghx"
 	"github.com/eharriett0/wt/internal/gitx"
 	"github.com/eharriett0/wt/internal/hooks"
 	"github.com/eharriett0/wt/internal/merge"
@@ -62,13 +63,7 @@ func Main(args []string) int {
 	case "new":
 		return cmdNew(rest)
 	case "clean":
-		return withConfig(func(c *config.Config) int {
-			if err := worktree.Clean(c); err != nil {
-				ui.Err("%v", err)
-				return 1
-			}
-			return 0
-		})
+		return cmdClean(rest)
 	case "claim":
 		return cmdClaim(rest)
 	case "release":
@@ -121,6 +116,22 @@ func cmdNew(args []string) int {
 	})
 }
 
+func cmdClean(args []string) int {
+	fs := flag.NewFlagSet("clean", flag.ContinueOnError)
+	apply := fs.Bool("y", false, "actually remove the shipped worktrees (default: list only)")
+	fs.BoolVar(apply, "yes", false, "alias for -y")
+	if err := fs.Parse(args); err != nil {
+		return 64
+	}
+	return withConfig(func(c *config.Config) int {
+		if err := worktree.Clean(c, *apply); err != nil {
+			ui.Err("%v", err)
+			return 1
+		}
+		return 0
+	})
+}
+
 func cmdClaim(args []string) int {
 	fs := flag.NewFlagSet("claim", flag.ContinueOnError)
 	force := fs.Bool("force", false, "claim even if the issue is already assigned")
@@ -160,17 +171,69 @@ func cmdMergePR(args []string) int {
 	fs := flag.NewFlagSet("merge-pr", flag.ContinueOnError)
 	dryRun := fs.Bool("dry-run", false, "print the guard verdict without merging")
 	bypass := fs.Bool("bypass", false, "merge despite a block verdict (rare)")
+	keep := fs.Bool("keep", false, "keep the worktree after merge (default: auto-remove it)")
 	if err := fs.Parse(args); err != nil {
 		return 64
 	}
 	if fs.NArg() < 1 {
-		ui.Err("usage: wt merge-pr <pr> [--dry-run] [--bypass] [-- extra gh args]")
+		ui.Err("usage: wt merge-pr <pr> [--dry-run] [--bypass] [--keep] [-- extra gh args]")
 		return 64
 	}
-	if err := merge.Run(fs.Arg(0), *dryRun, *bypass, fs.Args()[1:]); err != nil {
+	pr := fs.Arg(0)
+	if err := merge.Run(pr, *dryRun, *bypass, fs.Args()[1:]); err != nil {
 		return 1
 	}
+	// Auto-clean: the PR just shipped, so its worktree is done. Only on a real
+	// merge (not dry-run) and unless -keep. Best-effort — a cleanup miss must
+	// not fail the merge that already succeeded, so we warn and return 0.
+	if !*dryRun && !*keep {
+		autoCleanMergedWorktree(pr)
+	}
 	return 0
+}
+
+// autoCleanMergedWorktree resolves the merged PR's head branch, finds the
+// matching worktree under the configured root, and removes it (+ local branch).
+// Every failure path is a soft warning: the merge is already done.
+func autoCleanMergedWorktree(pr string) {
+	c, err := config.Load()
+	if err != nil {
+		return
+	}
+	branch, err := ghx.PRHeadBranch(pr)
+	if err != nil || branch == "" {
+		ui.Info("merged; couldn't resolve PR head branch to auto-clean (use `wt clean`)")
+		return
+	}
+	paths, err := gitx.WorktreePaths()
+	if err != nil {
+		return
+	}
+	for _, wt := range paths {
+		br, _ := gitx.CurrentBranchIn(wt)
+		if br != branch {
+			continue
+		}
+		if err := worktree.Remove(c, wt, branch, false); err != nil {
+			ui.Warn("worktree for %s not auto-removed: %v", branch, err)
+			ui.Info("remove it manually once clean, or `wt clean -y`")
+		} else if cwdUnder(wt) {
+			ui.Step("cd %s   (you were inside the removed worktree)", c.Root)
+		}
+		return
+	}
+	// No local worktree for the branch (e.g. merged from the primary checkout).
+}
+
+// cwdUnder reports whether the current dir is inside dir (so we can hint a cd
+// back to the primary checkout after removing the worktree we were sitting in).
+func cwdUnder(dir string) bool {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(dir, cwd)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func cmdStatus(c *config.Config) int {
@@ -217,14 +280,36 @@ func cmdStatus(c *config.Config) int {
 		ui.OK("no active collisions — %d file-overlap(s) are all on stale branches (merged / no open PR)", len(benign))
 		return 0
 	}
-	ui.Collision("%d file(s) with an active multi-window collision:", len(active))
+	// Shared docs (CLAUDE.md/MEMORY.md) overlap in nearly every window; surface
+	// them as an advisory rather than an alarming multi-window collision.
+	var hard, soft []collide.Overlap
 	for _, o := range active {
-		fmt.Fprintf(os.Stderr, "   %s  %s %s\n", ui.Bold(o.File), ui.Dim("←"), strings.Join(taggedWindows(o.Windows, live), ", "))
+		if collide.IsSharedDoc(o.File, c.SharedDocs) {
+			soft = append(soft, o)
+		} else {
+			hard = append(hard, o)
+		}
+	}
+	if len(hard) > 0 {
+		ui.Collision("%d file(s) with an active multi-window collision:", len(hard))
+		for _, o := range hard {
+			fmt.Fprintf(os.Stderr, "   %s  %s %s\n", ui.Bold(o.File), ui.Dim("←"), strings.Join(taggedWindows(o.Windows, live), ", "))
+		}
+	} else {
+		ui.OK("no blocking collisions across %d window(s)", len(ws))
+	}
+	if len(soft) > 0 {
+		fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("   %d shared-doc overlap(s) — advisory (coordinate sections, likely auto-mergeable):", len(soft))))
+		for _, o := range soft {
+			fmt.Fprintln(os.Stderr, "   "+ui.Dim(o.File+" ← "+strings.Join(o.Windows, ", ")))
+		}
 	}
 	if len(benign) > 0 {
 		fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("   +%d file-overlap(s) on stale branches only — not active collisions", len(benign))))
 	}
-	fmt.Fprintln(os.Stderr, ui.Yellow("   Coordinate on the active ones before committing."))
+	if len(hard) > 0 {
+		fmt.Fprintln(os.Stderr, ui.Yellow("   Coordinate on the active ones before committing."))
+	}
 	return 0
 }
 
@@ -282,18 +367,46 @@ func cmdCheck(args []string) int {
 			active, stale = conflicts, nil
 		}
 
-		if len(active) == 0 {
-			ui.OK("clear — %d path-overlap(s) are all on stale branches (merged / no open PR)", len(stale))
+		// Split active conflicts into HARD (block, exit 3) and SOFT — shared docs
+		// like CLAUDE.md/MEMORY.md that every window legitimately appends to.
+		// Soft ones are advisory only and never drive the exit code, so `wt check`
+		// (and any script gating on exit 3) stops crying wolf on doc edits.
+		var hard, soft []collide.Conflict
+		for _, cf := range active {
+			if collide.IsSharedDoc(cf.Path, c.SharedDocs) {
+				soft = append(soft, cf)
+			} else {
+				hard = append(hard, cf)
+			}
+		}
+
+		if len(hard) == 0 {
+			// Nothing blocking. Surface soft-doc advisories (if any), else the
+			// all-stale message, plus the stale tail — and exit 0.
+			if len(soft) > 0 {
+				ui.OK("clear of blocking collisions — %d shared-doc overlap(s), advisory only:", len(soft))
+				for _, cf := range soft {
+					fmt.Println("   " + ui.Dim(cf.Path+" ← "+cf.Window+" "+live[cf.Window].Badge()+" · coordinate sections, likely auto-mergeable"))
+				}
+			} else {
+				ui.OK("clear — %d path-overlap(s) are all on stale branches (merged / no open PR)", len(stale))
+			}
 			for _, cf := range stale {
 				fmt.Println("   " + ui.Dim(cf.Path+" ← "+cf.Window+" ["+live[cf.Window].Label()+"]"))
 			}
 			return 0
 		}
 
-		ui.Collision("%d path(s) being edited by an active window:", len(active))
-		for _, cf := range active {
+		ui.Collision("%d path(s) being edited by an active window:", len(hard))
+		for _, cf := range hard {
 			fmt.Fprintf(os.Stderr, "   %s  %s %s %s\n",
 				ui.Bold(cf.Path), ui.Dim("←"), cf.Window, live[cf.Window].Badge())
+		}
+		if len(soft) > 0 {
+			fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("   +%d shared-doc overlap(s) — advisory, not blocking:", len(soft))))
+			for _, cf := range soft {
+				fmt.Fprintln(os.Stderr, "   "+ui.Dim(cf.Path+" ← "+cf.Window))
+			}
 		}
 		if len(stale) > 0 {
 			fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("   +%d more on stale branch(es) (merged / no open PR) — ignored; `--include-stale` to show", len(stale))))

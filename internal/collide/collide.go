@@ -157,6 +157,20 @@ func matchesTouched(p string, touched []string, set map[string]bool) bool {
 	return false
 }
 
+// IsSharedDoc reports whether path is one of the configured append-heavy shared
+// docs (matched by basename) — CLAUDE.md, MEMORY.md, etc. A cross-window touch
+// on these is expected (every window edits them) and is surfaced as an advisory
+// rather than a blocking collision. Empty shared → always false (soft-list off).
+func IsSharedDoc(path string, shared []string) bool {
+	base := filepath.Base(strings.TrimSpace(path))
+	for _, d := range shared {
+		if base == filepath.Base(strings.TrimSpace(d)) {
+			return true
+		}
+	}
+	return false
+}
+
 func sameWorktree(a, b string) bool {
 	return a == b || realPath(a) == realPath(b)
 }
