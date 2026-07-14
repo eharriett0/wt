@@ -20,6 +20,10 @@ type Config struct {
 	Prefix       string   // claim branch prefix
 	LinkFiles    []string // gitignored files symlinked into new worktrees
 	ClaimOpenPR  bool     // open a draft PR on claim
+	SharedDocs   []string // basenames of append-heavy shared docs (CLAUDE.md,
+	// MEMORY.md…) where a cross-window touch is an ADVISORY, not a blocking
+	// collision — every window legitimately edits these, so they'd otherwise
+	// cry wolf on every check/commit. Matched by basename.
 }
 
 // Load resolves config for the repo containing cwd.
@@ -44,6 +48,7 @@ func Load() (*Config, error) {
 		Prefix:       "feat-",
 		LinkFiles:    []string{".env"},
 		ClaimOpenPR:  true,
+		SharedDocs:   []string{"CLAUDE.md", "MEMORY.md"},
 	}
 
 	// Repo-root .wt.conf overlay.
@@ -98,6 +103,9 @@ func ApplyConf(c *Config, m map[string]string) {
 	if v, ok := m["claim_open_pr"]; ok {
 		c.ClaimOpenPR = parseBool(v, c.ClaimOpenPR)
 	}
+	if v, ok := m["shared_docs"]; ok {
+		c.SharedDocs = splitCSV(v) // empty value → nil → soft-list disabled
+	}
 }
 
 func applyEnv(c *Config) {
@@ -118,6 +126,11 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WT_CLAIM_OPEN_PR"); v != "" {
 		c.ClaimOpenPR = parseBool(v, c.ClaimOpenPR)
+	}
+	// LookupEnv (not Getenv != "") so an explicit empty WT_SHARED_DOCS disables
+	// the soft-list entirely, rather than being ignored.
+	if v, ok := os.LookupEnv("WT_SHARED_DOCS"); ok {
+		c.SharedDocs = splitCSV(v)
 	}
 }
 

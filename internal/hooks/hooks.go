@@ -164,10 +164,24 @@ func HookPreCommit(c *config.Config) int {
 			// every commit against long-dead branches that touched the same file.
 			live := collide.ClassifyWindows(ws, c.Base, collide.ConflictWindowSet(conflicts))
 			active, stale := collide.PartitionConflicts(conflicts, live)
-			if len(active) > 0 {
-				ui.Collision("%d staged file(s) are ALSO being edited by an active window:", len(active))
-				for _, cf := range active {
+			// Shared docs (CLAUDE.md/MEMORY.md) are append-heavy and edited by
+			// nearly every window — downgrade them to an advisory so the notice
+			// only sounds the alarm on real code overlaps.
+			var hard, soft []collide.Conflict
+			for _, cf := range active {
+				if collide.IsSharedDoc(cf.Path, c.SharedDocs) {
+					soft = append(soft, cf)
+				} else {
+					hard = append(hard, cf)
+				}
+			}
+			if len(hard) > 0 {
+				ui.Collision("%d staged file(s) are ALSO being edited by an active window:", len(hard))
+				for _, cf := range hard {
 					fmt.Fprintf(os.Stderr, "   %s  %s %s %s\n", ui.Bold(cf.Path), ui.Dim("← also"), cf.Window, live[cf.Window].Badge())
+				}
+				if len(soft) > 0 {
+					fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("   (+%d shared-doc overlap(s) — advisory)", len(soft))))
 				}
 				if len(stale) > 0 {
 					fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("   (+%d on stale branch(es) — merged / no open PR — ignored)", len(stale))))
@@ -175,6 +189,13 @@ func HookPreCommit(c *config.Config) int {
 				fmt.Fprintln(os.Stderr, ui.Yellow("   Coordinate before committing to avoid a merge collision."))
 				fmt.Fprintln(os.Stderr, ui.Dim("   (informational — not blocking · HOOK_DISABLE_MULTIWINDOW_CHECK=1 to silence)"))
 				return 0
+			}
+			if len(soft) > 0 {
+				var names []string
+				for _, cf := range soft {
+					names = append(names, cf.Path)
+				}
+				fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("📝 shared doc(s) also edited in another window (advisory; coordinate sections): %s", strings.Join(names, ", "))))
 			}
 		}
 	}

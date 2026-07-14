@@ -163,3 +163,29 @@ func TestPartitionOverlaps(t *testing.T) {
 		t.Errorf("benign overlaps = %#v, want onelive.go + allstale.go", benign)
 	}
 }
+
+func TestIsSharedDoc(t *testing.T) {
+	shared := []string{"CLAUDE.md", "MEMORY.md"}
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"CLAUDE.md", true},
+		{"infrastructure/CLAUDE.md", true},                 // basename match through a path
+		{"MEMORY.md", true},
+		{".claude/memory/MEMORY.md", true},
+		{"internal/cli/cli.go", false},
+		{"claude.md", false},                               // case-sensitive basename
+		{"README.md", false},
+		{"  CLAUDE.md  ", true},                            // trimmed
+	}
+	for _, c := range cases {
+		if got := IsSharedDoc(c.path, shared); got != c.want {
+			t.Errorf("IsSharedDoc(%q) = %v, want %v", c.path, got, c.want)
+		}
+	}
+	// Empty shared list → soft-list disabled → always false.
+	if IsSharedDoc("CLAUDE.md", nil) {
+		t.Error("IsSharedDoc with nil shared list should be false (soft-list off)")
+	}
+}

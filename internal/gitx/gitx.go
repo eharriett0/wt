@@ -118,6 +118,25 @@ func WorktreePaths() ([]string, error) {
 	return paths, nil
 }
 
+// WorktreeRemove removes the worktree at path. force discards untracked/dirty
+// files (git refuses otherwise).
+func WorktreeRemove(path string, force bool) error {
+	args := []string{"worktree", "remove"}
+	if force {
+		args = append(args, "--force")
+	}
+	args = append(args, path)
+	_, err := Run(args...)
+	return err
+}
+
+// BranchDelete force-deletes local branch (git branch -D). Safe to call after a
+// squash-merge, where the branch is not fast-forward-merged into base.
+func BranchDelete(branch string) error {
+	_, err := Run("branch", "-D", branch)
+	return err
+}
+
 // Cherry returns `git cherry <base> <branchRef>` output (+/- lines).
 func Cherry(base, branchRef string) (string, error) {
 	return Run("cherry", base, branchRef)

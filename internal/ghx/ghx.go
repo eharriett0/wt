@@ -131,6 +131,12 @@ func OpenPRForBranch(branch string) (string, bool) {
 	return strings.TrimSpace(out), true
 }
 
+// PRHeadBranch returns the PR's head branch name (headRefName), for locating
+// the worktree to clean up after a merge.
+func PRHeadBranch(pr string) (string, error) {
+	return run("pr", "view", pr, "--json", "headRefName", "--jq", ".headRefName")
+}
+
 // MergePRSquash runs `gh pr merge <pr> --squash <extra...>`, inheriting stdio.
 func MergePRSquash(pr string, extra []string) error {
 	args := append([]string{"pr", "merge", pr, "--squash"}, extra...)

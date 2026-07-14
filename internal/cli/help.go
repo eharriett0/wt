@@ -20,11 +20,13 @@ func printHelp() {
 	fmt.Printf("    %s   %s\n", c("wt check <paths…>"), "before you edit: is anyone else in these files? "+d("(exit 3 = collision)"))
 	fmt.Println("    " + d("collisions on stale branches (merged / no open PR) are suppressed by"))
 	fmt.Println("    " + d("default — only live windows count. ") + c("--include-stale") + d(" shows them all."))
+	fmt.Println("    " + d("shared docs (CLAUDE.md, MEMORY.md) are advisory-only, never a block —"))
+	fmt.Println("    " + d("set ") + c("WT_SHARED_DOCS") + d(" (CSV, empty to disable) to change the list."))
 	fmt.Println()
 
 	fmt.Println(b(g("  ✦ WORKTREES")) + d("  — one isolated checkout per window"))
 	fmt.Printf("    %s        %s\n", c("wt new <branch>"), "create a worktree on a new branch from the base")
-	fmt.Printf("    %s              %s\n", c("wt clean"), "list worktrees whose branch already shipped (safe to remove)")
+	fmt.Printf("    %s              %s\n", c("wt clean"), "list worktrees whose branch already shipped  "+d("(-y to remove them)"))
 	fmt.Println()
 
 	fmt.Println(b(g("  ✦ CLAIM A UNIT OF WORK")) + d("  — assign issue + worktree + draft PR + record"))
@@ -33,7 +35,7 @@ func printHelp() {
 	fmt.Println()
 
 	fmt.Println(b(g("  ✦ MERGE")) + d("  — guarded squash that refuses empty/placeholder-only PRs"))
-	fmt.Printf("    %s     %s\n", c("wt merge-pr <pr>"), "guarded squash-merge  "+d("[--dry-run] [--bypass]"))
+	fmt.Printf("    %s     %s\n", c("wt merge-pr <pr>"), "guarded squash-merge, then auto-removes the worktree  "+d("[--dry-run] [--bypass] [--keep]"))
 	fmt.Println()
 
 	fmt.Println(b("  ✦ SETUP"))
@@ -48,7 +50,7 @@ func printHelp() {
 	fmt.Println()
 
 	fmt.Println(d("  Config: derived defaults → repo-root .wt.conf → env (WT_BASE, WT_PREFIX,"))
-	fmt.Println(d("  WT_WORKTREE_ROOT, WT_ACTIVE_WORK, WT_LINK_FILES, WT_CLAIM_OPEN_PR)."))
+	fmt.Println(d("  WT_WORKTREE_ROOT, WT_ACTIVE_WORK, WT_LINK_FILES, WT_CLAIM_OPEN_PR, WT_SHARED_DOCS)."))
 	fmt.Println(d("  Color off: NO_COLOR=1.   More: https://github.com/eharriett0/wt"))
 	fmt.Println()
 }
