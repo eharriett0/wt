@@ -38,11 +38,11 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	name := filepath.Base(root)
-	parent := filepath.Dir(root)
+	common, _ := gitx.CommonDir() // "" on error; absolute (…/<main>/.git) when present
+	name, parent := worktreeRootAnchor(root, common)
 
 	activeWork := filepath.Join(root, ".git", "wt-active-work.md")
-	if common, err := gitx.CommonDir(); err == nil && common != "" {
+	if common != "" {
 		activeWork = filepath.Join(common, "wt-active-work.md")
 	}
 
@@ -65,6 +65,23 @@ func Load() (*Config, error) {
 	applyEnv(c)
 
 	return c, nil
+}
+
+// worktreeRootAnchor returns the (name, parent) used to derive the default
+// WorktreeRoot ("<name>-worktrees" under <parent>). It anchors to the MAIN
+// worktree, not cwd's: when Load() runs from inside a LINKED worktree,
+// RepoRoot() (--show-toplevel) returns that worktree's own dir, so anchoring on
+// it would nest a bogus "<worktree>-worktrees" that no worktree is ever under —
+// breaking Remove()'s under-root guard (merge auto-clean refused, eharriett0/wt#11).
+// The shared common dir is "…/<main>/.git" from ANY worktree, so its parent is
+// the stable main root. Falls back to `root` when common isn't a "…/.git"
+// (bare repo / unusual layout) — the pre-#11 behavior.
+func worktreeRootAnchor(root, common string) (name, parent string) {
+	if common != "" && filepath.Base(common) == ".git" {
+		mainRoot := filepath.Dir(common)
+		return filepath.Base(mainRoot), filepath.Dir(mainRoot)
+	}
+	return filepath.Base(root), filepath.Dir(root)
 }
 
 // ParseConf parses a key=value config body. Lines beginning with # and blank
