@@ -137,6 +137,30 @@ func PRHeadBranch(pr string) (string, error) {
 	return run("pr", "view", pr, "--json", "headRefName", "--jq", ".headRefName")
 }
 
+// PRStateByURL returns a short live state ("OPEN", "MERGED", "DRAFT", "CLOSED")
+// for a PR identified by URL — gh resolves the repo from the URL, so this works
+// cross-repo. Empty string on error / gh unavailable.
+func PRStateByURL(url string) string {
+	if url == "" || !Present() || !Authed() {
+		return ""
+	}
+	out, err := run("pr", "view", url, "--json", "state,isDraft", "--jq",
+		`if .isDraft then "DRAFT" else .state end`)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+// PRIsDraft reports whether PR pr is a draft.
+func PRIsDraft(pr string) (bool, error) {
+	out, err := run("pr", "view", pr, "--json", "isDraft", "--jq", ".isDraft")
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) == "true", nil
+}
+
 // MergePRSquash runs `gh pr merge <pr> --squash <extra...>`, inheriting stdio.
 func MergePRSquash(pr string, extra []string) error {
 	args := append([]string{"pr", "merge", pr, "--squash"}, extra...)

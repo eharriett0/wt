@@ -20,8 +20,9 @@ import (
 
 var issueRe = regexp.MustCompile(`^[0-9]+$`)
 
-// Claim adopts issue for the current window.
-func Claim(c *config.Config, issue string, force, openPR bool) error {
+// Claim adopts issue for the current window. epic (optional) tags the claim for
+// cross-repo grouping (wt status --epic).
+func Claim(c *config.Config, issue string, force, openPR bool, epic string) error {
 	if !issueRe.MatchString(issue) {
 		return fmt.Errorf("issue must be a positive integer, got %q", issue)
 	}
@@ -73,7 +74,7 @@ func Claim(c *config.Config, issue string, force, openPR bool) error {
 
 	entry := activework.Entry{
 		Issue: issue, Title: title, Branch: branch, Worktree: wtDir,
-		PRURL: prURL, Window: windowID(), When: time.Now(),
+		PRURL: prURL, Window: windowID(), Epic: epic, When: time.Now(),
 	}
 	if err := activework.Write(c.ActiveWork, activework.AppendSection(activework.Read(c.ActiveWork), entry)); err != nil {
 		ui.Warn("active-work update failed (continuing): %v", err)

@@ -3,6 +3,7 @@ package config
 import (
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestParseConf(t *testing.T) {
@@ -87,5 +88,45 @@ func TestApplyConf_SharedDocs(t *testing.T) {
 	ApplyConf(c2, ParseConf("shared_docs="))
 	if len(c2.SharedDocs) != 0 {
 		t.Errorf("shared_docs= should disable soft-list, got %v", c2.SharedDocs)
+	}
+}
+
+func TestParseAge(t *testing.T) {
+	day := 24 * time.Hour
+	cases := []struct {
+		in   string
+		want time.Duration
+		ok   bool
+	}{
+		{"4d", 4 * day, true},
+		{"2w", 14 * day, true},
+		{"36h", 36 * time.Hour, true},
+		{"90m", 90 * time.Minute, true},
+		{"7", 7 * day, true}, // bare int → days
+		{"", 0, false},
+		{"garbage", 0, false},
+	}
+	for _, c := range cases {
+		got, err := ParseAge(c.in)
+		if c.ok && (err != nil || got != c.want) {
+			t.Errorf("ParseAge(%q) = %v, %v; want %v", c.in, got, err, c.want)
+		}
+		if !c.ok && err == nil {
+			t.Errorf("ParseAge(%q) should error", c.in)
+		}
+	}
+}
+
+func TestApplyConf_Issue7Settings(t *testing.T) {
+	c := &Config{}
+	ApplyConf(c, ParseConf("append_only_paths=*.log,CHANGELOG.md\nmax_age=4d\nmerge_is_deploy=true"))
+	if !reflect.DeepEqual(c.AppendOnlyPaths, []string{"*.log", "CHANGELOG.md"}) {
+		t.Errorf("AppendOnlyPaths = %v", c.AppendOnlyPaths)
+	}
+	if c.MaxAge != 4*24*time.Hour {
+		t.Errorf("MaxAge = %v, want 4d", c.MaxAge)
+	}
+	if !c.MergeIsDeploy {
+		t.Error("MergeIsDeploy should be true")
 	}
 }

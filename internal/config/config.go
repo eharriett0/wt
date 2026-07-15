@@ -4,9 +4,12 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/eharriett0/wt/internal/gitx"
 )
@@ -24,6 +27,9 @@ type Config struct {
 	// MEMORY.md…) where a cross-window touch is an ADVISORY, not a blocking
 	// collision — every window legitimately edits these, so they'd otherwise
 	// cry wolf on every check/commit. Matched by basename.
+	AppendOnlyPaths []string      // globs (filepath.Match) whose overlaps are downgraded to FYI regardless of hunk overlap (changelogs, inventory lists…)
+	MaxAge          time.Duration // suppress unmerged branches whose last commit is older than this (0 = off); dormancy suppression (#7)
+	MergeIsDeploy   bool          // this repo auto-deploys on merge to base — merge-pr adds a prod-safety gate (refuse draft, banner, confirm)
 }
 
 // Load resolves config for the repo containing cwd.
@@ -106,6 +112,17 @@ func ApplyConf(c *Config, m map[string]string) {
 	if v, ok := m["shared_docs"]; ok {
 		c.SharedDocs = splitCSV(v) // empty value → nil → soft-list disabled
 	}
+	if v, ok := m["append_only_paths"]; ok {
+		c.AppendOnlyPaths = splitCSV(v)
+	}
+	if v, ok := m["max_age"]; ok {
+		if d, err := ParseAge(v); err == nil {
+			c.MaxAge = d // empty or unparseable → left at current (0 = off)
+		}
+	}
+	if v, ok := m["merge_is_deploy"]; ok {
+		c.MergeIsDeploy = parseBool(v, c.MergeIsDeploy)
+	}
 }
 
 func applyEnv(c *Config) {
@@ -132,6 +149,57 @@ func applyEnv(c *Config) {
 	if v, ok := os.LookupEnv("WT_SHARED_DOCS"); ok {
 		c.SharedDocs = splitCSV(v)
 	}
+	if v, ok := os.LookupEnv("WT_APPEND_ONLY_PATHS"); ok {
+		c.AppendOnlyPaths = splitCSV(v)
+	}
+	if v := os.Getenv("WT_MAX_AGE"); v != "" {
+		if d, err := ParseAge(v); err == nil {
+			c.MaxAge = d
+		}
+	}
+	if v := os.Getenv("WT_MERGE_IS_DEPLOY"); v != "" {
+		c.MergeIsDeploy = parseBool(v, c.MergeIsDeploy)
+	}
+}
+
+// ParseAge parses a human duration for dormancy: Go's time.ParseDuration units
+// (s/m/h…) plus "d" (days) and "w" (weeks), e.g. "4d", "36h", "2w". A bare
+// number is treated as days. Empty, malformed, or non-positive → error (a
+// negative/zero threshold would silently disable dormancy, so it's rejected
+// loudly rather than mistaken for "off").
+func ParseAge(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, strconv.ErrSyntax
+	}
+	d, err := parseAgeRaw(s)
+	if err != nil {
+		return 0, err
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("max_age must be positive, got %q", s)
+	}
+	return d, nil
+}
+
+func parseAgeRaw(s string) (time.Duration, error) {
+	// Plain integer → days.
+	if n, err := strconv.Atoi(s); err == nil {
+		return time.Duration(n) * 24 * time.Hour, nil
+	}
+	// <number><d|w> — scale to hours and let ParseDuration do the rest.
+	if unit := s[len(s)-1]; unit == 'd' || unit == 'w' {
+		n, err := strconv.ParseFloat(s[:len(s)-1], 64)
+		if err != nil {
+			return 0, err
+		}
+		mult := 24.0 // days
+		if unit == 'w' {
+			mult = 24 * 7
+		}
+		return time.Duration(n * mult * float64(time.Hour)), nil
+	}
+	return time.ParseDuration(s)
 }
 
 func splitCSV(v string) []string {

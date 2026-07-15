@@ -162,7 +162,7 @@ func HookPreCommit(c *config.Config) int {
 			// Suppress collisions against stale branches (merged / no open PR) —
 			// same liveness rule as `wt check`, so the hook doesn't cry wolf on
 			// every commit against long-dead branches that touched the same file.
-			live := collide.ClassifyWindows(ws, c.Base, collide.ConflictWindowSet(conflicts))
+			live := collide.ClassifyWindows(ws, c.Base, collide.ConflictWindowSet(conflicts), c.MaxAge)
 			active, stale := collide.PartitionConflicts(conflicts, live)
 			// Shared docs (CLAUDE.md/MEMORY.md) are append-heavy and edited by
 			// nearly every window — downgrade them to an advisory so the notice
