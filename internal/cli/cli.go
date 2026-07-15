@@ -134,21 +134,54 @@ func cmdClean(args []string) int {
 	})
 }
 
+// parseInterspersed parses a FlagSet allowing flags to appear BEFORE or AFTER
+// positional args. Go's flag package stops parsing at the first positional and
+// silently drops any flag that follows it — a real footgun: `wt merge-pr 968
+// --confirm-deploy` left --confirm-deploy unparsed (so the prod gate wasn't
+// acknowledged) AND leaked "--confirm-deploy" downstream as a gh arg. We first
+// split off a trailing `-- passthrough` (everything after the first standalone
+// "--"), then loop fs.Parse, peeling one positional at a time. The loop handles
+// value-taking flags correctly (e.g. `claim 913 --epic 43`): each Parse consumes
+// the flag+its value before stopping at the next positional. On an undefined flag
+// Parse errors (ContinueOnError) and we surface it — undefined flags no longer
+// leak through as positionals. Use `--` for genuine downstream passthrough.
+func parseInterspersed(fs *flag.FlagSet, args []string) (positionals, passthrough []string, err error) {
+	for i, a := range args {
+		if a == "--" {
+			passthrough = append(passthrough, args[i+1:]...)
+			args = args[:i]
+			break
+		}
+	}
+	for {
+		if err = fs.Parse(args); err != nil {
+			return nil, nil, err
+		}
+		if fs.NArg() == 0 {
+			break
+		}
+		positionals = append(positionals, fs.Arg(0))
+		args = fs.Args()[1:]
+	}
+	return positionals, passthrough, nil
+}
+
 func cmdClaim(args []string) int {
 	fs := flag.NewFlagSet("claim", flag.ContinueOnError)
 	force := fs.Bool("force", false, "claim even if the issue is already assigned")
 	noPR := fs.Bool("no-pr", false, "skip opening a draft PR")
 	epic := fs.String("epic", "", "tag this claim with a cross-repo epic id (wt status --epic)")
-	if err := fs.Parse(args); err != nil {
+	pos, _, err := parseInterspersed(fs, args)
+	if err != nil {
 		return 64
 	}
-	if fs.NArg() < 1 {
+	if len(pos) < 1 {
 		ui.Err("usage: wt claim <issue> [--force] [--no-pr] [--epic <id>]")
 		return 64
 	}
 	return withConfig(func(c *config.Config) int {
 		openPR := c.ClaimOpenPR && !*noPR
-		if err := claim.Claim(c, fs.Arg(0), *force, openPR, *epic); err != nil {
+		if err := claim.Claim(c, pos[0], *force, openPR, *epic); err != nil {
 			ui.Err("%v", err)
 			return 1
 		}
@@ -176,14 +209,15 @@ func cmdMergePR(args []string) int {
 	bypass := fs.Bool("bypass", false, "merge despite a block verdict (rare)")
 	keep := fs.Bool("keep", false, "keep the worktree after merge (default: auto-remove it)")
 	confirmDeploy := fs.Bool("confirm-deploy", false, "acknowledge merge auto-applies to prod (merge_is_deploy repos)")
-	if err := fs.Parse(args); err != nil {
+	pos, ghArgs, err := parseInterspersed(fs, args)
+	if err != nil {
 		return 64
 	}
-	if fs.NArg() < 1 {
+	if len(pos) < 1 {
 		ui.Err("usage: wt merge-pr <pr> [--dry-run] [--bypass] [--keep] [--confirm-deploy] [-- extra gh args]")
 		return 64
 	}
-	pr := fs.Arg(0)
+	pr := pos[0]
 	// merge==deploy prod gate: in a repo where merging auto-applies (Flux/Argo
 	// reconcile on push to base), require a deliberate ack before the squash.
 	// Fail CLOSED — if we can't resolve config we can't verify merge_is_deploy,
@@ -198,7 +232,7 @@ func cmdMergePR(args []string) int {
 			return code
 		}
 	}
-	if err := merge.Run(pr, *dryRun, *bypass, fs.Args()[1:]); err != nil {
+	if err := merge.Run(pr, *dryRun, *bypass, ghArgs); err != nil {
 		return 1
 	}
 	// Auto-clean: the PR just shipped, so its worktree is done. Only on a real
