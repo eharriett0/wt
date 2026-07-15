@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/eharriett0/wt/internal/activework"
 	"github.com/eharriett0/wt/internal/claim"
 	"github.com/eharriett0/wt/internal/collide"
 	"github.com/eharriett0/wt/internal/config"
@@ -71,7 +73,7 @@ func Main(args []string) int {
 	case "merge-pr":
 		return cmdMergePR(rest)
 	case "status":
-		return withConfig(cmdStatus)
+		return cmdStatus(rest)
 	case "todos":
 		return cmdTodos(rest)
 	case "check":
@@ -136,16 +138,17 @@ func cmdClaim(args []string) int {
 	fs := flag.NewFlagSet("claim", flag.ContinueOnError)
 	force := fs.Bool("force", false, "claim even if the issue is already assigned")
 	noPR := fs.Bool("no-pr", false, "skip opening a draft PR")
+	epic := fs.String("epic", "", "tag this claim with a cross-repo epic id (wt status --epic)")
 	if err := fs.Parse(args); err != nil {
 		return 64
 	}
 	if fs.NArg() < 1 {
-		ui.Err("usage: wt claim <issue> [--force] [--no-pr]")
+		ui.Err("usage: wt claim <issue> [--force] [--no-pr] [--epic <id>]")
 		return 64
 	}
 	return withConfig(func(c *config.Config) int {
 		openPR := c.ClaimOpenPR && !*noPR
-		if err := claim.Claim(c, fs.Arg(0), *force, openPR); err != nil {
+		if err := claim.Claim(c, fs.Arg(0), *force, openPR, *epic); err != nil {
 			ui.Err("%v", err)
 			return 1
 		}
@@ -172,14 +175,29 @@ func cmdMergePR(args []string) int {
 	dryRun := fs.Bool("dry-run", false, "print the guard verdict without merging")
 	bypass := fs.Bool("bypass", false, "merge despite a block verdict (rare)")
 	keep := fs.Bool("keep", false, "keep the worktree after merge (default: auto-remove it)")
+	confirmDeploy := fs.Bool("confirm-deploy", false, "acknowledge merge auto-applies to prod (merge_is_deploy repos)")
 	if err := fs.Parse(args); err != nil {
 		return 64
 	}
 	if fs.NArg() < 1 {
-		ui.Err("usage: wt merge-pr <pr> [--dry-run] [--bypass] [--keep] [-- extra gh args]")
+		ui.Err("usage: wt merge-pr <pr> [--dry-run] [--bypass] [--keep] [--confirm-deploy] [-- extra gh args]")
 		return 64
 	}
 	pr := fs.Arg(0)
+	// merge==deploy prod gate: in a repo where merging auto-applies (Flux/Argo
+	// reconcile on push to base), require a deliberate ack before the squash.
+	// Fail CLOSED — if we can't resolve config we can't verify merge_is_deploy,
+	// so abort rather than risk an ungated prod deploy.
+	c, err := config.Load()
+	if err != nil {
+		ui.Err("cannot resolve repo config (%v) — refusing merge; can't verify merge_is_deploy", err)
+		return 1
+	}
+	if c.MergeIsDeploy && !*dryRun {
+		if code := deployGate(pr, *confirmDeploy); code != 0 {
+			return code
+		}
+	}
 	if err := merge.Run(pr, *dryRun, *bypass, fs.Args()[1:]); err != nil {
 		return 1
 	}
@@ -236,12 +254,69 @@ func cwdUnder(dir string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-func cmdStatus(c *config.Config) int {
+// deployGate enforces the merge==deploy prod safety check. Returns 0 to proceed,
+// non-zero to abort. Refuses a draft PR outright, prints a prod banner, and
+// requires either --confirm-deploy or a typed "deploy" at an interactive prompt.
+func deployGate(pr string, confirmed bool) int {
+	if draft, err := ghx.PRIsDraft(pr); err == nil && draft {
+		ui.Err("PR #%s is a DRAFT — refusing to merge in a merge==deploy repo (would auto-apply to prod).", pr)
+		ui.Info("mark it ready first: gh pr ready %s", pr)
+		return 1
+	}
+	ui.Banner("⚠ merge_is_deploy — merging PR #" + pr + " AUTO-APPLIES to prod")
+	if confirmed {
+		ui.Info("--confirm-deploy set — proceeding with the prod deploy.")
+		return 0
+	}
+	if !stdinIsTTY() {
+		ui.Err("prod deploy not confirmed. Re-run with --confirm-deploy to merge PR #%s.", pr)
+		return 1
+	}
+	fmt.Fprintf(os.Stderr, "%s Type %s to merge PR #%s to prod (anything else aborts): ",
+		ui.Yellow("→"), ui.Bold("deploy"), pr)
+	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	if strings.TrimSpace(line) == "deploy" {
+		return 0
+	}
+	ui.Err("aborted — deploy not confirmed.")
+	return 1
+}
+
+// stdinIsTTY reports whether stdin is an interactive terminal (so we only
+// prompt a human; an agent/pipe must pass --confirm-deploy explicitly).
+func stdinIsTTY() bool {
+	fi, err := os.Stdin.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+func cmdStatus(args []string) int {
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	asJSON := fs.Bool("json", false, "structured JSON output")
+	epic := fs.String("epic", "", "aggregate claims tagged with this epic id across sibling repos")
+	if err := fs.Parse(args); err != nil {
+		return 64
+	}
+	if *epic != "" {
+		return withConfig(func(c *config.Config) int { return cmdStatusEpic(c, *epic, *asJSON) })
+	}
+	return withConfig(func(c *config.Config) int { return statusReport(c, *asJSON) })
+}
+
+func statusReport(c *config.Config, asJSON bool) int {
 	ws, err := collide.Scan(c)
 	if err != nil {
 		ui.Err("scan failed: %v", err)
 		return 1
 	}
+	ov := collide.Overlaps(ws)
+	live := collide.ClassifyWindows(ws, c.Base, collide.OverlapWindowSet(ov), c.MaxAge)
+	active, benign := collide.PartitionOverlaps(ov, live)
+	graded := gradeStatusOverlaps(c, ws, active)
+
+	if asJSON {
+		return renderStatusJSON(ws, graded, len(benign))
+	}
+
 	ui.Banner("wt status — " + filepath.Base(c.Root) + " (" + fmt.Sprintf("%d window(s)", len(ws)) + ")")
 	for _, w := range ws {
 		line := ui.Bold(w.Label()) + "  " + ui.Cyan(w.Branch)
@@ -265,50 +340,145 @@ func cmdStatus(c *config.Config) int {
 		fmt.Println()
 	}
 
-	ov := collide.Overlaps(ws)
 	if len(ov) == 0 {
 		ui.OK("no file collisions across %d window(s) — all clear", len(ws))
 		return 0
 	}
-
-	// Classify the windows appearing in overlaps; an overlap is a real
-	// collision only when ≥2 of its windows are non-stale.
-	live := collide.ClassifyWindows(ws, c.Base, collide.OverlapWindowSet(ov))
-	active, benign := collide.PartitionOverlaps(ov, live)
-
-	if len(active) == 0 {
-		ui.OK("no active collisions — %d file-overlap(s) are all on stale branches (merged / no open PR)", len(benign))
+	if len(graded) == 0 {
+		ui.OK("no active collisions — %d file-overlap(s) are all on stale/dormant branches", len(benign))
 		return 0
 	}
-	// Shared docs (CLAUDE.md/MEMORY.md) overlap in nearly every window; surface
-	// them as an advisory rather than an alarming multi-window collision.
-	var hard, soft []collide.Overlap
-	for _, o := range active {
-		if collide.IsSharedDoc(o.File, c.SharedDocs) {
-			soft = append(soft, o)
+
+	// Bucket graded overlaps: HIGH (overlapping hunks) blocks attention; the
+	// rest — shared docs and disjoint-hunk / append-only overlaps — are advisory.
+	var high, low []StatusOverlap
+	for _, o := range graded {
+		if o.Category == CatBlocking {
+			high = append(high, o)
 		} else {
-			hard = append(hard, o)
+			low = append(low, o)
 		}
 	}
-	if len(hard) > 0 {
-		ui.Collision("%d file(s) with an active multi-window collision:", len(hard))
-		for _, o := range hard {
-			fmt.Fprintf(os.Stderr, "   %s  %s %s\n", ui.Bold(o.File), ui.Dim("←"), strings.Join(taggedWindows(o.Windows, live), ", "))
+	if len(high) > 0 {
+		ui.Collision("%d file(s) with a HIGH-risk collision (overlapping hunks):", len(high))
+		for _, o := range high {
+			detail := ui.Yellow("indeterminate (untracked/binary — can't prove disjoint)")
+			if s := spansString(o.OverlapSpans); s != "" {
+				detail = ui.Yellow("overlap " + s)
+			}
+			fmt.Fprintf(os.Stderr, "   %s  %s %s  %s\n", ui.Bold(o.File), ui.Dim("←"),
+				strings.Join(taggedWindows(o.Windows, live), ", "), detail)
 		}
 	} else {
-		ui.OK("no blocking collisions across %d window(s)", len(ws))
+		ui.OK("no HIGH-risk (overlapping-hunk) collisions across %d window(s)", len(ws))
 	}
-	if len(soft) > 0 {
-		fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("   %d shared-doc overlap(s) — advisory (coordinate sections, likely auto-mergeable):", len(soft))))
-		for _, o := range soft {
-			fmt.Fprintln(os.Stderr, "   "+ui.Dim(o.File+" ← "+strings.Join(o.Windows, ", ")))
+	for _, o := range low {
+		reason := fmt.Sprintf("%d windows, 0 overlapping hunks → low", len(o.Windows))
+		if o.Category == CatAdvisory {
+			reason = "shared doc → advisory, coordinate sections"
 		}
+		fmt.Fprintln(os.Stderr, "   "+ui.Dim(fmt.Sprintf("%s — %s (%s)", o.File, reason, strings.Join(o.Windows, ", "))))
 	}
 	if len(benign) > 0 {
-		fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("   +%d file-overlap(s) on stale branches only — not active collisions", len(benign))))
+		fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("   +%d file-overlap(s) on stale/dormant branches only — not active collisions", len(benign))))
 	}
-	if len(hard) > 0 {
-		fmt.Fprintln(os.Stderr, ui.Yellow("   Coordinate on the active ones before committing."))
+	if len(high) > 0 {
+		fmt.Fprintln(os.Stderr, ui.Yellow("   Coordinate on the HIGH ones before committing."))
+	}
+	return 0
+}
+
+// cmdStatusEpic aggregates every claim tagged with the given epic id across the
+// current repo and its sibling repos (git repos under the shared parent dir),
+// reading each repo's active-work file. PR state is resolved live via the
+// recorded PR URL when gh is available (works cross-repo).
+func cmdStatusEpic(c *config.Config, epic string, asJSON bool) int {
+	type unit struct {
+		Repo     string `json:"repo"`
+		Issue    string `json:"issue"`
+		Title    string `json:"title,omitempty"`
+		Branch   string `json:"branch"`
+		PRURL    string `json:"pr_url,omitempty"`
+		PRState  string `json:"pr_state,omitempty"`
+		Worktree string `json:"worktree"`
+	}
+
+	// c.Root is the CURRENT worktree, which may be a linked worktree whose .git
+	// is a file. Resolve the true primary repo root + shared parent from the git
+	// common dir so we scan sibling REPOS, not sibling worktrees.
+	primaryRoot := c.Root
+	if cd, err := gitx.CommonDir(); err == nil && cd != "" {
+		primaryRoot = filepath.Dir(cd)
+	}
+	parent := filepath.Dir(primaryRoot)
+
+	// (repoName, active-work path). Self uses c.ActiveWork (already resolved via
+	// the common dir + honoring active_work overrides); siblings resolve their
+	// own common dir.
+	type repoAW struct{ name, aw string }
+	repos := []repoAW{{filepath.Base(primaryRoot), c.ActiveWork}}
+	seen := map[string]bool{primaryRoot: true}
+	if entries, err := os.ReadDir(parent); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			p := filepath.Join(parent, e.Name())
+			if seen[p] {
+				continue
+			}
+			cd, err := gitx.CommonDirIn(p) // fails for non-repos → skipped
+			if err != nil || cd == "" {
+				continue
+			}
+			seen[p] = true
+			repos = append(repos, repoAW{e.Name(), filepath.Join(cd, "wt-active-work.md")})
+		}
+	}
+
+	units := make([]unit, 0)
+	for _, r := range repos {
+		content := activework.Read(r.aw)
+		if content == "" {
+			continue
+		}
+		for _, e := range activework.Parse(content) {
+			if e.Epic != epic {
+				continue
+			}
+			units = append(units, unit{
+				Repo: r.name, Issue: e.Issue, Title: e.Title,
+				Branch: e.Branch, PRURL: e.PRURL, PRState: ghx.PRStateByURL(e.PRURL),
+				Worktree: e.Worktree,
+			})
+		}
+	}
+
+	if asJSON {
+		b, _ := json.MarshalIndent(struct {
+			Epic  string `json:"epic"`
+			Units []unit `json:"units"`
+		}{epic, units}, "", "  ")
+		fmt.Println(string(b))
+		return 0
+	}
+	if len(units) == 0 {
+		ui.Info("no claims tagged epic %q across %d repo(s)", epic, len(repos))
+		return 0
+	}
+	ui.Banner(fmt.Sprintf("epic %s — %d unit(s) across %d repo(s)", epic, len(units), len(repos)))
+	for _, u := range units {
+		state := u.PRState
+		if state == "" {
+			state = "no PR / offline"
+		}
+		fmt.Printf("  %s  #%s  %s  %s\n", ui.Bold(u.Repo), u.Issue, ui.Cyan(u.Branch), ui.Dim("["+state+"]"))
+		if u.Title != "" {
+			fmt.Println("     " + ui.Dim(u.Title))
+		}
+		if u.PRURL != "" {
+			fmt.Println("     " + ui.Dim(u.PRURL))
+		}
 	}
 	return 0
 }
@@ -329,21 +499,24 @@ func taggedWindows(windows []string, live map[string]collide.WindowLiveness) []s
 }
 
 func cmdCheck(args []string) int {
-	// Manual scan (not flag.FlagSet): paths are positional and the flag may
-	// appear anywhere — flag.Parse would stop at the first positional and miss
-	// a trailing `--include-stale`.
-	includeStale := false
+	// Manual scan (not flag.FlagSet): paths are positional and flags may appear
+	// anywhere — flag.Parse would stop at the first positional.
+	includeStale, showDiff, asJSON := false, false, false
 	var paths []string
 	for _, a := range args {
 		switch a {
 		case "--include-stale", "-include-stale":
 			includeStale = true
+		case "--show-diff", "-show-diff":
+			showDiff = true
+		case "--json", "-json":
+			asJSON = true
 		default:
 			paths = append(paths, a)
 		}
 	}
 	if len(paths) == 0 {
-		ui.Err("usage: wt check [--include-stale] <path> [path...]")
+		ui.Err("usage: wt check [--include-stale] [--show-diff] [--json] <path> [path...]")
 		return 64
 	}
 	return withConfig(func(c *config.Config) int {
@@ -353,65 +526,11 @@ func cmdCheck(args []string) int {
 			return 1
 		}
 		root, _ := gitx.RepoRoot()
-		conflicts := collide.CheckPaths(ws, root, paths)
-		if len(conflicts) == 0 {
-			ui.OK("clear — no other window is touching %s", strings.Join(paths, ", "))
-			return 0
+		entries := buildCheckReport(c, ws, root, paths, includeStale)
+		if asJSON {
+			return renderCheckJSON(entries, includeStale)
 		}
-
-		// Classify only the windows actually in a conflict, then split off the
-		// stale ones (merged / no open PR — they can no longer change the file).
-		live := collide.ClassifyWindows(ws, c.Base, collide.ConflictWindowSet(conflicts))
-		active, stale := collide.PartitionConflicts(conflicts, live)
-		if includeStale {
-			active, stale = conflicts, nil
-		}
-
-		// Split active conflicts into HARD (block, exit 3) and SOFT — shared docs
-		// like CLAUDE.md/MEMORY.md that every window legitimately appends to.
-		// Soft ones are advisory only and never drive the exit code, so `wt check`
-		// (and any script gating on exit 3) stops crying wolf on doc edits.
-		var hard, soft []collide.Conflict
-		for _, cf := range active {
-			if collide.IsSharedDoc(cf.Path, c.SharedDocs) {
-				soft = append(soft, cf)
-			} else {
-				hard = append(hard, cf)
-			}
-		}
-
-		if len(hard) == 0 {
-			// Nothing blocking. Surface soft-doc advisories (if any), else the
-			// all-stale message, plus the stale tail — and exit 0.
-			if len(soft) > 0 {
-				ui.OK("clear of blocking collisions — %d shared-doc overlap(s), advisory only:", len(soft))
-				for _, cf := range soft {
-					fmt.Println("   " + ui.Dim(cf.Path+" ← "+cf.Window+" "+live[cf.Window].Badge()+" · coordinate sections, likely auto-mergeable"))
-				}
-			} else {
-				ui.OK("clear — %d path-overlap(s) are all on stale branches (merged / no open PR)", len(stale))
-			}
-			for _, cf := range stale {
-				fmt.Println("   " + ui.Dim(cf.Path+" ← "+cf.Window+" ["+live[cf.Window].Label()+"]"))
-			}
-			return 0
-		}
-
-		ui.Collision("%d path(s) being edited by an active window:", len(hard))
-		for _, cf := range hard {
-			fmt.Fprintf(os.Stderr, "   %s  %s %s %s\n",
-				ui.Bold(cf.Path), ui.Dim("←"), cf.Window, live[cf.Window].Badge())
-		}
-		if len(soft) > 0 {
-			fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("   +%d shared-doc overlap(s) — advisory, not blocking:", len(soft))))
-			for _, cf := range soft {
-				fmt.Fprintln(os.Stderr, "   "+ui.Dim(cf.Path+" ← "+cf.Window))
-			}
-		}
-		if len(stale) > 0 {
-			fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("   +%d more on stale branch(es) (merged / no open PR) — ignored; `--include-stale` to show", len(stale))))
-		}
-		return 3 // distinct exit code so a caller/script can branch on "collision found"
+		return renderCheckText(entries, paths, includeStale, showDiff)
 	})
 }
 

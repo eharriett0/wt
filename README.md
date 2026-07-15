@@ -3,7 +3,10 @@
 Run **3 or 4 windows on different things in the same repo** without stepping on
 each other. `wt` gives each window its own worktree, lets a window *claim* a
 unit of work so the others can see it, and — the core — tells you when two
-windows are **touching the same files**, before that becomes a merge conflict.
+windows are **editing the same lines**, before that becomes a merge conflict.
+It distinguishes real conflicts (overlapping hunks) from parallel appends to the
+same file, quiets down dormant branches, cleans up worktrees when work ships,
+and can gate merges in repos where merge == deploy-to-prod.
 
 Repo-agnostic, single static binary, zero third-party dependencies (it shells
 out to `git` and `gh`). Works in any git repo on any machine.
@@ -21,7 +24,7 @@ works even when windows are on different branches and even when a window never
 claimed an issue.
 
 ```
-wt status            # every window, the files each is touching, and overlaps
+wt status            # every window, the files each is touching, and graded overlaps
 wt check <paths…>    # before you edit: is anyone else in these files?
 ```
 
@@ -29,6 +32,31 @@ wt check <paths…>    # before you edit: is anyone else in these files?
 of files touched by more than one window. `wt check` exits **3** when another
 window is already in one of the given paths (so a script — or an agent in one
 window — can branch on "collision found"), **0** when clear.
+
+### Hunk-level, not just file-level
+
+Append-heavy files — an image-inventory YAML, a kustomize `resources:` list, a
+changelog — get edited by many windows at once where every edit is a disjoint
+append; the real conflict risk is ~zero, yet a file-level check lights up a `💥`
+wall on exactly the files touched most. `wt` diffs the **pending hunks** of each
+window (`git diff -U0`, uncommitted ∪ committed-vs-base) and grades the overlap:
+
+```
+config.yaml   — overlapping L88-95  → HIGH   (exit 3, blocks)
+inventory.yaml — 6 windows, 0 overlapping hunks → low (FYI, exit 0)
+```
+
+Only **overlapping line ranges** (or an indeterminate case where your side has
+no edits yet — kept blocking, to be safe) count as HIGH and drive exit 3.
+Provably-disjoint hunks are downgraded to a non-blocking FYI. Two escape hatches
+make files always-advisory regardless of hunks: `shared_docs` (basename match,
+default `CLAUDE.md,MEMORY.md`) and `append_only_paths` (globs — changelogs,
+inventory lists).
+
+`wt check --show-diff` previews the *other* window's hunk ranges inline so you
+can eyeball disjoint-ness; `wt check --json` / `wt status --json` emit the same
+data structured (with a `severity` field and `blocking` flag) for tooling and
+pre-push hooks.
 
 ### Stale branches don't count
 
@@ -42,8 +70,15 @@ report only the live ones. Each colliding window is classified:
 |---|---|---|
 | Open PR for the branch | **active** | `[open PR #123]` |
 | Uncommitted changes in the worktree | **active** | `[uncommitted edits]` |
-| Commits not yet on base, no PR | **active** (latent) | `[commits, no PR]` |
+| Commits not yet on base, no PR | **active** (latent) | `[commits, no PR, last commit 4d ago]` |
+| Commits, no PR, idle past `max_age` | **dormant** → suppressed | `[dormant, last commit 12d ago]` |
 | Clean worktree, no PR, nothing unshipped | **stale** → suppressed | `[stale: merged / no PR]` |
+
+The last-commit age is always shown on unmerged/dormant windows. **Dormancy** is
+opt-in: set `max_age` (e.g. `4d`, `2w`, `36h`) and an unmerged-but-idle branch —
+one you'd otherwise have to confirm out-of-band was abandoned — is suppressed
+just like a merged one. A dirty or open-PR branch is never dormant (it's active
+by definition).
 
 Without this, hot shared files (a top-level `CLAUDE.md`, a central policy file)
 light up against every long-dead branch that ever touched them, training you to
@@ -61,13 +96,14 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 
 | Command | What it does |
 |---|---|
-| `wt status` | All windows + the files each is touching + cross-window overlaps |
-| `wt check <paths…>` | Is another window touching these paths? (exit 3 = collision) |
+| `wt status [--json]` | All windows + files each touches + severity-graded overlaps |
+| `wt status --epic <id>` | Aggregate an epic's claims + live PR states across sibling repos |
+| `wt check <paths…>` | Is another window touching these paths? `[--show-diff] [--json] [--include-stale]` (exit 3 = HIGH) |
 | `wt new <branch>` | Create a worktree on a new branch from the base branch |
-| `wt clean` | List worktrees whose branch already shipped (prints safe `remove` cmds; never auto-deletes) |
-| `wt claim <issue>` | Assign a GitHub issue, make a worktree, open a draft PR, record the claim `[--force] [--no-pr]` |
+| `wt clean [-y]` | List worktrees whose branch already shipped; `-y` removes them (+ local branch), skipping dirty ones |
+| `wt claim <issue>` | Assign a GitHub issue, make a worktree, open a draft PR, record the claim `[--force] [--no-pr] [--epic <id>]` |
 | `wt release <issue>` | Drop the claim (leaves the worktree + PR in place) |
-| `wt merge-pr <pr>` | Guarded squash-merge — refuses empty or placeholder-only PRs `[--dry-run] [--bypass]` |
+| `wt merge-pr <pr>` | Guarded squash-merge, then auto-removes the worktree `[--dry-run] [--bypass] [--keep] [--confirm-deploy]` |
 | `wt install-hooks` | Install pre-push (base-branch guard) + pre-commit (collision notice) `[--force]` |
 | `wt doctor` | Check git/gh and show the resolved config |
 | `wt help` | Colorful overview |
@@ -87,6 +123,40 @@ Each `claim`/`new` creates an isolated worktree (default
 never poach another window's HEAD. Claims are recorded in a shared file inside
 `$GIT_COMMON_DIR` (visible to every worktree of the repo, never committed) — no
 external service, no Claude Code dependency.
+
+## Merging, auto-cleanup, and merge == deploy
+
+`wt merge-pr <pr>` does the guarded squash (refusing an empty or
+placeholder-only PR) and then, since the work has shipped, **auto-removes that
+PR's worktree and local branch**. Guarded: it only removes a worktree under the
+configured root (never your primary or a foreign checkout) and never one with
+uncommitted changes. `--keep` opts out; if you were sitting inside the removed
+worktree it prints a `cd` hint back. `wt clean -y` sweeps any already-shipped
+worktrees the same way.
+
+In a **GitOps repo where merging to base auto-applies to prod** (Flux/Argo
+reconcile on push), that squash is far higher-stakes than normal. Set
+`merge_is_deploy = true` and `wt merge-pr`:
+
+- refuses to merge a **draft** PR,
+- prints a `⚠ merging … AUTO-APPLIES to prod` banner,
+- requires a deliberate confirm — a typed `deploy` at an interactive prompt, or
+  `--confirm-deploy` for non-interactive/agent use (never a silent default).
+
+## Cross-repo epics
+
+A logical change often spans repos (a build PR in repo A gates a deploy PR in
+repo B). Tag related claims with `wt claim <issue> --epic <id>`, then:
+
+```
+wt status --epic <id>       # (add --json for structured output)
+```
+
+aggregates every claim carrying that tag across the current repo **and its
+sibling repos** (git repos under the shared parent dir), showing each unit's
+repo, branch, and live PR state (`OPEN` / `DRAFT` / `MERGED` / `CLOSED`,
+resolved via the recorded PR URL) — so you can see `A #NNN MERGED → B #MMM DRAFT`
+in one view.
 
 ## Hooks
 
@@ -115,6 +185,10 @@ Zero-config works by derivation. Override via a repo-root `.wt.conf`
 | `prefix` | `WT_PREFIX` | `feat-` (claim branch prefix) |
 | `link_files` | `WT_LINK_FILES` | `.env` (gitignored files symlinked into new worktrees) |
 | `claim_open_pr` | `WT_CLAIM_OPEN_PR` | `true` |
+| `shared_docs` | `WT_SHARED_DOCS` | `CLAUDE.md,MEMORY.md` (advisory-only basenames; empty disables) |
+| `append_only_paths` | `WT_APPEND_ONLY_PATHS` | *(none)* — globs whose overlaps are always FYI |
+| `max_age` | `WT_MAX_AGE` | *(off)* — dormancy threshold, e.g. `4d`, `2w`, `36h`, or a bare int (days) |
+| `merge_is_deploy` | `WT_MERGE_IS_DEPLOY` | `false` — enable the prod-deploy gate on `merge-pr` |
 
 Color is auto-disabled when stdout isn't a TTY; force off with `NO_COLOR=1`.
 

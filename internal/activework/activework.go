@@ -42,6 +42,7 @@ type Entry struct {
 	Worktree string
 	PRURL    string
 	Window   string
+	Epic     string // optional cross-repo grouping tag (wt claim --epic)
 	When     time.Time
 }
 
@@ -64,6 +65,9 @@ func AppendSection(content string, e Entry) string {
 	fmt.Fprintf(&b, "- Worktree: `%s`\n", e.Worktree)
 	if e.PRURL != "" {
 		fmt.Fprintf(&b, "- Draft PR: %s\n", e.PRURL)
+	}
+	if e.Epic != "" {
+		fmt.Fprintf(&b, "- Epic: %s\n", e.Epic)
 	}
 	fmt.Fprintf(&b, "- Window: `%s`\n", e.Window)
 	fmt.Fprintf(&b, "- Last seen: %s\n", ts)
@@ -145,6 +149,8 @@ func Parse(content string) []Entry {
 			cur.Worktree = unbacktick(strings.TrimPrefix(ln, "- Worktree: "))
 		case strings.HasPrefix(ln, "- Draft PR: "):
 			cur.PRURL = strings.TrimPrefix(ln, "- Draft PR: ")
+		case strings.HasPrefix(ln, "- Epic: "):
+			cur.Epic = strings.TrimSpace(strings.TrimPrefix(ln, "- Epic: "))
 		case strings.HasPrefix(ln, "- Window: "):
 			cur.Window = unbacktick(strings.TrimPrefix(ln, "- Window: "))
 		}

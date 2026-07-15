@@ -8,10 +8,12 @@
 package collide
 
 import (
+	"fmt"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/eharriett0/wt/internal/activework"
 	"github.com/eharriett0/wt/internal/config"
@@ -107,8 +109,11 @@ func Overlaps(ws []Window) []Overlap {
 
 // Conflict is a requested path that another window is already touching.
 type Conflict struct {
-	Path   string
-	Window string // the other window's label
+	Path        string
+	Window      string // the other window's label
+	MatchedFile string // the other window's actual repo-relative touched file that
+	// matched Path (may differ from Path when Path was a basename/suffix) — used
+	// for hunk-range lookup so basename checks on nested files still grade.
 }
 
 // CheckPaths reports, for each requested path, which OTHER windows (not
@@ -121,17 +126,13 @@ func CheckPaths(ws []Window, currentWorktree string, paths []string) []Conflict 
 		if sameWorktree(w.Worktree, currentWorktree) {
 			continue
 		}
-		touched := map[string]bool{}
-		for _, f := range w.Touched {
-			touched[f] = true
-		}
 		for _, p := range paths {
 			p = strings.TrimSpace(p)
 			if p == "" {
 				continue
 			}
-			if matchesTouched(p, w.Touched, touched) {
-				out = append(out, Conflict{Path: p, Window: w.Label()})
+			if matched, ok := matchTouched(p, w.Touched); ok {
+				out = append(out, Conflict{Path: p, Window: w.Label(), MatchedFile: matched})
 			}
 		}
 	}
@@ -144,17 +145,21 @@ func CheckPaths(ws []Window, currentWorktree string, paths []string) []Conflict 
 	return out
 }
 
-func matchesTouched(p string, touched []string, set map[string]bool) bool {
-	if set[p] {
-		return true
-	}
-	// suffix match so a basename or partial path still flags a real overlap.
+// matchTouched reports whether requested path p matches any touched file — by
+// exact repo-relative path, path suffix, or basename — and returns the actual
+// matched touched file (repo-relative), preferring an exact match.
+func matchTouched(p string, touched []string) (string, bool) {
 	for _, f := range touched {
-		if f == p || strings.HasSuffix(f, "/"+p) || filepath.Base(f) == p {
-			return true
+		if f == p {
+			return f, true
 		}
 	}
-	return false
+	for _, f := range touched {
+		if strings.HasSuffix(f, "/"+p) || filepath.Base(f) == p {
+			return f, true
+		}
+	}
+	return "", false
 }
 
 // IsSharedDoc reports whether path is one of the configured append-heavy shared
@@ -169,6 +174,110 @@ func IsSharedDoc(path string, shared []string) bool {
 		}
 	}
 	return false
+}
+
+// IsAppendOnly reports whether path matches any of the configured append-only
+// globs (filepath.Match against both the full repo-relative path and the
+// basename). Overlaps on these are always downgraded to FYI regardless of hunk
+// analysis — files where concurrent appends are expected safe (changelogs,
+// inventory lists, kustomize resource lists).
+func IsAppendOnly(path string, globs []string) bool {
+	path = strings.TrimSpace(path)
+	base := filepath.Base(path)
+	for _, g := range globs {
+		g = strings.TrimSpace(g)
+		if g == "" {
+			continue
+		}
+		if ok, _ := filepath.Match(g, path); ok {
+			return true
+		}
+		if ok, _ := filepath.Match(g, base); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// Severity grades a file collision after hunk analysis.
+type Severity int
+
+const (
+	SevFYI  Severity = iota // disjoint hunks / append-only / indeterminate-safe — advisory, non-blocking
+	SevHigh                 // overlapping line ranges — real conflict risk, blocks
+)
+
+func (s Severity) String() string {
+	if s == SevHigh {
+		return "HIGH"
+	}
+	return "low"
+}
+
+// OverlappingSpans returns the intersections between two sets of line ranges
+// (empty ⇒ fully disjoint). O(n·m); the n,m here are per-file hunk counts, tiny.
+func OverlappingSpans(a, b []gitx.LineRange) []gitx.LineRange {
+	var hits []gitx.LineRange
+	for _, ra := range a {
+		for _, rb := range b {
+			if ra.Overlaps(rb) {
+				lo, hi := ra.Start, ra.End
+				if rb.Start > lo {
+					lo = rb.Start
+				}
+				if rb.End < hi {
+					hi = rb.End
+				}
+				hits = append(hits, gitx.LineRange{Start: lo, End: hi})
+			}
+		}
+	}
+	return hits
+}
+
+// ConflictSeverity grades a check/pre-commit collision on a file between the
+// CURRENT worktree's changed ranges and one OTHER window's ranges (pure):
+//   - append-only path              → SevFYI
+//   - either side has no ranges yet → SevHigh (indeterminate — can't prove
+//     disjoint, so don't silently clear; preserves the pre-edit "heads up")
+//   - ranges provably disjoint      → SevFYI (the crying-wolf case #7 targets)
+//   - ranges overlap                → SevHigh
+func ConflictSeverity(current, other []gitx.LineRange, appendOnly bool) Severity {
+	if appendOnly {
+		return SevFYI
+	}
+	if len(current) == 0 || len(other) == 0 {
+		return SevHigh
+	}
+	if len(OverlappingSpans(current, other)) > 0 {
+		return SevHigh
+	}
+	return SevFYI
+}
+
+// OverlapSeverity grades a status overlap on one file touched by several
+// windows, given each window's ranges (pure). append-only ⇒ FYI. Otherwise:
+// if ANY participating window has no computable ranges (untracked/binary/diff
+// error), the overlap is indeterminate → SevHigh (can't prove disjoint, so
+// don't clear — mirrors ConflictSeverity's fail-safe). Else HIGH iff any pair
+// of windows has overlapping ranges; all-disjoint ⇒ FYI.
+func OverlapSeverity(rangesByWindow [][]gitx.LineRange, appendOnly bool) Severity {
+	if appendOnly {
+		return SevFYI
+	}
+	for _, r := range rangesByWindow {
+		if len(r) == 0 {
+			return SevHigh // indeterminate — a real add/add or binary collision can't be graded disjoint
+		}
+	}
+	for i := 0; i < len(rangesByWindow); i++ {
+		for j := i + 1; j < len(rangesByWindow); j++ {
+			if len(OverlappingSpans(rangesByWindow[i], rangesByWindow[j])) > 0 {
+				return SevHigh
+			}
+		}
+	}
+	return SevFYI
 }
 
 func sameWorktree(a, b string) bool {
@@ -196,14 +305,20 @@ type Liveness int
 const (
 	LiveUnknown  Liveness = iota // couldn't determine (git error) — treated as active
 	LiveStale                    // clean worktree, no open PR, nothing unshipped vs base — noise
+	LiveDormant                  // unmerged commits but no activity for > max-age — parked, suppressed like stale (#7)
 	LiveUnmerged                 // commits not yet on base, no open PR — latent collision
 	LiveDirty                    // uncommitted changes in the worktree — actively editing
 	LiveOpenPR                   // an open PR exists for the branch — active contention
 )
 
-// IsStale reports whether this level is the definitively-merged/abandoned case
-// that should be suppressed from collision output.
+// IsStale reports whether this level is the definitively-merged/abandoned case.
 func (l Liveness) IsStale() bool { return l == LiveStale }
+
+// IsSuppressed reports whether a collision against a window at this level should
+// be filtered out of the default output — merged-and-clean (stale) or parked
+// past the dormancy threshold (dormant). Both mean the other window is unlikely
+// to change the file underneath you right now.
+func (l Liveness) IsSuppressed() bool { return l == LiveStale || l == LiveDormant }
 
 // Tag is a short human label for the level.
 func (l Liveness) Tag() string {
@@ -214,6 +329,8 @@ func (l Liveness) Tag() string {
 		return "uncommitted edits"
 	case LiveUnmerged:
 		return "commits, no PR"
+	case LiveDormant:
+		return "dormant"
 	case LiveStale:
 		return "stale: merged / no PR"
 	default:
@@ -225,20 +342,25 @@ func (l Liveness) Tag() string {
 // the level is LiveOpenPR (for display, e.g. "[open PR #747]").
 type WindowLiveness struct {
 	Level Liveness
-	PR    string // open PR number when Level == LiveOpenPR, else ""
+	PR    string        // open PR number when Level == LiveOpenPR, else ""
+	Age   time.Duration // time since the branch's last commit (0 if unknown)
 }
 
 // Label is the plain (uncolored) liveness word, e.g. "open PR #747" or
-// "stale: merged / no PR".
+// "stale: merged / no PR", with a "· last commit Nd ago" suffix when known.
 func (wl WindowLiveness) Label() string {
+	base := wl.Level.Tag()
 	if wl.Level == LiveOpenPR && wl.PR != "" {
-		return "open PR #" + wl.PR
+		base = "open PR #" + wl.PR
 	}
-	return wl.Level.Tag()
+	if wl.Age > 0 && (wl.Level == LiveUnmerged || wl.Level == LiveDormant) {
+		base += ", last commit " + HumanAge(wl.Age) + " ago"
+	}
+	return base
 }
 
 // Badge is the colored, bracketed liveness tag for output lines: red for an
-// open PR, yellow for in-progress (dirty / unmerged), dim for stale/unknown.
+// open PR, yellow for in-progress (dirty / unmerged), dim for stale/dormant/unknown.
 func (wl WindowLiveness) Badge() string {
 	tag := "[" + wl.Label() + "]"
 	switch wl.Level {
@@ -246,8 +368,22 @@ func (wl WindowLiveness) Badge() string {
 		return ui.Red(tag)
 	case LiveDirty, LiveUnmerged:
 		return ui.Yellow(tag)
-	default: // LiveStale, LiveUnknown
+	default: // LiveStale, LiveDormant, LiveUnknown
 		return ui.Dim(tag)
+	}
+}
+
+// HumanAge renders a duration coarsely: "3d", "5h", "12m", or "just now".
+func HumanAge(d time.Duration) string {
+	switch {
+	case d >= 24*time.Hour:
+		return fmt.Sprintf("%dd", int(d.Hours()/24))
+	case d >= time.Hour:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	case d >= time.Minute:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	default:
+		return "just now"
 	}
 }
 
@@ -255,21 +391,36 @@ func (wl WindowLiveness) Badge() string {
 // out from the I/O so the decision boundary is pure and unit-testable.
 type LiveFacts struct {
 	HasOpenPR bool
+	PRChecked bool          // whether open-PR status was actually resolvable (gh present+authed)
 	Dirty     bool
-	Unshipped int // git cherry "+" count; <0 means it could not be computed
+	Unshipped int           // git cherry "+" count; <0 means it could not be computed
+	Age       time.Duration // time since last commit (0 = unknown)
 }
 
 // ClassifyFacts maps observations to a Liveness (pure). Precedence is by
 // descending certainty-of-activity: open PR > dirty worktree > unmerged commits
 // > (fully merged ⇒ stale). An uncomputable unshipped count with no other
 // signal is LiveUnknown (surfaced, not suppressed).
-func ClassifyFacts(f LiveFacts) Liveness {
+//
+// maxAge (>0) enables dormancy: an unmerged, no-PR, clean branch whose last
+// commit is older than maxAge is LiveDormant (suppressed) rather than
+// LiveUnmerged. A dirty or open-PR branch is never dormant — it's active by
+// definition. maxAge==0 disables dormancy entirely (backward-compatible).
+//
+// Dormancy also requires PRChecked: if open-PR status couldn't be resolved (gh
+// offline/unauthed) we must NOT downgrade an idle unmerged branch to dormant,
+// because it might have an open PR we couldn't see — suppressing it would hide
+// a live collision. Ambiguous PR status ⇒ stay LiveUnmerged (active).
+func ClassifyFacts(f LiveFacts, maxAge time.Duration) Liveness {
 	switch {
 	case f.HasOpenPR:
 		return LiveOpenPR
 	case f.Dirty:
 		return LiveDirty
 	case f.Unshipped > 0:
+		if maxAge > 0 && f.Age > maxAge && f.PRChecked {
+			return LiveDormant
+		}
 		return LiveUnmerged
 	case f.Unshipped == 0:
 		return LiveStale
@@ -280,11 +431,13 @@ func ClassifyFacts(f LiveFacts) Liveness {
 
 // Classify resolves one window's liveness via I/O (gh + git). gh is consulted
 // only when present+authed; otherwise classification degrades to git-only
-// signals (a merged clean branch is still correctly LiveStale offline).
-func Classify(w Window, base string) WindowLiveness {
+// signals (a merged clean branch is still correctly LiveStale offline). maxAge
+// enables dormancy suppression; now is injected for testability.
+func Classify(w Window, base string, maxAge time.Duration, now time.Time) WindowLiveness {
 	var f LiveFacts
 	pr := ""
 	if ghx.Present() && ghx.Authed() {
+		f.PRChecked = true
 		if n, ok := ghx.OpenPRForBranch(w.Branch); ok {
 			f.HasOpenPR, pr = true, n
 		}
@@ -295,7 +448,10 @@ func Classify(w Window, base string) WindowLiveness {
 	} else {
 		f.Unshipped = -1
 	}
-	wl := WindowLiveness{Level: ClassifyFacts(f)}
+	if age, err := gitx.LastCommitAge(w.Worktree, now); err == nil {
+		f.Age = age
+	}
+	wl := WindowLiveness{Level: ClassifyFacts(f, maxAge), Age: f.Age}
 	if wl.Level == LiveOpenPR {
 		wl.PR = pr
 	}
@@ -304,8 +460,9 @@ func Classify(w Window, base string) WindowLiveness {
 
 // ClassifyWindows resolves liveness, concurrently, for the windows whose label
 // is in `labels` (the small set actually involved in a collision — NOT all
-// windows, which would be one gh call each). Keyed by window label.
-func ClassifyWindows(ws []Window, base string, labels map[string]bool) map[string]WindowLiveness {
+// windows, which would be one gh call each). Keyed by window label. maxAge
+// enables dormancy suppression (0 = off).
+func ClassifyWindows(ws []Window, base string, labels map[string]bool, maxAge time.Duration) map[string]WindowLiveness {
 	type job struct {
 		label string
 		w     Window
@@ -321,6 +478,7 @@ func ClassifyWindows(ws []Window, base string, labels map[string]bool) map[strin
 	}
 
 	out := make(map[string]WindowLiveness, len(jobs))
+	now := time.Now()
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 8) // bound concurrent gh/git shell-outs
@@ -330,7 +488,7 @@ func ClassifyWindows(ws []Window, base string, labels map[string]bool) map[strin
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			wl := Classify(j.w, base)
+			wl := Classify(j.w, base, maxAge, now)
 			mu.Lock()
 			out[j.label] = wl
 			mu.Unlock()
@@ -367,7 +525,7 @@ func OverlapWindowSet(ov []Overlap) map[string]bool {
 // treated as active (never suppress on ambiguity).
 func PartitionConflicts(cs []Conflict, live map[string]WindowLiveness) (active, stale []Conflict) {
 	for _, c := range cs {
-		if wl, ok := live[c.Window]; ok && wl.Level.IsStale() {
+		if wl, ok := live[c.Window]; ok && wl.Level.IsSuppressed() {
 			stale = append(stale, c)
 		} else {
 			active = append(active, c)
@@ -384,7 +542,7 @@ func PartitionOverlaps(ov []Overlap, live map[string]WindowLiveness) (active, be
 	for _, o := range ov {
 		liveCount := 0
 		for _, w := range o.Windows {
-			if wl, ok := live[w]; !ok || !wl.Level.IsStale() {
+			if wl, ok := live[w]; !ok || !wl.Level.IsSuppressed() {
 				liveCount++
 			}
 		}

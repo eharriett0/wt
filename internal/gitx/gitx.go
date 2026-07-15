@@ -5,7 +5,10 @@ package gitx
 import (
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // run executes git with args in dir ("" = current dir) and returns trimmed
@@ -49,6 +52,12 @@ func RepoRoot() (string, error) { return Run("rev-parse", "--show-toplevel") }
 // CommonDir returns the absolute $GIT_COMMON_DIR (shared across all worktrees).
 func CommonDir() (string, error) {
 	return Run("rev-parse", "--path-format=absolute", "--git-common-dir")
+}
+
+// CommonDirIn returns the absolute $GIT_COMMON_DIR for the repo at dir (or an
+// error if dir isn't a git repo). Used to resolve a sibling repo's shared state.
+func CommonDirIn(dir string) (string, error) {
+	return RunDir(dir, "rev-parse", "--path-format=absolute", "--git-common-dir")
 }
 
 // CurrentBranch returns the abbreviated current branch (or "HEAD" if detached).
@@ -201,6 +210,85 @@ func TouchedFiles(dir, base string) []string {
 		files = append(files, f)
 	}
 	return files
+}
+
+// LineRange is a 1-based inclusive span of lines changed on the NEW side of a
+// diff. A pure deletion (new-count 0) is recorded spanning the gap boundary
+// (the surviving line before + after the removed content) so a delete in one
+// window still overlaps an edit of the same region in another — biasing toward
+// flagging (a missed conflict is worse than an extra heads-up for a safety tool).
+type LineRange struct{ Start, End int }
+
+// Overlaps reports whether two line ranges intersect.
+func (r LineRange) Overlaps(o LineRange) bool {
+	return r.Start <= o.End && o.Start <= r.End
+}
+
+var hunkRe = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
+
+// parseHunkRanges extracts NEW-side line ranges from unified-diff (-U0) output.
+func parseHunkRanges(diff string) []LineRange {
+	var out []LineRange
+	for _, ln := range strings.Split(diff, "\n") {
+		m := hunkRe.FindStringSubmatch(ln)
+		if m == nil {
+			continue
+		}
+		start, _ := strconv.Atoi(m[1])
+		count := 1
+		if m[2] != "" {
+			count, _ = strconv.Atoi(m[2])
+		}
+		if count == 0 {
+			// Pure deletion: git reports the new-side line BEFORE the gap. Span
+			// [start, start+1] to cover both surviving neighbors so an edit of
+			// the removed region in another window overlaps.
+			out = append(out, LineRange{start, start + 1})
+		} else {
+			out = append(out, LineRange{start, start + count - 1})
+		}
+	}
+	return out
+}
+
+// ChangedRanges returns the NEW-side line ranges file was changed on in the
+// worktree at dir — the union of uncommitted (staged + unstaged) hunks and
+// committed-on-branch hunks vs base. -U0 so ranges are tight (no context
+// bleed). Used for hunk-level overlap between windows.
+func ChangedRanges(dir, base, file string) []LineRange {
+	var ranges []LineRange
+	add := func(args ...string) {
+		if out, err := runRaw(dir, args...); err == nil {
+			ranges = append(ranges, parseHunkRanges(out)...)
+		}
+	}
+	add("diff", "-U0", "--", file)            // unstaged
+	add("diff", "-U0", "--cached", "--", file) // staged
+	for _, ref := range []string{"origin/" + base, base} {
+		if _, err := RunDir(dir, "rev-parse", "--verify", "--quiet", ref+"^{commit}"); err == nil {
+			add("diff", "-U0", ref+"...HEAD", "--", file)
+			break
+		}
+	}
+	return ranges
+}
+
+// LastCommitUnix returns the committer timestamp (unix seconds) of HEAD in dir.
+func LastCommitUnix(dir string) (int64, error) {
+	out, err := RunDir(dir, "log", "-1", "--format=%ct")
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+}
+
+// LastCommitAge returns how long ago HEAD in dir was committed, relative to now.
+func LastCommitAge(dir string, now time.Time) (time.Duration, error) {
+	ts, err := LastCommitUnix(dir)
+	if err != nil {
+		return 0, err
+	}
+	return now.Sub(time.Unix(ts, 0)), nil
 }
 
 // IsClean reports whether the worktree at dir has NO uncommitted changes
