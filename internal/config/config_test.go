@@ -58,6 +58,60 @@ func TestApplyConf_EmptyValuesIgnored(t *testing.T) {
 	}
 }
 
+func TestWorktreeRootAnchor(t *testing.T) {
+	cases := []struct {
+		name       string
+		root       string // --show-toplevel (cwd's worktree)
+		common     string // --git-common-dir (absolute)
+		wantName   string
+		wantParent string
+	}{
+		{
+			// From the MAIN checkout: root == main, common == main/.git.
+			name:       "main worktree",
+			root:       "/home/u/repos/transwarp",
+			common:     "/home/u/repos/transwarp/.git",
+			wantName:   "transwarp",
+			wantParent: "/home/u/repos",
+		},
+		{
+			// The #11 case: invoked from a LINKED worktree. root is the
+			// worktree dir, but common still points at the main .git, so the
+			// anchor must resolve to the MAIN root (not "<wt>-worktrees").
+			name:       "linked worktree resolves to main",
+			root:       "/home/u/repos/transwarp-worktrees/feat-x",
+			common:     "/home/u/repos/transwarp/.git",
+			wantName:   "transwarp",
+			wantParent: "/home/u/repos",
+		},
+		{
+			// No/failed common dir → fall back to root (pre-#11 behavior).
+			name:       "empty common falls back to root",
+			root:       "/home/u/repos/transwarp",
+			common:     "",
+			wantName:   "transwarp",
+			wantParent: "/home/u/repos",
+		},
+		{
+			// Bare repo / unusual layout: common doesn't end in .git → fall back.
+			name:       "bare common falls back to root",
+			root:       "/home/u/repos/transwarp",
+			common:     "/home/u/repos/transwarp.git",
+			wantName:   "transwarp",
+			wantParent: "/home/u/repos",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			gotName, gotParent := worktreeRootAnchor(c.root, c.common)
+			if gotName != c.wantName || gotParent != c.wantParent {
+				t.Errorf("worktreeRootAnchor(%q, %q) = (%q, %q), want (%q, %q)",
+					c.root, c.common, gotName, gotParent, c.wantName, c.wantParent)
+			}
+		})
+	}
+}
+
 func TestParseBool(t *testing.T) {
 	for _, v := range []string{"1", "true", "TRUE", "yes", "on"} {
 		if !parseBool(v, false) {
