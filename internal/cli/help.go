@@ -42,6 +42,16 @@ func printHelp() {
 	fmt.Println("    " + d("a draft PR, banners the deploy, and requires a typed confirm / --confirm-deploy."))
 	fmt.Println()
 
+	fmt.Println(b(y("  ✦ CROSS-WINDOW COORDINATION")) + d("  — hand off disruptive changes (incidents, rolls, deploys)"))
+	fmt.Printf("    %s  %s\n", c("wt announce \"<msg>\""), "tell other windows a change is starting  "+d("[--hold \"merge-main,…\"] [--issue N]"))
+	fmt.Printf("    %s                %s\n", c("wt inbox"), "un-acked announcements from other windows  "+d("[--json]"))
+	fmt.Printf("    %s           %s\n", c("wt ack <id>"), "acknowledge one  "+d("[--state \"what this window is touching\"]"))
+	fmt.Printf("    %s     %s\n", c("wt all-clear <id>"), "release your hold  "+d("(also: wt announce --clear <id>)"))
+	fmt.Println("    " + d("A ") + y("--hold") + d(" surfaces as a banner on other windows' next ") + c("status/new/check/claim") + d(","))
+	fmt.Println("    " + d("and ") + c("merge-pr") + d(" REFUSES a held ") + y("merge-main") + d(" until you ack (or --bypass). Shared local"))
+	fmt.Println("    " + d("log ~/.wt/coordination/<repo>.jsonl; ") + c("--issue") + d(" mirrors to a GitHub issue (cross-machine)."))
+	fmt.Println()
+
 	fmt.Println(b("  ✦ SETUP"))
 	fmt.Printf("    %s        %s\n", c("wt install-hooks"), "install pre-push (base-branch guard) + pre-commit (collision notice)")
 	fmt.Printf("    %s              %s\n", c("wt doctor"), "check git/gh + show resolved config")
