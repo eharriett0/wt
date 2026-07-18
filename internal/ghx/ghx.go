@@ -69,6 +69,13 @@ func IssueRemoveAssignee(n, user string) error {
 	return err
 }
 
+// IssueComment posts body as a comment on issue n (the cross-machine mirror for
+// wt's coordination channel — announce/ack/all-clear become issue comments).
+func IssueComment(n, body string) error {
+	_, err := run("issue", "comment", n, "--body", body)
+	return err
+}
+
 // --- PRs ---
 
 // PRCreateArgs builds the `gh pr create` argv. head and base are passed

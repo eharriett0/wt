@@ -80,6 +80,14 @@ func Main(args []string) int {
 		return cmdCheck(rest)
 	case "install-hooks":
 		return cmdInstallHooks(rest)
+	case "announce":
+		return cmdAnnounce(rest)
+	case "inbox":
+		return cmdInbox(rest)
+	case "ack":
+		return cmdAck(rest)
+	case "all-clear":
+		return cmdAllClear(rest)
 	default:
 		ui.Err("unknown command %q", cmd)
 		fmt.Fprintln(os.Stderr, "run `wt help` for usage")
@@ -110,6 +118,7 @@ func cmdNew(args []string) int {
 		return 64
 	}
 	return withConfig(func(c *config.Config) int {
+		peerHoldBanner(c)
 		if _, err := worktree.New(c, args[0]); err != nil {
 			ui.Err("%v", err)
 			return 1
@@ -180,6 +189,7 @@ func cmdClaim(args []string) int {
 		return 64
 	}
 	return withConfig(func(c *config.Config) int {
+		peerHoldBanner(c)
 		openPR := c.ClaimOpenPR && !*noPR
 		if err := claim.Claim(c, pos[0], *force, openPR, *epic); err != nil {
 			ui.Err("%v", err)
@@ -229,6 +239,14 @@ func cmdMergePR(args []string) int {
 	}
 	if c.MergeIsDeploy && !*dryRun {
 		if code := deployGate(pr, *confirmDeploy); code != 0 {
+			return code
+		}
+	}
+	// Cross-window coordination interlock (#13): refuse if another window holds
+	// `merge-main` (a disruptive change in flight) and this window hasn't acked
+	// it. --bypass overrides, matching the collision guard's escape hatch.
+	if !*dryRun && !*bypass {
+		if code := mergeCoordGate(c); code != 0 {
 			return code
 		}
 	}
@@ -337,6 +355,9 @@ func cmdStatus(args []string) int {
 }
 
 func statusReport(c *config.Config, asJSON bool) int {
+	if !asJSON {
+		peerHoldBanner(c)
+	}
 	ws, err := collide.Scan(c)
 	if err != nil {
 		ui.Err("scan failed: %v", err)
@@ -554,6 +575,9 @@ func cmdCheck(args []string) int {
 		return 64
 	}
 	return withConfig(func(c *config.Config) int {
+		if !asJSON {
+			peerHoldBanner(c)
+		}
 		ws, err := collide.Scan(c)
 		if err != nil {
 			ui.Err("scan failed: %v", err)
