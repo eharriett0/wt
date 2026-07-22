@@ -55,10 +55,30 @@ func GuardVerdict(fileCount string, subjects []string) Verdict {
 	return VerdictOK
 }
 
+// BranchIsForeign reports whether head is NOT one of the wt-managed worktree
+// branches (worktreeBranches) — i.e. the PR would merge a branch with no local
+// wt lane here. This is the "merged the wrong lane" class from wt#15. Fail-open:
+// an empty head OR an empty/unknown worktree set returns false (don't block —
+// the surfaced head-branch line is the safety net when we can't be sure).
+func BranchIsForeign(head string, worktreeBranches []string) bool {
+	head = strings.TrimSpace(head)
+	if head == "" || len(worktreeBranches) == 0 {
+		return false
+	}
+	for _, b := range worktreeBranches {
+		if strings.TrimSpace(b) == head {
+			return false
+		}
+	}
+	return true
+}
+
 // Run executes the guarded merge for PR number pr. dryRun prints the verdict
 // without merging; bypass proceeds past a block verdict (loud warning).
-// extraArgs pass through to `gh pr merge`.
-func Run(pr string, dryRun, bypass bool, extraArgs []string) error {
+// mergeForeign permits merging a PR whose head branch has no wt worktree here
+// (the foreign-branch guard, wt#15). worktreeBranches is the set of wt-managed
+// worktree branches for this repo. extraArgs pass through to `gh pr merge`.
+func Run(pr string, dryRun, bypass, mergeForeign bool, worktreeBranches []string, extraArgs []string) error {
 	fileCount := ghx.PRChangedFileCount(pr)
 	subjects := ghx.PRCommitSubjects(pr)
 	v := GuardVerdict(fileCount, subjects)
@@ -84,11 +104,39 @@ func Run(pr string, dryRun, bypass bool, extraArgs []string) error {
 		// fallthrough to merge
 	}
 
+	head, _ := ghx.PRHeadBranch(pr)
+	head = strings.TrimSpace(head)
+	foreign := BranchIsForeign(head, worktreeBranches)
+
+	// Always surface the head branch — the single line that catches a
+	// wrong-branch merge before it happens (wt#15).
+	label := "PR #" + pr
+	if head != "" {
+		label = fmt.Sprintf("PR #%s from branch %q", pr, head)
+	}
+
+	// dry-run previews (never blocks) — but flags a foreign head so the operator
+	// sees the guard would fire on the real merge.
 	if dryRun {
-		fmt.Printf("merge-pr: PR #%s verdict=%s file_count=%s (dry-run, not merging)\n", pr, v, fileCount)
+		note := ""
+		if foreign {
+			note = " [FOREIGN: head has no wt worktree here — a real merge needs --merge-foreign]"
+		}
+		fmt.Printf("merge-pr: %s verdict=%s file_count=%s%s (dry-run, not merging)\n", label, v, fileCount, note)
 		return nil
 	}
 
-	fmt.Printf("merge-pr: PR #%s has %s changed file(s) — merging (squash).\n", pr, fileCount)
+	// Foreign-branch guard (wt#15): refuse to merge a PR whose head branch has
+	// no wt worktree here — in a multi-window setup this is the "merged the wrong
+	// lane" class. --merge-foreign (or --bypass) proceeds. Fail-open via
+	// BranchIsForeign when the head / worktree set is unknown.
+	if foreign && !mergeForeign && !bypass {
+		fmt.Fprintf(os.Stderr, "REFUSING to merge PR #%s — head branch %q has no wt worktree here (foreign branch).\n", pr, head)
+		fmt.Fprintln(os.Stderr, "In a multi-window setup this is the 'merged the wrong lane' class (wt#15).")
+		fmt.Fprintf(os.Stderr, "If intended: wt merge-pr %s --merge-foreign\n", pr)
+		return fmt.Errorf("foreign branch")
+	}
+
+	fmt.Printf("merge-pr: %s — %s changed file(s) — merging (squash).\n", label, fileCount)
 	return ghx.MergePRSquash(pr, extraArgs)
 }
