@@ -32,3 +32,30 @@ func TestGuardVerdict(t *testing.T) {
 		})
 	}
 }
+
+func TestBranchIsForeign(t *testing.T) {
+	managed := []string{"feat-1-alpha", "feat-2-beta", "fix-3-gamma"}
+	cases := []struct {
+		name     string
+		head     string
+		branches []string
+		want     bool
+	}{
+		{"managed branch is not foreign", "feat-2-beta", managed, false},
+		{"unknown branch is foreign", "feat-99-other-window", managed, true},
+		{"empty head fails open (not foreign)", "", managed, false},
+		{"whitespace-only head fails open", "   ", managed, false},
+		{"empty worktree set fails open (can't determine)", "feat-2-beta", nil, false},
+		{"empty worktree set + unknown head still fails open", "whatever", []string{}, false},
+		{"head matches after trimming", "  feat-1-alpha  ", managed, false},
+		{"managed entry padded, head clean", "fix-3-gamma", []string{" fix-3-gamma "}, false},
+		{"case-sensitive: different case IS foreign", "Feat-1-Alpha", managed, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := BranchIsForeign(tc.head, tc.branches); got != tc.want {
+				t.Errorf("BranchIsForeign(%q, %v) = %v, want %v", tc.head, tc.branches, got, tc.want)
+			}
+		})
+	}
+}

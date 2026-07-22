@@ -207,6 +207,7 @@ func cmdMergePR(args []string) int {
 	fs := flag.NewFlagSet("merge-pr", flag.ContinueOnError)
 	dryRun := fs.Bool("dry-run", false, "print the guard verdict without merging")
 	bypass := fs.Bool("bypass", false, "merge despite a block verdict (rare)")
+	mergeForeign := fs.Bool("merge-foreign", false, "merge a PR whose head branch has no wt worktree here (wt#15)")
 	keep := fs.Bool("keep", false, "keep the worktree after merge (default: auto-remove it)")
 	confirmDeploy := fs.Bool("confirm-deploy", false, "acknowledge merge auto-applies to prod (merge_is_deploy repos)")
 	pos, ghArgs, err := parseInterspersed(fs, args)
@@ -214,7 +215,7 @@ func cmdMergePR(args []string) int {
 		return 64
 	}
 	if len(pos) < 1 {
-		ui.Err("usage: wt merge-pr <pr> [--dry-run] [--bypass] [--keep] [--confirm-deploy] [-- extra gh args]")
+		ui.Err("usage: wt merge-pr <pr> [--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [-- extra gh args]")
 		return 64
 	}
 	pr := pos[0]
@@ -232,7 +233,14 @@ func cmdMergePR(args []string) int {
 			return code
 		}
 	}
-	if err := merge.Run(pr, *dryRun, *bypass, ghArgs); err != nil {
+	// Foreign-branch guard input (wt#15): the wt-managed worktree branches for
+	// this repo. Best-effort — if we can't enumerate them, merge.Run fails open
+	// (surfaces the head branch but doesn't block).
+	var wtBranches []string
+	if c.WorktreeRoot != "" {
+		wtBranches, _ = gitx.WorktreeBranchesUnder(c.WorktreeRoot)
+	}
+	if err := merge.Run(pr, *dryRun, *bypass, *mergeForeign, wtBranches, ghArgs); err != nil {
 		return 1
 	}
 	// Auto-clean: the PR just shipped, so its worktree is done. Only on a real

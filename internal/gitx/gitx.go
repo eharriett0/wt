@@ -127,6 +127,43 @@ func WorktreePaths() ([]string, error) {
 	return paths, nil
 }
 
+// WorktreeBranchesUnder returns the branch names of every worktree whose path
+// is under root (the wt-managed worktree root). Detached worktrees are skipped.
+// These are the "wt-managed worktree branches for this repo" used by merge-pr's
+// foreign-branch guard (wt#15) — a PR head branch that is NOT one of these has
+// no local wt lane and may be another window's branch merged by mistake.
+func WorktreeBranchesUnder(root string) ([]string, error) {
+	out, err := Run("worktree", "list", "--porcelain")
+	if err != nil {
+		return nil, err
+	}
+	var branches []string
+	var curPath string
+	for _, ln := range strings.Split(out, "\n") {
+		switch {
+		case strings.HasPrefix(ln, "worktree "):
+			curPath = strings.TrimSpace(strings.TrimPrefix(ln, "worktree "))
+		case strings.HasPrefix(ln, "branch "):
+			br := strings.TrimPrefix(strings.TrimSpace(strings.TrimPrefix(ln, "branch ")), "refs/heads/")
+			if br != "" && pathUnder(curPath, root) {
+				branches = append(branches, br)
+			}
+		}
+	}
+	return branches, nil
+}
+
+// pathUnder reports whether path is root itself or nested under it.
+func pathUnder(path, root string) bool {
+	if path == "" || root == "" {
+		return false
+	}
+	sep := string(filepath.Separator)
+	path = strings.TrimSuffix(path, sep)
+	root = strings.TrimSuffix(root, sep)
+	return path == root || strings.HasPrefix(path, root+sep)
+}
+
 // WorktreeRemove removes the worktree at path. force discards untracked/dirty
 // files (git refuses otherwise).
 func WorktreeRemove(path string, force bool) error {
@@ -262,7 +299,7 @@ func ChangedRanges(dir, base, file string) []LineRange {
 			ranges = append(ranges, parseHunkRanges(out)...)
 		}
 	}
-	add("diff", "-U0", "--", file)            // unstaged
+	add("diff", "-U0", "--", file)             // unstaged
 	add("diff", "-U0", "--cached", "--", file) // staged
 	for _, ref := range []string{"origin/" + base, base} {
 		if _, err := RunDir(dir, "rev-parse", "--verify", "--quiet", ref+"^{commit}"); err == nil {
