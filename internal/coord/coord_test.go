@@ -167,3 +167,82 @@ func TestLogPathSlug(t *testing.T) {
 		t.Fatalf("unexpected slug path: %s", p)
 	}
 }
+
+func TestWindowID(t *testing.T) {
+	cases := []struct {
+		name, env, toplevel, branch, want string
+	}{
+		{"env wins over everything", "roll-nodes", "/x/me-worktrees/feat-1", "feat-1", "roll-nodes"},
+		{"env is trimmed", "  dep-sweep  ", "/x/me", "main", "dep-sweep"},
+		{"no env -> FULL worktree path (not basename — over-relax fix)", "", "/Users/e/engineering/me-worktrees/feat-1591-carry", "feat-1591-carry", "/Users/e/engineering/me-worktrees/feat-1591-carry"},
+		{"no env -> full main-checkout path", "", "/Users/e/engineering/me", "some-branch", "/Users/e/engineering/me"},
+		// THE #18 FIX: same worktree dir, branch flipped (shared-checkout
+		// contamination) -> identity is UNCHANGED, so the own-hold exemption fires.
+		{"STABLE across branch flip: same toplevel diff branch", "", "/x/me-worktrees/feat-1", "OTHER-AFTER-CONTAMINATION", "/x/me-worktrees/feat-1"},
+		{"trailing slash canonicalized", "", "/x/me-worktrees/feat-1/", "b", "/x/me-worktrees/feat-1"},
+		{"no env, no toplevel -> branch fallback", "", "", "feat-9", "feat-9"},
+		{"blank toplevel ignored -> branch", "", "   ", "feat-9", "feat-9"},
+		{"nothing -> detached", "", "", "", "detached"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := WindowID(tc.env, tc.toplevel, tc.branch); got != tc.want {
+				t.Errorf("WindowID(%q,%q,%q) = %q, want %q", tc.env, tc.toplevel, tc.branch, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSelfBlockFixedByStableIdentity is the end-to-end #15/#18 acceptance: a
+// window announces a merge-main hold, then its branch flips before it merges.
+// With a STABLE identity the coordinator is NOT blocked on its own hold, while a
+// genuinely different window still IS. (Guards against over-relaxing the block.)
+func TestSelfBlockFixedByStableIdentity(t *testing.T) {
+	top := "/x/me-worktrees/roll"
+	selfAtAnnounce := WindowID("", top, "roll")
+	selfAtMerge := WindowID("", top, "some-other-branch-after-flip") // branch changed, dir didn't
+	if selfAtAnnounce != selfAtMerge {
+		t.Fatalf("identity drifted across branch flip: %q != %q", selfAtAnnounce, selfAtMerge)
+	}
+	recs := []Record{
+		{ID: "a1", Kind: KindAnnounce, Window: selfAtAnnounce, Hold: []string{"merge-main"}},
+	}
+	if h := ActiveHolds(recs, selfAtMerge, "merge-main"); len(h) != 0 {
+		t.Fatalf("coordinator self-blocked on its OWN hold: got %d", len(h))
+	}
+	other := WindowID("", "/x/me-worktrees/dep-sweep", "dep-sweep")
+	if h := ActiveHolds(recs, other, "merge-main"); len(h) != 1 {
+		t.Fatalf("a genuinely different window must still be blocked: got %d", len(h))
+	}
+	// WT_WINDOW override also yields a stable, self-exempting identity across dirs.
+	pinned := WindowID("roll-coordinator", "/anywhere/else", "any-branch")
+	recs2 := []Record{{ID: "a2", Kind: KindAnnounce, Window: WindowID("roll-coordinator", top, "roll"), Hold: []string{"merge-main"}}}
+	if h := ActiveHolds(recs2, pinned, "merge-main"); len(h) != 0 {
+		t.Fatalf("WT_WINDOW-pinned coordinator self-blocked across dirs: got %d", len(h))
+	}
+}
+
+// TestDistinctTreesSameBasenameDoNotCollapse pins the over-relax fix from the
+// 2026-07-23 adversarial pass: two DIFFERENT working trees that share a dir leaf
+// name (e.g. two `git clone`s both named "me" on different branches, which share
+// one coordination log) must NOT collapse to a single identity — otherwise one
+// silently bypasses the other's merge-main hold. Using the FULL path (not its
+// basename) keeps them distinct.
+func TestDistinctTreesSameBasenameDoNotCollapse(t *testing.T) {
+	a := WindowID("", "/Users/e/engineering/me", "feat-x")
+	b := WindowID("", "/Users/e/review/me", "feat-y")
+	if a == b {
+		t.Fatalf("distinct trees collapsed to one identity %q — over-relax regression", a)
+	}
+	// clone B must still be blocked by clone A's merge-main hold.
+	recs := []Record{{ID: "h", Kind: KindAnnounce, Window: a, Hold: []string{"merge-main"}}}
+	if h := ActiveHolds(recs, b, "merge-main"); len(h) != 1 {
+		t.Fatalf("clone B must be blocked by clone A's hold, got %d", len(h))
+	}
+	// main checkout vs a worktree that happens to share the leaf name: distinct.
+	main := WindowID("", "/Users/e/engineering/me", "main")
+	wt := WindowID("", "/Users/e/engineering/me-worktrees/me", "me")
+	if main == wt {
+		t.Fatalf("main checkout and worktree collapsed to %q", main)
+	}
+}

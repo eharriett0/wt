@@ -2,7 +2,10 @@
 package doctor
 
 import (
+	"os"
+
 	"github.com/eharriett0/wt/internal/config"
+	"github.com/eharriett0/wt/internal/coord"
 	"github.com/eharriett0/wt/internal/ghx"
 	"github.com/eharriett0/wt/internal/gitx"
 	"github.com/eharriett0/wt/internal/ui"
@@ -43,6 +46,8 @@ func Run(c *config.Config) int {
 		ui.Info("worktree root: %s", c.WorktreeRoot)
 		ui.Info("active-work:   %s", c.ActiveWork)
 		ui.Info("branch prefix: %s", c.Prefix)
+		br, _ := gitx.CurrentBranch()
+		ui.Info("window id:     %s", coord.WindowID(os.Getenv("WT_WINDOW"), c.Root, br))
 	}
 
 	if !hardOK {
