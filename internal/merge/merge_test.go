@@ -1,6 +1,9 @@
 package merge
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 func TestGuardVerdict(t *testing.T) {
 	cases := []struct {
@@ -57,5 +60,44 @@ func TestBranchIsForeign(t *testing.T) {
 				t.Errorf("BranchIsForeign(%q, %v) = %v, want %v", tc.head, tc.branches, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestWithAdmin(t *testing.T) {
+	cases := []struct {
+		name  string
+		admin bool
+		extra []string
+		want  []string
+	}{
+		{"off: nil unchanged", false, nil, nil},
+		{"off: extra passthrough unchanged", false, []string{"--delete-branch"}, []string{"--delete-branch"}},
+		{"on: appends to nil", true, nil, []string{"--admin"}},
+		{"on: appends after existing passthrough", true, []string{"--delete-branch"}, []string{"--delete-branch", "--admin"}},
+		{"on: dedups when passthrough already has --admin", true, []string{"--admin"}, []string{"--admin"}},
+		{"on: dedups whitespace-padded --admin", true, []string{" --admin "}, []string{" --admin "}},
+		{"on: dedups --admin alongside other args", true, []string{"--delete-branch", "--admin"}, []string{"--delete-branch", "--admin"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := WithAdmin(tc.admin, tc.extra); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("WithAdmin(%v, %v) = %v, want %v", tc.admin, tc.extra, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestWithAdminDoesNotMutateCaller pins the copy-before-append: appending to a
+// slice with spare capacity would clobber the caller's backing array. WithAdmin
+// must leave the input slice untouched.
+func TestWithAdminDoesNotMutateCaller(t *testing.T) {
+	extra := make([]string, 1, 4) // len 1, cap 4 — spare capacity to clobber
+	extra[0] = "--delete-branch"
+	got := WithAdmin(true, extra)
+	if len(extra) != 1 || extra[0] != "--delete-branch" {
+		t.Errorf("caller slice mutated: %v", extra)
+	}
+	if want := []string{"--delete-branch", "--admin"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("WithAdmin returned %v, want %v", got, want)
 	}
 }

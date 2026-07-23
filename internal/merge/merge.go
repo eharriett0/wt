@@ -73,6 +73,27 @@ func BranchIsForeign(head string, worktreeBranches []string) bool {
 	return true
 }
 
+// WithAdmin returns extraArgs with "--admin" appended when admin is set, so the
+// squash forwards --admin to `gh pr merge` — the maintainer bypass for a branch
+// whose protection REQUIRES a PR review (own low-risk CI-green PRs on a
+// required-review repo; wt#20). Deduplicated so an explicit `-- --admin`
+// passthrough doesn't double it. This bypasses GitHub branch protection, NOT
+// wt's own safety checks: the CLI runs the merge_is_deploy deploy-gate + the
+// empty-diff/placeholder + foreign-branch guards BEFORE the merge, so the value
+// of wt merge-pr (the deploy gate the raw `gh` fallback loses) is preserved.
+func WithAdmin(admin bool, extraArgs []string) []string {
+	if !admin {
+		return extraArgs
+	}
+	for _, a := range extraArgs {
+		if strings.TrimSpace(a) == "--admin" {
+			return extraArgs // already present via `-- --admin` passthrough
+		}
+	}
+	out := append([]string(nil), extraArgs...)
+	return append(out, "--admin")
+}
+
 // Run executes the guarded merge for PR number pr. dryRun prints the verdict
 // without merging; bypass proceeds past a block verdict (loud warning).
 // mergeForeign permits merging a PR whose head branch has no wt worktree here
