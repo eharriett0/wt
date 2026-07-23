@@ -220,12 +220,13 @@ func cmdMergePR(args []string) int {
 	mergeForeign := fs.Bool("merge-foreign", false, "merge a PR whose head branch has no wt worktree here (wt#15)")
 	keep := fs.Bool("keep", false, "keep the worktree after merge (default: auto-remove it)")
 	confirmDeploy := fs.Bool("confirm-deploy", false, "acknowledge merge auto-applies to prod (merge_is_deploy repos)")
+	admin := fs.Bool("admin", false, "forward --admin to gh pr merge — maintainer bypass of a required-review branch (wt#20)")
 	pos, ghArgs, err := parseInterspersed(fs, args)
 	if err != nil {
 		return 64
 	}
 	if len(pos) < 1 {
-		ui.Err("usage: wt merge-pr <pr> [--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [-- extra gh args]")
+		ui.Err("usage: wt merge-pr <pr> [--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [-- extra gh args]")
 		return 64
 	}
 	pr := pos[0]
@@ -258,6 +259,12 @@ func cmdMergePR(args []string) int {
 	if c.WorktreeRoot != "" {
 		wtBranches, _ = gitx.WorktreeBranchesUnder(c.WorktreeRoot)
 	}
+	// --admin forwards through to `gh pr merge` for the required-review-branch
+	// maintainer bypass (wt#20). Appended only here — AFTER the deploy-gate +
+	// coord + guard checks above — so it bypasses GitHub branch protection, not
+	// wt's own safety checks (which is exactly the value the raw `gh` fallback
+	// lost).
+	ghArgs = merge.WithAdmin(*admin, ghArgs)
 	if err := merge.Run(pr, *dryRun, *bypass, *mergeForeign, wtBranches, ghArgs); err != nil {
 		return 1
 	}

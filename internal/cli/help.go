@@ -37,9 +37,10 @@ func printHelp() {
 	fmt.Println()
 
 	fmt.Println(b(g("  ✦ MERGE")) + d("  — guarded squash that refuses empty/placeholder-only PRs"))
-	fmt.Printf("    %s     %s\n", c("wt merge-pr <pr>"), "guarded squash (surfaces head branch) + auto-remove worktree  "+d("[--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy]"))
+	fmt.Printf("    %s     %s\n", c("wt merge-pr <pr>"), "guarded squash (surfaces head branch) + auto-remove worktree  "+d("[--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin]"))
 	fmt.Println("    " + d("set ") + c("merge_is_deploy") + d(" for GitOps repos (merge auto-applies to prod): refuses"))
 	fmt.Println("    " + d("a draft PR, banners the deploy, and requires a typed confirm / --confirm-deploy."))
+	fmt.Println("    " + d("--admin forwards to gh pr merge to bypass a required-review branch (keeps the guard)."))
 	fmt.Println()
 
 	fmt.Println(b(y("  ✦ CROSS-WINDOW COORDINATION")) + d("  — hand off disruptive changes (incidents, rolls, deploys)"))
