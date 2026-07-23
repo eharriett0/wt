@@ -26,10 +26,11 @@ import (
 // shares one log per repo.
 func coordCtx(c *config.Config) (logPath, window string) {
 	home, _ := os.UserHomeDir()
-	window, _ = gitx.CurrentBranch()
-	if strings.TrimSpace(window) == "" {
-		window = "detached"
-	}
+	branch, _ := gitx.CurrentBranch()
+	// c.Root is this worktree's toplevel (git rev-parse --show-toplevel) — stable
+	// across branch switches, unlike the branch itself (#18). WT_WINDOW overrides
+	// for pinning identity across separate checkouts.
+	window = coord.WindowID(os.Getenv("WT_WINDOW"), c.Root, branch)
 	return coord.LogPath(home, mainRepoName(c)), window
 }
 

@@ -204,6 +204,42 @@ func HoldCovers(hold []string, op string) bool {
 	return false
 }
 
+// WindowID picks a STABLE window identity for coordination, resilient to branch
+// switches within a checkout (#18). The old identity was the current branch, so
+// announcing a `--hold` from branch W then running `merge-pr` after the branch
+// flipped (the shared-checkout contamination of #15) made a window self-block on
+// its OWN hold: ActiveHolds already exempts own-window holds (a.Window == self),
+// but only if `self` is stable. Precedence:
+//
+//  1. WT_WINDOW env — explicit, survives dir AND branch changes; set per terminal
+//     to pin identity across checkouts (the only fix for announcing in one dir and
+//     merging from another) and to get a short readable label.
+//  2. worktree toplevel PATH (canonical, full) — stable across `git checkout`
+//     within a dir (the branch flips, the dir doesn't), so announce + merge from
+//     one checkout keep one identity even if the branch changed between them.
+//     The FULL path (not its basename) is load-bearing: two distinct working
+//     trees that share a dir leaf name — e.g. two `git clone`s both named "me" on
+//     different branches, which share one coordination log — must NOT collapse to
+//     one identity, or one would silently bypass the other's merge-main hold (the
+//     adversarial-verify regression, 2026-07-23). The old branch identity was
+//     collision-free only because git enforces one-worktree-per-branch; the path
+//     is collision-free by construction.
+//  3. current branch — last-resort fallback (the original behavior).
+//
+// Never returns "" — everything empty degrades to "detached".
+func WindowID(env, toplevel, branch string) string {
+	if w := strings.TrimSpace(env); w != "" {
+		return w
+	}
+	if t := strings.TrimSpace(toplevel); t != "" {
+		return filepath.Clean(t)
+	}
+	if b := strings.TrimSpace(branch); b != "" {
+		return b
+	}
+	return "detached"
+}
+
 // ActiveHolds returns announcements from OTHER windows whose hold covers op,
 // that have not been all-cleared and that self has not acked. These are the
 // holds that should block/warn an operation (e.g. merge-pr checking "merge-main").

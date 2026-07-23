@@ -50,6 +50,8 @@ func printHelp() {
 	fmt.Println("    " + d("A ") + y("--hold") + d(" surfaces as a banner on other windows' next ") + c("status/new/check/claim") + d(","))
 	fmt.Println("    " + d("and ") + c("merge-pr") + d(" REFUSES a held ") + y("merge-main") + d(" until you ack (or --bypass). Shared local"))
 	fmt.Println("    " + d("log ~/.wt/coordination/<repo>.jsonl; ") + c("--issue") + d(" mirrors to a GitHub issue (cross-machine)."))
+	fmt.Println("    " + d("Window identity = the worktree (stable across branch switches); export ") + c("WT_WINDOW"))
+	fmt.Println("    " + d("to pin it across checkouts so a hold's creator is never blocked by its own hold (#18)."))
 	fmt.Println()
 
 	fmt.Println(b("  ✦ SETUP"))
