@@ -90,6 +90,8 @@ func Main(args []string) int {
 		return cmdAllClear(rest)
 	case "block-id":
 		return cmdBlockID(rest)
+	case "append":
+		return cmdAppend(rest)
 	default:
 		ui.Err("unknown command %q", cmd)
 		fmt.Fprintln(os.Stderr, "run `wt help` for usage")
@@ -438,6 +440,8 @@ func statusReport(c *config.Config, asJSON bool) int {
 			detail := ui.Yellow("indeterminate (untracked/binary — can't prove disjoint)")
 			if s := spansString(o.OverlapSpans); s != "" {
 				detail = ui.Yellow("overlap " + s)
+			} else if s := sectionsString(o.SharedSections); s != "" {
+				detail = ui.Yellow(s)
 			}
 			fmt.Fprintf(os.Stderr, "   %s  %s %s  %s\n", ui.Bold(o.File), ui.Dim("←"),
 				strings.Join(taggedWindows(o.Windows, live), ", "), detail)
