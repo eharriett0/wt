@@ -10,6 +10,7 @@ package collide
 import (
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -61,18 +62,48 @@ func Scan(c *config.Config) ([]Window, error) {
 		}
 	}
 
-	var ws []Window
-	for _, p := range paths {
-		br, _ := gitx.CurrentBranchIn(p)
-		w := Window{Worktree: p, Branch: br, Touched: gitx.TouchedFiles(p, c.Base)}
-		if e, ok := byWorktree[p]; ok {
-			w.Issue, w.Title = e.Issue, e.Title
-		} else if e, ok := byBranch[br]; ok {
-			w.Issue, w.Title = e.Issue, e.Title
-		}
-		ws = append(ws, w)
+	// Enumerate worktrees CONCURRENTLY (#22). Each window needs 3 git
+	// subprocess calls (CurrentBranchIn + status + diff inside TouchedFiles);
+	// run sequentially at ~30 windows this blew past 2 minutes, and `wt check`
+	// inherited the cost since it also calls Scan. The reads are independent per
+	// worktree (separate working trees, read-only — no git-lock contention), so
+	// a bounded worker pool cuts wall time to roughly the slowest single
+	// worktree. Indexed writes preserve WorktreePaths order (stable output);
+	// per-worktree git errors stay swallowed, exactly as before.
+	ws := make([]Window, len(paths))
+	sem := make(chan struct{}, scanWorkers())
+	var wg sync.WaitGroup
+	for i, p := range paths {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, p string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			br, _ := gitx.CurrentBranchIn(p)
+			w := Window{Worktree: p, Branch: br, Touched: gitx.TouchedFiles(p, c.Base)}
+			if e, ok := byWorktree[p]; ok {
+				w.Issue, w.Title = e.Issue, e.Title
+			} else if e, ok := byBranch[br]; ok {
+				w.Issue, w.Title = e.Issue, e.Title
+			}
+			ws[i] = w
+		}(i, p)
 	}
+	wg.Wait()
 	return ws, nil
+}
+
+// scanWorkers bounds the concurrent per-worktree git reads in Scan: enough to
+// hide latency at ~30 windows without spawning dozens of git processes at once.
+func scanWorkers() int {
+	n := runtime.NumCPU() * 2
+	if n < 4 {
+		n = 4
+	}
+	if n > 16 {
+		n = 16
+	}
+	return n
 }
 
 // Overlap is a file touched by more than one window.

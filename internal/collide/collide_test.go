@@ -289,3 +289,12 @@ func TestHumanAge(t *testing.T) {
 		}
 	}
 }
+
+func TestScanWorkers(t *testing.T) {
+	// Bounded worker count for the concurrent worktree scan (#22): enough to
+	// hide git latency at ~30 windows, capped so we don't spawn dozens of git
+	// processes at once.
+	if n := scanWorkers(); n < 4 || n > 16 {
+		t.Errorf("scanWorkers() = %d, want within [4,16]", n)
+	}
+}
