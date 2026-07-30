@@ -20,6 +20,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/eharriett0/wt/internal/lock"
 )
 
 // Kind enumerates the record types on the coordination log.
@@ -337,10 +339,10 @@ func ReserveBlock(path string, r Record, file string, fileMax func() (int, error
 		return Record{}, err
 	}
 	defer lf.Close()
-	if err := flockExclusive(lf); err != nil {
+	if err := lock.Exclusive(lf); err != nil {
 		return Record{}, err
 	}
-	defer flockRelease(lf)
+	defer lock.Release(lf)
 
 	recs, err := Load(path)
 	if err != nil {

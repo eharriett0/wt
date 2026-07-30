@@ -27,9 +27,10 @@ type Config struct {
 	// MEMORY.md…) where a cross-window touch is an ADVISORY, not a blocking
 	// collision — every window legitimately edits these, so they'd otherwise
 	// cry wolf on every check/commit. Matched by basename.
-	AppendOnlyPaths []string      // globs (filepath.Match) whose overlaps are downgraded to FYI regardless of hunk overlap (changelogs, inventory lists…)
-	MaxAge          time.Duration // suppress unmerged branches whose last commit is older than this (0 = off); dormancy suppression (#7)
-	MergeIsDeploy   bool          // this repo auto-deploys on merge to base — merge-pr adds a prod-safety gate (refuse draft, banner, confirm)
+	AppendOnlyPaths []string          // globs (filepath.Match) whose overlaps are downgraded to FYI regardless of hunk overlap (changelogs, inventory lists…)
+	MaxAge          time.Duration     // suppress unmerged branches whose last commit is older than this (0 = off); dormancy suppression (#7)
+	MergeIsDeploy   bool              // this repo auto-deploys on merge to base — merge-pr adds a prod-safety gate (refuse draft, banner, confirm)
+	StructuredDocs  map[string]string // basename → section-delimiter regex (#22): docs that partition into sections/lanes, so a cross-window touch grades by SECTION (same section = HIGH) instead of the blanket shared-doc advisory. Per-doc because delimiters differ (CLAUDE.md by "## " headings, the resume memory by "**═══" lane bars). Config-file only.
 }
 
 // Load resolves config for the repo containing cwd.
@@ -139,6 +140,19 @@ func ApplyConf(c *Config, m map[string]string) {
 	}
 	if v, ok := m["merge_is_deploy"]; ok {
 		c.MergeIsDeploy = parseBool(v, c.MergeIsDeploy)
+	}
+	// structured_doc.<basename> = <section-delimiter regex> (#22). Prefixed keys
+	// because the flat key=value config has no nesting, and each doc needs its
+	// own delimiter. A bad regex is tolerated (that doc just falls back to the
+	// blanket shared-doc advisory) — compilation happens at grade time, not here,
+	// so config parsing never fails on a typo.
+	for k, v := range m {
+		if name, ok := strings.CutPrefix(k, "structured_doc."); ok && name != "" && v != "" {
+			if c.StructuredDocs == nil {
+				c.StructuredDocs = map[string]string{}
+			}
+			c.StructuredDocs[name] = v
+		}
 	}
 }
 
