@@ -88,6 +88,8 @@ func Main(args []string) int {
 		return cmdAck(rest)
 	case "all-clear":
 		return cmdAllClear(rest)
+	case "block-id":
+		return cmdBlockID(rest)
 	default:
 		ui.Err("unknown command %q", cmd)
 		fmt.Fprintln(os.Stderr, "run `wt help` for usage")
@@ -372,6 +374,7 @@ func cmdStatus(args []string) int {
 func statusReport(c *config.Config, asJSON bool) int {
 	if !asJSON {
 		peerHoldBanner(c)
+		blockReservationBanner(c)
 	}
 	ws, err := collide.Scan(c)
 	if err != nil {

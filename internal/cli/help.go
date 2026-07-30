@@ -48,6 +48,7 @@ func printHelp() {
 	fmt.Printf("    %s                %s\n", c("wt inbox"), "un-acked announcements from other windows  "+d("[--json]"))
 	fmt.Printf("    %s           %s\n", c("wt ack <id>"), "acknowledge one  "+d("[--state \"what this window is touching\"]"))
 	fmt.Printf("    %s     %s\n", c("wt all-clear <id>"), "release your hold  "+d("(also: wt announce --clear <id>)"))
+	fmt.Printf("    %s  %s\n", c("wt block-id <file>"), "reserve the next append-log id so two windows never grab the same NEWEST-N  "+d("[--pattern \"NEWEST-{n}\"] [--format]"))
 	fmt.Println("    " + d("A ") + y("--hold") + d(" surfaces as a banner on other windows' next ") + c("status/new/check/claim") + d(","))
 	fmt.Println("    " + d("and ") + c("merge-pr") + d(" REFUSES a held ") + y("merge-main") + d(" until you ack (or --bypass). Shared local"))
 	fmt.Println("    " + d("log ~/.wt/coordination/<repo>.jsonl; ") + c("--issue") + d(" mirrors to a GitHub issue (cross-machine)."))

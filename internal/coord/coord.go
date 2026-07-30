@@ -27,6 +27,11 @@ const (
 	KindAnnounce = "announce"
 	KindAck      = "ack"
 	KindAllClear = "all-clear"
+	// KindBlockReserve records a reserved append-log block id (#23): a window
+	// atomically claims the next NEWEST-N slot on a shared append-log doc so two
+	// windows never grab the same N. Reservation-only — nothing marks it
+	// "written"; recency is the "prepend imminent" signal.
+	KindBlockReserve = "block-reserve"
 )
 
 // Record is one line on the coordination log.
@@ -35,12 +40,14 @@ type Record struct {
 	TS      string   `json:"ts"`     // RFC3339
 	Window  string   `json:"window"` // announcing/acking window (worktree branch)
 	Repo    string   `json:"repo"`   // repo slug
-	Kind    string   `json:"kind"`   // announce | ack | all-clear
+	Kind    string   `json:"kind"`   // announce | ack | all-clear | block-reserve
 	Message string   `json:"message,omitempty"`
 	Issue   int      `json:"issue,omitempty"`  // mirrored GitHub issue #, if any
 	Hold    []string `json:"hold,omitempty"`   // ops other windows should avoid until all-clear
 	AckOf   string   `json:"ack_of,omitempty"` // announce id this record acks / clears
 	State   string   `json:"state,omitempty"`  // one-line in-flight state (on ack)
+	File    string   `json:"file,omitempty"`   // block-reserve: the append-log doc
+	Block   int      `json:"block,omitempty"`  // block-reserve: the reserved block id (N)
 }
 
 // LogPath returns the coordination log path for repo under home's ~/.wt.
@@ -271,4 +278,85 @@ func Age(r Record, now time.Time) time.Duration {
 		return 0
 	}
 	return now.Sub(t)
+}
+
+// NextBlock returns the next append-log block id for file: one past the max of
+// (a) every block-reserve record for file already on the coordination log and
+// (b) fileMax — the highest block id already written in the target file itself.
+// Seeding from fileMax is what lets wt take over allocation for a file that
+// predates it (existing NEWEST-55 in the doc → next is 56, not 1). Pure.
+func NextBlock(recs []Record, file string, fileMax int) int {
+	max := fileMax
+	for _, r := range recs {
+		if r.Kind == KindBlockReserve && r.File == file && r.Block > max {
+			max = r.Block
+		}
+	}
+	return max + 1
+}
+
+// RecentBlockReservations returns block-reserve records from OTHER windows that
+// are younger than maxAge — the "a prepend is imminent, don't anchor on the
+// same header" signal for wt status. Self's own reservations are excluded (you
+// know your own). Newest first. Pure.
+func RecentBlockReservations(recs []Record, self string, now time.Time, maxAge time.Duration) []Record {
+	var out []Record
+	for _, r := range recs {
+		if r.Kind != KindBlockReserve || r.Window == self {
+			continue
+		}
+		if Age(r, now) <= maxAge {
+			out = append(out, r)
+		}
+	}
+	// Newest first: the log is append-order (oldest first), so reverse.
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
+}
+
+// ReserveBlock atomically allocates and records the next block id for file.
+//
+// It holds an EXCLUSIVE advisory lock (flock) on the coordination log across
+// the whole read-modify-write — (load reservations → evaluate fileMax → append)
+// — so two windows calling it concurrently can never allocate the same id. The
+// bare Append used by announce/ack is O_APPEND (torn-write-safe) but has no such
+// serialization; block ids need it because they're a read-then-write allocation.
+//
+// fileMax is a closure so the doc scan runs UNDER the lock (it sees the latest
+// on-disk content, e.g. a block another window just wrote). Nil fileMax => 0.
+// r should be a fresh record (ID/TS/Window/Repo set); Kind/File/Block are set
+// here. Returns the completed record whose .Block is the reserved id.
+func ReserveBlock(path string, r Record, file string, fileMax func() (int, error)) (Record, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return Record{}, err
+	}
+	lf, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return Record{}, err
+	}
+	defer lf.Close()
+	if err := flockExclusive(lf); err != nil {
+		return Record{}, err
+	}
+	defer flockRelease(lf)
+
+	recs, err := Load(path)
+	if err != nil {
+		return Record{}, err
+	}
+	fm := 0
+	if fileMax != nil {
+		if fm, err = fileMax(); err != nil {
+			return Record{}, err
+		}
+	}
+	r.Kind = KindBlockReserve
+	r.File = file
+	r.Block = NextBlock(recs, file, fm)
+	if err := Append(path, r); err != nil {
+		return Record{}, err
+	}
+	return r, nil
 }
