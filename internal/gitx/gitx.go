@@ -213,15 +213,35 @@ func TouchedFiles(dir, base string) []string {
 	// (a) uncommitted (staged + unstaged + untracked) via porcelain. Use the
 	// raw runner: the 2-char status code + space prefix is positional, so the
 	// path begins at byte 3 of every line — trimming the blob would corrupt it.
-	if out, err := runRaw(dir, "status", "--porcelain"); err == nil {
+	//
+	// --untracked-files=all (#27): git's DEFAULT untracked mode collapses a
+	// fully-untracked directory to a single "dir/" entry, which never
+	// string-matches another window's specific "dir/foo.go" in Overlaps — so a
+	// collision under a freshly-created dir goes silently undetected. -uall
+	// lists each new file at its full path. Gitignored files stay excluded, so
+	// the cost is bounded to genuinely-new files.
+	if out, err := runRaw(dir, "status", "--porcelain", "--untracked-files=all"); err == nil {
 		for _, ln := range strings.Split(out, "\n") {
 			if len(ln) < 4 {
 				continue
 			}
 			path := strings.TrimSpace(ln[3:])
-			// Rename/copy: "old -> new" — take the new path.
+			// Rename/copy "old -> new" (#28): record BOTH sides. Keeping only
+			// the new path misses a rename/modify clash — window A renames
+			// x.go, window B edits x.go — a real 3-way conflict that would
+			// otherwise show no overlap. Recording old can only add a flag,
+			// never hide one (correct for a safety tool). Each side may be
+			// individually quoted when it contains special chars.
 			if i := strings.Index(path, " -> "); i >= 0 {
-				path = path[i+4:]
+				oldp := strings.Trim(strings.TrimSpace(path[:i]), "\"")
+				newp := strings.Trim(strings.TrimSpace(path[i+len(" -> "):]), "\"")
+				if oldp != "" {
+					set[oldp] = struct{}{}
+				}
+				if newp != "" {
+					set[newp] = struct{}{}
+				}
+				continue
 			}
 			path = strings.Trim(path, "\"")
 			if path != "" {
