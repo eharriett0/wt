@@ -267,6 +267,23 @@ func cmdMergePR(args []string) int {
 		ui.Err("cannot resolve repo config (%v) — refusing merge; can't verify merge_is_deploy", err)
 		return 1
 	}
+	// #39: PR-state precheck. An already-merged PR shouldn't raise a confusing gh
+	// error AND orphan its worktree — skip the merge but still clean up. A
+	// closed-not-merged PR has nothing to merge. Unknown state → fall through
+	// (fail-open). Only on a real merge; dry-run still previews.
+	if !*dryRun {
+		switch merge.PreMergeVerdict(ghx.PRState(pr)) {
+		case merge.PreAlreadyMerged:
+			ui.Info("PR #%s is already merged — skipping the merge, cleaning up its worktree.", pr)
+			if !*keep {
+				autoCleanMergedWorktree(pr)
+			}
+			return 0
+		case merge.PreClosed:
+			ui.Err("PR #%s is closed (not merged) — nothing to merge.", pr)
+			return 1
+		}
+	}
 	if c.MergeIsDeploy && !*dryRun {
 		if code := deployGate(pr, *confirmDeploy); code != 0 {
 			return code
@@ -318,6 +335,11 @@ func autoCleanMergedWorktree(pr string) {
 		ui.Info("merged; couldn't resolve PR head branch to auto-clean (use `wt clean`)")
 		return
 	}
+	// #40: symmetric with claim.Release — the PR merged, so drop its active-work
+	// claim section too (auto-clean previously removed the worktree but left the
+	// section forever). Best-effort; fires regardless of whether a local worktree
+	// exists (merge from the primary checkout still resolves + clears the claim).
+	removeActiveWorkForBranch(c, branch)
 	paths, err := gitx.WorktreePaths()
 	if err != nil {
 		return
@@ -336,6 +358,32 @@ func autoCleanMergedWorktree(pr string) {
 		return
 	}
 	// No local worktree for the branch (e.g. merged from the primary checkout).
+}
+
+// removeActiveWorkForBranch drops the active-work claim section whose branch is
+// `branch` (#40) — resolving the issue number from the active-work file, since
+// autoClean has the branch, not the issue. Best-effort + soft: a miss must never
+// fail the merge that already succeeded.
+func removeActiveWorkForBranch(c *config.Config, branch string) {
+	content := activework.Read(c.ActiveWork)
+	if content == "" {
+		return
+	}
+	var issue string
+	for _, e := range activework.Parse(content) {
+		if e.Branch == branch {
+			issue = e.Issue
+			break
+		}
+	}
+	if issue == "" {
+		return
+	}
+	if newC, changed := activework.RemoveSection(content, issue); changed {
+		if err := activework.Write(c.ActiveWork, newC); err == nil {
+			ui.Info("removed #%s from active-work (claim resolved)", issue)
+		}
+	}
 }
 
 // cwdUnder reports whether the current dir is inside dir (so we can hint a cd

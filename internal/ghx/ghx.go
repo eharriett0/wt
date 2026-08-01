@@ -149,6 +149,19 @@ func PRTitle(pr string) (string, error) {
 	return run("pr", "view", pr, "--json", "title", "--jq", ".title")
 }
 
+// PRState returns the PR's state (OPEN / MERGED / CLOSED) for the merge-pr
+// precheck (#39). Empty on error / gh unavailable, so the caller fails open.
+func PRState(pr string) string {
+	if !Present() || !Authed() {
+		return ""
+	}
+	out, err := run("pr", "view", pr, "--json", "state", "--jq", ".state")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
 // MergedPRForBranch reports whether branch has a MERGED PR. Used by `wt clean`
 // to treat a squash-merged wt branch as shipped even though `git cherry` never
 // reads 0 for it (wt branches carry an empty placeholder + real work, so they're
