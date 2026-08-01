@@ -208,10 +208,15 @@ func IsSharedDoc(path string, shared []string) bool {
 }
 
 // IsAppendOnly reports whether path matches any of the configured append-only
-// globs (filepath.Match against both the full repo-relative path and the
-// basename). Overlaps on these are always downgraded to FYI regardless of hunk
-// analysis — files where concurrent appends are expected safe (changelogs,
-// inventory lists, kustomize resource lists).
+// globs, against both the full repo-relative path and the basename. Overlaps on
+// these are always downgraded to FYI regardless of hunk analysis — files where
+// concurrent appends are expected safe (changelogs, inventory lists, kustomize
+// resource lists).
+//
+// Matching is doublestar-aware (#31): plain filepath.Match treats "**" as a
+// single-level "*", so a configured `docs/**/*.md` (or any nested target)
+// silently NEVER matched — the downgrade quietly no-op'd. MatchDoubleStar lets
+// "**" span any number of path segments; a `*` still stays within one segment.
 func IsAppendOnly(path string, globs []string) bool {
 	path = strings.TrimSpace(path)
 	base := filepath.Base(path)
@@ -220,14 +225,45 @@ func IsAppendOnly(path string, globs []string) bool {
 		if g == "" {
 			continue
 		}
-		if ok, _ := filepath.Match(g, path); ok {
-			return true
-		}
-		if ok, _ := filepath.Match(g, base); ok {
+		if MatchDoubleStar(g, path) || MatchDoubleStar(g, base) {
 			return true
 		}
 	}
 	return false
+}
+
+// MatchDoubleStar reports whether name matches pattern, where a "**" path
+// segment matches ANY number of segments (including zero). Every other segment
+// is matched with filepath.Match (so *, ?, [set] work within one segment). Both
+// are '/'-separated. A pattern with no "**" behaves exactly like the pre-#31
+// segment-wise filepath.Match.
+func MatchDoubleStar(pattern, name string) bool {
+	return matchSegments(strings.Split(pattern, "/"), strings.Split(name, "/"))
+}
+
+func matchSegments(pat, name []string) bool {
+	for len(pat) > 0 {
+		if pat[0] == "**" {
+			rest := pat[1:]
+			if len(rest) == 0 {
+				return true // trailing ** absorbs everything remaining
+			}
+			for i := 0; i <= len(name); i++ { // ** consumes 0..len(name) segments
+				if matchSegments(rest, name[i:]) {
+					return true
+				}
+			}
+			return false
+		}
+		if len(name) == 0 {
+			return false
+		}
+		if ok, _ := filepath.Match(pat[0], name[0]); !ok {
+			return false
+		}
+		pat, name = pat[1:], name[1:]
+	}
+	return len(name) == 0
 }
 
 // Severity grades a file collision after hunk analysis.

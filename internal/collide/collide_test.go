@@ -182,13 +182,13 @@ func TestIsSharedDoc(t *testing.T) {
 		want bool
 	}{
 		{"CLAUDE.md", true},
-		{"infrastructure/CLAUDE.md", true},                 // basename match through a path
+		{"infrastructure/CLAUDE.md", true}, // basename match through a path
 		{"MEMORY.md", true},
 		{".claude/memory/MEMORY.md", true},
 		{"internal/cli/cli.go", false},
-		{"claude.md", false},                               // case-sensitive basename
+		{"claude.md", false}, // case-sensitive basename
 		{"README.md", false},
-		{"  CLAUDE.md  ", true},                            // trimmed
+		{"  CLAUDE.md  ", true}, // trimmed
 	}
 	for _, c := range cases {
 		if got := IsSharedDoc(c.path, shared); got != c.want {
@@ -259,12 +259,12 @@ func TestOverlapSeverity(t *testing.T) {
 func TestIsAppendOnly(t *testing.T) {
 	globs := []string{"*.log", "envs/*/inventory.yaml", "CHANGELOG.md"}
 	cases := map[string]bool{
-		"build.log":                 true,  // *.log basename
-		"deep/nested/build.log":     true,  // *.log basename match
-		"envs/prod/inventory.yaml":  true,  // path glob
-		"envs/inventory.yaml":       false, // one level short of envs/*/…
-		"CHANGELOG.md":              true,
-		"internal/cli/cli.go":       false,
+		"build.log":                true,  // *.log basename
+		"deep/nested/build.log":    true,  // *.log basename match
+		"envs/prod/inventory.yaml": true,  // path glob
+		"envs/inventory.yaml":      false, // one level short of envs/*/…
+		"CHANGELOG.md":             true,
+		"internal/cli/cli.go":      false,
 	}
 	for p, want := range cases {
 		if got := IsAppendOnly(p, globs); got != want {
@@ -296,5 +296,46 @@ func TestScanWorkers(t *testing.T) {
 	// processes at once.
 	if n := scanWorkers(); n < 4 || n > 16 {
 		t.Errorf("scanWorkers() = %d, want within [4,16]", n)
+	}
+}
+
+func TestMatchDoubleStar(t *testing.T) {
+	yes := [][2]string{
+		{"docs/**/*.md", "docs/sub/a.md"},     // ** spans one dir
+		{"docs/**/*.md", "docs/x/y/a.md"},     // ** spans multiple dirs
+		{"**/*.md", "a.md"},                   // ** matches zero segments
+		{"**/*.md", "deep/nested/a.md"},       // ** matches many
+		{"docs/*.md", "docs/a.md"},            // no ** → single-level (unchanged)
+		{"cluster/**", "cluster/apps/x.yaml"}, // trailing ** absorbs the rest
+		{"*.md", "a.md"},                      // basename glob
+	}
+	for _, c := range yes {
+		if !MatchDoubleStar(c[0], c[1]) {
+			t.Errorf("MatchDoubleStar(%q,%q) = false, want true", c[0], c[1])
+		}
+	}
+	no := [][2]string{
+		{"docs/*.md", "docs/sub/a.md"}, // single * does NOT cross '/'
+		{"docs/**/*.md", "src/a.md"},   // prefix must still match
+		{"*.md", "a.go"},               // wrong ext
+		{"docs/**/*.md", "docs/a.txt"}, // ** ok but final seg mismatches
+	}
+	for _, c := range no {
+		if MatchDoubleStar(c[0], c[1]) {
+			t.Errorf("MatchDoubleStar(%q,%q) = true, want false", c[0], c[1])
+		}
+	}
+}
+
+func TestIsAppendOnly_DoubleStar(t *testing.T) {
+	globs := []string{"docs/**/*.md", "CHANGELOG.md"}
+	if !IsAppendOnly("docs/gotchas/trading.md", globs) {
+		t.Error("nested doc under docs/**/*.md should be append-only")
+	}
+	if !IsAppendOnly("CHANGELOG.md", globs) {
+		t.Error("basename glob should still match")
+	}
+	if IsAppendOnly("src/main.go", globs) {
+		t.Error("unrelated path must not match")
 	}
 }
