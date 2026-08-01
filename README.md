@@ -113,7 +113,7 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 | `wt all-clear <id>` | Release your hold |
 | `wt holds` | YOUR outstanding announcements/holds + block reservations, with copy-pasteable all-clear lines |
 | `wt prune-coord` | GC the coordination log — drop resolved handshakes + aged block reservations `[--block-max-age D]` |
-| `wt block-id <file>` | Atomically reserve the next append-log id so two windows never grab the same `NEWEST-N` `[--pattern] [--format]` |
+| `wt block-id <file>` | Atomically reserve the next append-log id so two windows never grab the same `NEWEST-N`. `--written N` marks a reservation done (clears the banner; frees it if never written) `[--pattern] [--format]` |
 | `wt append <doc> --section H "txt"` | Locked, section-scoped append to a structured shared doc (parallel adds can't clobber) |
 | `wt install-hooks` | Install pre-push (base-branch guard) + pre-commit (collision notice) `[--force]` |
 | `wt doctor` | Check git/gh and show the resolved config |

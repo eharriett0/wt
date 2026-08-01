@@ -9,26 +9,91 @@ import (
 )
 
 func TestNextBlock(t *testing.T) {
-	if got := NextBlock(nil, "resume.md", 0); got != 1 {
+	now := time.Now()
+	if got := NextBlock(nil, "resume.md", 0, now, 30*time.Minute); got != 1 {
 		t.Errorf("empty → %d, want 1", got)
 	}
-	if got := NextBlock(nil, "resume.md", 55); got != 56 {
+	if got := NextBlock(nil, "resume.md", 55, now, 30*time.Minute); got != 56 {
 		t.Errorf("fileMax=55 seed → %d, want 56", got)
 	}
+	// TS-less records have Age 0 → always fresh, so they still count.
 	recs := []Record{
 		{Kind: KindBlockReserve, File: "resume.md", Block: 3},
 		{Kind: KindBlockReserve, File: "resume.md", Block: 7},
 		{Kind: KindBlockReserve, File: "other.md", Block: 99}, // different file — ignored
 		{Kind: KindAnnounce, File: "resume.md"},               // wrong kind — ignored
 	}
-	if got := NextBlock(recs, "resume.md", 0); got != 8 {
+	if got := NextBlock(recs, "resume.md", 0, now, 30*time.Minute); got != 8 {
 		t.Errorf("max reservation 7 → %d, want 8", got)
 	}
-	if got := NextBlock(recs, "resume.md", 20); got != 21 {
+	if got := NextBlock(recs, "resume.md", 20, now, 30*time.Minute); got != 21 {
 		t.Errorf("fileMax=20 beats reservation 7 → %d, want 21", got)
 	}
-	if got := NextBlock(recs, "other.md", 0); got != 100 {
+	if got := NextBlock(recs, "other.md", 0, now, 30*time.Minute); got != 100 {
 		t.Errorf("per-file isolation: other.md → %d, want 100", got)
+	}
+}
+
+// A stale, never-written reservation frees its id (#35): NextBlock skips it, so
+// a crashed window that reserved N but never prepended doesn't burn N.
+func TestNextBlock_FreesStaleUnwritten(t *testing.T) {
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	ago := func(min int) string { return now.Add(-time.Duration(min) * time.Minute).Format(time.RFC3339) }
+	recs := []Record{
+		{Kind: KindBlockReserve, File: "r.md", Block: 5, TS: ago(90)}, // stale, no write → freed
+	}
+	if got := NextBlock(recs, "r.md", 0, now, 30*time.Minute); got != 1 {
+		t.Errorf("stale unwritten reservation should be freed → %d, want 1", got)
+	}
+	// A written reservation of the same age is still honored via the file's
+	// fileMax (the block is on disk); the marker itself doesn't inflate beyond it.
+	recs = append(recs,
+		Record{Kind: KindBlockReserve, File: "r.md", Block: 8, TS: ago(90)},
+		Record{Kind: KindBlockWritten, File: "r.md", Block: 8, TS: ago(89)},
+	)
+	if got := NextBlock(recs, "r.md", 8, now, 30*time.Minute); got != 9 {
+		t.Errorf("written block 8 (in fileMax) → %d, want 9", got)
+	}
+	// ttl<=0 disables aging: even the stale reservation counts (back-compat).
+	if got := NextBlock(recs, "r.md", 0, now, 0); got != 9 {
+		t.Errorf("ttl=0 counts all reservations → %d, want 9 (max 8)", got)
+	}
+}
+
+// A written reservation drops out of the imminent-prepend banner and `wt holds`.
+func TestBlockWritten_ExcludesFromViews(t *testing.T) {
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	fresh := now.Add(-time.Minute).Format(time.RFC3339)
+	recs := []Record{
+		{Kind: KindBlockReserve, Window: "other", File: "r.md", Block: 3, TS: fresh},
+		{Kind: KindBlockReserve, Window: "self", File: "r.md", Block: 4, TS: fresh},
+	}
+	if got := RecentBlockReservations(recs, "self", now, 30*time.Minute); len(got) != 1 {
+		t.Fatalf("before write: banner shows %d, want 1", len(got))
+	}
+	if got := OwnBlockReservations(recs, "self"); len(got) != 1 {
+		t.Fatalf("before write: holds shows %d, want 1", len(got))
+	}
+	// Mark both written.
+	recs = append(recs,
+		Record{Kind: KindBlockWritten, Window: "other", File: "r.md", Block: 3, TS: fresh},
+		Record{Kind: KindBlockWritten, Window: "self", File: "r.md", Block: 4, TS: fresh},
+	)
+	if got := RecentBlockReservations(recs, "self", now, 30*time.Minute); len(got) != 0 {
+		t.Errorf("after write: banner should be empty, got %d", len(got))
+	}
+	if got := OwnBlockReservations(recs, "self"); len(got) != 0 {
+		t.Errorf("after write: holds should be empty, got %d", len(got))
+	}
+	// prune-coord GCs the written reservation + its marker.
+	kept, dropped := PruneRecords(recs, now, 24*time.Hour)
+	if dropped != 4 {
+		t.Errorf("prune dropped %d, want 4 (2 reservations + 2 markers)", dropped)
+	}
+	for _, r := range kept {
+		if r.Kind == KindBlockReserve || r.Kind == KindBlockWritten {
+			t.Errorf("prune left a block record: %+v", r)
+		}
 	}
 }
 

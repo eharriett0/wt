@@ -26,8 +26,9 @@ const defaultBlockPattern = "NEWEST-{n}"
 
 // blockReservationMaxAge bounds which reservations wt status surfaces — a
 // reservation older than this is assumed already written (or abandoned), so it
-// no longer signals an imminent prepend.
-const blockReservationMaxAge = 30 * time.Minute
+// no longer signals an imminent prepend. Single source: the coord TTL that also
+// governs id-freeing in NextBlock (#35).
+const blockReservationMaxAge = coord.DefaultBlockReserveTTL
 
 // blockPatternRe compiles a pattern like "NEWEST-{n}" into a regexp capturing
 // the numeric id. Everything outside {n} is matched literally.
@@ -73,13 +74,15 @@ func cmdBlockID(args []string) int {
 		"append-log id pattern; {n} is the numeric placeholder")
 	format := fs.Bool("format", false,
 		"print the full formatted token (e.g. NEWEST-56) instead of the bare number")
+	written := fs.Int("written", -1,
+		"mark block N as WRITTEN (prepended) — clears the reservation instead of allocating a new id")
 	pos, _, err := parseInterspersed(fs, args)
 	if err != nil {
 		return 64
 	}
 	file := strings.TrimSpace(strings.Join(pos, " "))
 	if file == "" {
-		ui.Err(`usage: wt block-id <file> [--pattern "NEWEST-{n}"] [--format]`)
+		ui.Err(`usage: wt block-id <file> [--pattern "NEWEST-{n}"] [--format] [--written N]`)
 		return 64
 	}
 	re, err := blockPatternRe(*pattern)
@@ -97,6 +100,25 @@ func cmdBlockID(args []string) int {
 	}
 	return withConfig(func(c *config.Config) int {
 		path, window := coordCtx(c)
+
+		// --written N: terminal signal that reservation N was actually prepended
+		// (#35). Clears the "imminent prepend" banner + `wt holds` entry now, and
+		// lets prune-coord GC the reservation. Best-effort — never allocates.
+		if *written >= 0 {
+			recs, _ := coord.Load(path)
+			m := newRecord(c, window, coord.KindBlockWritten)
+			m.File, m.Block = absFile, *written
+			if res, ok := coord.FindOwnReservation(recs, window, absFile, *written); ok {
+				m.AckOf = res.ID
+			}
+			if err := coord.Append(path, m); err != nil {
+				ui.Err("could not record block-written: %v", err)
+				return 1
+			}
+			ui.OK("marked block %d written on %s — reservation cleared", *written, filepath.Base(absFile))
+			return 0
+		}
+
 		r := newRecord(c, window, coord.KindBlockReserve)
 		out, rerr := coord.ReserveBlock(path, r, absFile, func() (int, error) {
 			return scanFileMaxBlock(absFile, re)
@@ -110,9 +132,9 @@ func cmdBlockID(args []string) int {
 		} else {
 			fmt.Println(out.Block)
 		}
-		ui.Info("reserved block %d for %s (window %s) — write your %s block now",
+		ui.Info("reserved block %d for %s (window %s) — write your %s block now, then `wt block-id %s --written %d`",
 			out.Block, filepath.Base(absFile), window,
-			strings.Replace(*pattern, "{n}", strconv.Itoa(out.Block), 1))
+			strings.Replace(*pattern, "{n}", strconv.Itoa(out.Block), 1), file, out.Block)
 		return 0
 	})
 }
