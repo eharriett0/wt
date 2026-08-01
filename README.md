@@ -96,17 +96,35 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 
 | Command | What it does |
 |---|---|
-| `wt status [--json]` | All windows + files each touches + severity-graded overlaps |
+| `wt status [--json]` | All windows + files each touches + severity-graded overlaps. `[--blocking]` = only HIGH, exit 3 (a gate). `[--max-age D]` |
 | `wt status --epic <id>` | Aggregate an epic's claims + live PR states across sibling repos |
-| `wt check <paths…>` | Is another window touching these paths? `[--show-diff] [--json] [--include-stale]` (exit 3 = HIGH) |
+| `wt check <paths…>` | Is another window touching these paths? `[--show-diff] [--json] [--include-stale] [--max-age D]` (exit 3 = HIGH) |
+| `wt where <issue\|branch>` | Print that window's worktree path — `cd $(wt where 42)` |
 | `wt new <branch>` | Create a worktree on a new branch from the base branch |
-| `wt clean [-y]` | List worktrees whose branch already shipped; `-y` removes them (+ local branch), skipping dirty ones |
+| `wt clean [-y]` | List worktrees whose branch already shipped (incl. squash-merged PRs); `-y` removes them, skipping dirty ones |
 | `wt claim <issue>` | Assign a GitHub issue, make a worktree, open a draft PR, record the claim `[--force] [--no-pr] [--epic <id>]` |
 | `wt release <issue>` | Drop the claim (leaves the worktree + PR in place) |
-| `wt merge-pr <pr>` | Guarded squash-merge, then auto-removes the worktree `[--dry-run] [--bypass] [--keep] [--confirm-deploy]` |
+| `wt merge-pr <pr>` | Guarded squash-merge (PR-state precheck, strips a `WIP:` subject), then auto-removes the worktree + claim `[--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin]` |
+| `wt todos` | What every window is working on (mirrors each window's TODO list) |
+| **— cross-window coordination —** | |
+| `wt announce "<msg>"` | Tell other windows a change is starting `[--hold "merge-main,…"] [--issue N]` |
+| `wt inbox` | Un-acked announcements from other windows `[--json]` |
+| `wt ack <id>` | Acknowledge one `[--state "what this window is touching"]` |
+| `wt all-clear <id>` | Release your hold |
+| `wt holds` | YOUR outstanding announcements/holds + block reservations, with copy-pasteable all-clear lines |
+| `wt prune-coord` | GC the coordination log — drop resolved handshakes + aged block reservations `[--block-max-age D]` |
+| `wt block-id <file>` | Atomically reserve the next append-log id so two windows never grab the same `NEWEST-N` `[--pattern] [--format]` |
+| `wt append <doc> --section H "txt"` | Locked, section-scoped append to a structured shared doc (parallel adds can't clobber) |
 | `wt install-hooks` | Install pre-push (base-branch guard) + pre-commit (collision notice) `[--force]` |
 | `wt doctor` | Check git/gh and show the resolved config |
+| `wt version` | Print the version |
 | `wt help` | Colorful overview |
+
+Structured shared docs (`structured_doc.<name>` in config) upgrade the blanket
+"shared doc — advisory" to **section-aware** grading: two windows editing the
+**same** section is HIGH, disjoint sections stay advisory. The installed binary
+also nudges (once/day, best-effort) when a newer `wt` is available on the remote
+— silence with `WT_NO_UPDATE_CHECK=1`.
 
 ## Typical multi-window flow
 
@@ -186,8 +204,10 @@ Zero-config works by derivation. Override via a repo-root `.wt.conf`
 | `link_files` | `WT_LINK_FILES` | `.env` (gitignored files symlinked into new worktrees) |
 | `claim_open_pr` | `WT_CLAIM_OPEN_PR` | `true` |
 | `shared_docs` | `WT_SHARED_DOCS` | `CLAUDE.md,MEMORY.md` (advisory-only basenames; empty disables) |
-| `append_only_paths` | `WT_APPEND_ONLY_PATHS` | *(none)* — globs whose overlaps are always FYI |
+| `structured_doc.<basename>` | *(config-file only)* | *(none)* — section-delimiter regex; the doc grades by SECTION (same section = HIGH). e.g. `structured_doc.CLAUDE.md = ^##\s` |
+| `append_only_paths` | `WT_APPEND_ONLY_PATHS` | *(none)* — globs whose overlaps are always FYI (`**` matches any depth) |
 | `max_age` | `WT_MAX_AGE` | *(off)* — dormancy threshold, e.g. `4d`, `2w`, `36h`, or a bare int (days) |
+| `hold_max_age` | `WT_HOLD_MAX_AGE` | `24h` — a `--hold` older than this stops hard-blocking `merge-pr` (warns instead); `0`/`off` = never expire |
 | `merge_is_deploy` | `WT_MERGE_IS_DEPLOY` | `false` — enable the prod-deploy gate on `merge-pr` |
 
 Color is auto-disabled when stdout isn't a TTY; force off with `NO_COLOR=1`.
