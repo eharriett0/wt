@@ -232,12 +232,18 @@ func cmdClaim(args []string) int {
 }
 
 func cmdRelease(args []string) int {
-	if len(args) < 1 {
-		ui.Err("usage: wt release <issue>")
+	fs := flag.NewFlagSet("release", flag.ContinueOnError)
+	clean := fs.Bool("clean", false, "also remove the worktree if the branch is abandoned (clean, no live PR, WIP-only)")
+	pos, _, err := parseInterspersed(fs, args)
+	if err != nil {
+		return 64
+	}
+	if len(pos) < 1 {
+		ui.Err("usage: wt release <issue> [--clean]")
 		return 64
 	}
 	return withConfig(func(c *config.Config) int {
-		if err := claim.Release(c, args[0]); err != nil {
+		if err := claim.Release(c, pos[0], *clean); err != nil {
 			ui.Err("%v", err)
 			return 1
 		}

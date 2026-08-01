@@ -188,6 +188,30 @@ func Cherry(base, branchRef string) (string, error) {
 	return Run("cherry", base, branchRef)
 }
 
+// CommitSubjects returns the one-line subjects of commits on branchRef that are
+// not on base (git log --format=%s base..branchRef), newest first. Used to tell
+// whether a branch carries only WIP placeholder commits (#42).
+func CommitSubjects(base, branchRef string) ([]string, error) {
+	out, err := Run("log", "--format=%s", base+".."+branchRef)
+	if err != nil {
+		return nil, err
+	}
+	var subjects []string
+	for _, ln := range strings.Split(out, "\n") {
+		if ln = strings.TrimSpace(ln); ln != "" {
+			subjects = append(subjects, ln)
+		}
+	}
+	return subjects, nil
+}
+
+// WorktreePrune runs `git worktree prune`, dropping administrative metadata for
+// worktrees whose directories were removed out-of-band (#42). Best-effort.
+func WorktreePrune() error {
+	_, err := Run("worktree", "prune")
+	return err
+}
+
 // CountUnshipped counts cherry "+" lines (commits with no patch-equivalent on
 // base). Zero means the branch is fully shipped (squash-merge safe).
 func CountUnshipped(base, branchRef string) (int, error) {

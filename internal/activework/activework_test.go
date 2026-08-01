@@ -116,3 +116,28 @@ func TestOtherClaims(t *testing.T) {
 		t.Errorf("OtherClaims(.., \"\") should return all 2, got %v", all)
 	}
 }
+
+func TestUpsertSection_RefreshesLastSeenNoDuplicate(t *testing.T) {
+	t0 := time.Date(2026, 6, 18, 15, 4, 5, 0, time.UTC)
+	base := AppendSection("", Entry{Issue: "42", Title: "T", Branch: "feat-42", Worktree: "/w", Window: "win", When: t0})
+	t1 := t0.Add(3 * time.Hour)
+	got := UpsertSection(base, Entry{Issue: "42", Title: "T", Branch: "feat-42", Worktree: "/w", Window: "win", When: t1})
+	if strings.Count(got, "## #42 ") != 1 {
+		t.Fatalf("resume duplicated the section:\n%s", got)
+	}
+	if !strings.Contains(got, "- Last seen: "+t1.Format(time.RFC3339)) {
+		t.Fatalf("Last seen not refreshed:\n%s", got)
+	}
+	// original claimed timestamp preserved (header line unchanged)
+	if !strings.Contains(got, "## #42 — claimed "+t0.Format(time.RFC3339)) {
+		t.Fatalf("claimed timestamp was reset:\n%s", got)
+	}
+}
+
+func TestUpsertSection_AppendsWhenAbsent(t *testing.T) {
+	t0 := time.Date(2026, 6, 18, 15, 4, 5, 0, time.UTC)
+	got := UpsertSection("", Entry{Issue: "99", Title: "N", Branch: "feat-99", Worktree: "/w", Window: "win", When: t0})
+	if strings.Count(got, "## #99 ") != 1 {
+		t.Fatalf("expected one #99 section:\n%s", got)
+	}
+}

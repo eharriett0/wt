@@ -74,6 +74,46 @@ func AppendSection(content string, e Entry) string {
 	return b.String()
 }
 
+// UpsertSection refreshes an existing claim's "Last seen" timestamp (a resume
+// after a crash — #41) or appends a fresh section when the issue isn't recorded
+// yet. On resume it preserves the original "claimed" time and every other field
+// so a re-claim never duplicates or resets the record. Pure.
+func UpsertSection(content string, e Entry) string {
+	if updated, found := touchLastSeen(content, e.Issue, e.When); found {
+		return updated
+	}
+	return AppendSection(content, e)
+}
+
+// touchLastSeen replaces the "- Last seen:" line inside the section for issue
+// with ts, leaving the rest untouched. found reports whether such a section
+// exists (regardless of whether a Last-seen line was present to replace).
+func touchLastSeen(content, issue string, when time.Time) (string, bool) {
+	want := "#" + issue
+	ts := when.UTC().Format(time.RFC3339)
+	lines := strings.Split(content, "\n")
+	inSection := false
+	found := false
+	for i, ln := range lines {
+		if strings.HasPrefix(ln, "## ") {
+			fields := strings.Fields(strings.TrimPrefix(ln, "## "))
+			inSection = len(fields) > 0 && fields[0] == want
+			if inSection {
+				found = true
+			}
+			continue
+		}
+		if inSection && strings.HasPrefix(ln, "- Last seen: ") {
+			lines[i] = "- Last seen: " + ts
+			inSection = false // only the first Last-seen line in the section
+		}
+	}
+	if !found {
+		return content, false
+	}
+	return strings.Join(lines, "\n"), true
+}
+
 // RemoveSection removes the "## #<issue> — ..." section through the line
 // before the next "## " (or EOF). Returns the new content and whether anything
 // changed.

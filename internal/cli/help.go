@@ -34,7 +34,7 @@ func printHelp() {
 
 	fmt.Println(b(g("  ✦ CLAIM A UNIT OF WORK")) + d("  — assign issue + worktree + draft PR + record"))
 	fmt.Printf("    %s   %s\n", c("wt claim <issue>"), "claim a GitHub issue for this window  "+d("[--force] [--no-pr] [--epic <id>]"))
-	fmt.Printf("    %s %s\n", c("wt release <issue>"), "drop the claim (leaves worktree + PR in place)")
+	fmt.Printf("    %s %s\n", c("wt release <issue>"), "drop the claim  "+d("[--clean = also remove an abandoned worktree]"))
 	fmt.Printf("    %s %s\n", c("wt status --epic <id>"), "aggregate an epic's claims + PR states across sibling repos")
 	fmt.Println()
 
