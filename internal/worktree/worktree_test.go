@@ -43,3 +43,30 @@ func TestIsAbandonedBranch(t *testing.T) {
 		}
 	}
 }
+
+func TestReapVerdict(t *testing.T) {
+	cases := []struct {
+		name                                       string
+		unshipped                                  int
+		cherryFailed, prMerged, hasUpstream, grace bool
+		want                                       bool
+	}{
+		// The #61 data-loss cases — must all be KEEP (false):
+		{"fresh commitless wt new (no upstream)", 0, false, false, false, false, false},
+		{"within grace window", 0, false, false, true, true, false},
+		{"merged PR but still in grace", 0, false, true, true, true, false},
+		{"pushed, unshipped commits", 2, false, false, true, false, false},
+		{"no upstream even if cherry says 0", 0, false, false, false, false, false},
+		// Legit reaps (true):
+		{"merged PR, past grace", 0, false, true, true, false, true},
+		{"pushed + patch-equivalent on base", 0, false, false, true, false, true},
+		// cherry failed, no merged PR, has upstream → can't prove shipped → keep
+		{"cherry failed, no PR", 0, true, false, true, false, false},
+	}
+	for _, tc := range cases {
+		got := ReapVerdict(tc.unshipped, tc.cherryFailed, tc.prMerged, tc.hasUpstream, tc.grace)
+		if got != tc.want {
+			t.Errorf("%s: ReapVerdict = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

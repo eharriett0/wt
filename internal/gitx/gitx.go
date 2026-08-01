@@ -108,8 +108,21 @@ func Fetch(remote, branch string) error {
 
 // WorktreeAdd creates a new worktree at path on a new branch from base.
 func WorktreeAdd(path, branch, base string) error {
+	// If the branch already exists (its previous worktree was removed out-of-band
+	// but the branch — and its commits — survived), re-attach it to a fresh
+	// worktree instead of `-b` (which errors "branch already exists") (#62).
+	if LocalBranchExists(branch) {
+		_, err := Run("worktree", "add", path, branch)
+		return err
+	}
 	_, err := Run("worktree", "add", path, "-b", branch, base)
 	return err
+}
+
+// LocalBranchExists reports whether refs/heads/<branch> exists.
+func LocalBranchExists(branch string) bool {
+	_, err := Run("rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
+	return err == nil
 }
 
 // WorktreePaths lists every worktree path (primary first), via porcelain.
@@ -210,6 +223,22 @@ func CommitSubjects(base, branchRef string) ([]string, error) {
 func WorktreePrune() error {
 	_, err := Run("worktree", "prune")
 	return err
+}
+
+// HasUpstream reports whether the checkout at dir has a configured upstream
+// (@{u}) — i.e. the branch has been pushed. A branch with no upstream was never
+// shared, so it can't be "merged" and must not be reaped by `wt clean` (#61).
+func HasUpstream(dir string) bool {
+	_, err := RunDir(dir, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+	return err == nil
+}
+
+// IsInsideWorktree reports whether dir is a live git worktree (its .git resolves
+// and rev-parse succeeds). Distinguishes a real worktree from a leftover empty
+// directory whose worktree was removed out-of-band (#62).
+func IsInsideWorktree(dir string) bool {
+	out, err := RunDir(dir, "rev-parse", "--is-inside-work-tree")
+	return err == nil && strings.TrimSpace(out) == "true"
 }
 
 // CountUnshipped counts cherry "+" lines (commits with no patch-equivalent on
