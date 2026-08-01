@@ -285,3 +285,28 @@ func TestOwnOpenAnnouncements(t *testing.T) {
 		t.Errorf("OwnBlockReservations = %+v, want [block 5]", res)
 	}
 }
+
+func TestPruneRecords(t *testing.T) {
+	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-48 * time.Hour).Format(time.RFC3339)
+	fresh := now.Add(-1 * time.Hour).Format(time.RFC3339)
+	recs := []Record{
+		{ID: "a1", Kind: KindAnnounce, Window: "w", TS: fresh},                  // cleared → drop
+		{ID: "ack1", Kind: KindAck, AckOf: "a1", Window: "w2", TS: fresh},       // ack of cleared → drop
+		{ID: "clr1", Kind: KindAllClear, AckOf: "a1", Window: "w", TS: fresh},   // all-clear of a1 → drop
+		{ID: "a2", Kind: KindAnnounce, Window: "w", TS: fresh},                  // still open → keep
+		{ID: "b_old", Kind: KindBlockReserve, Window: "w", Block: 1, TS: old},   // aged reserve → drop
+		{ID: "b_new", Kind: KindBlockReserve, Window: "w", Block: 2, TS: fresh}, // fresh reserve → keep
+	}
+	kept, dropped := PruneRecords(recs, now, 24*time.Hour)
+	if dropped != 4 {
+		t.Fatalf("dropped = %d, want 4", dropped)
+	}
+	ids := map[string]bool{}
+	for _, r := range kept {
+		ids[r.ID] = true
+	}
+	if !ids["a2"] || !ids["b_new"] || len(kept) != 2 {
+		t.Errorf("kept = %v, want just a2 + b_new", kept)
+	}
+}

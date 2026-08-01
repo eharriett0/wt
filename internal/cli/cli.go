@@ -90,6 +90,8 @@ func Main(args []string) int {
 		return cmdAllClear(rest)
 	case "holds":
 		return cmdHolds(rest)
+	case "prune-coord":
+		return cmdPruneCoord(rest)
 	case "block-id":
 		return cmdBlockID(rest)
 	case "append":
