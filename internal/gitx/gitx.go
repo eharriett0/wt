@@ -293,11 +293,13 @@ func TouchedFiles(dir, base string) []string {
 	return files
 }
 
-// LineRange is a 1-based inclusive span of lines changed on the NEW side of a
-// diff. A pure deletion (new-count 0) is recorded spanning the gap boundary
-// (the surviving line before + after the removed content) so a delete in one
-// window still overlaps an edit of the same region in another — biasing toward
-// flagging (a missed conflict is worse than an extra heads-up for a safety tool).
+// LineRange is a 1-based inclusive span of changed lines. ChangedRanges emits
+// these in BASE coordinates (the OLD side of a base-vs-worktree diff, #29) so
+// two windows that fork from the same base can be compared in one frame. A pure
+// insertion/deletion (count 0) is recorded spanning the gap boundary (the
+// surviving line before + after) so it still overlaps an edit of the same region
+// in another window — biasing toward flagging (a missed conflict is worse than
+// an extra heads-up for a safety tool).
 type LineRange struct{ Start, End int }
 
 // Overlaps reports whether two line ranges intersect.
@@ -307,11 +309,30 @@ func (r LineRange) Overlaps(o LineRange) bool {
 
 var hunkRe = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
 
+// oldHunkRe captures the OLD-side (base) start+count of a -U0 hunk header (#29).
+var oldHunkRe = regexp.MustCompile(`^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@`)
+
 // parseHunkRanges extracts NEW-side line ranges from unified-diff (-U0) output.
 func parseHunkRanges(diff string) []LineRange {
+	return parseHunkRangesWith(diff, hunkRe)
+}
+
+// parseHunkRangesOld extracts BASE-side (OLD) line ranges from -U0 output (#29).
+// Grading in base coordinates is what lets two windows' ranges be compared in a
+// single shared frame: once either has an insert/delete before a shared region,
+// their NEW-side numbers diverge and a same-base-line conflict grades disjoint.
+func parseHunkRangesOld(diff string) []LineRange {
+	return parseHunkRangesWith(diff, oldHunkRe)
+}
+
+// parseHunkRangesWith is the shared parser; re captures (start, optional count)
+// on whichever side. A zero count is a pure insertion/deletion on that side —
+// git reports the surviving line before the gap, so span [start, start+1] to
+// cover both neighbors (biases toward flagging, correct for a safety tool).
+func parseHunkRangesWith(diff string, re *regexp.Regexp) []LineRange {
 	var out []LineRange
 	for _, ln := range strings.Split(diff, "\n") {
-		m := hunkRe.FindStringSubmatch(ln)
+		m := re.FindStringSubmatch(ln)
 		if m == nil {
 			continue
 		}
@@ -321,9 +342,6 @@ func parseHunkRanges(diff string) []LineRange {
 			count, _ = strconv.Atoi(m[2])
 		}
 		if count == 0 {
-			// Pure deletion: git reports the new-side line BEFORE the gap. Span
-			// [start, start+1] to cover both surviving neighbors so an edit of
-			// the removed region in another window overlaps.
 			out = append(out, LineRange{start, start + 1})
 		} else {
 			out = append(out, LineRange{start, start + count - 1})
@@ -332,24 +350,35 @@ func parseHunkRanges(diff string) []LineRange {
 	return out
 }
 
-// ChangedRanges returns the NEW-side line ranges file was changed on in the
-// worktree at dir — the union of uncommitted (staged + unstaged) hunks and
-// committed-on-branch hunks vs base. -U0 so ranges are tight (no context
-// bleed). Used for hunk-level overlap between windows.
+// ChangedRanges returns the line ranges file was changed on in the worktree at
+// dir, expressed in BASE coordinates (#29). It runs ONE `git diff -U0 <base> --
+// <file>` — base commit vs the working tree, which folds committed + staged +
+// unstaged changes into a single diff — and parses the OLD (base) side of each
+// hunk. Because every window diffs against the SAME base ref, their ranges live
+// in one shared frame, so OverlappingSpans compares like-for-like even after one
+// window has inserts/deletes before a shared edit region (the pre-#29 latent
+// false-negative: NEW-side numbers from three separate diffs in three frames).
+//
+// Fallback: when neither origin/<base> nor <base> resolves (a base-less repo,
+// where cross-window base comparison is meaningless anyway), degrade to the
+// NEW-side uncommitted hunks so a single window still self-reports.
 func ChangedRanges(dir, base, file string) []LineRange {
-	var ranges []LineRange
-	add := func(args ...string) {
-		if out, err := runRaw(dir, args...); err == nil {
-			ranges = append(ranges, parseHunkRanges(out)...)
-		}
-	}
-	add("diff", "-U0", "--", file)             // unstaged
-	add("diff", "-U0", "--cached", "--", file) // staged
 	for _, ref := range []string{"origin/" + base, base} {
-		if _, err := RunDir(dir, "rev-parse", "--verify", "--quiet", ref+"^{commit}"); err == nil {
-			add("diff", "-U0", ref+"...HEAD", "--", file)
-			break
+		if _, err := RunDir(dir, "rev-parse", "--verify", "--quiet", ref+"^{commit}"); err != nil {
+			continue
 		}
+		if out, err := runRaw(dir, "diff", "-U0", ref, "--", file); err == nil {
+			return parseHunkRangesOld(out)
+		}
+		return nil
+	}
+	// No base ref — degraded NEW-side self-report (index frame).
+	var ranges []LineRange
+	if out, err := runRaw(dir, "diff", "-U0", "--", file); err == nil {
+		ranges = append(ranges, parseHunkRanges(out)...)
+	}
+	if out, err := runRaw(dir, "diff", "-U0", "--cached", "--", file); err == nil {
+		ranges = append(ranges, parseHunkRanges(out)...)
 	}
 	return ranges
 }
