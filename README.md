@@ -103,7 +103,7 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 | `wt new <branch>` | Create a worktree on a new branch from the base branch |
 | `wt clean [-y]` | List worktrees whose branch already shipped (incl. squash-merged PRs); `-y` removes them, skipping dirty ones |
 | `wt claim <issue>` | Assign a GitHub issue, make a worktree, open a draft PR, record the claim `[--force] [--no-pr] [--epic <id>]` |
-| `wt release <issue>` | Drop the claim (leaves the worktree + PR in place) |
+| `wt release <issue>` | Drop the claim. `[--clean]` also removes the worktree when the branch is abandoned (clean tree, no live PR, WIP-only commits) |
 | `wt merge-pr <pr>` | Guarded squash-merge (PR-state precheck, strips a `WIP:` subject), then auto-removes the worktree + claim `[--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin]` |
 | `wt todos` | What every window is working on (mirrors each window's TODO list) |
 | **— cross-window coordination —** | |

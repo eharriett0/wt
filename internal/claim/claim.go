@@ -6,6 +6,7 @@ package claim
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -32,8 +33,33 @@ func Claim(c *config.Config, issue string, force, openPR bool, epic string) erro
 	if state, _ := ghx.IssueState(issue); state != "OPEN" {
 		return fmt.Errorf("issue #%s is %s, not OPEN", issue, state)
 	}
-	if a := ghx.IssueAssignees(issue); len(a) > 0 && !force {
-		ui.Warn("issue #%s already assigned to: %s", issue, strings.Join(a, ", "))
+
+	assignees := ghx.IssueAssignees(issue)
+	title, _ := ghx.IssueTitle(issue)
+	branch := BranchName(c.Prefix, issue, SlugFromTitle(title))
+	wtPath := filepath.Join(c.WorktreeRoot, strings.ReplaceAll(branch, "/", "-"))
+
+	// Resume path (#41): an owned re-claim — this window is assigned, its
+	// worktree still exists, and there's an active-work section. Refresh the
+	// Last-seen timestamp and hand the worktree back, WITHOUT stacking a second
+	// placeholder commit / draft PR / duplicate section. No --force needed.
+	if user, _ := ghx.CurrentUser(); assignedTo(assignees, user) && isDir(wtPath) && hasSection(c, issue) {
+		content := activework.Read(c.ActiveWork)
+		e := activework.Entry{Issue: issue, Title: title, Branch: branch, Worktree: wtPath, Window: windowID(), Epic: epic, When: time.Now()}
+		if err := activework.Write(c.ActiveWork, activework.UpsertSection(content, e)); err != nil {
+			ui.Warn("active-work refresh failed (continuing): %v", err)
+		}
+		ui.OK("resumed #%s — worktree + claim already yours, refreshed Last-seen", issue)
+		ui.Banner(fmt.Sprintf("Resumed #%s", issue))
+		ui.Info("branch:   %s", branch)
+		ui.Info("worktree: %s", wtPath)
+		fmt.Println()
+		ui.Step("cd %s", wtPath)
+		return nil
+	}
+
+	if len(assignees) > 0 && !force {
+		ui.Warn("issue #%s already assigned to: %s", issue, strings.Join(assignees, ", "))
 		ui.Warn("another window may be working on this — override with: wt claim %s --force", issue)
 		return fmt.Errorf("already assigned")
 	}
@@ -42,9 +68,6 @@ func Claim(c *config.Config, issue string, force, openPR bool, epic string) erro
 		return fmt.Errorf("assign issue: %w", err)
 	}
 	ui.OK("assigned #%s to @me", issue)
-
-	title, _ := ghx.IssueTitle(issue)
-	branch := BranchName(c.Prefix, issue, SlugFromTitle(title))
 
 	wtDir, err := worktree.New(c, branch)
 	if err != nil {
@@ -94,13 +117,26 @@ func Claim(c *config.Config, issue string, force, openPR bool, epic string) erro
 	return nil
 }
 
-// Release clears the claim's active-work entry and unassigns the issue. Leaves
-// the worktree + draft PR in place.
-func Release(c *config.Config, issue string) error {
+// Release clears the claim's active-work entry and unassigns the issue. With
+// clean, it ALSO removes the worktree when the branch is abandoned — clean tree,
+// no open/merged PR, only WIP placeholder commits (#42) — so releasing actually
+// frees the slot instead of leaving an orphan `wt clean` can never sweep.
+func Release(c *config.Config, issue string, clean bool) error {
 	if !issueRe.MatchString(issue) {
 		return fmt.Errorf("issue must be a positive integer, got %q", issue)
 	}
-	if content := activework.Read(c.ActiveWork); content != "" {
+
+	// Capture the recorded branch/worktree BEFORE we drop the section (#42).
+	var recorded activework.Entry
+	content := activework.Read(c.ActiveWork)
+	for _, e := range activework.Parse(content) {
+		if e.Issue == issue {
+			recorded = e
+			break
+		}
+	}
+
+	if content != "" {
 		if newC, changed := activework.RemoveSection(content, issue); changed {
 			if err := activework.Write(c.ActiveWork, newC); err != nil {
 				ui.Warn("active-work update failed: %v", err)
@@ -118,9 +154,87 @@ func Release(c *config.Config, issue string) error {
 			ui.Info("couldn't unassign #%s (issue may be closed, or you weren't assigned)", issue)
 		}
 	}
+
+	if clean {
+		cleanAbandonedWorktree(c, recorded)
+	}
+
 	ui.Banner(fmt.Sprintf("Released #%s", issue))
-	ui.Info("worktree + draft PR left in place — clean later with `wt clean` / `gh pr close`")
+	if !clean {
+		ui.Info("worktree + draft PR left in place — remove with `wt release %s --clean` or `wt clean`", issue)
+	}
 	return nil
+}
+
+// cleanAbandonedWorktree removes the released claim's worktree iff it's under
+// the worktree root, clean, and abandoned (no live PR, WIP-only commits). Any
+// non-abandoned/dirty case is reported, never forced.
+func cleanAbandonedWorktree(c *config.Config, e activework.Entry) {
+	if e.Branch == "" || e.Worktree == "" {
+		ui.Info("--clean: no recorded worktree/branch for this claim — nothing to remove")
+		return
+	}
+	if !isDir(e.Worktree) {
+		ui.Info("--clean: worktree %s already gone", e.Worktree)
+		_ = gitx.WorktreePrune()
+		return
+	}
+	if !gitx.IsClean(e.Worktree) {
+		ui.Warn("--clean: worktree %s has uncommitted changes — left in place", e.Worktree)
+		return
+	}
+	subjects, serr := gitx.CommitSubjects("origin/"+c.Base, "refs/heads/"+e.Branch)
+	if serr != nil {
+		subjects, serr = gitx.CommitSubjects(c.Base, "refs/heads/"+e.Branch)
+	}
+	if serr != nil {
+		ui.Warn("--clean: can't inspect %s vs %s (%v) — left in place", e.Branch, c.Base, serr)
+		return
+	}
+	_, prOpen := ghx.OpenPRForBranch(e.Branch)
+	prMerged := ghx.MergedPRForBranch(e.Branch)
+	if !worktree.IsAbandonedBranch(subjects, prOpen, prMerged) {
+		switch {
+		case prMerged:
+			ui.Info("--clean: %s has a MERGED PR — leave it for `wt clean`", e.Branch)
+		case prOpen:
+			ui.Info("--clean: %s still has an OPEN PR — not abandoned, left in place", e.Branch)
+		default:
+			ui.Info("--clean: %s has real (non-placeholder) commits — left in place", e.Branch)
+		}
+		return
+	}
+	if err := worktree.Remove(c, e.Worktree, e.Branch, false); err != nil {
+		ui.Warn("--clean: couldn't remove worktree: %v", err)
+	}
+}
+
+// assignedTo reports whether user (case-insensitive) is in assignees.
+func assignedTo(assignees []string, user string) bool {
+	if user == "" {
+		return false
+	}
+	for _, a := range assignees {
+		if strings.EqualFold(a, user) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasSection reports whether the active-work file records a claim for issue.
+func hasSection(c *config.Config, issue string) bool {
+	for _, e := range activework.Parse(activework.Read(c.ActiveWork)) {
+		if e.Issue == issue {
+			return true
+		}
+	}
+	return false
+}
+
+func isDir(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.IsDir()
 }
 
 // SlugFromTitle lowercases, collapses non-alphanumeric runs to single dashes,

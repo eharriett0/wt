@@ -26,6 +26,23 @@ func ShippedVerdict(unshipped int, cherryFailed, prMerged bool) bool {
 	return !cherryFailed && unshipped == 0
 }
 
+// IsAbandonedBranch decides whether a released branch's worktree is safe to
+// auto-remove (#42): no OPEN or MERGED PR keeps it alive, AND every commit ahead
+// of base is a `WIP: claim #` placeholder (empty subjects — nothing ahead — is
+// vacuously abandoned). A branch with any real commit, or any live PR, is never
+// abandoned. Pure.
+func IsAbandonedBranch(unshippedSubjects []string, prOpen, prMerged bool) bool {
+	if prOpen || prMerged {
+		return false
+	}
+	for _, s := range unshippedSubjects {
+		if !strings.HasPrefix(strings.TrimSpace(s), "WIP: claim #") {
+			return false
+		}
+	}
+	return true
+}
+
 // New creates a worktree for branch under c.WorktreeRoot, based on the repo's
 // base branch. Idempotent: if the worktree already exists, prints the cd hint
 // and returns its path. Returns the worktree path.
@@ -75,6 +92,7 @@ func New(c *config.Config, branch string) (string, error) {
 func Clean(c *config.Config, apply bool) error {
 	ui.Step("fetching origin/%s", c.Base)
 	_ = gitx.Fetch("origin", c.Base)
+	_ = gitx.WorktreePrune() // #42: drop stale metadata for manually-deleted dirs
 
 	paths, err := gitx.WorktreePaths()
 	if err != nil {
