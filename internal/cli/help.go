@@ -52,7 +52,7 @@ func printHelp() {
 	fmt.Printf("    %s     %s\n", c("wt all-clear <id>"), "release your hold  "+d("(also: wt announce --clear <id>)"))
 	fmt.Printf("    %s               %s\n", c("wt holds"), "YOUR outstanding announcements/holds + block reservations (with all-clear lines)")
 	fmt.Printf("    %s          %s\n", c("wt prune-coord"), "GC the coordination log (drop resolved handshakes + aged block reservations)")
-	fmt.Printf("    %s  %s\n", c("wt block-id <file>"), "reserve the next append-log id so two windows never grab the same NEWEST-N  "+d("[--pattern \"NEWEST-{n}\"] [--format]"))
+	fmt.Printf("    %s  %s\n", c("wt block-id <file>"), "reserve the next append-log id so two windows never grab the same NEWEST-N  "+d("[--pattern \"NEWEST-{n}\"] [--format] [--written N]"))
 	fmt.Printf("    %s  %s\n", c("wt append <doc> --section H \"txt\""), "locked append under a section — parallel gotcha-adds can't clobber")
 	fmt.Println("    " + d("Structured docs (") + c("structured_doc.<name>") + d(" = <section regexp> in .wt.conf) grade by"))
 	fmt.Println("    " + d("SECTION: two windows editing the SAME section is ") + y("HIGH") + d(", disjoint sections stay advisory."))
