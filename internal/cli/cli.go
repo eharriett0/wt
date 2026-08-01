@@ -575,13 +575,21 @@ func taggedWindows(windows []string, live map[string]collide.WindowLiveness) []s
 	return out
 }
 
-func cmdCheck(args []string) int {
-	// Manual scan (not flag.FlagSet): paths are positional and flags may appear
-	// anywhere — flag.Parse would stop at the first positional.
-	includeStale, showDiff, asJSON := false, false, false
-	var paths []string
+// parseCheckArgs splits `check` args into flags + positional paths. A token that
+// starts with '-' (and isn't a known flag, isn't "-", and is before a "--") is
+// returned as unknownFlag so the caller REJECTS it instead of silently treating
+// a typo as a path — a mistyped flag must never produce a false "clear" (#30).
+// Everything after a "--" is a path (so a genuine '-'-prefixed filename works).
+func parseCheckArgs(args []string) (paths []string, includeStale, showDiff, asJSON bool, unknownFlag string) {
+	afterDashes := false
 	for _, a := range args {
+		if afterDashes {
+			paths = append(paths, a)
+			continue
+		}
 		switch a {
+		case "--":
+			afterDashes = true
 		case "--include-stale", "-include-stale":
 			includeStale = true
 		case "--show-diff", "-show-diff":
@@ -589,8 +597,25 @@ func cmdCheck(args []string) int {
 		case "--json", "-json":
 			asJSON = true
 		default:
+			if strings.HasPrefix(a, "-") && a != "-" {
+				if unknownFlag == "" {
+					unknownFlag = a
+				}
+				continue
+			}
 			paths = append(paths, a)
 		}
+	}
+	return
+}
+
+func cmdCheck(args []string) int {
+	// paths are positional and flags may appear anywhere (a plain flag.Parse
+	// would stop at the first positional), so we scan manually.
+	paths, includeStale, showDiff, asJSON, unknownFlag := parseCheckArgs(args)
+	if unknownFlag != "" {
+		ui.Err("wt check: unknown flag %q — a typo'd flag must not be checked as a path (that would falsely report 'clear'). Known: --include-stale --show-diff --json. Use `--` to check a path that starts with '-'.", unknownFlag)
+		return 64
 	}
 	if len(paths) == 0 {
 		ui.Err("usage: wt check [--include-stale] [--show-diff] [--json] <path> [path...]")

@@ -123,3 +123,26 @@ func TestParseInterspersed_empty(t *testing.T) {
 		t.Fatalf("pos=%v pass=%v err=%v", pos, pass, err)
 	}
 }
+
+func TestParseCheckArgs(t *testing.T) {
+	// known flags interspersed with paths
+	paths, stale, diff, js, unk := parseCheckArgs([]string{"--include-stale", "a.go", "--json", "b.go"})
+	if unk != "" || !stale || !js || diff {
+		t.Fatalf("flags: unk=%q stale=%v diff=%v json=%v", unk, stale, diff, js)
+	}
+	if len(paths) != 2 || paths[0] != "a.go" || paths[1] != "b.go" {
+		t.Fatalf("paths = %v, want [a.go b.go]", paths)
+	}
+	// #30: a typo'd flag is CAPTURED as unknown, never silently treated as a path
+	if _, _, _, _, u := parseCheckArgs([]string{"--includ-stale", "a.go"}); u != "--includ-stale" {
+		t.Errorf("unknown flag not captured: %q", u)
+	}
+	// "--" escapes a dash-prefixed path
+	if p, _, _, _, u := parseCheckArgs([]string{"--", "-weird.go"}); u != "" || len(p) != 1 || p[0] != "-weird.go" {
+		t.Errorf("-- escape: paths=%v unk=%q", p, u)
+	}
+	// bare "-" is a path, not an unknown flag
+	if p, _, _, _, u := parseCheckArgs([]string{"-"}); u != "" || len(p) != 1 || p[0] != "-" {
+		t.Errorf("bare dash: paths=%v unk=%q", p, u)
+	}
+}
