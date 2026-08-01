@@ -22,6 +22,7 @@ import (
 	"github.com/eharriett0/wt/internal/gitx"
 	"github.com/eharriett0/wt/internal/hooks"
 	"github.com/eharriett0/wt/internal/merge"
+	"github.com/eharriett0/wt/internal/selfupdate"
 	"github.com/eharriett0/wt/internal/todos"
 	"github.com/eharriett0/wt/internal/ui"
 	"github.com/eharriett0/wt/internal/worktree"
@@ -43,6 +44,23 @@ func version() string {
 	return "dev"
 }
 
+// checkForUpdate prints a throttled "newer wt available" nudge to STDERR (#54).
+// Skipped for meta / machine-consumed commands (their stdout AND their latency
+// matter), and disabled by WT_NO_UPDATE_CHECK. The check itself only touches the
+// network at most once per interval — see internal/selfupdate.
+func checkForUpdate(cmd string) {
+	switch cmd {
+	case "version", "-v", "--version", "help", "-h", "--help", "_hook":
+		return
+	}
+	if os.Getenv("WT_NO_UPDATE_CHECK") != "" {
+		return
+	}
+	if nudge := selfupdate.Check(selfupdate.DefaultStampPath(), time.Now(), selfupdate.DefaultInterval); nudge != "" {
+		fmt.Fprintln(os.Stderr, ui.Dim(nudge))
+	}
+}
+
 // Main dispatches a subcommand and returns a process exit code.
 func Main(args []string) int {
 	if len(args) == 0 {
@@ -50,6 +68,8 @@ func Main(args []string) int {
 		return 0
 	}
 	cmd, rest := args[0], args[1:]
+
+	checkForUpdate(cmd)
 
 	switch cmd {
 	case "help", "-h", "--help":
