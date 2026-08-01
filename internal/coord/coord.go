@@ -268,6 +268,51 @@ func ActiveHolds(recs []Record, self, op string) []Record {
 	return out
 }
 
+// ActiveHoldsAt splits ActiveHolds into fresh vs stale by age (#32). A hold
+// older than maxAge (when maxAge > 0) is `stale` — aged out, almost always a
+// crashed/forgotten window — and callers should WARN rather than hard-block on
+// it, so a dead window's --hold can't wedge everyone's merge-pr forever. maxAge
+// <= 0 disables expiry (everything fresh — the pre-#32 behavior).
+func ActiveHoldsAt(recs []Record, self, op string, now time.Time, maxAge time.Duration) (fresh, stale []Record) {
+	for _, a := range ActiveHolds(recs, self, op) {
+		if maxAge > 0 && Age(a, now) > maxAge {
+			stale = append(stale, a)
+		} else {
+			fresh = append(fresh, a)
+		}
+	}
+	return fresh, stale
+}
+
+// OwnOpenAnnouncements returns THIS window's own announcements that have not been
+// all-cleared — the holds/announcements you still own and can `wt all-clear`
+// (#34). Includes both hold and plain announcements; excludes cleared ones.
+func OwnOpenAnnouncements(recs []Record, self string) []Record {
+	cl := cleared(recs)
+	var out []Record
+	for _, a := range announcements(recs) {
+		if a.Window == self && !cl[a.ID] {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// OwnBlockReservations returns THIS window's block-id reservations, newest first
+// — the ids you hold (and may not have written yet), for `wt holds` (#34).
+func OwnBlockReservations(recs []Record, self string) []Record {
+	var out []Record
+	for _, r := range recs {
+		if r.Kind == KindBlockReserve && r.Window == self {
+			out = append(out, r)
+		}
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
+}
+
 // NewID derives a short, log-sortable id from a timestamp (nanos, base36).
 func NewID(t time.Time) string {
 	return strconv.FormatInt(t.UnixNano(), 36)

@@ -184,3 +184,21 @@ func TestApplyConf_Issue7Settings(t *testing.T) {
 		t.Error("MergeIsDeploy should be true")
 	}
 }
+
+func TestApplyConf_HoldMaxAge(t *testing.T) {
+	c := &Config{HoldMaxAge: DefaultHoldMaxAge}
+	ApplyConf(c, map[string]string{"hold_max_age": "6h"})
+	if c.HoldMaxAge != 6*time.Hour {
+		t.Errorf("hold_max_age=6h → %v, want 6h", c.HoldMaxAge)
+	}
+	ApplyConf(c, map[string]string{"hold_max_age": "off"})
+	if c.HoldMaxAge != 0 {
+		t.Errorf("hold_max_age=off → %v, want 0 (never expire)", c.HoldMaxAge)
+	}
+	// "0" also means never-expire (distinct from max_age, where 0 is rejected)
+	c.HoldMaxAge = time.Hour
+	ApplyConf(c, map[string]string{"hold_max_age": "0"})
+	if c.HoldMaxAge != 0 {
+		t.Errorf("hold_max_age=0 → %v, want 0", c.HoldMaxAge)
+	}
+}
