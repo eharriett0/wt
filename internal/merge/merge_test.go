@@ -101,3 +101,23 @@ func TestWithAdminDoesNotMutateCaller(t *testing.T) {
 		t.Errorf("WithAdmin returned %v, want %v", got, want)
 	}
 }
+
+func TestDeWIPTitle(t *testing.T) {
+	cases := []struct {
+		in     string
+		want   string
+		wasWIP bool
+	}{
+		{"WIP: #1313 — Go runtime", "#1313 — Go runtime", true},
+		{"WIP:no space", "no space", true},
+		{"  WIP: trimmed  ", "trimmed", true},
+		{"feat(x): real title", "feat(x): real title", false},
+		{"not a wip", "not a wip", false},
+	}
+	for _, c := range cases {
+		got, wip := DeWIPTitle(c.in)
+		if got != c.want || wip != c.wasWIP {
+			t.Errorf("DeWIPTitle(%q) = (%q,%v), want (%q,%v)", c.in, got, wip, c.want, c.wasWIP)
+		}
+	}
+}
