@@ -98,6 +98,8 @@ func Main(args []string) int {
 		return cmdTodos(rest)
 	case "check":
 		return cmdCheck(rest)
+	case "where":
+		return cmdWhere(rest)
 	case "install-hooks":
 		return cmdInstallHooks(rest)
 	case "announce":
@@ -436,16 +438,67 @@ func cmdStatus(args []string) int {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	asJSON := fs.Bool("json", false, "structured JSON output")
 	epic := fs.String("epic", "", "aggregate claims tagged with this epic id across sibling repos")
+	blocking := fs.Bool("blocking", false, "print ONLY HIGH-risk collisions + exit non-zero if any (a gate, like check)")
+	maxAge := fs.String("max-age", "", "override dormancy suppression for this run (e.g. 4d, 36h; 0/off = show all)")
 	if err := fs.Parse(args); err != nil {
 		return 64
 	}
 	if *epic != "" {
 		return withConfig(func(c *config.Config) int { return cmdStatusEpic(c, *epic, *asJSON) })
 	}
-	return withConfig(func(c *config.Config) int { return statusReport(c, *asJSON) })
+	return withConfig(func(c *config.Config) int {
+		applyMaxAgeOverride(c, *maxAge)
+		return statusReport(c, *asJSON, *blocking)
+	})
 }
 
-func statusReport(c *config.Config, asJSON bool) int {
+// applyMaxAgeOverride lets a --max-age flag override the configured dormancy
+// window for a single status/check run (#48). "0"/"off"/"never" disables
+// suppression; empty leaves config untouched; unparseable is ignored.
+func applyMaxAgeOverride(c *config.Config, v string) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return
+	}
+	switch strings.ToLower(v) {
+	case "0", "off", "never":
+		c.MaxAge = 0
+		return
+	}
+	if d, err := config.ParseAge(v); err == nil {
+		c.MaxAge = d
+	}
+}
+
+// renderBlockingGate prints ONLY the HIGH-risk overlaps and returns exit 3 when
+// any exist (0 otherwise) — `wt status --blocking` as a scriptable gate (#47),
+// mirroring check's exit-3 contract. Reuses the normal HIGH render.
+func renderBlockingGate(graded []StatusOverlap, ws []collide.Window, live map[string]collide.WindowLiveness) int {
+	var high []StatusOverlap
+	for _, o := range graded {
+		if o.Category == CatBlocking {
+			high = append(high, o)
+		}
+	}
+	if len(high) == 0 {
+		ui.OK("no HIGH-risk collisions across %d window(s)", len(ws))
+		return 0
+	}
+	ui.Collision("%d file(s) with a HIGH-risk collision:", len(high))
+	for _, o := range high {
+		detail := ui.Yellow("indeterminate (untracked/binary — can't prove disjoint)")
+		if s := spansString(o.OverlapSpans); s != "" {
+			detail = ui.Yellow("overlap " + s)
+		} else if s := sectionsString(o.SharedSections); s != "" {
+			detail = ui.Yellow(s)
+		}
+		fmt.Fprintf(os.Stderr, "   %s  %s %s  %s\n", ui.Bold(o.File), ui.Dim("←"),
+			strings.Join(taggedWindows(o.Windows, live), ", "), detail)
+	}
+	return 3
+}
+
+func statusReport(c *config.Config, asJSON, blocking bool) int {
 	if !asJSON {
 		peerHoldBanner(c)
 		blockReservationBanner(c)
@@ -460,6 +513,9 @@ func statusReport(c *config.Config, asJSON bool) int {
 	active, benign := collide.PartitionOverlaps(ov, live)
 	graded := gradeStatusOverlaps(c, ws, active)
 
+	if blocking {
+		return renderBlockingGate(graded, ws, live)
+	}
 	if asJSON {
 		return renderStatusJSON(ws, graded, len(benign))
 	}
@@ -652,29 +708,35 @@ func taggedWindows(windows []string, live map[string]collide.WindowLiveness) []s
 // returned as unknownFlag so the caller REJECTS it instead of silently treating
 // a typo as a path — a mistyped flag must never produce a false "clear" (#30).
 // Everything after a "--" is a path (so a genuine '-'-prefixed filename works).
-func parseCheckArgs(args []string) (paths []string, includeStale, showDiff, asJSON bool, unknownFlag string) {
+func parseCheckArgs(args []string) (paths []string, includeStale, showDiff, asJSON bool, maxAge, unknownFlag string) {
 	afterDashes := false
-	for _, a := range args {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
 		if afterDashes {
 			paths = append(paths, a)
 			continue
 		}
-		switch a {
-		case "--":
+		switch {
+		case a == "--":
 			afterDashes = true
-		case "--include-stale", "-include-stale":
+		case a == "--include-stale" || a == "-include-stale":
 			includeStale = true
-		case "--show-diff", "-show-diff":
+		case a == "--show-diff" || a == "-show-diff":
 			showDiff = true
-		case "--json", "-json":
+		case a == "--json" || a == "-json":
 			asJSON = true
-		default:
-			if strings.HasPrefix(a, "-") && a != "-" {
-				if unknownFlag == "" {
-					unknownFlag = a
-				}
-				continue
+		case a == "--max-age" || a == "-max-age": // value in the next token (#48)
+			if i+1 < len(args) {
+				maxAge = args[i+1]
+				i++
 			}
+		case strings.HasPrefix(a, "--max-age="):
+			maxAge = strings.TrimPrefix(a, "--max-age=")
+		case strings.HasPrefix(a, "-") && a != "-":
+			if unknownFlag == "" {
+				unknownFlag = a
+			}
+		default:
 			paths = append(paths, a)
 		}
 	}
@@ -684,7 +746,7 @@ func parseCheckArgs(args []string) (paths []string, includeStale, showDiff, asJS
 func cmdCheck(args []string) int {
 	// paths are positional and flags may appear anywhere (a plain flag.Parse
 	// would stop at the first positional), so we scan manually.
-	paths, includeStale, showDiff, asJSON, unknownFlag := parseCheckArgs(args)
+	paths, includeStale, showDiff, asJSON, maxAge, unknownFlag := parseCheckArgs(args)
 	if unknownFlag != "" {
 		ui.Err("wt check: unknown flag %q — a typo'd flag must not be checked as a path (that would falsely report 'clear'). Known: --include-stale --show-diff --json. Use `--` to check a path that starts with '-'.", unknownFlag)
 		return 64
@@ -694,6 +756,7 @@ func cmdCheck(args []string) int {
 		return 64
 	}
 	return withConfig(func(c *config.Config) int {
+		applyMaxAgeOverride(c, maxAge)
 		if !asJSON {
 			peerHoldBanner(c)
 		}
@@ -708,6 +771,33 @@ func cmdCheck(args []string) int {
 			return renderCheckJSON(entries, includeStale)
 		}
 		return renderCheckText(entries, paths, includeStale, showDiff)
+	})
+}
+
+// cmdWhere resolves an issue number or branch to its worktree path and prints
+// JUST the absolute path to stdout (so `cd $(wt where 42)` works); non-zero +
+// stderr when not found (#46).
+func cmdWhere(args []string) int {
+	if len(args) < 1 || strings.TrimSpace(args[0]) == "" {
+		ui.Err("usage: wt where <issue|branch>")
+		return 64
+	}
+	target := strings.TrimSpace(args[0])
+	norm := strings.TrimPrefix(target, "#")
+	return withConfig(func(c *config.Config) int {
+		ws, err := collide.Scan(c)
+		if err != nil {
+			ui.Err("scan failed: %v", err)
+			return 1
+		}
+		for _, w := range ws {
+			if (w.Issue != "" && w.Issue == norm) || w.Branch == target || w.Branch == norm {
+				fmt.Println(w.Worktree)
+				return 0
+			}
+		}
+		ui.Err("no worktree found for %q — see `wt status`", target)
+		return 1
 	})
 }
 

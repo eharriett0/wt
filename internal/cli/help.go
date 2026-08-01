@@ -15,9 +15,10 @@ func printHelp() {
 	fmt.Println()
 
 	fmt.Println(b(y("  ✦ COLLISION AWARENESS")) + d("  — the core: who's touching what, right now"))
-	fmt.Printf("    %s       %s\n", c("wt status [--json]"), "all windows + which files each is touching + graded overlaps")
+	fmt.Printf("    %s       %s\n", c("wt status [--json]"), "all windows + which files each is touching + graded overlaps  "+d("[--blocking] [--max-age D]"))
 	fmt.Printf("    %s             %s\n", c("wt todos"), "what every window is working on (mirrors each window's TODO list)")
-	fmt.Printf("    %s   %s\n", c("wt check <paths…>"), "before you edit: is anyone in these files? "+d("[--show-diff] [--json]"))
+	fmt.Printf("    %s   %s\n", c("wt check <paths…>"), "before you edit: is anyone in these files? "+d("[--show-diff] [--json] [--max-age D]"))
+	fmt.Printf("    %s      %s\n", c("wt where <issue|branch>"), "print that window's worktree path — "+d("cd $(wt where 42)"))
 	fmt.Println("    " + d("HUNK-LEVEL: overlapping line ranges = ") + y("HIGH") + d(" (exit 3); same file but"))
 	fmt.Println("    " + d("disjoint hunks = low/FYI (exit 0) — no more crying wolf on parallel appends."))
 	fmt.Println("    " + d("Suppressed by default: stale branches (merged / no PR) and — with ") + c("max_age") + d(" —"))
