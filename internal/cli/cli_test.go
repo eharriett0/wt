@@ -126,23 +126,30 @@ func TestParseInterspersed_empty(t *testing.T) {
 
 func TestParseCheckArgs(t *testing.T) {
 	// known flags interspersed with paths
-	paths, stale, diff, js, unk := parseCheckArgs([]string{"--include-stale", "a.go", "--json", "b.go"})
-	if unk != "" || !stale || !js || diff {
-		t.Fatalf("flags: unk=%q stale=%v diff=%v json=%v", unk, stale, diff, js)
+	paths, stale, diff, js, ma, unk := parseCheckArgs([]string{"--include-stale", "a.go", "--json", "b.go"})
+	if unk != "" || !stale || !js || diff || ma != "" {
+		t.Fatalf("flags: unk=%q stale=%v diff=%v json=%v maxAge=%q", unk, stale, diff, js, ma)
 	}
 	if len(paths) != 2 || paths[0] != "a.go" || paths[1] != "b.go" {
 		t.Fatalf("paths = %v, want [a.go b.go]", paths)
 	}
 	// #30: a typo'd flag is CAPTURED as unknown, never silently treated as a path
-	if _, _, _, _, u := parseCheckArgs([]string{"--includ-stale", "a.go"}); u != "--includ-stale" {
+	if _, _, _, _, _, u := parseCheckArgs([]string{"--includ-stale", "a.go"}); u != "--includ-stale" {
 		t.Errorf("unknown flag not captured: %q", u)
 	}
 	// "--" escapes a dash-prefixed path
-	if p, _, _, _, u := parseCheckArgs([]string{"--", "-weird.go"}); u != "" || len(p) != 1 || p[0] != "-weird.go" {
+	if p, _, _, _, _, u := parseCheckArgs([]string{"--", "-weird.go"}); u != "" || len(p) != 1 || p[0] != "-weird.go" {
 		t.Errorf("-- escape: paths=%v unk=%q", p, u)
 	}
 	// bare "-" is a path, not an unknown flag
-	if p, _, _, _, u := parseCheckArgs([]string{"-"}); u != "" || len(p) != 1 || p[0] != "-" {
+	if p, _, _, _, _, u := parseCheckArgs([]string{"-"}); u != "" || len(p) != 1 || p[0] != "-" {
 		t.Errorf("bare dash: paths=%v unk=%q", p, u)
+	}
+	// #48: --max-age captured in both value forms; still yields the path
+	if p, _, _, _, m, u := parseCheckArgs([]string{"--max-age", "4d", "x.go"}); u != "" || m != "4d" || len(p) != 1 || p[0] != "x.go" {
+		t.Errorf("--max-age D: maxAge=%q paths=%v unk=%q", m, p, u)
+	}
+	if _, _, _, _, m, _ := parseCheckArgs([]string{"--max-age=36h", "x.go"}); m != "36h" {
+		t.Errorf("--max-age=D: maxAge=%q, want 36h", m)
 	}
 }
