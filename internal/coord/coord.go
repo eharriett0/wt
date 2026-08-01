@@ -268,6 +268,76 @@ func ActiveHolds(recs []Record, self, op string) []Record {
 	return out
 }
 
+// PruneRecords returns the log with resolved + expired records removed (#33):
+// (a) every announcement that has been all-cleared, together with its acks and
+// the all-clear record itself (a completed handshake — no longer live); and (b)
+// block-id reservations older than blockMaxAge (they're consumed within
+// minutes). Every STILL-OPEN announcement (incl. un-cleared stale holds — the
+// operator all-clears those, they're not silently GC'd), its acks, and any
+// other record are kept. Pure. dropped = len(recs) - len(kept).
+func PruneRecords(recs []Record, now time.Time, blockMaxAge time.Duration) (kept []Record, dropped int) {
+	cl := cleared(recs) // announce ids that have an all-clear
+	for _, r := range recs {
+		drop := false
+		switch r.Kind {
+		case KindAnnounce:
+			drop = cl[r.ID]
+		case KindAck, KindAllClear:
+			drop = cl[r.AckOf]
+		case KindBlockReserve:
+			drop = blockMaxAge > 0 && Age(r, now) > blockMaxAge
+		}
+		if !drop {
+			kept = append(kept, r)
+		}
+	}
+	return kept, len(recs) - len(kept)
+}
+
+// PruneLog GCs the coordination log at path under an exclusive lock (#33): load
+// -> PruneRecords -> rewrite the file with only the survivors. Returns how many
+// records were dropped. A missing/empty log is a no-op.
+func PruneLog(path string, now time.Time, blockMaxAge time.Duration) (dropped int, err error) {
+	lf, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return 0, err
+	}
+	defer lf.Close()
+	if err := lock.Exclusive(lf); err != nil {
+		return 0, err
+	}
+	defer lock.Release(lf)
+
+	recs, err := Load(path)
+	if err != nil {
+		return 0, err
+	}
+	kept, dropped := PruneRecords(recs, now, blockMaxAge)
+	if dropped == 0 {
+		return 0, nil
+	}
+	if _, err := lf.Seek(0, 0); err != nil {
+		return 0, err
+	}
+	if err := lf.Truncate(0); err != nil {
+		return 0, err
+	}
+	w := bufio.NewWriter(lf)
+	for _, r := range kept {
+		b, mErr := json.Marshal(r)
+		if mErr != nil {
+			continue
+		}
+		if _, err := w.Write(append(b, '\n')); err != nil {
+			return 0, err
+		}
+	}
+	if err := w.Flush(); err != nil {
+		return 0, err
+	}
+	return dropped, nil
+}
+
 // ActiveHoldsAt splits ActiveHolds into fresh vs stale by age (#32). A hold
 // older than maxAge (when maxAge > 0) is `stale` — aged out, almost always a
 // crashed/forgotten window — and callers should WARN rather than hard-block on

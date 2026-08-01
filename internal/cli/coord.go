@@ -258,6 +258,37 @@ func mergeCoordGate(c *config.Config) int {
 	return 1
 }
 
+// cmdPruneCoord GCs the coordination log — drops completed (all-cleared)
+// announce+ack+all-clear handshakes and aged-out block reservations, keeping
+// every still-open record (#33). The log is append-only and re-parsed on every
+// command, so this bounds a file that otherwise grows forever.
+func cmdPruneCoord(args []string) int {
+	fs := flag.NewFlagSet("prune-coord", flag.ContinueOnError)
+	blockAge := fs.String("block-max-age", "24h", "drop block-id reservations older than this")
+	if err := fs.Parse(args); err != nil {
+		return 64
+	}
+	dur, derr := config.ParseAge(*blockAge)
+	if derr != nil {
+		ui.Err("bad --block-max-age: %v", derr)
+		return 64
+	}
+	return withConfig(func(c *config.Config) int {
+		path, _ := coordCtx(c)
+		dropped, err := coord.PruneLog(path, time.Now(), dur)
+		if err != nil {
+			ui.Err("prune failed: %v", err)
+			return 1
+		}
+		if dropped == 0 {
+			ui.OK("coordination log already tidy — nothing to prune")
+		} else {
+			ui.OK("pruned %d resolved/expired record(s) from the coordination log", dropped)
+		}
+		return 0
+	})
+}
+
 // cmdHolds lists THIS window's own outstanding announcements/holds (each with a
 // copy-pasteable all-clear line) + its block-id reservations, so the
 // announce->hold->all-clear lifecycle is self-service instead of grepping the
