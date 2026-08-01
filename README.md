@@ -101,7 +101,7 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 | `wt check <paths…>` | Is another window touching these paths? `[--show-diff] [--json] [--include-stale] [--max-age D]` (exit 3 = HIGH) |
 | `wt where <issue\|branch>` | Print that window's worktree path — `cd $(wt where 42)` |
 | `wt new <branch>` | Create a worktree on a new branch from the base branch |
-| `wt clean [-y]` | List worktrees whose branch already shipped (incl. squash-merged PRs); `-y` removes them, skipping dirty ones |
+| `wt clean [-y]` | List worktrees whose branch already shipped (incl. squash-merged PRs); `-y` removes them. Never reaps a just-created worktree (grace window), a never-pushed branch (no upstream = unshared work), or a dirty one |
 | `wt claim <issue>` | Assign a GitHub issue, make a worktree, open a draft PR, record the claim `[--force] [--no-pr] [--epic <id>]` |
 | `wt release <issue>` | Drop the claim. `[--clean]` also removes the worktree when the branch is abandoned (clean tree, no live PR, WIP-only commits) |
 | `wt merge-pr <pr>` | Guarded squash-merge (PR-state precheck, strips a `WIP:` subject), then auto-removes the worktree + claim `[--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin]` |

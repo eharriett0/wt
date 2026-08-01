@@ -6,12 +6,19 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/eharriett0/wt/internal/config"
 	"github.com/eharriett0/wt/internal/ghx"
 	"github.com/eharriett0/wt/internal/gitx"
 	"github.com/eharriett0/wt/internal/ui"
 )
+
+// cleanGraceWindow protects a just-created worktree from being reaped by another
+// window's `wt clean` before it has had a chance to be pushed / PR'd (#61). A
+// worktree whose .git entry is younger than this is never swept, regardless of
+// commit/PR state.
+const cleanGraceWindow = 10 * time.Minute
 
 // ShippedVerdict decides whether a branch is shipped and its worktree safe to
 // prune (#37). A MERGED PR means shipped regardless of `git cherry` — wt's only
@@ -43,6 +50,47 @@ func IsAbandonedBranch(unshippedSubjects []string, prOpen, prMerged bool) bool {
 	return true
 }
 
+// ReapVerdict is the SAFE invariant for `wt clean` (#61): only ever remove a
+// worktree that is provably shipped, and never one that could hold live work.
+//   - within the grace window (just created)      → keep (race protection)
+//   - a MERGED PR                                  → reap (pushed + merged)
+//   - no upstream (never pushed)                   → keep (new / unshared work)
+//   - pushed AND patch-equivalent on base (cherry) → reap
+//
+// The old ShippedVerdict classified a commitless worktree (cherry reports 0)
+// as shipped — reaping a brand-new `wt new` checkout. Requiring an upstream
+// closes that: `wt new` never pushes, so its worktree is never swept. Pure.
+func ReapVerdict(unshipped int, cherryFailed, prMerged, hasUpstream, withinGrace bool) bool {
+	if withinGrace {
+		return false
+	}
+	if prMerged {
+		return true
+	}
+	if !hasUpstream {
+		return false
+	}
+	return !cherryFailed && unshipped == 0
+}
+
+// worktreeAge returns how long ago the worktree at wt was created, via the mtime
+// of its `.git` entry (written by `git worktree add`). ok=false when it can't be
+// stat'd — treated by callers as "not fresh" (don't over-protect an unknowable).
+func worktreeAge(wt string, now time.Time) (age time.Duration, ok bool) {
+	fi, err := os.Stat(filepath.Join(wt, ".git"))
+	if err != nil {
+		return 0, false
+	}
+	return now.Sub(fi.ModTime()), true
+}
+
+// isValidWorktree reports whether wtDir is a live git worktree — the directory
+// exists AND git recognizes it (#62). A leftover empty dir from an out-of-band
+// removal is NOT valid, so `wt new` recreates rather than short-circuiting.
+func isValidWorktree(wtDir string) bool {
+	return isDir(wtDir) && gitx.IsInsideWorktree(wtDir)
+}
+
 // New creates a worktree for branch under c.WorktreeRoot, based on the repo's
 // base branch. Idempotent: if the worktree already exists, prints the cd hint
 // and returns its path. Returns the worktree path.
@@ -50,10 +98,21 @@ func New(c *config.Config, branch string) (string, error) {
 	slug := strings.ReplaceAll(branch, "/", "-")
 	wtDir := filepath.Join(c.WorktreeRoot, slug)
 
-	if isDir(wtDir) {
+	// Short-circuit only when it's a LIVE worktree (#62) — not a stale/empty dir
+	// left by another window's clean or an out-of-band `git worktree remove`.
+	if isValidWorktree(wtDir) {
 		ui.OK("worktree already exists at %s", wtDir)
 		ui.Step("cd %s", wtDir)
 		return wtDir, nil
+	}
+	// Reconcile stale state: prune git's admin metadata, and clear a leftover
+	// empty dir so `git worktree add` doesn't refuse with "already exists" (#62).
+	_ = gitx.WorktreePrune()
+	if isDir(wtDir) && !gitx.IsInsideWorktree(wtDir) {
+		if err := os.Remove(wtDir); err != nil { // only succeeds if empty — never nukes files
+			return "", fmt.Errorf("stale worktree dir %s exists but isn't a git worktree and isn't empty; remove it and retry: %w", wtDir, err)
+		}
+		ui.Step("cleared stale empty worktree dir %s", wtDir)
 	}
 
 	ui.Step("fetching origin/%s", c.Base)
@@ -103,6 +162,7 @@ func Clean(c *config.Config, apply bool) error {
 		return nil
 	}
 
+	now := time.Now()
 	removed := 0
 	for _, wt := range paths[1:] { // skip primary (index 0)
 		if !under(wt, c.WorktreeRoot) {
@@ -116,17 +176,29 @@ func Clean(c *config.Config, apply bool) error {
 		if err != nil || br == "" || br == "HEAD" {
 			continue
 		}
+		// #61 safety: freshly-created worktrees are protected by a grace window so
+		// another window's clean can't reap them mid-work; a branch with no
+		// upstream was never pushed, so it holds new/unshared work, not stale work.
+		age, ageOK := worktreeAge(wt, now)
+		withinGrace := ageOK && age < cleanGraceWindow
+		hasUpstream := gitx.HasUpstream(wt)
 		n, cerr := gitx.CountUnshipped("origin/"+c.Base, "refs/heads/"+br)
 		if cerr != nil {
 			n, cerr = gitx.CountUnshipped(c.Base, "refs/heads/"+br)
 		}
 		cherryFailed := cerr != nil
 		prMerged := ghx.MergedPRForBranch(br) // #37: squash-merged branches read shipped here
-		if !ShippedVerdict(n, cherryFailed, prMerged) {
-			if cherryFailed {
-				continue // can't tell (no cherry base) and no merged PR → leave alone silently
+		if !ReapVerdict(n, cherryFailed, prMerged, hasUpstream, withinGrace) {
+			switch {
+			case withinGrace:
+				ui.Info("%s — created %s ago, within grace window, leave alone", br, age.Round(time.Second))
+			case !hasUpstream:
+				ui.Info("%s — never pushed (no upstream), holds unshared work, leave alone", br)
+			case cherryFailed:
+				// can't tell (no cherry base) and no merged PR → leave alone silently
+			default:
+				ui.Info("%s — %d commit(s) not on %s, leave alone", br, n, c.Base)
 			}
-			ui.Info("%s — %d commit(s) not on %s, leave alone", br, n, c.Base)
 			continue
 		}
 		reason := fmt.Sprintf("patch-equivalent on %s", c.Base)
