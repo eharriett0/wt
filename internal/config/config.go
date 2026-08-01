@@ -14,6 +14,12 @@ import (
 	"github.com/eharriett0/wt/internal/gitx"
 )
 
+// DefaultHoldMaxAge is how long a coordination --hold hard-blocks merge-pr
+// before it's treated as stale (a crashed/forgotten window) and downgraded to a
+// warning. A legitimate merge-main hold lasts minutes; a day-old hold is dead.
+// Override with `hold_max_age` / WT_HOLD_MAX_AGE; set 0/off to never expire.
+const DefaultHoldMaxAge = 24 * time.Hour
+
 // Config holds resolved settings for the repo at Root.
 type Config struct {
 	Root         string   // repo top-level
@@ -29,6 +35,7 @@ type Config struct {
 	// cry wolf on every check/commit. Matched by basename.
 	AppendOnlyPaths []string          // globs (filepath.Match) whose overlaps are downgraded to FYI regardless of hunk overlap (changelogs, inventory lists…)
 	MaxAge          time.Duration     // suppress unmerged branches whose last commit is older than this (0 = off); dormancy suppression (#7)
+	HoldMaxAge      time.Duration     // a coordination --hold older than this stops HARD-blocking merge-pr and downgrades to a loud warn (a crashed window can't wedge everyone forever); 0 = never expire. Default DefaultHoldMaxAge (#32)
 	MergeIsDeploy   bool              // this repo auto-deploys on merge to base — merge-pr adds a prod-safety gate (refuse draft, banner, confirm)
 	StructuredDocs  map[string]string // basename → section-delimiter regex (#22): docs that partition into sections/lanes, so a cross-window touch grades by SECTION (same section = HIGH) instead of the blanket shared-doc advisory. Per-doc because delimiters differ (CLAUDE.md by "## " headings, the resume memory by "**═══" lane bars). Config-file only.
 }
@@ -56,6 +63,7 @@ func Load() (*Config, error) {
 		LinkFiles:    []string{".env"},
 		ClaimOpenPR:  true,
 		SharedDocs:   []string{"CLAUDE.md", "MEMORY.md"},
+		HoldMaxAge:   DefaultHoldMaxAge,
 	}
 
 	// Repo-root .wt.conf overlay.
@@ -141,6 +149,9 @@ func ApplyConf(c *Config, m map[string]string) {
 	if v, ok := m["merge_is_deploy"]; ok {
 		c.MergeIsDeploy = parseBool(v, c.MergeIsDeploy)
 	}
+	if v, ok := m["hold_max_age"]; ok {
+		c.HoldMaxAge = parseHoldMaxAge(v, c.HoldMaxAge)
+	}
 	// structured_doc.<basename> = <section-delimiter regex> (#22). Prefixed keys
 	// because the flat key=value config has no nesting, and each doc needs its
 	// own delimiter. A bad regex is tolerated (that doc just falls back to the
@@ -191,6 +202,24 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WT_MERGE_IS_DEPLOY"); v != "" {
 		c.MergeIsDeploy = parseBool(v, c.MergeIsDeploy)
 	}
+	if v, ok := os.LookupEnv("WT_HOLD_MAX_AGE"); ok {
+		c.HoldMaxAge = parseHoldMaxAge(v, c.HoldMaxAge)
+	}
+}
+
+// parseHoldMaxAge resolves a hold_max_age value: "0"/"off"/"never" → 0 (expiry
+// disabled), a ParseAge duration otherwise; anything unparseable leaves the
+// current value. Unlike max_age, 0 is a MEANINGFUL setting here (never expire),
+// so it can't reuse ParseAge (which rejects non-positive).
+func parseHoldMaxAge(v string, cur time.Duration) time.Duration {
+	switch strings.TrimSpace(strings.ToLower(v)) {
+	case "0", "off", "never":
+		return 0
+	}
+	if d, err := ParseAge(v); err == nil {
+		return d
+	}
+	return cur
 }
 
 // ParseAge parses a human duration for dormancy: Go's time.ParseDuration units

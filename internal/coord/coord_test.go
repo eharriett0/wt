@@ -246,3 +246,42 @@ func TestDistinctTreesSameBasenameDoNotCollapse(t *testing.T) {
 		t.Fatalf("main checkout and worktree collapsed to %q", main)
 	}
 }
+
+func TestActiveHoldsAt(t *testing.T) {
+	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	mk := func(id, win string, ageH int) Record {
+		return Record{ID: id, Kind: KindAnnounce, Window: win, Hold: []string{"merge-main"},
+			TS: now.Add(-time.Duration(ageH) * time.Hour).Format(time.RFC3339)}
+	}
+	recs := []Record{mk("a", "winA", 1), mk("b", "winB", 48)} // a fresh, b 2 days old
+	fresh, stale := ActiveHoldsAt(recs, "self", "merge-main", now, 24*time.Hour)
+	if len(fresh) != 1 || fresh[0].ID != "a" {
+		t.Errorf("fresh = %+v, want [a]", fresh)
+	}
+	if len(stale) != 1 || stale[0].ID != "b" {
+		t.Errorf("stale = %+v, want [b]", stale)
+	}
+	// maxAge 0 disables expiry — everything fresh (pre-#32 behavior)
+	f0, s0 := ActiveHoldsAt(recs, "self", "merge-main", now, 0)
+	if len(f0) != 2 || len(s0) != 0 {
+		t.Errorf("maxAge=0: fresh=%d stale=%d, want 2/0", len(f0), len(s0))
+	}
+}
+
+func TestOwnOpenAnnouncements(t *testing.T) {
+	recs := []Record{
+		{ID: "1", Kind: KindAnnounce, Window: "me"},
+		{ID: "2", Kind: KindAnnounce, Window: "other"},            // not mine
+		{ID: "3", Kind: KindAnnounce, Window: "me"},               // mine, will be cleared
+		{ID: "x", Kind: KindAllClear, Window: "me", AckOf: "3"},   // clears 3
+		{ID: "4", Kind: KindBlockReserve, Window: "me", Block: 5}, // not an announcement
+	}
+	own := OwnOpenAnnouncements(recs, "me")
+	if len(own) != 1 || own[0].ID != "1" {
+		t.Errorf("OwnOpenAnnouncements = %+v, want just id 1 (2=other, 3=cleared)", own)
+	}
+	res := OwnBlockReservations(recs, "me")
+	if len(res) != 1 || res[0].Block != 5 {
+		t.Errorf("OwnBlockReservations = %+v, want [block 5]", res)
+	}
+}

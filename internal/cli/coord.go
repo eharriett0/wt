@@ -231,13 +231,22 @@ func mergeCoordGate(c *config.Config) int {
 	if err != nil {
 		return 0
 	}
-	holds := coord.ActiveHolds(recs, window, "merge-main")
-	if len(holds) == 0 {
+	now := time.Now()
+	fresh, stale := coord.ActiveHoldsAt(recs, window, "merge-main", now, c.HoldMaxAge)
+	// Stale holds (aged out past hold_max_age — almost always a crashed/forgotten
+	// window) WARN but never block, so a dead window can't wedge merge forever (#32).
+	if len(stale) > 0 {
+		ui.Warn("%d stale merge-main hold(s) past hold_max_age — NOT blocking (likely a crashed window); clear with wt all-clear:", len(stale))
+		for _, h := range stale {
+			fmt.Fprintf(os.Stderr, "    %s  %s  %s  (all-clear: wt all-clear %s)\n",
+				ui.Bold(h.ID), ui.Cyan(h.Window), ui.Dim(humanAge(coord.Age(h, now))), h.ID)
+		}
+	}
+	if len(fresh) == 0 {
 		return 0
 	}
 	ui.Collision("merge blocked — another window holds `merge-main` (change in flight):")
-	now := time.Now()
-	for _, h := range holds {
+	for _, h := range fresh {
 		iss := ""
 		if h.Issue > 0 {
 			iss = fmt.Sprintf("  #%d", h.Issue)
@@ -247,6 +256,53 @@ func mergeCoordGate(c *config.Config) int {
 	ui.Info("ack it first: wt ack <id> --state \"merging PR ...\"   (then it won't block)")
 	ui.Info("or override with --bypass if you've confirmed the merge is safe alongside it.")
 	return 1
+}
+
+// cmdHolds lists THIS window's own outstanding announcements/holds (each with a
+// copy-pasteable all-clear line) + its block-id reservations, so the
+// announce->hold->all-clear lifecycle is self-service instead of grepping the
+// jsonl for an id (#34).
+func cmdHolds(args []string) int {
+	fs := flag.NewFlagSet("holds", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return 64
+	}
+	return withConfig(func(c *config.Config) int {
+		path, window := coordCtx(c)
+		recs, err := coord.Load(path)
+		if err != nil {
+			ui.Err("could not read coordination log: %v", err)
+			return 1
+		}
+		own := coord.OwnOpenAnnouncements(recs, window)
+		reserves := coord.OwnBlockReservations(recs, window)
+		if len(own) == 0 && len(reserves) == 0 {
+			ui.OK("no outstanding holds/announcements or block reservations for this window (%s)", window)
+			return 0
+		}
+		now := time.Now()
+		if len(own) > 0 {
+			ui.Banner(fmt.Sprintf("your open announcements — window %s", window))
+			for _, a := range own {
+				tag := ""
+				if len(a.Hold) > 0 {
+					tag = " " + ui.Yellow("[hold: "+strings.Join(a.Hold, ",")+"]")
+				}
+				fmt.Printf("  %s  %s%s\n    %s\n    all-clear: %s\n",
+					ui.Bold(a.ID), ui.Dim(humanAge(coord.Age(a, now))), tag, a.Message,
+					ui.Cyan("wt all-clear "+a.ID))
+			}
+		}
+		if len(reserves) > 0 {
+			ui.Banner("your block-id reservations")
+			for _, r := range reserves {
+				fmt.Printf("  block %s on %s  %s\n",
+					ui.Bold(fmt.Sprintf("%d", r.Block)), filepath.Base(r.File),
+					ui.Dim(humanAge(coord.Age(r, now))))
+			}
+		}
+		return 0
+	})
 }
 
 // peerHoldBanner surfaces active coordination holds from OTHER windows before a

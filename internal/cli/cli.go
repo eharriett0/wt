@@ -88,6 +88,8 @@ func Main(args []string) int {
 		return cmdAck(rest)
 	case "all-clear":
 		return cmdAllClear(rest)
+	case "holds":
+		return cmdHolds(rest)
 	case "block-id":
 		return cmdBlockID(rest)
 	case "append":
