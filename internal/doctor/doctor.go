@@ -125,7 +125,15 @@ func resolvedConfig(c *config.Config) map[string]string {
 		"max_age":           ageStr(c.MaxAge, "off"),
 		"hold_max_age":      ageStr(c.HoldMaxAge, "never"),
 		"merge_is_deploy":   boolStr(c.MergeIsDeploy),
+		"coord_issue":       coordIssueStr(c.CoordIssue),
 	}
+}
+
+func coordIssueStr(n int) string {
+	if n <= 0 {
+		return "off"
+	}
+	return fmt.Sprintf("#%d", n)
 }
 
 func validateStructured(c *config.Config) []DocCheck {

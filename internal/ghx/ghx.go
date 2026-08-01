@@ -3,6 +3,7 @@
 package ghx
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -74,6 +75,30 @@ func IssueRemoveAssignee(n, user string) error {
 func IssueComment(n, body string) error {
 	_, err := run("issue", "comment", n, "--body", body)
 	return err
+}
+
+// IssueComments returns the bodies of every comment on issue n, oldest first —
+// the read-back half of the coordination mirror (#36). Bodies can be multi-line,
+// so it decodes the JSON payload rather than line-splitting. Empty (nil, nil) on
+// no comments; error only when gh itself fails.
+func IssueComments(n string) ([]string, error) {
+	out, err := run("issue", "view", n, "--json", "comments")
+	if err != nil {
+		return nil, err
+	}
+	var payload struct {
+		Comments []struct {
+			Body string `json:"body"`
+		} `json:"comments"`
+	}
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		return nil, err
+	}
+	bodies := make([]string, 0, len(payload.Comments))
+	for _, c := range payload.Comments {
+		bodies = append(bodies, c.Body)
+	}
+	return bodies, nil
 }
 
 // --- PRs ---
