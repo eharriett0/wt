@@ -144,6 +144,23 @@ func PRHeadBranch(pr string) (string, error) {
 	return run("pr", "view", pr, "--json", "headRefName", "--jq", ".headRefName")
 }
 
+// PRTitle returns the PR's title (for the #38 WIP-subject strip).
+func PRTitle(pr string) (string, error) {
+	return run("pr", "view", pr, "--json", "title", "--jq", ".title")
+}
+
+// MergedPRForBranch reports whether branch has a MERGED PR. Used by `wt clean`
+// to treat a squash-merged wt branch as shipped even though `git cherry` never
+// reads 0 for it (wt branches carry an empty placeholder + real work, so they're
+// never patch-equivalent to the squash). Best-effort: false on any error / no gh.
+func MergedPRForBranch(branch string) bool {
+	if branch == "" || branch == "HEAD" || !Present() || !Authed() {
+		return false
+	}
+	out, err := run("pr", "list", "--head", branch, "--state", "merged", "--json", "number", "--jq", ".[0].number // empty")
+	return err == nil && strings.TrimSpace(out) != ""
+}
+
 // PRStateByURL returns a short live state ("OPEN", "MERGED", "DRAFT", "CLOSED")
 // for a PR identified by URL — gh resolves the repo from the URL, so this works
 // cross-repo. Empty string on error / gh unavailable.

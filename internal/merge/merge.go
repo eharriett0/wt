@@ -158,6 +158,28 @@ func Run(pr string, dryRun, bypass, mergeForeign bool, worktreeBranches []string
 		return fmt.Errorf("foreign branch")
 	}
 
+	// #38: strip a "WIP:" prefix (the wt-claim placeholder title) from the squash
+	// SUBJECT so it doesn't land on base history. gh's --squash defaults the
+	// subject to the PR title; --subject overrides it. Best-effort — a failed
+	// title lookup just leaves the default behavior.
+	mergeArgs := extraArgs
+	if title, err := ghx.PRTitle(pr); err == nil {
+		if stripped, wasWIP := DeWIPTitle(title); wasWIP && stripped != "" {
+			mergeArgs = append(append([]string{}, extraArgs...), "--subject", stripped)
+			fmt.Fprintf(os.Stderr, "note: stripping 'WIP:' from the squash subject → %q\n", stripped)
+		}
+	}
+
 	fmt.Printf("merge-pr: %s — %s changed file(s) — merging (squash).\n", label, fileCount)
-	return ghx.MergePRSquash(pr, extraArgs)
+	return ghx.MergePRSquash(pr, mergeArgs)
+}
+
+// DeWIPTitle strips a leading "WIP:" — the wt-claim placeholder title prefix
+// ("WIP: #N — title") — so it isn't stamped onto shared base history as the
+// squash commit subject (#38). Returns (stripped, wasWIP). Pure.
+func DeWIPTitle(title string) (string, bool) {
+	if rest, ok := strings.CutPrefix(strings.TrimSpace(title), "WIP:"); ok {
+		return strings.TrimSpace(rest), true
+	}
+	return title, false
 }

@@ -8,9 +8,23 @@ import (
 	"strings"
 
 	"github.com/eharriett0/wt/internal/config"
+	"github.com/eharriett0/wt/internal/ghx"
 	"github.com/eharriett0/wt/internal/gitx"
 	"github.com/eharriett0/wt/internal/ui"
 )
+
+// ShippedVerdict decides whether a branch is shipped and its worktree safe to
+// prune (#37). A MERGED PR means shipped regardless of `git cherry` — wt's only
+// merge path is squash, and a wt-claimed branch carries an empty placeholder
+// commit + real work, so it's never patch-equivalent to the squash and cherry
+// never reads 0. Otherwise fall back to cherry: shipped iff it succeeded and
+// reported 0 unshipped commits.
+func ShippedVerdict(unshipped int, cherryFailed, prMerged bool) bool {
+	if prMerged {
+		return true
+	}
+	return !cherryFailed && unshipped == 0
+}
 
 // New creates a worktree for branch under c.WorktreeRoot, based on the repo's
 // base branch. Idempotent: if the worktree already exists, prints the cd hint
@@ -84,18 +98,25 @@ func Clean(c *config.Config, apply bool) error {
 		if err != nil || br == "" || br == "HEAD" {
 			continue
 		}
-		n, err := gitx.CountUnshipped("origin/"+c.Base, "refs/heads/"+br)
-		if err != nil {
-			if n, err = gitx.CountUnshipped(c.Base, "refs/heads/"+br); err != nil {
-				continue
-			}
+		n, cerr := gitx.CountUnshipped("origin/"+c.Base, "refs/heads/"+br)
+		if cerr != nil {
+			n, cerr = gitx.CountUnshipped(c.Base, "refs/heads/"+br)
 		}
-		if n != 0 {
+		cherryFailed := cerr != nil
+		prMerged := ghx.MergedPRForBranch(br) // #37: squash-merged branches read shipped here
+		if !ShippedVerdict(n, cherryFailed, prMerged) {
+			if cherryFailed {
+				continue // can't tell (no cherry base) and no merged PR → leave alone silently
+			}
 			ui.Info("%s — %d commit(s) not on %s, leave alone", br, n, c.Base)
 			continue
 		}
+		reason := fmt.Sprintf("patch-equivalent on %s", c.Base)
+		if prMerged {
+			reason = "PR merged"
+		}
 		if !apply {
-			ui.OK("%s — fully shipped (patch-equivalent on %s), safe to remove", br, c.Base)
+			ui.OK("%s — shipped (%s), safe to remove", br, reason)
 			fmt.Printf("  git worktree remove %s && git branch -D %s\n", wt, br)
 			continue
 		}
