@@ -174,6 +174,29 @@ func Run(pr string, dryRun, bypass, mergeForeign bool, worktreeBranches []string
 	return ghx.MergePRSquash(pr, mergeArgs)
 }
 
+// PreVerdict is the merge-pr PR-state precheck outcome (#39).
+type PreVerdict string
+
+const (
+	PreProceed       PreVerdict = "proceed"        // OPEN / unknown → merge as normal
+	PreAlreadyMerged PreVerdict = "already_merged" // skip the merge, still run cleanup
+	PreClosed        PreVerdict = "closed"         // closed-not-merged → nothing to merge
+)
+
+// PreMergeVerdict maps a gh PR state (OPEN / MERGED / CLOSED; "" = unknown) to a
+// merge action. Unknown/empty → proceed (fail-open: the merge itself surfaces a
+// real error), so a gh hiccup never blocks a legitimate merge. Pure. #39.
+func PreMergeVerdict(state string) PreVerdict {
+	switch strings.ToUpper(strings.TrimSpace(state)) {
+	case "MERGED":
+		return PreAlreadyMerged
+	case "CLOSED":
+		return PreClosed
+	default:
+		return PreProceed
+	}
+}
+
 // DeWIPTitle strips a leading "WIP:" — the wt-claim placeholder title prefix
 // ("WIP: #N — title") — so it isn't stamped onto shared base history as the
 // squash commit subject (#38). Returns (stripped, wasWIP). Pure.

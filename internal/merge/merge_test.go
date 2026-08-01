@@ -121,3 +121,15 @@ func TestDeWIPTitle(t *testing.T) {
 		}
 	}
 }
+
+func TestPreMergeVerdict(t *testing.T) {
+	cases := map[string]PreVerdict{
+		"OPEN": PreProceed, "MERGED": PreAlreadyMerged, "CLOSED": PreClosed,
+		"merged": PreAlreadyMerged, " closed ": PreClosed, "": PreProceed, "WEIRD": PreProceed,
+	}
+	for state, want := range cases {
+		if got := PreMergeVerdict(state); got != want {
+			t.Errorf("PreMergeVerdict(%q) = %v, want %v", state, got, want)
+		}
+	}
+}
