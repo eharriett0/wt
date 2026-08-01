@@ -238,3 +238,20 @@ func TestUnknownKeys(t *testing.T) {
 		t.Fatal("all-known config reported unknown keys")
 	}
 }
+
+func TestApplyConf_CoordIssue(t *testing.T) {
+	c := &Config{}
+	ApplyConf(c, ParseConf("coord_issue = 77\n"))
+	if c.CoordIssue != 77 {
+		t.Fatalf("coord_issue = %d, want 77", c.CoordIssue)
+	}
+	// junk / non-positive leaves it off
+	c2 := &Config{}
+	ApplyConf(c2, ParseConf("coord_issue = nope\n"))
+	if c2.CoordIssue != 0 {
+		t.Fatalf("junk coord_issue = %d, want 0", c2.CoordIssue)
+	}
+	if len(UnknownKeys(ParseConf("coord_issue = 5\n"))) != 0 {
+		t.Fatal("coord_issue flagged unknown")
+	}
+}

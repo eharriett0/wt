@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -87,6 +88,56 @@ func slug(repo string) string {
 		}
 	}
 	return b.String()
+}
+
+// mirrorFence is the code-block language tag wrapping the machine-readable
+// record inside a mirrored GitHub comment (#36) — human markdown above, exact
+// record below, so the write-only mirror becomes read-back-able.
+const mirrorFence = "wt-record"
+
+var mirrorBlockRe = regexp.MustCompile("(?s)```" + mirrorFence + "\\s*\\n(.*?)\\n```")
+
+// MirrorJSONBlock renders r as a fenced JSON block to append to a mirrored
+// comment, so a machine reading the issue back can reconstruct the exact record.
+func MirrorJSONBlock(r Record) string {
+	b, _ := json.Marshal(r)
+	return "```" + mirrorFence + "\n" + string(b) + "\n```"
+}
+
+// ParseMirroredRecords extracts coord.Records from mirrored comment bodies — the
+// read-back half of the --issue mirror (#36). A body with no wt-record block, or
+// malformed JSON, is skipped. Pure.
+func ParseMirroredRecords(bodies []string) []Record {
+	var out []Record
+	for _, body := range bodies {
+		for _, m := range mirrorBlockRe.FindAllStringSubmatch(body, -1) {
+			var r Record
+			if json.Unmarshal([]byte(m[1]), &r) == nil && r.ID != "" {
+				out = append(out, r)
+			}
+		}
+	}
+	return out
+}
+
+// MergeByID unions local and remote records, de-duped by ID (local wins). Order
+// is all local, then remote records whose ID isn't already present — so a
+// machine folds cross-machine mirror records into its own log view without
+// double-counting its own echoed-back announces (#36). Pure.
+func MergeByID(local, remote []Record) []Record {
+	seen := make(map[string]bool, len(local))
+	out := make([]Record, 0, len(local)+len(remote))
+	for _, r := range local {
+		seen[r.ID] = true
+		out = append(out, r)
+	}
+	for _, r := range remote {
+		if !seen[r.ID] {
+			seen[r.ID] = true
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // Append writes r as one JSON line to path, creating parent dirs as needed.

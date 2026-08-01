@@ -71,17 +71,44 @@ func newRecord(c *config.Config, window, kind string) coord.Record {
 	}
 }
 
-// mirror posts body to issue n (best-effort — a failed GitHub mirror must not
-// fail the local coordination write that already succeeded).
-func mirror(issue int, body string) {
+// mirror posts humanBody + a machine-readable record block to issue n
+// (best-effort — a failed GitHub mirror must not fail the local coordination
+// write that already succeeded). The embedded block (#36) is what another
+// machine reads back via remoteRecords, so the mirror is bi-directional.
+func mirror(issue int, r coord.Record, humanBody string) {
 	if issue <= 0 {
 		return
 	}
+	body := humanBody + "\n\n" + coord.MirrorJSONBlock(r)
 	if err := ghx.IssueComment(fmt.Sprintf("%d", issue), body); err != nil {
 		ui.Warn("wrote locally but GitHub mirror to #%d failed: %v", issue, err)
 		return
 	}
 	ui.Info("mirrored to issue #%d", issue)
+}
+
+// effectiveIssue resolves which issue to mirror to / read back from: an explicit
+// --issue wins, else the pinned coord_issue config (#36), else 0 (off).
+func effectiveIssue(explicit int, c *config.Config) int {
+	if explicit > 0 {
+		return explicit
+	}
+	return c.CoordIssue
+}
+
+// remoteRecords pulls the coordination records another machine mirrored onto
+// issue — the read-back path (#36). Best-effort: no issue / gh absent or
+// unauthed / read error → nil, so cross-machine coordination degrades to
+// local-only rather than breaking the command.
+func remoteRecords(issue int) []coord.Record {
+	if issue <= 0 || !ghx.Present() || !ghx.Authed() {
+		return nil
+	}
+	bodies, err := ghx.IssueComments(fmt.Sprintf("%d", issue))
+	if err != nil {
+		return nil
+	}
+	return coord.ParseMirroredRecords(bodies)
 }
 
 func cmdAnnounce(args []string) int {
@@ -103,8 +130,9 @@ func cmdAnnounce(args []string) int {
 			ui.Err("usage: wt announce \"<message>\" [--issue N] [--hold \"op,...\"]   (or --clear <id>)")
 			return 64
 		}
+		iss := effectiveIssue(*issue, c)
 		r := newRecord(c, window, coord.KindAnnounce)
-		r.Message, r.Issue, r.Hold = msg, *issue, splitHold(*hold)
+		r.Message, r.Issue, r.Hold = msg, iss, splitHold(*hold)
 		if err := coord.Append(path, r); err != nil {
 			ui.Err("could not write coordination log: %v", err)
 			return 1
@@ -113,7 +141,7 @@ func cmdAnnounce(args []string) int {
 		if len(r.Hold) > 0 {
 			ui.Info("hold: %s — other windows are asked to avoid these until `wt all-clear %s`", strings.Join(r.Hold, ", "), r.ID)
 		}
-		mirror(*issue, fmt.Sprintf("📣 **wt announce** — window `%s`, id `%s`\n\n%s%s", window, r.ID, msg, holdLine(r.Hold)))
+		mirror(iss, r, fmt.Sprintf("📣 **wt announce** — window `%s`, id `%s`\n\n%s%s", window, r.ID, msg, holdLine(r.Hold)))
 		return 0
 	})
 }
@@ -121,6 +149,7 @@ func cmdAnnounce(args []string) int {
 func cmdInbox(args []string) int {
 	fs := flag.NewFlagSet("inbox", flag.ContinueOnError)
 	asJSON := fs.Bool("json", false, "emit raw JSON")
+	issue := fs.Int("issue", 0, "also read back the coordination mirror on GitHub issue #N (cross-machine); default: coord_issue")
 	if err := fs.Parse(args); err != nil {
 		return 64
 	}
@@ -130,6 +159,10 @@ func cmdInbox(args []string) int {
 		if err != nil {
 			ui.Err("could not read coordination log: %v", err)
 			return 1
+		}
+		// Fold in cross-machine records from the mirror issue (#36).
+		if iss := effectiveIssue(*issue, c); iss > 0 {
+			recs = coord.MergeByID(recs, remoteRecords(iss))
 		}
 		box := coord.Inbox(recs, window)
 		if *asJSON {
@@ -173,7 +206,9 @@ func cmdAck(args []string) int {
 	id := pos[0]
 	return withConfig(func(c *config.Config) int {
 		path, window := coordCtx(c)
-		recs, _ := coord.Load(path)
+		// Fold in remote records so a cross-machine announce is ackable (#36).
+		local, _ := coord.Load(path)
+		recs := coord.MergeByID(local, remoteRecords(c.CoordIssue))
 		ann, ok := findAnnounce(recs, id)
 		if !ok {
 			ui.Err("no announcement with id %s (see `wt inbox`)", id)
@@ -186,7 +221,8 @@ func cmdAck(args []string) int {
 			return 1
 		}
 		ui.OK("acked %s (from window %s)", id, ann.Window)
-		mirror(ann.Issue, fmt.Sprintf("✅ **wt ack** of `%s` — window `%s`%s", id, window, stateLine(r.State)))
+		iss := effectiveIssue(ann.Issue, c)
+		mirror(iss, r, fmt.Sprintf("✅ **wt ack** of `%s` — window `%s`%s", id, window, stateLine(r.State)))
 		return 0
 	})
 }
@@ -203,7 +239,8 @@ func cmdAllClear(args []string) int {
 }
 
 func allClear(c *config.Config, path, window, id string) int {
-	recs, _ := coord.Load(path)
+	local, _ := coord.Load(path)
+	recs := coord.MergeByID(local, remoteRecords(c.CoordIssue)) // allow clearing a remote hold (#36)
 	ann, ok := findAnnounce(recs, id)
 	if !ok {
 		ui.Err("no announcement with id %s", id)
@@ -216,7 +253,8 @@ func allClear(c *config.Config, path, window, id string) int {
 		return 1
 	}
 	ui.OK("all-clear posted for %s — hold released", id)
-	mirror(ann.Issue, fmt.Sprintf("🟢 **wt all-clear** for `%s` — window `%s`, hold released.", id, window))
+	iss := effectiveIssue(ann.Issue, c)
+	mirror(iss, r, fmt.Sprintf("🟢 **wt all-clear** for `%s` — window `%s`, hold released.", id, window))
 	return 0
 }
 
@@ -230,6 +268,12 @@ func mergeCoordGate(c *config.Config) int {
 	recs, err := coord.Load(path)
 	if err != nil {
 		return 0
+	}
+	// Fold in cross-machine holds from the pinned mirror issue so a hold on
+	// another machine actually gates this merge (#36). Best-effort — a read
+	// failure leaves the gate local-only (fail-open, as before).
+	if c.CoordIssue > 0 {
+		recs = coord.MergeByID(recs, remoteRecords(c.CoordIssue))
 	}
 	now := time.Now()
 	fresh, stale := coord.ActiveHoldsAt(recs, window, "merge-main", now, c.HoldMaxAge)

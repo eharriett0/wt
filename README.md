@@ -108,7 +108,7 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 | `wt todos` | What every window is working on (mirrors each window's TODO list) |
 | **— cross-window coordination —** | |
 | `wt announce "<msg>"` | Tell other windows a change is starting `[--hold "merge-main,…"] [--issue N]` |
-| `wt inbox` | Un-acked announcements from other windows `[--json]` |
+| `wt inbox` | Un-acked announcements from other windows. `[--issue N]` also reads back the cross-machine mirror `[--json]` |
 | `wt ack <id>` | Acknowledge one `[--state "what this window is touching"]` |
 | `wt all-clear <id>` | Release your hold |
 | `wt holds` | YOUR outstanding announcements/holds + block reservations, with copy-pasteable all-clear lines |
@@ -208,6 +208,7 @@ Zero-config works by derivation. Override via a repo-root `.wt.conf`
 | `append_only_paths` | `WT_APPEND_ONLY_PATHS` | *(none)* — globs whose overlaps are always FYI (`**` matches any depth) |
 | `max_age` | `WT_MAX_AGE` | *(off)* — dormancy threshold, e.g. `4d`, `2w`, `36h`, or a bare int (days) |
 | `hold_max_age` | `WT_HOLD_MAX_AGE` | `24h` — a `--hold` older than this stops hard-blocking `merge-pr` (warns instead); `0`/`off` = never expire |
+| `coord_issue` | `WT_COORD_ISSUE` | *(off)* — a pinned GitHub issue as the **cross-machine** mirror: announce/ack/all-clear auto-mirror to it, and `inbox` + the `merge-pr` gate read it back, so a hold on one machine blocks/warns on another |
 | `merge_is_deploy` | `WT_MERGE_IS_DEPLOY` | `false` — enable the prod-deploy gate on `merge-pr` |
 
 Color is auto-disabled when stdout isn't a TTY; force off with `NO_COLOR=1`.

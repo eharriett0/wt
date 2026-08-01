@@ -47,7 +47,7 @@ func printHelp() {
 
 	fmt.Println(b(y("  ✦ CROSS-WINDOW COORDINATION")) + d("  — hand off disruptive changes (incidents, rolls, deploys)"))
 	fmt.Printf("    %s  %s\n", c("wt announce \"<msg>\""), "tell other windows a change is starting  "+d("[--hold \"merge-main,…\"] [--issue N]"))
-	fmt.Printf("    %s                %s\n", c("wt inbox"), "un-acked announcements from other windows  "+d("[--json]"))
+	fmt.Printf("    %s                %s\n", c("wt inbox"), "un-acked announcements from other windows  "+d("[--json] [--issue N = read the cross-machine mirror]"))
 	fmt.Printf("    %s           %s\n", c("wt ack <id>"), "acknowledge one  "+d("[--state \"what this window is touching\"]"))
 	fmt.Printf("    %s     %s\n", c("wt all-clear <id>"), "release your hold  "+d("(also: wt announce --clear <id>)"))
 	fmt.Printf("    %s               %s\n", c("wt holds"), "YOUR outstanding announcements/holds + block reservations (with all-clear lines)")

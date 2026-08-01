@@ -38,6 +38,7 @@ type Config struct {
 	MaxAge          time.Duration     // suppress unmerged branches whose last commit is older than this (0 = off); dormancy suppression (#7)
 	HoldMaxAge      time.Duration     // a coordination --hold older than this stops HARD-blocking merge-pr and downgrades to a loud warn (a crashed window can't wedge everyone forever); 0 = never expire. Default DefaultHoldMaxAge (#32)
 	MergeIsDeploy   bool              // this repo auto-deploys on merge to base — merge-pr adds a prod-safety gate (refuse draft, banner, confirm)
+	CoordIssue      int               // a pinned GitHub issue used as the cross-machine coordination mirror (#36): when set, announce/ack/all-clear auto-mirror to it, and inbox + the merge gate read it back so a hold on one machine blocks/warns on another. 0 = off.
 	StructuredDocs  map[string]string // basename → section-delimiter regex (#22): docs that partition into sections/lanes, so a cross-window touch grades by SECTION (same section = HIGH) instead of the blanket shared-doc advisory. Per-doc because delimiters differ (CLAUDE.md by "## " headings, the resume memory by "**═══" lane bars). Config-file only.
 }
 
@@ -135,6 +136,11 @@ func ScaffoldConf(c *Config) string {
 	entry("max_age", ageStr(c.MaxAge), "4d")
 	entry("hold_max_age", ageStr(c.HoldMaxAge), "24h")
 	entry("merge_is_deploy", boolStr(c.MergeIsDeploy), "false")
+	issueStr := ""
+	if c.CoordIssue > 0 {
+		issueStr = strconv.Itoa(c.CoordIssue)
+	}
+	entry("coord_issue", issueStr, "0")
 	return b.String()
 }
 
@@ -144,7 +150,7 @@ var knownKeys = map[string]bool{
 	"base": true, "worktree_root": true, "active_work": true, "prefix": true,
 	"link_files": true, "claim_open_pr": true, "shared_docs": true,
 	"append_only_paths": true, "max_age": true, "hold_max_age": true,
-	"merge_is_deploy": true,
+	"merge_is_deploy": true, "coord_issue": true,
 }
 
 // UnknownKeys returns the parsed .wt.conf keys that wt does not recognize,
@@ -225,6 +231,11 @@ func ApplyConf(c *Config, m map[string]string) {
 	if v, ok := m["hold_max_age"]; ok {
 		c.HoldMaxAge = parseHoldMaxAge(v, c.HoldMaxAge)
 	}
+	if v, ok := m["coord_issue"]; ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			c.CoordIssue = n
+		}
+	}
 	// structured_doc.<basename> = <section-delimiter regex> (#22). Prefixed keys
 	// because the flat key=value config has no nesting, and each doc needs its
 	// own delimiter. A bad regex is tolerated (that doc just falls back to the
@@ -277,6 +288,11 @@ func applyEnv(c *Config) {
 	}
 	if v, ok := os.LookupEnv("WT_HOLD_MAX_AGE"); ok {
 		c.HoldMaxAge = parseHoldMaxAge(v, c.HoldMaxAge)
+	}
+	if v := os.Getenv("WT_COORD_ISSUE"); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			c.CoordIssue = n
+		}
 	}
 }
 
