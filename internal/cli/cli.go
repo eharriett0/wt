@@ -79,7 +79,7 @@ func Main(args []string) int {
 		fmt.Printf("wt %s\n", version())
 		return 0
 	case "doctor":
-		return doctor.Run(loadConfigOrNil())
+		return cmdDoctor(rest)
 	case "_hook":
 		return runHook(rest)
 	case "new":
@@ -798,6 +798,16 @@ func cmdInit(args []string) int {
 		ui.OK("wrote %s — every key is commented; uncomment + edit what you need", path)
 		return 0
 	})
+}
+
+// cmdDoctor parses --json and runs the preflight checklist (#43).
+func cmdDoctor(args []string) int {
+	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	asJSON := fs.Bool("json", false, "emit the report as JSON")
+	if err := fs.Parse(args); err != nil {
+		return 64
+	}
+	return doctor.Run(loadConfigOrNil(), *asJSON)
 }
 
 // cmdWhere resolves an issue number or branch to its worktree path and prints

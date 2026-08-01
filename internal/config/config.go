@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -135,6 +136,34 @@ func ScaffoldConf(c *Config) string {
 	entry("hold_max_age", ageStr(c.HoldMaxAge), "24h")
 	entry("merge_is_deploy", boolStr(c.MergeIsDeploy), "false")
 	return b.String()
+}
+
+// knownKeys is every recognized flat .wt.conf key. structured_doc.<name> is
+// handled by prefix (unbounded suffix), so it's not listed here.
+var knownKeys = map[string]bool{
+	"base": true, "worktree_root": true, "active_work": true, "prefix": true,
+	"link_files": true, "claim_open_pr": true, "shared_docs": true,
+	"append_only_paths": true, "max_age": true, "hold_max_age": true,
+	"merge_is_deploy": true,
+}
+
+// UnknownKeys returns the parsed .wt.conf keys that wt does not recognize,
+// sorted — a typo'd key (e.g. `worktree-root` instead of `worktree_root`) is
+// silently ignored by ApplyConf, so `wt doctor` surfaces it here. A
+// `structured_doc.<name>` key is always recognized (prefix match). Pure (#43).
+func UnknownKeys(m map[string]string) []string {
+	var out []string
+	for k := range m {
+		if knownKeys[k] {
+			continue
+		}
+		if name, ok := strings.CutPrefix(k, "structured_doc."); ok && name != "" {
+			continue
+		}
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // ParseConf parses a key=value config body. Lines beginning with # and blank

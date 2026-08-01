@@ -226,3 +226,15 @@ func TestScaffoldConf(t *testing.T) {
 		t.Errorf("scaffold should be all-commented (no-op on apply), but base changed to %q", fresh.Base)
 	}
 }
+
+func TestUnknownKeys(t *testing.T) {
+	m := ParseConf("base = main\nworktree-root = /tmp\nstructured_doc.CLAUDE.md = ^##\nbogus = 1\n")
+	got := UnknownKeys(m)
+	// known: base; unknown: worktree-root (typo of _), bogus; structured_doc.* recognized
+	if len(got) != 2 || got[0] != "bogus" || got[1] != "worktree-root" {
+		t.Fatalf("UnknownKeys = %v, want [bogus worktree-root]", got)
+	}
+	if len(UnknownKeys(ParseConf("base = main\nmax_age = 4d\n"))) != 0 {
+		t.Fatal("all-known config reported unknown keys")
+	}
+}

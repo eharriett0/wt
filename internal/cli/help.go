@@ -65,7 +65,7 @@ func printHelp() {
 
 	fmt.Println(b("  ✦ SETUP"))
 	fmt.Printf("    %s        %s\n", c("wt install-hooks"), "install pre-push (base-branch guard) + pre-commit (collision notice)")
-	fmt.Printf("    %s              %s\n", c("wt doctor"), "check git/gh + show resolved config")
+	fmt.Printf("    %s              %s\n", c("wt doctor"), "check git/gh + all resolved config + structured-doc regex + coord-log health + preflight  "+d("[--json]"))
 	fmt.Printf("    %s                %s\n", c("wt help"), "this screen")
 	fmt.Println()
 
