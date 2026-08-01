@@ -2,6 +2,7 @@ package config
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -200,5 +201,28 @@ func TestApplyConf_HoldMaxAge(t *testing.T) {
 	ApplyConf(c, map[string]string{"hold_max_age": "0"})
 	if c.HoldMaxAge != 0 {
 		t.Errorf("hold_max_age=0 → %v, want 0", c.HoldMaxAge)
+	}
+}
+
+func TestScaffoldConf(t *testing.T) {
+	c := &Config{
+		Root: "/r", Base: "trunk", WorktreeRoot: "/wr", ActiveWork: "/aw",
+		Prefix: "feat-", LinkFiles: []string{".env"}, ClaimOpenPR: true,
+		SharedDocs: []string{"CLAUDE.md"}, HoldMaxAge: DefaultHoldMaxAge,
+	}
+	out := ScaffoldConf(c)
+	for _, want := range []string{
+		"# resolved: trunk", "# base = trunk", "# worktree_root = /wr",
+		"structured_doc.CLAUDE.md", "# hold_max_age = 24h", "# merge_is_deploy = false",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("ScaffoldConf missing %q\n---\n%s", want, out)
+		}
+	}
+	// every line commented → applying the scaffold changes nothing
+	fresh := &Config{Base: "x"}
+	ApplyConf(fresh, ParseConf(out))
+	if fresh.Base != "x" {
+		t.Errorf("scaffold should be all-commented (no-op on apply), but base changed to %q", fresh.Base)
 	}
 }

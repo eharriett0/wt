@@ -84,6 +84,8 @@ func Main(args []string) int {
 		return runHook(rest)
 	case "new":
 		return cmdNew(rest)
+	case "init":
+		return cmdInit(rest)
 	case "clean":
 		return cmdClean(rest)
 	case "claim":
@@ -771,6 +773,30 @@ func cmdCheck(args []string) int {
 			return renderCheckJSON(entries, includeStale)
 		}
 		return renderCheckText(entries, paths, includeStale, showDiff)
+	})
+}
+
+// cmdInit scaffolds a commented .wt.conf at the repo root, pre-filled with this
+// repo's derived defaults (#44). Refuses to clobber an existing file without
+// --force.
+func cmdInit(args []string) int {
+	fs := flag.NewFlagSet("init", flag.ContinueOnError)
+	force := fs.Bool("force", false, "overwrite an existing .wt.conf")
+	if err := fs.Parse(args); err != nil {
+		return 64
+	}
+	return withConfig(func(c *config.Config) int {
+		path := filepath.Join(c.Root, ".wt.conf")
+		if _, err := os.Stat(path); err == nil && !*force {
+			ui.Err(".wt.conf already exists at %s — use --force to overwrite", path)
+			return 1
+		}
+		if err := os.WriteFile(path, []byte(config.ScaffoldConf(c)), 0o644); err != nil {
+			ui.Err("write %s: %v", path, err)
+			return 1
+		}
+		ui.OK("wrote %s — every key is commented; uncomment + edit what you need", path)
+		return 0
 	})
 }
 
