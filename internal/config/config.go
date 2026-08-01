@@ -93,6 +93,50 @@ func worktreeRootAnchor(root, common string) (name, parent string) {
 	return filepath.Base(root), filepath.Dir(root)
 }
 
+// ScaffoldConf returns a commented .wt.conf template for c (#44). Every line is
+// commented — uncommenting one overrides that default — and each key is preceded
+// by a "# resolved:" line showing what wt DERIVED for this repo, so the operator
+// can see (and confirm) the effective value without triggering behavior.
+func ScaffoldConf(c *Config) string {
+	boolStr := func(b bool) string {
+		if b {
+			return "true"
+		}
+		return "false"
+	}
+	ageStr := func(d time.Duration) string {
+		if d == 0 {
+			return "off"
+		}
+		return d.String()
+	}
+	var b strings.Builder
+	b.WriteString("# wt config — repo-root .wt.conf (key=value).\n")
+	b.WriteString("# Every line is commented: uncomment + edit only what you want to override.\n")
+	b.WriteString("# '# resolved:' shows the value wt derived for THIS repo.\n\n")
+	entry := func(key, resolved, example string) {
+		if resolved != "" {
+			b.WriteString("# resolved: " + resolved + "\n")
+		}
+		b.WriteString("# " + key + " = " + example + "\n\n")
+	}
+	entry("base", c.Base, c.Base)
+	entry("worktree_root", c.WorktreeRoot, c.WorktreeRoot)
+	entry("active_work", c.ActiveWork, c.ActiveWork)
+	entry("prefix", c.Prefix, "feat-")
+	entry("link_files", strings.Join(c.LinkFiles, ","), ".env,.envrc")
+	entry("claim_open_pr", boolStr(c.ClaimOpenPR), "true")
+	entry("shared_docs", strings.Join(c.SharedDocs, ","), "CLAUDE.md,MEMORY.md")
+	b.WriteString("# structured_doc.<basename> = <section-delimiter regexp> — grade that shared\n")
+	b.WriteString("# doc by SECTION (two windows editing the SAME section = HIGH):\n")
+	b.WriteString("# structured_doc.CLAUDE.md = ^##\\s\n\n")
+	entry("append_only_paths", strings.Join(c.AppendOnlyPaths, ","), "CHANGELOG.md,docs/**/*.md")
+	entry("max_age", ageStr(c.MaxAge), "4d")
+	entry("hold_max_age", ageStr(c.HoldMaxAge), "24h")
+	entry("merge_is_deploy", boolStr(c.MergeIsDeploy), "false")
+	return b.String()
+}
+
 // ParseConf parses a key=value config body. Lines beginning with # and blank
 // lines are ignored; the first '=' splits key/value; both sides are trimmed.
 func ParseConf(body string) map[string]string {
