@@ -294,7 +294,7 @@ func cmdMergePR(args []string) int {
 			return 1
 		}
 	}
-	if c.MergeIsDeploy && !*dryRun {
+	if c.MergeIsDeploy && !*dryRun && deployGateApplies(c, pr) {
 		if code := deployGate(pr, *confirmDeploy); code != 0 {
 			return code
 		}
@@ -410,6 +410,49 @@ func cwdUnder(dir string) bool {
 // deployGate enforces the merge==deploy prod safety check. Returns 0 to proceed,
 // non-zero to abort. Refuses a draft PR outright, prints a prod banner, and
 // requires either --confirm-deploy or a typed "deploy" at an interactive prompt.
+// deployGateApplies reports whether the merge==deploy prod gate should fire for
+// this PR. With merge_is_deploy_paths UNSET, every merge is a deploy (legacy: the
+// whole repo is a deploy surface). With it SET, the gate fires only when the PR
+// changes at least one file matching a deploy glob — a docs/CI/scripts-only PR is
+// not a prod deploy and shouldn't demand the ack. Fails CLOSED: if the globs are
+// set but the PR's files can't be listed, gate anyway rather than risk skipping.
+func deployGateApplies(c *config.Config, pr string) bool {
+	if len(c.MergeIsDeployPaths) == 0 {
+		return true // no path scoping → whole-repo deploy surface (legacy behavior)
+	}
+	files, err := ghx.PRChangedFiles(pr)
+	if err != nil {
+		ui.Warn("merge_is_deploy_paths set but couldn't list PR #%s files (%v) — gating to be safe", pr, err)
+		return true // fail CLOSED
+	}
+	if len(files) == 0 {
+		return true // empty diff (the merge guard blocks it anyway) — gate to be safe
+	}
+	if anyDeployPath(files, c.MergeIsDeployPaths) {
+		return true
+	}
+	ui.Info("PR #%s changes no deploy-path files (merge_is_deploy_paths) — skipping the prod gate", pr)
+	return false
+}
+
+// anyDeployPath reports whether any changed file matches any deploy glob. Reuses
+// collide.MatchDoubleStar so `**` spans path segments ("infrastructure/**" matches
+// a deeply-nested file) while `*` stays within one segment — the same matcher the
+// append-only globs use (#31), so deploy-path globs behave identically.
+func anyDeployPath(files, globs []string) bool {
+	for _, f := range files {
+		if f = strings.TrimSpace(f); f == "" {
+			continue
+		}
+		for _, g := range globs {
+			if g = strings.TrimSpace(g); g != "" && collide.MatchDoubleStar(g, f) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func deployGate(pr string, confirmed bool) int {
 	if draft, err := ghx.PRIsDraft(pr); err == nil && draft {
 		ui.Err("PR #%s is a DRAFT — refusing to merge in a merge==deploy repo (would auto-apply to prod).", pr)
