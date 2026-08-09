@@ -34,12 +34,13 @@ type Config struct {
 	// MEMORY.md…) where a cross-window touch is an ADVISORY, not a blocking
 	// collision — every window legitimately edits these, so they'd otherwise
 	// cry wolf on every check/commit. Matched by basename.
-	AppendOnlyPaths []string          // globs (filepath.Match) whose overlaps are downgraded to FYI regardless of hunk overlap (changelogs, inventory lists…)
-	MaxAge          time.Duration     // suppress unmerged branches whose last commit is older than this (0 = off); dormancy suppression (#7)
-	HoldMaxAge      time.Duration     // a coordination --hold older than this stops HARD-blocking merge-pr and downgrades to a loud warn (a crashed window can't wedge everyone forever); 0 = never expire. Default DefaultHoldMaxAge (#32)
-	MergeIsDeploy   bool              // this repo auto-deploys on merge to base — merge-pr adds a prod-safety gate (refuse draft, banner, confirm)
-	CoordIssue      int               // a pinned GitHub issue used as the cross-machine coordination mirror (#36): when set, announce/ack/all-clear auto-mirror to it, and inbox + the merge gate read it back so a hold on one machine blocks/warns on another. 0 = off.
-	StructuredDocs  map[string]string // basename → section-delimiter regex (#22): docs that partition into sections/lanes, so a cross-window touch grades by SECTION (same section = HIGH) instead of the blanket shared-doc advisory. Per-doc because delimiters differ (CLAUDE.md by "## " headings, the resume memory by "**═══" lane bars). Config-file only.
+	AppendOnlyPaths    []string          // globs (filepath.Match) whose overlaps are downgraded to FYI regardless of hunk overlap (changelogs, inventory lists…)
+	MaxAge             time.Duration     // suppress unmerged branches whose last commit is older than this (0 = off); dormancy suppression (#7)
+	HoldMaxAge         time.Duration     // a coordination --hold older than this stops HARD-blocking merge-pr and downgrades to a loud warn (a crashed window can't wedge everyone forever); 0 = never expire. Default DefaultHoldMaxAge (#32)
+	MergeIsDeploy      bool              // this repo auto-deploys on merge to base — merge-pr adds a prod-safety gate (refuse draft, banner, confirm)
+	MergeIsDeployPaths []string          // globs (** via collide.MatchDoubleStar) scoping the deploy gate: when set, merge-pr fires the prod gate ONLY if the PR changes a matching file — docs/CI/scripts-only PRs skip it. Unset → whole repo is a deploy surface (legacy). e.g. "infrastructure/**,envs/**".
+	CoordIssue         int               // a pinned GitHub issue used as the cross-machine coordination mirror (#36): when set, announce/ack/all-clear auto-mirror to it, and inbox + the merge gate read it back so a hold on one machine blocks/warns on another. 0 = off.
+	StructuredDocs     map[string]string // basename → section-delimiter regex (#22): docs that partition into sections/lanes, so a cross-window touch grades by SECTION (same section = HIGH) instead of the blanket shared-doc advisory. Per-doc because delimiters differ (CLAUDE.md by "## " headings, the resume memory by "**═══" lane bars). Config-file only.
 }
 
 // Load resolves config for the repo containing cwd.
@@ -136,6 +137,7 @@ func ScaffoldConf(c *Config) string {
 	entry("max_age", ageStr(c.MaxAge), "4d")
 	entry("hold_max_age", ageStr(c.HoldMaxAge), "24h")
 	entry("merge_is_deploy", boolStr(c.MergeIsDeploy), "false")
+	entry("merge_is_deploy_paths", strings.Join(c.MergeIsDeployPaths, ","), "infrastructure/**,envs/**")
 	issueStr := ""
 	if c.CoordIssue > 0 {
 		issueStr = strconv.Itoa(c.CoordIssue)
@@ -150,7 +152,7 @@ var knownKeys = map[string]bool{
 	"base": true, "worktree_root": true, "active_work": true, "prefix": true,
 	"link_files": true, "claim_open_pr": true, "shared_docs": true,
 	"append_only_paths": true, "max_age": true, "hold_max_age": true,
-	"merge_is_deploy": true, "coord_issue": true,
+	"merge_is_deploy": true, "merge_is_deploy_paths": true, "coord_issue": true,
 }
 
 // UnknownKeys returns the parsed .wt.conf keys that wt does not recognize,
@@ -228,6 +230,9 @@ func ApplyConf(c *Config, m map[string]string) {
 	if v, ok := m["merge_is_deploy"]; ok {
 		c.MergeIsDeploy = parseBool(v, c.MergeIsDeploy)
 	}
+	if v, ok := m["merge_is_deploy_paths"]; ok {
+		c.MergeIsDeployPaths = splitCSV(v)
+	}
 	if v, ok := m["hold_max_age"]; ok {
 		c.HoldMaxAge = parseHoldMaxAge(v, c.HoldMaxAge)
 	}
@@ -285,6 +290,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WT_MERGE_IS_DEPLOY"); v != "" {
 		c.MergeIsDeploy = parseBool(v, c.MergeIsDeploy)
+	}
+	if v, ok := os.LookupEnv("WT_MERGE_IS_DEPLOY_PATHS"); ok {
+		c.MergeIsDeployPaths = splitCSV(v)
 	}
 	if v, ok := os.LookupEnv("WT_HOLD_MAX_AGE"); ok {
 		c.HoldMaxAge = parseHoldMaxAge(v, c.HoldMaxAge)

@@ -42,6 +42,7 @@ func printHelp() {
 	fmt.Printf("    %s     %s\n", c("wt merge-pr <pr>"), "guarded squash (surfaces head branch) + auto-remove worktree  "+d("[--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin]"))
 	fmt.Println("    " + d("set ") + c("merge_is_deploy") + d(" for GitOps repos (merge auto-applies to prod): refuses"))
 	fmt.Println("    " + d("a draft PR, banners the deploy, and requires a typed confirm / --confirm-deploy."))
+	fmt.Println("    " + d("scope it with ") + c("merge_is_deploy_paths") + d(" (globs, ** ok) so the gate skips docs/CI/scripts-only PRs."))
 	fmt.Println("    " + d("--admin forwards to gh pr merge to bypass a required-review branch (keeps the guard)."))
 	fmt.Println()
 
@@ -76,7 +77,7 @@ func printHelp() {
 
 	fmt.Println(d("  Config: derived defaults → repo-root .wt.conf → env. Keys/vars: base, prefix,"))
 	fmt.Println(d("  worktree_root, active_work, link_files, claim_open_pr, shared_docs,"))
-	fmt.Println(d("  append_only_paths, max_age (e.g. 4d/2w), merge_is_deploy  (env = WT_<UPPER>)."))
+	fmt.Println(d("  append_only_paths, max_age (e.g. 4d/2w), merge_is_deploy[_paths]  (env = WT_<UPPER>)."))
 	fmt.Println(d("  Color off: NO_COLOR=1.   More: https://github.com/eharriett0/wt"))
 	fmt.Println()
 }

@@ -153,3 +153,29 @@ func TestParseCheckArgs(t *testing.T) {
 		t.Errorf("--max-age=D: maxAge=%q, want 36h", m)
 	}
 }
+
+func TestAnyDeployPath(t *testing.T) {
+	deploy := []string{"infrastructure/**", "envs/**"}
+	cases := []struct {
+		name  string
+		files []string
+		globs []string
+		want  bool
+	}{
+		{"docs+scripts only → not a deploy", []string{"scripts/x.sh", "doc/y.md"}, deploy, false},
+		{"one infra file → deploy", []string{"doc/plan.md", "infrastructure/controllers/istio-cni/helmrelease.yaml"}, deploy, true},
+		{"one envs file → deploy", []string{"envs/landru/tofu/aws/vars.tfvars"}, deploy, true},
+		{"root readme only → not a deploy", []string{"README.md"}, deploy, false},
+		{"no files → no match", nil, deploy, false},
+		{"* stays within a segment", []string{"doc/README.md"}, []string{"*.md"}, false},
+		{"whitespace trimmed both sides", []string{"  infrastructure/x.yaml  "}, []string{"  infrastructure/**  "}, true},
+		{"blank entries ignored", []string{"", "  ", "doc/z.md"}, deploy, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := anyDeployPath(tc.files, tc.globs); got != tc.want {
+				t.Errorf("anyDeployPath(%v, %v) = %v, want %v", tc.files, tc.globs, got, tc.want)
+			}
+		})
+	}
+}

@@ -138,6 +138,23 @@ func PRChangedFileCount(pr string) string {
 	return fmt.Sprintf("%d", n)
 }
 
+// PRChangedFiles returns the repo-relative paths changed in the PR diff vs base.
+// An error is returned (not swallowed to empty) so callers can fail CLOSED — a
+// deploy gate must not skip just because gh couldn't list the files.
+func PRChangedFiles(pr string) ([]string, error) {
+	out, err := run("pr", "diff", pr, "--name-only")
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, ln := range strings.Split(out, "\n") {
+		if s := strings.TrimSpace(ln); s != "" {
+			files = append(files, s)
+		}
+	}
+	return files, nil
+}
+
 // PRCommitSubjects returns one messageHeadline per commit on the PR.
 func PRCommitSubjects(pr string) []string {
 	out, err := run("pr", "view", pr, "--json", "commits", "--jq", ".commits[].messageHeadline")
