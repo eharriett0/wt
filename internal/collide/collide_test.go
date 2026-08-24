@@ -122,6 +122,13 @@ func TestClassifyFacts(t *testing.T) {
 		{"open PR beats closed", LiveFacts{ClosedPR: true, HasOpenPR: true}, 0, LiveOpenPR},
 		// no PR resolved + dirty ⇒ genuinely live editing, still HIGH.
 		{"dirty, no PR → dirty (live work)", LiveFacts{Dirty: true, Unshipped: 3, PRChecked: true}, 0, LiveDirty},
+		// #87 (post-review SAFETY invariant): ClassifyFacts has NO base-drift
+		// branch. A dirty base checkout — however far behind — stays LiveDirty
+		// (HIGH), because its uncommitted edits could be real work and hiding a
+		// dirty collision on the default path would violate "never hide a real
+		// collision". The behind-count only enriches the label (see Label test) +
+		// drives the wt doctor probe; it never suppresses. A resolved merged/closed
+		// PR still outranks dirty (that's the #79 leftover-index case, above).
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -182,6 +189,14 @@ func TestWindowLiveness_Label(t *testing.T) {
 		{"no PR opened (still HIGH)", WindowLiveness{Level: LiveUnmerged}, "commits, no PR opened"},
 		// a plain dirty (no PR) window does NOT get the leftover-edits note.
 		{"dirty live work", WindowLiveness{Level: LiveDirty, Dirty: true}, "uncommitted edits"},
+		// #87: a far-behind dirty base checkout STAYS LiveDirty (HIGH, never
+		// hidden) — the behind-count + "likely stale" only enrich the label so a
+		// reader dismisses probable rot fast.
+		{"dirty base far behind (HIGH + likely stale)", WindowLiveness{Level: LiveDirty, Dirty: true, BehindBase: 144},
+			"uncommitted edits · 144 behind base — likely stale"},
+		// below the threshold: note the drift but no "likely stale".
+		{"dirty base slightly behind", WindowLiveness{Level: LiveDirty, Dirty: true, BehindBase: 3},
+			"uncommitted edits · 3 behind base"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

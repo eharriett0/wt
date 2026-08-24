@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/eharriett0/wt/internal/collide"
 	"github.com/eharriett0/wt/internal/config"
 	"github.com/eharriett0/wt/internal/coord"
 	"github.com/eharriett0/wt/internal/ghx"
@@ -40,7 +41,22 @@ type Report struct {
 	Preflight *Preflight   `json:"preflight,omitempty"`
 
 	Upstream       []UpstreamCheck `json:"upstream_checks,omitempty"` // worktree branches tracking the base / no upstream (#76)
+	StaleCheckouts []StaleCheckout `json:"stale_checkouts,omitempty"` // base-branch checkouts, dirty + far behind, poisoning collision checks (#87)
 	HooksInstalled *bool           `json:"hooks_installed,omitempty"` // wt pre-push guard present in this repo (#76)
+}
+
+// StaleCheckout flags a worktree checked out ON the base branch that is dirty
+// AND far behind origin/base (#87) — very likely rot. Its uncommitted edits
+// surface as an active (HIGH) window in any `wt check`/`status` that touches one
+// of them; `wt check` correctly still flags them (a dirty checkout can hold real
+// work, so they are never hidden), but nothing else nudges you to clean the
+// checkout up. This probe names it so the root cause gets fixed.
+type StaleCheckout struct {
+	Path       string `json:"path"`
+	Branch     string `json:"branch"`      // == base
+	BehindBase int    `json:"behind_base"` // commits origin/base is ahead
+	DirtyFiles int    `json:"dirty_files"` // uncommitted changes in the checkout
+	Severity   string `json:"severity"`    // "warn"
 }
 
 // UpstreamCheck flags a worktree whose branch tracks the BASE ref — a bare
@@ -125,6 +141,7 @@ func build(c *config.Config) *Report {
 	rep.Coord = coordHealth(c)
 	rep.Preflight = preflight(c)
 	rep.Upstream = upstreamChecks(c)
+	rep.StaleCheckouts = staleCheckouts(c)
 	rep.HooksInstalled = hooksInstalled(c)
 	// A worktree tracking the base branch in a merge_is_deploy repo is a hard
 	// finding — a bare `git push` there ships to prod. That fails doctor.
@@ -167,6 +184,74 @@ func upstreamChecks(c *config.Config) []UpstreamCheck {
 		out = append(out, uc)
 	}
 	return out
+}
+
+// staleCheckouts finds every worktree checked out ON the base branch that is
+// dirty AND at least collide.StaleBaseBehindThreshold commits behind origin/base
+// (#87). That is precisely the checkout whose uncommitted edits poison `wt
+// check`/`status` — its diff overlaps almost any file — and which nothing else
+// names. A base checkout that is clean, or only slightly behind, is not flagged.
+func staleCheckouts(c *config.Config) []StaleCheckout {
+	refs, err := gitx.WorktreeList()
+	if err != nil {
+		return nil
+	}
+	baseRef := gitx.ResolveRemoteBase(c.Base)
+	if baseRef == "" {
+		return nil
+	}
+	var out []StaleCheckout
+	for _, r := range refs {
+		if r.Branch != c.Base {
+			continue // only the base-branch checkout can be this phantom
+		}
+		if gitx.IsClean(r.Path) {
+			continue // a clean checkout has no dirty diff to overlap anything
+		}
+		headSHA, err := gitx.RunDir(r.Path, "rev-parse", "HEAD")
+		if err != nil {
+			continue
+		}
+		behind := gitx.BehindCount(strings.TrimSpace(headSHA), baseRef)
+		if _, sev := classifyStaleCheckout(behind); sev == "" {
+			continue
+		}
+		out = append(out, StaleCheckout{
+			Path:       r.Path,
+			Branch:     r.Branch,
+			BehindBase: behind,
+			DirtyFiles: dirtyFileCount(r.Path),
+			Severity:   "warn",
+		})
+	}
+	return out
+}
+
+// classifyStaleCheckout decides whether a dirty base checkout is stale enough to
+// report, from how far behind origin/base it is. Pure — the testable core.
+// Returns ("","") below the threshold (or when behind couldn't be computed, so a
+// git error never manufactures a warning).
+func classifyStaleCheckout(behind int) (issue, severity string) {
+	if behind >= collide.StaleBaseBehindThreshold {
+		return "stale_base_checkout", "warn"
+	}
+	return "", ""
+}
+
+// dirtyFileCount counts uncommitted changes in the worktree at path (porcelain
+// lines) for the report message; 0 on any error.
+func dirtyFileCount(path string) int {
+	out, err := gitx.RunDir(path, "status", "--porcelain")
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, ln := range strings.Split(out, "\n") {
+		if strings.TrimSpace(ln) != "" {
+			n++
+		}
+	}
+	return n
 }
 
 // classifyUpstream decides a worktree branch's upstream finding from its git
@@ -410,6 +495,16 @@ func render(rep *Report) {
 		case "info":
 			ui.Info("worktree branch %q has no upstream — a `git push` there prompts rather than landing anywhere", u.Branch)
 		}
+	}
+
+	// Stale base checkout (#87): a dirty base-branch checkout fallen far behind
+	// origin/base surfaces as an active (HIGH) window in every `wt check`/`status`
+	// that touches one of its dirty files, and is very likely rot. `wt check`
+	// still flags it (a dirty checkout can hold real edits — never hidden), so
+	// nothing else nudges you to clean it up; name it here.
+	for _, s := range rep.StaleCheckouts {
+		ui.Warn("base checkout %s is %d commit(s) behind origin/%s with %d dirty file(s) — likely stale, and its edits show up as HIGH collisions in `wt check`. Fix: commit/stash + `git -C %s pull --ff-only`, or move the edits to a `wt new` branch.",
+			s.Path, s.BehindBase, s.Branch, s.DirtyFiles, s.Path)
 	}
 
 	// Hooks installed? An unguarded repo is how the base-tracking worktrees above

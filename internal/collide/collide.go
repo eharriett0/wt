@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -379,6 +380,20 @@ const (
 	LiveClosedPR                 // the branch's PR was CLOSED unmerged — abandoned/superseded, branch kept on purpose (#79)
 )
 
+// StaleBaseBehindThreshold is how many commits behind origin/base a dirty
+// base-branch checkout must be before wt flags it as likely-stale (#87). A
+// shared `main` checkout drifted this far with dirty edits is very likely rot a
+// reader wants to dismiss quickly + clean up. It is deliberately NOT suppressed:
+// a dirty checkout can still hold real live edits, and hiding a dirty collision
+// on the default `wt check` path would violate the core "never hide a real
+// collision" invariant (the #87 adversarial review caught exactly this — the
+// operator commits to base directly, and base churns past 20-behind within a day
+// or two of genuine WIP). Instead the count enriches the LiveDirty label
+// ("· N behind base — likely stale") so a reader dismisses it in one second, and
+// the `wt doctor` probe (same threshold) names it so the root cause gets fixed.
+// Well above "just haven't pulled today".
+const StaleBaseBehindThreshold = 20
+
 // IsStale reports whether this level is the definitively-merged/abandoned case.
 func (l Liveness) IsStale() bool { return l == LiveStale }
 
@@ -386,7 +401,10 @@ func (l Liveness) IsStale() bool { return l == LiveStale }
 // be filtered out of the default output. Merged-and-clean (stale), parked past
 // the dormancy threshold (dormant), or CLOSED-PR (#79 — the work already lost
 // its adjudication) all mean the other window won't change the file underneath
-// you right now, so none should surface as HIGH.
+// you right now. A DIRTY window is never suppressed — even a badly-drifted base
+// checkout: its uncommitted edits could be real work, so it stays HIGH (just
+// labelled "likely stale"). #87 surfaces the stale base checkout; it never hides
+// it.
 func (l Liveness) IsSuppressed() bool {
 	return l == LiveStale || l == LiveDormant || l == LiveClosedPR
 }
@@ -416,12 +434,13 @@ func (l Liveness) Tag() string {
 // WindowLiveness is a window's resolved liveness plus the PR number attached to
 // the deciding level (open / merged / closed) for display, e.g. "[open PR #747]".
 type WindowLiveness struct {
-	Level    Liveness
-	PR       string        // open PR number when Level == LiveOpenPR, else ""
-	MergedPR string        // merged PR number when the branch is shipped (Level LiveStale, #73)
-	ClosedPR string        // closed-unmerged PR number when Level == LiveClosedPR (#79)
-	Dirty    bool          // the worktree also has uncommitted edits — noted on a suppressed level so a reopened-merged/closed branch is legible (#79 comment 2)
-	Age      time.Duration // time since the branch's last commit (0 if unknown)
+	Level      Liveness
+	PR         string        // open PR number when Level == LiveOpenPR, else ""
+	MergedPR   string        // merged PR number when the branch is shipped (Level LiveStale, #73)
+	ClosedPR   string        // closed-unmerged PR number when Level == LiveClosedPR (#79)
+	Dirty      bool          // the worktree also has uncommitted edits — noted on a suppressed level so a reopened-merged/closed branch is legible (#79 comment 2)
+	BehindBase int           // commits behind origin/base; >0 only computed for a dirty base checkout, enriches the LiveDirty "likely stale" label (#87)
+	Age        time.Duration // time since the branch's last commit (0 if unknown)
 }
 
 // Label is the plain (uncolored) liveness word, e.g. "open PR #747" or
@@ -450,6 +469,15 @@ func (wl WindowLiveness) Label() string {
 	// index, so `check` would flag it forever), say WHY it's still only an FYI.
 	if wl.Dirty && (wl.Level == LiveStale || wl.Level == LiveClosedPR) {
 		base += " · leftover uncommitted edits"
+	}
+	// #87: a dirty base checkout that's fallen behind origin/base stays HIGH (its
+	// uncommitted edits could be live work — never hidden), but the drift is
+	// noted so a reader can dismiss likely rot fast. Past the threshold, say so.
+	if wl.Level == LiveDirty && wl.BehindBase > 0 {
+		base += " · " + strconv.Itoa(wl.BehindBase) + " behind base"
+		if wl.BehindBase >= StaleBaseBehindThreshold {
+			base += " — likely stale"
+		}
 	}
 	return base
 }
@@ -526,6 +554,11 @@ func ClassifyFacts(f LiveFacts, maxAge time.Duration) Liveness {
 		// suppression + same reasoning as merged; the row reads "PR #N closed" (#79).
 		return LiveClosedPR
 	case f.Dirty:
+		// A dirty worktree is live editing — ALWAYS surfaced (HIGH), including a
+		// far-behind base checkout (#87): its uncommitted edits could be real work,
+		// so it is never hidden. The base-drift is carried into the label
+		// ("· N behind base — likely stale"), and `wt doctor` names it — but it is
+		// not suppressed. The #87 review proved suppressing it hides real WIP.
 		return LiveDirty
 	case f.Unshipped > 0:
 		if maxAge > 0 && f.Age > maxAge && f.PRChecked {
@@ -572,7 +605,23 @@ func Classify(w Window, base string, maxAge time.Duration, now time.Time) Window
 	if age, err := gitx.LastCommitAge(w.Worktree, now); err == nil {
 		f.Age = age
 	}
-	wl := WindowLiveness{Level: ClassifyFacts(f, maxAge), Age: f.Age, Dirty: f.Dirty}
+	// #87: for the dirty base-branch checkout (only the primary can be on base —
+	// git forbids the same branch in two worktrees), measure how far behind
+	// origin/base it is. Computed ONLY for that one window (no extra git call in
+	// the common case). It does NOT change the level (a dirty checkout stays
+	// LiveDirty/HIGH — never hidden); it enriches the label so a reader can spot
+	// likely rot, and `wt doctor` names it.
+	behindBase := 0
+	if w.Branch == base && f.Dirty {
+		if ref := gitx.ResolveRemoteBase(base); ref != "" {
+			if headSHA, err := gitx.RunDir(w.Worktree, "rev-parse", "HEAD"); err == nil {
+				if n := gitx.BehindCount(strings.TrimSpace(headSHA), ref); n > 0 {
+					behindBase = n
+				}
+			}
+		}
+	}
+	wl := WindowLiveness{Level: ClassifyFacts(f, maxAge), Age: f.Age, Dirty: f.Dirty, BehindBase: behindBase}
 	if wl.Level == LiveOpenPR {
 		wl.PR = pr
 	}
