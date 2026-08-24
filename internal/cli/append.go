@@ -27,16 +27,27 @@ func cmdAppend(args []string) int {
 	fs := flag.NewFlagSet("append", flag.ContinueOnError)
 	sec := fs.String("section", "", "heading of the section to append under (exact or contains match)")
 	pattern := fs.String("pattern", "", "section-delimiter regexp (default: the doc's structured_doc config, else markdown headings)")
+	file := fs.String("file", "", "read the appended text from a file (or - for stdin) instead of the argument — opaque to the shell (#75)")
 	pos, _, err := parseInterspersed(fs, args)
 	if err != nil {
 		return 64
 	}
-	if len(pos) < 2 || strings.TrimSpace(*sec) == "" {
-		ui.Err(`usage: wt append <doc> --section "<heading>" "<text>"`)
+	// text from --file (opaque to the shell) or the positional args after <doc>.
+	minPos := 2
+	if *file != "" {
+		minPos = 1
+	}
+	if len(pos) < minPos || strings.TrimSpace(*sec) == "" {
+		ui.Err(`usage: wt append <doc> --section "<heading>" "<text>"   (or --file <path>)`)
 		return 64
 	}
 	doc := pos[0]
-	text := strings.Join(pos[1:], " ")
+	text, ferr := readFreeform(*file, pos[1:])
+	if ferr != nil {
+		ui.Err("could not read --file: %v", ferr)
+		return 1
+	}
+	warnSuspiciousFreeform(*file, text)
 
 	return withConfig(func(c *config.Config) int {
 		delim := *pattern
@@ -104,6 +115,7 @@ func cmdAppend(args []string) int {
 			return 1
 		}
 		ui.OK("appended to section %q in %s", *sec, filepath.Base(doc))
+		echoStored(text)
 		return 0
 	})
 }
