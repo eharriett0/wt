@@ -133,3 +133,51 @@ func TestPreMergeVerdict(t *testing.T) {
 		}
 	}
 }
+
+func TestClosingRefs(t *testing.T) {
+	type want struct {
+		num  int
+		repo string
+	}
+	cases := []struct {
+		name string
+		text string
+		want []want
+	}{
+		{"bare ref does NOT close", "see #123 for context", nil},
+		{"closes same-repo", "Closes #1633", []want{{1633, ""}}},
+		{"fixes/resolved variants", "Fixes #1 and resolved #2, fix #3", []want{{1, ""}, {2, ""}, {3, ""}}},
+		{"negation still closes (GitHub ignores 'not')", "this does not close #77", []want{{77, ""}}},
+		{"cross-repo owner/repo#N closes", "Closes eharriett0/wt#5", []want{{5, "eharriett0/wt"}}},
+		{"single-segment repo#N does NOT close", "Closes wt#5", nil},
+		{"full issue URL closes", "resolves https://github.com/o/r/issues/9", []want{{9, "o/r"}}},
+		{"dedup by repo#num", "Closes #7 ... closes #7", []want{{7, ""}}},
+		{"'postfix #9' — no keyword boundary match", "postfix #9", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ClosingRefs(tc.text)
+			if len(got) != len(tc.want) {
+				t.Fatalf("ClosingRefs(%q) = %+v, want %d refs", tc.text, got, len(tc.want))
+			}
+			for i, w := range tc.want {
+				if got[i].Number != w.num || got[i].Repo != w.repo {
+					t.Errorf("ref[%d] = (#%d,%q), want (#%d,%q)", i, got[i].Number, got[i].Repo, w.num, w.repo)
+				}
+			}
+		})
+	}
+}
+
+func TestExtraClosings(t *testing.T) {
+	// commit body closes #1633; PR's closingIssuesReferences only knows #1586 →
+	// #1633 is the trap-2 extra.
+	got := ExtraClosings("Fixes #1633\n\nunrelated body Closes #1586", []int{1586})
+	if len(got) != 1 || got[0] != 1633 {
+		t.Fatalf("ExtraClosings = %v, want [1633]", got)
+	}
+	// all closings already in graph → no extras.
+	if got := ExtraClosings("Closes #5", []int{5}); got != nil {
+		t.Fatalf("ExtraClosings = %v, want nil", got)
+	}
+}

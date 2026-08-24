@@ -259,12 +259,14 @@ func cmdMergePR(args []string) int {
 	keep := fs.Bool("keep", false, "keep the worktree after merge (default: auto-remove it)")
 	confirmDeploy := fs.Bool("confirm-deploy", false, "acknowledge merge auto-applies to prod (merge_is_deploy repos)")
 	admin := fs.Bool("admin", false, "forward --admin to gh pr merge — maintainer bypass of a required-review branch (wt#20)")
+	closeOK := fs.Bool("close-ok", false, "proceed even when the squash closes issues the PR's own closing references don't (#77)")
+	noCloseCheck := fs.Bool("no-close-check", false, "skip the close-keyword lint + post-merge issue-state verify (#77)")
 	pos, ghArgs, err := parseInterspersed(fs, args)
 	if err != nil {
 		return 64
 	}
 	if len(pos) < 1 {
-		ui.Err("usage: wt merge-pr <pr> [--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [-- extra gh args]")
+		ui.Err("usage: wt merge-pr <pr> [--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok] [--no-close-check] [-- extra gh args]")
 		return 64
 	}
 	pr := pos[0]
@@ -319,9 +321,27 @@ func cmdMergePR(args []string) int {
 	// coord + guard checks above — so it bypasses GitHub branch protection, not
 	// wt's own safety checks (which is exactly the value the raw `gh` fallback
 	// lost).
+	// Close-keyword lint (#77): merge-pr is the only place that sees BOTH the PR
+	// body and the squash commit body it forwards — the two texts that decide
+	// what auto-closes. Print the resolved close set; refuse only when the squash
+	// closes something the PR's own closing references don't (trap 2), unless
+	// --close-ok. Best-effort — a gh failure yields an empty plan (never blocks).
+	var plan closePlan
+	if !*dryRun && !*noCloseCheck {
+		plan = analyzeClosings(pr)
+		if gate := renderClosePlan(plan); gate && !*closeOK {
+			ui.Err("refusing to merge — the squash would close issues the PR doesn't declare (see above). Verify, then pass --close-ok to proceed.")
+			return 1
+		}
+	}
 	ghArgs = merge.WithAdmin(*admin, ghArgs)
 	if err := merge.Run(pr, *dryRun, *bypass, *mergeForeign, wtBranches, ghArgs); err != nil {
 		return 1
+	}
+	// Post-merge verification (#77): re-check the referenced issues + report any
+	// that changed state — catches a silent close (trap 2) in the same command.
+	if !*dryRun && !*noCloseCheck {
+		verifyClosings(plan)
 	}
 	// Auto-clean: the PR just shipped, so its worktree is done. Only on a real
 	// merge (not dry-run) and unless -keep. Best-effort — a cleanup miss must
