@@ -376,16 +376,20 @@ const (
 	LiveUnmerged                 // commits not yet on base, no open PR — latent collision
 	LiveDirty                    // uncommitted changes in the worktree — actively editing
 	LiveOpenPR                   // an open PR exists for the branch — active contention
+	LiveClosedPR                 // the branch's PR was CLOSED unmerged — abandoned/superseded, branch kept on purpose (#79)
 )
 
 // IsStale reports whether this level is the definitively-merged/abandoned case.
 func (l Liveness) IsStale() bool { return l == LiveStale }
 
 // IsSuppressed reports whether a collision against a window at this level should
-// be filtered out of the default output — merged-and-clean (stale) or parked
-// past the dormancy threshold (dormant). Both mean the other window is unlikely
-// to change the file underneath you right now.
-func (l Liveness) IsSuppressed() bool { return l == LiveStale || l == LiveDormant }
+// be filtered out of the default output. Merged-and-clean (stale), parked past
+// the dormancy threshold (dormant), or CLOSED-PR (#79 — the work already lost
+// its adjudication) all mean the other window won't change the file underneath
+// you right now, so none should surface as HIGH.
+func (l Liveness) IsSuppressed() bool {
+	return l == LiveStale || l == LiveDormant || l == LiveClosedPR
+}
 
 // Tag is a short human label for the level.
 func (l Liveness) Tag() string {
@@ -395,27 +399,34 @@ func (l Liveness) Tag() string {
 	case LiveDirty:
 		return "uncommitted edits"
 	case LiveUnmerged:
-		return "commits, no PR"
+		// #79 comment 3a: distinguish "never opened a PR" (possibly-live, HIGH)
+		// from the merged/closed cases, which now read "merged #N" / "PR #N closed".
+		return "commits, no PR opened"
 	case LiveDormant:
 		return "dormant"
 	case LiveStale:
 		return "stale: merged / no PR"
+	case LiveClosedPR:
+		return "PR closed"
 	default:
 		return "unknown"
 	}
 }
 
-// WindowLiveness is a window's resolved liveness plus the open-PR number when
-// the level is LiveOpenPR (for display, e.g. "[open PR #747]").
+// WindowLiveness is a window's resolved liveness plus the PR number attached to
+// the deciding level (open / merged / closed) for display, e.g. "[open PR #747]".
 type WindowLiveness struct {
 	Level    Liveness
 	PR       string        // open PR number when Level == LiveOpenPR, else ""
 	MergedPR string        // merged PR number when the branch is shipped (Level LiveStale, #73)
+	ClosedPR string        // closed-unmerged PR number when Level == LiveClosedPR (#79)
+	Dirty    bool          // the worktree also has uncommitted edits — noted on a suppressed level so a reopened-merged/closed branch is legible (#79 comment 2)
 	Age      time.Duration // time since the branch's last commit (0 if unknown)
 }
 
 // Label is the plain (uncolored) liveness word, e.g. "open PR #747" or
-// "stale: merged / no PR", with a "· last commit Nd ago" suffix when known.
+// "merged #84", with a "· last commit Nd ago" suffix when known and a leftover-
+// edits note when a shipped/closed branch still has a dirty index.
 func (wl WindowLiveness) Label() string {
 	base := wl.Level.Tag()
 	if wl.Level == LiveOpenPR && wl.PR != "" {
@@ -426,8 +437,19 @@ func (wl WindowLiveness) Label() string {
 	if wl.Level == LiveStale && wl.MergedPR != "" {
 		base = "merged #" + wl.MergedPR
 	}
+	// #79: a CLOSED-unmerged PR — name it so the row reads "PR #N closed", not
+	// "in progress". The branch is kept on purpose; this isn't a judgement on it.
+	if wl.Level == LiveClosedPR && wl.ClosedPR != "" {
+		base = "PR #" + wl.ClosedPR + " closed"
+	}
 	if wl.Age > 0 && (wl.Level == LiveUnmerged || wl.Level == LiveDormant) {
 		base += ", last commit " + HumanAge(wl.Age) + " ago"
+	}
+	// #79 comment 2: when a shipped/closed branch ALSO has a leftover dirty index
+	// (the unresolvable false-HIGH case — `wt clean` won't remove the unshared
+	// index, so `check` would flag it forever), say WHY it's still only an FYI.
+	if wl.Dirty && (wl.Level == LiveStale || wl.Level == LiveClosedPR) {
+		base += " · leftover uncommitted edits"
 	}
 	return base
 }
@@ -464,40 +486,47 @@ func HumanAge(d time.Duration) string {
 // out from the I/O so the decision boundary is pure and unit-testable.
 type LiveFacts struct {
 	HasOpenPR bool
-	PRChecked bool // whether open-PR status was actually resolvable (gh present+authed)
+	PRChecked bool // whether PR status was actually resolvable (gh present+authed)
 	Dirty     bool
 	Merged    bool          // a MERGED PR exists for the branch — squash-merged/shipped (#73)
+	ClosedPR  bool          // the branch's most-recent PR was CLOSED unmerged — abandoned/superseded (#79)
 	Unshipped int           // git cherry "+" count; <0 means it could not be computed
 	Age       time.Duration // time since last commit (0 = unknown)
 }
 
-// ClassifyFacts maps observations to a Liveness (pure). Precedence is by
-// descending certainty-of-activity: open PR > dirty worktree > unmerged commits
-// > (fully merged ⇒ stale). An uncomputable unshipped count with no other
-// signal is LiveUnknown (surfaced, not suppressed).
+// ClassifyFacts maps observations to a Liveness (pure). Precedence, by descending
+// certainty that the OTHER window can still change a file underneath you:
 //
-// maxAge (>0) enables dormancy: an unmerged, no-PR, clean branch whose last
-// commit is older than maxAge is LiveDormant (suppressed) rather than
-// LiveUnmerged. A dirty or open-PR branch is never dormant — it's active by
-// definition. maxAge==0 disables dormancy entirely (backward-compatible).
+//	open PR > merged PR > closed PR > dirty worktree > unmerged commits > merged-by-ancestry
 //
-// Dormancy also requires PRChecked: if open-PR status couldn't be resolved (gh
-// offline/unauthed) we must NOT downgrade an idle unmerged branch to dormant,
-// because it might have an open PR we couldn't see — suppressing it would hide
-// a live collision. Ambiguous PR status ⇒ stay LiveUnmerged (active).
+// The load-bearing ordering change (#79 comment 2): a resolved PR state — merged
+// (#73) OR closed-unmerged (#79) — now outranks a dirty worktree. A shipped or
+// abandoned branch frequently carries a leftover staged index that `wt clean`
+// refuses to delete (unshared), which previously read as LiveDirty ⇒ HIGH
+// forever, an unresolvable false positive. PR state is the stronger signal:
+// merged ⇒ the work already landed; closed ⇒ it already lost its adjudication.
+// Neither can create NEW contention on base, so both suppress regardless of the
+// index. Only when NO PR resolved does a dirty worktree mean live editing.
+//
+// maxAge (>0) enables dormancy on an unmerged, no-PR, clean branch idle past the
+// threshold (LiveDormant, suppressed). Dormancy also requires PRChecked: if PR
+// status couldn't be resolved (gh offline/unauthed) we must NOT downgrade an
+// idle unmerged branch, because it might have an open PR we couldn't see.
 func ClassifyFacts(f LiveFacts, maxAge time.Duration) Liveness {
 	switch {
 	case f.HasOpenPR:
 		return LiveOpenPR
+	case f.Merged:
+		// MERGED ⇒ shipped. Suppress even with Unshipped>0 (squash-merge breaks
+		// git-cherry patch-equivalence) and even with a leftover dirty index (#73,
+		// #79 comment 2). The dirtiness is carried into the label, not the level.
+		return LiveStale
+	case f.ClosedPR:
+		// CLOSED-unmerged ⇒ abandoned/superseded, branch kept on purpose. Same
+		// suppression + same reasoning as merged; the row reads "PR #N closed" (#79).
+		return LiveClosedPR
 	case f.Dirty:
 		return LiveDirty
-	case f.Merged:
-		// A MERGED PR ⇒ shipped. Suppress even when Unshipped>0 — squash-merge
-		// breaks patch-equivalence to base, so git cherry reads the branch as
-		// unmerged, which used to surface a merged-and-deleted branch as a false
-		// HIGH collision (#73). A dirty worktree still wins above (someone reopened
-		// the branch to edit it), so we only reach here when it's clean.
-		return LiveStale
 	case f.Unshipped > 0:
 		if maxAge > 0 && f.Age > maxAge && f.PRChecked {
 			return LiveDormant
@@ -516,11 +545,22 @@ func ClassifyFacts(f LiveFacts, maxAge time.Duration) Liveness {
 // enables dormancy suppression; now is injected for testability.
 func Classify(w Window, base string, maxAge time.Duration, now time.Time) WindowLiveness {
 	var f LiveFacts
-	pr := ""
+	pr, mergedPR, closedPR := "", "", ""
+	// One `gh pr list --head <branch> --state all` resolves OPEN / MERGED / CLOSED
+	// in a single call (#79) — replacing the separate open- + merged-lookups (#73).
+	// The most-recent PR's state decides: OPEN ⇒ contention, MERGED ⇒ shipped (#73),
+	// CLOSED ⇒ abandoned/superseded (#79). Absent ⇒ fall through to git signals.
 	if ghx.Present() && ghx.Authed() {
 		f.PRChecked = true
-		if n, ok := ghx.OpenPRForBranch(w.Branch); ok {
-			f.HasOpenPR, pr = true, n
+		if n, state, ok := ghx.PRForBranch(w.Branch); ok {
+			switch state {
+			case "OPEN":
+				f.HasOpenPR, pr = true, n
+			case "MERGED":
+				f.Merged, mergedPR = true, n
+			case "CLOSED":
+				f.ClosedPR, closedPR = true, n
+			}
 		}
 	}
 	f.Dirty = !gitx.IsClean(w.Worktree)
@@ -529,26 +569,18 @@ func Classify(w Window, base string, maxAge time.Duration, now time.Time) Window
 	} else {
 		f.Unshipped = -1
 	}
-	// #73: a squash-merged-then-deleted branch has Unshipped>0 (squash breaks
-	// patch-equivalence to base) + no OPEN PR, so it read as LiveUnmerged — a
-	// false HIGH collision. A MERGED PR means it's shipped ⇒ stale. Only checked
-	// when it could change the verdict (gh available, not open-PR, not dirty, and
-	// not already fully-merged by ancestry) to avoid an extra gh call per window.
-	mergedPR := ""
-	if f.PRChecked && !f.HasOpenPR && !f.Dirty && f.Unshipped != 0 {
-		if n, ok := ghx.MergedPRForBranchNum(w.Branch); ok {
-			f.Merged, mergedPR = true, n
-		}
-	}
 	if age, err := gitx.LastCommitAge(w.Worktree, now); err == nil {
 		f.Age = age
 	}
-	wl := WindowLiveness{Level: ClassifyFacts(f, maxAge), Age: f.Age}
+	wl := WindowLiveness{Level: ClassifyFacts(f, maxAge), Age: f.Age, Dirty: f.Dirty}
 	if wl.Level == LiveOpenPR {
 		wl.PR = pr
 	}
 	if f.Merged {
 		wl.MergedPR = mergedPR
+	}
+	if f.ClosedPR {
+		wl.ClosedPR = closedPR
 	}
 	return wl
 }
