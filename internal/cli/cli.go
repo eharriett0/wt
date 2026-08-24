@@ -779,7 +779,7 @@ func taggedWindows(windows []string, live map[string]collide.WindowLiveness) []s
 // returned as unknownFlag so the caller REJECTS it instead of silently treating
 // a typo as a path — a mistyped flag must never produce a false "clear" (#30).
 // Everything after a "--" is a path (so a genuine '-'-prefixed filename works).
-func parseCheckArgs(args []string) (paths []string, includeStale, showDiff, asJSON bool, maxAge, unknownFlag string) {
+func parseCheckArgs(args []string) (paths []string, includeStale, showDiff, asJSON, blocking bool, maxAge, unknownFlag string) {
 	afterDashes := false
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -796,6 +796,8 @@ func parseCheckArgs(args []string) (paths []string, includeStale, showDiff, asJS
 			showDiff = true
 		case a == "--json" || a == "-json":
 			asJSON = true
+		case a == "--blocking" || a == "-blocking":
+			blocking = true
 		case a == "--max-age" || a == "-max-age": // value in the next token (#48)
 			if i+1 < len(args) {
 				maxAge = args[i+1]
@@ -817,18 +819,18 @@ func parseCheckArgs(args []string) (paths []string, includeStale, showDiff, asJS
 func cmdCheck(args []string) int {
 	// paths are positional and flags may appear anywhere (a plain flag.Parse
 	// would stop at the first positional), so we scan manually.
-	paths, includeStale, showDiff, asJSON, maxAge, unknownFlag := parseCheckArgs(args)
+	paths, includeStale, showDiff, asJSON, blocking, maxAge, unknownFlag := parseCheckArgs(args)
 	if unknownFlag != "" {
-		ui.Err("wt check: unknown flag %q — a typo'd flag must not be checked as a path (that would falsely report 'clear'). Known: --include-stale --show-diff --json. Use `--` to check a path that starts with '-'.", unknownFlag)
+		ui.Err("wt check: unknown flag %q — a typo'd flag must not be checked as a path (that would falsely report 'clear'). Known: --include-stale --show-diff --json --blocking. Use `--` to check a path that starts with '-'.", unknownFlag)
 		return 64
 	}
 	if len(paths) == 0 {
-		ui.Err("usage: wt check [--include-stale] [--show-diff] [--json] <path> [path...]")
+		ui.Err("usage: wt check [--include-stale] [--show-diff] [--json] [--blocking] <path> [path...]")
 		return 64
 	}
 	return withConfig(func(c *config.Config) int {
 		applyMaxAgeOverride(c, maxAge)
-		if !asJSON {
+		if !asJSON && !blocking {
 			peerHoldBanner(c)
 		}
 		ws, err := collide.Scan(c)
@@ -840,6 +842,9 @@ func cmdCheck(args []string) int {
 		entries := buildCheckReport(c, ws, root, paths, includeStale)
 		if asJSON {
 			return renderCheckJSON(entries, includeStale)
+		}
+		if blocking {
+			return renderCheckBlocking(entries, paths)
 		}
 		return renderCheckText(entries, paths, includeStale, showDiff)
 	})

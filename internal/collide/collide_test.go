@@ -105,6 +105,12 @@ func TestClassifyFacts(t *testing.T) {
 		{"unmerged + old but gh NOT checked → unmerged (never suppress on unknown PR)", LiveFacts{Unshipped: 3, Age: 5 * day, PRChecked: false}, 3 * day, LiveUnmerged},
 		{"dirty is never dormant", LiveFacts{Dirty: true, Unshipped: 3, Age: 30 * day, PRChecked: true}, day, LiveDirty},
 		{"open PR is never dormant", LiveFacts{HasOpenPR: true, Unshipped: 3, Age: 30 * day, PRChecked: true}, day, LiveOpenPR},
+		// #73: squash-merged-and-deleted branch — Unshipped>0 (ancestry broken) but
+		// a MERGED PR exists ⇒ stale (suppressed), not a false HIGH collision.
+		{"merged PR + unshipped (squash) → stale", LiveFacts{Merged: true, Unshipped: 3, PRChecked: true}, 0, LiveStale},
+		{"merged wins over dormancy age", LiveFacts{Merged: true, Unshipped: 3, Age: 30 * day, PRChecked: true}, day, LiveStale},
+		{"dirty beats merged (branch reopened to edit)", LiveFacts{Merged: true, Dirty: true, Unshipped: 3}, 0, LiveDirty},
+		{"open PR beats merged (shouldn't co-occur, but PR wins)", LiveFacts{Merged: true, HasOpenPR: true}, 0, LiveOpenPR},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
