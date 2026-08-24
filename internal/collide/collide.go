@@ -408,9 +408,10 @@ func (l Liveness) Tag() string {
 // WindowLiveness is a window's resolved liveness plus the open-PR number when
 // the level is LiveOpenPR (for display, e.g. "[open PR #747]").
 type WindowLiveness struct {
-	Level Liveness
-	PR    string        // open PR number when Level == LiveOpenPR, else ""
-	Age   time.Duration // time since the branch's last commit (0 if unknown)
+	Level    Liveness
+	PR       string        // open PR number when Level == LiveOpenPR, else ""
+	MergedPR string        // merged PR number when the branch is shipped (Level LiveStale, #73)
+	Age      time.Duration // time since the branch's last commit (0 if unknown)
 }
 
 // Label is the plain (uncolored) liveness word, e.g. "open PR #747" or
@@ -419,6 +420,11 @@ func (wl WindowLiveness) Label() string {
 	base := wl.Level.Tag()
 	if wl.Level == LiveOpenPR && wl.PR != "" {
 		base = "open PR #" + wl.PR
+	}
+	// #73: say "merged #N", not "no PR", when the branch actually shipped via a
+	// squash-merged (and usually deleted) PR.
+	if wl.Level == LiveStale && wl.MergedPR != "" {
+		base = "merged #" + wl.MergedPR
 	}
 	if wl.Age > 0 && (wl.Level == LiveUnmerged || wl.Level == LiveDormant) {
 		base += ", last commit " + HumanAge(wl.Age) + " ago"
@@ -458,8 +464,9 @@ func HumanAge(d time.Duration) string {
 // out from the I/O so the decision boundary is pure and unit-testable.
 type LiveFacts struct {
 	HasOpenPR bool
-	PRChecked bool          // whether open-PR status was actually resolvable (gh present+authed)
+	PRChecked bool // whether open-PR status was actually resolvable (gh present+authed)
 	Dirty     bool
+	Merged    bool          // a MERGED PR exists for the branch — squash-merged/shipped (#73)
 	Unshipped int           // git cherry "+" count; <0 means it could not be computed
 	Age       time.Duration // time since last commit (0 = unknown)
 }
@@ -484,6 +491,13 @@ func ClassifyFacts(f LiveFacts, maxAge time.Duration) Liveness {
 		return LiveOpenPR
 	case f.Dirty:
 		return LiveDirty
+	case f.Merged:
+		// A MERGED PR ⇒ shipped. Suppress even when Unshipped>0 — squash-merge
+		// breaks patch-equivalence to base, so git cherry reads the branch as
+		// unmerged, which used to surface a merged-and-deleted branch as a false
+		// HIGH collision (#73). A dirty worktree still wins above (someone reopened
+		// the branch to edit it), so we only reach here when it's clean.
+		return LiveStale
 	case f.Unshipped > 0:
 		if maxAge > 0 && f.Age > maxAge && f.PRChecked {
 			return LiveDormant
@@ -515,12 +529,26 @@ func Classify(w Window, base string, maxAge time.Duration, now time.Time) Window
 	} else {
 		f.Unshipped = -1
 	}
+	// #73: a squash-merged-then-deleted branch has Unshipped>0 (squash breaks
+	// patch-equivalence to base) + no OPEN PR, so it read as LiveUnmerged — a
+	// false HIGH collision. A MERGED PR means it's shipped ⇒ stale. Only checked
+	// when it could change the verdict (gh available, not open-PR, not dirty, and
+	// not already fully-merged by ancestry) to avoid an extra gh call per window.
+	mergedPR := ""
+	if f.PRChecked && !f.HasOpenPR && !f.Dirty && f.Unshipped != 0 {
+		if n, ok := ghx.MergedPRForBranchNum(w.Branch); ok {
+			f.Merged, mergedPR = true, n
+		}
+	}
 	if age, err := gitx.LastCommitAge(w.Worktree, now); err == nil {
 		f.Age = age
 	}
 	wl := WindowLiveness{Level: ClassifyFacts(f, maxAge), Age: f.Age}
 	if wl.Level == LiveOpenPR {
 		wl.PR = pr
+	}
+	if f.Merged {
+		wl.MergedPR = mergedPR
 	}
 	return wl
 }

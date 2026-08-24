@@ -206,6 +206,35 @@ func renderCheckText(entries []CheckEntry, paths []string, includeStale, showDif
 	return 3
 }
 
+// renderCheckBlocking is the scriptable-gate variant of `wt check` (#73/#74):
+// print ONLY the HIGH-risk (blocking) collisions and exit 3 iff any exist, 0
+// otherwise. Advisory / FYI / stale noise is suppressed so a pre-push hook (or
+// any CI gate) can key purely on the exit code without parsing prose. Mirrors
+// `wt status --blocking` (renderBlockingGate) but scoped to requested paths.
+func renderCheckBlocking(entries []CheckEntry, paths []string) int {
+	var blocking []CheckEntry
+	for _, e := range entries {
+		if e.Category == CatBlocking {
+			blocking = append(blocking, e)
+		}
+	}
+	if len(blocking) == 0 {
+		ui.OK("clear of blocking collisions on %s", strings.Join(paths, ", "))
+		return 0
+	}
+	ui.Collision("%d path(s) with a HIGH-risk collision (overlapping edits by an active window):", len(blocking))
+	for _, e := range blocking {
+		line := fmt.Sprintf("   %s  %s %s [%s]", ui.Bold(e.Path), ui.Dim("←"), e.Window, e.Liveness)
+		if s := spansString(e.OverlapSpans); s != "" {
+			line += "  " + ui.Yellow("overlap "+s)
+		} else if s := sectionsString(e.SharedSections); s != "" {
+			line += "  " + ui.Yellow(s)
+		}
+		fmt.Fprintln(os.Stderr, line)
+	}
+	return 3
+}
+
 func printCheckAdvisories(advisory, fyi []CheckEntry, showDiff bool) {
 	for _, e := range advisory {
 		fmt.Fprintln(os.Stderr, "   "+ui.Dim(fmt.Sprintf("%s ← %s [%s] · shared doc, advisory — coordinate sections", e.Path, e.Window, e.Liveness)))

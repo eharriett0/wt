@@ -253,16 +253,28 @@ func PRState(pr string) string {
 	return strings.TrimSpace(out)
 }
 
-// MergedPRForBranch reports whether branch has a MERGED PR. Used by `wt clean`
-// to treat a squash-merged wt branch as shipped even though `git cherry` never
-// reads 0 for it (wt branches carry an empty placeholder + real work, so they're
-// never patch-equivalent to the squash). Best-effort: false on any error / no gh.
-func MergedPRForBranch(branch string) bool {
+// MergedPRForBranchNum returns the number of a MERGED PR whose head is branch,
+// and whether one exists. `gh pr list --head` still resolves a merged PR after
+// its branch is deleted (the PR record keeps headRefName), so this detects a
+// squash-merged-then-deleted branch — the case git cherry can't (squash breaks
+// patch-equivalence to base). Best-effort: ("", false) on any error / no gh.
+func MergedPRForBranchNum(branch string) (string, bool) {
 	if branch == "" || branch == "HEAD" || !Present() || !Authed() {
-		return false
+		return "", false
 	}
 	out, err := run("pr", "list", "--head", branch, "--state", "merged", "--json", "number", "--jq", ".[0].number // empty")
-	return err == nil && strings.TrimSpace(out) != ""
+	if err != nil || strings.TrimSpace(out) == "" {
+		return "", false
+	}
+	return strings.TrimSpace(out), true
+}
+
+// MergedPRForBranch reports whether branch has a MERGED PR (bool wrapper). Used
+// by `wt clean` to treat a squash-merged wt branch as shipped even though
+// `git cherry` never reads 0 for it.
+func MergedPRForBranch(branch string) bool {
+	_, ok := MergedPRForBranchNum(branch)
+	return ok
 }
 
 // PRStateByURL returns a short live state ("OPEN", "MERGED", "DRAFT", "CLOSED")
