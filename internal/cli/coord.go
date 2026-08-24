@@ -116,6 +116,7 @@ func cmdAnnounce(args []string) int {
 	issue := fs.Int("issue", 0, "mirror this announcement as a comment on GitHub issue #N")
 	hold := fs.String("hold", "", "comma-separated ops other windows should avoid until all-clear (e.g. \"merge-main,flux-reconcile\")")
 	clear := fs.String("clear", "", "post an all-clear for announcement <id> instead of announcing")
+	file := fs.String("file", "", "read the message from a file (or - for stdin) instead of the argument — opaque to the shell (#75)")
 	pos, _, err := parseInterspersed(fs, args)
 	if err != nil {
 		return 64
@@ -125,11 +126,16 @@ func cmdAnnounce(args []string) int {
 		if *clear != "" {
 			return allClear(c, path, window, *clear)
 		}
-		msg := strings.TrimSpace(strings.Join(pos, " "))
+		msg, ferr := readFreeform(*file, pos)
+		if ferr != nil {
+			ui.Err("could not read --file: %v", ferr)
+			return 1
+		}
 		if msg == "" {
-			ui.Err("usage: wt announce \"<message>\" [--issue N] [--hold \"op,...\"]   (or --clear <id>)")
+			ui.Err("usage: wt announce \"<message>\" [--file <path>] [--issue N] [--hold \"op,...\"]   (or --clear <id>)")
 			return 64
 		}
+		warnSuspiciousFreeform(*file, msg)
 		iss := effectiveIssue(*issue, c)
 		r := newRecord(c, window, coord.KindAnnounce)
 		r.Message, r.Issue, r.Hold = msg, iss, splitHold(*hold)
@@ -138,6 +144,7 @@ func cmdAnnounce(args []string) int {
 			return 1
 		}
 		ui.OK("announced %s (window %s)", ui.Bold(r.ID), window)
+		echoStored(msg)
 		if len(r.Hold) > 0 {
 			ui.Info("hold: %s — other windows are asked to avoid these until `wt all-clear %s`", strings.Join(r.Hold, ", "), r.ID)
 		}
@@ -195,15 +202,27 @@ func cmdInbox(args []string) int {
 func cmdAck(args []string) int {
 	fs := flag.NewFlagSet("ack", flag.ContinueOnError)
 	state := fs.String("state", "", "one-line report of what THIS window is currently touching")
+	file := fs.String("file", "", "read --state from a file (or - for stdin) instead of the flag — opaque to the shell (#75)")
 	pos, _, err := parseInterspersed(fs, args)
 	if err != nil {
 		return 64
 	}
 	if len(pos) < 1 {
-		ui.Err("usage: wt ack <id> [--state \"<current-state>\"]")
+		ui.Err("usage: wt ack <id> [--state \"<current-state>\"] [--file <path>]")
 		return 64
 	}
 	id := pos[0]
+	// --file wins over --state; both are optional (a bare ack is fine).
+	stateVal := strings.TrimSpace(*state)
+	if *file != "" {
+		s, ferr := readFreeform(*file, nil)
+		if ferr != nil {
+			ui.Err("could not read --file: %v", ferr)
+			return 1
+		}
+		stateVal = s
+	}
+	warnSuspiciousFreeform(*file, stateVal)
 	return withConfig(func(c *config.Config) int {
 		path, window := coordCtx(c)
 		// Fold in remote records so a cross-machine announce is ackable (#36).
@@ -215,12 +234,13 @@ func cmdAck(args []string) int {
 			return 1
 		}
 		r := newRecord(c, window, coord.KindAck)
-		r.AckOf, r.State = id, strings.TrimSpace(*state)
+		r.AckOf, r.State = id, stateVal
 		if err := coord.Append(path, r); err != nil {
 			ui.Err("could not write coordination log: %v", err)
 			return 1
 		}
 		ui.OK("acked %s (from window %s)", id, ann.Window)
+		echoStored(stateVal)
 		iss := effectiveIssue(ann.Issue, c)
 		mirror(iss, r, fmt.Sprintf("✅ **wt ack** of `%s` — window `%s`%s", id, window, stateLine(r.State)))
 		return 0
