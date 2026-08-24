@@ -73,6 +73,44 @@ func ReapVerdict(unshipped int, cherryFailed, prMerged, hasUpstream, withinGrace
 	return !cherryFailed && unshipped == 0
 }
 
+// dirtyCount counts uncommitted changes in the worktree at wt (porcelain lines),
+// for the --stale-index preview message; 0 on any error.
+func dirtyCount(wt string) int {
+	out, err := gitx.RunDir(wt, "status", "--porcelain")
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, ln := range strings.Split(out, "\n") {
+		if strings.TrimSpace(ln) != "" {
+			n++
+		}
+	}
+	return n
+}
+
+// StaleIndexReportable decides whether `wt clean --stale-index` should REPORT a
+// worktree (#88): the opt-in flag is set, the worktree is past the just-created
+// grace window, its most-recent PR resolved to MERGED, AND it has a dirty index
+// — the exact worktree a plain clean silently leaves in place forever (#79:
+// clean reaps a merged branch, but Remove then refuses the dirty index).
+//
+// Report-ONLY, never auto-remove — the #88 adversarial review proved a
+// force-remove here is a permanent-data-loss footgun: a MERGED PR certifies only
+// that the COMMITTED work shipped; the dirty index could just as well be FRESH
+// post-merge work the operator started in that worktree, which is
+// indistinguishable from stale pre-merge cruft and is not reflog-recoverable
+// once `git worktree remove --force` discards it. So wt surfaces these worktrees
+// + the exact manual command, and the operator inspects the changes and makes
+// the destructive decision themselves. MERGED-only (a CLOSED-PR branch is kept
+// on purpose per #79/#87, so it isn't reported either). Pure — the testable core.
+func StaleIndexReportable(prState string, prOK, dirty, staleIndex, withinGrace bool) bool {
+	if !staleIndex || withinGrace || !dirty || !prOK {
+		return false
+	}
+	return prState == "MERGED"
+}
+
 // worktreeAge returns how long ago the worktree at wt was created, via the mtime
 // of its `.git` entry (written by `git worktree add`). ok=false when it can't be
 // stat'd — treated by callers as "not fresh" (don't over-protect an unknowable).
@@ -148,7 +186,16 @@ func New(c *config.Config, branch string) (string, error) {
 // base, via git cherry). With apply=false (default) it only LISTS them and
 // prints the remove commands; with apply=true it removes each (worktree +
 // local branch) via Remove, skipping any that still have uncommitted changes.
-func Clean(c *config.Config, apply bool) error {
+//
+// staleIndex (#88) additionally REPORTS (never removes) a worktree whose PR is
+// MERGED but that holds a leftover uncommitted index a plain clean silently
+// leaves forever — the #79 case (`check` won't stop flagging it, `clean` won't
+// remove it). wt deliberately does NOT force-remove it: a MERGED PR only proves
+// the committed work shipped, so the dirty index might be fresh post-merge work
+// (the #88 review), and discarding uncommitted work wt can't prove is cruft is a
+// permanent-loss footgun. It surfaces the worktree + the manual command so the
+// operator inspects the changes and makes the destructive decision themselves.
+func Clean(c *config.Config, apply, staleIndex bool) error {
 	ui.Step("fetching origin/%s", c.Base)
 	_ = gitx.Fetch("origin", c.Base)
 	_ = gitx.WorktreePrune() // #42: drop stale metadata for manually-deleted dirs
@@ -187,7 +234,23 @@ func Clean(c *config.Config, apply bool) error {
 			n, cerr = gitx.CountUnshipped(c.Base, "refs/heads/"+br)
 		}
 		cherryFailed := cerr != nil
-		prMerged := ghx.MergedPRForBranch(br) // #37: squash-merged branches read shipped here
+		// One PR-state read (#88) shared with collide/status/check via ghx —
+		// merged ⇒ shipped (#37 squash). Feeds both the normal reap and --stale-index.
+		prNum, prState, prOK := ghx.PRForBranch(br)
+		prMerged := prOK && prState == "MERGED"
+
+		// #88 --stale-index: REPORT (never auto-remove) a MERGED-PR worktree that
+		// holds a leftover uncommitted index a plain clean silently leaves forever
+		// (#79). wt won't force-discard it — a MERGED PR only proves the committed
+		// work shipped, and the dirty index could be fresh post-merge work (the #88
+		// review). Surface it + the manual command; the operator inspects + decides.
+		if StaleIndexReportable(prState, prOK, !gitx.IsClean(wt), staleIndex, withinGrace) {
+			ui.Warn("%s — PR #%s merged, but this worktree has a leftover uncommitted index (%d dirty file(s)) so plain clean leaves it. INSPECT it, then if it's stale leftovers (not fresh work) remove it by hand:", br, prNum, dirtyCount(wt))
+			fmt.Printf("  git -C %s status              # confirm what's uncommitted FIRST\n", wt)
+			fmt.Printf("  git worktree remove --force %s && git branch -D %s\n", wt, br)
+			continue
+		}
+
 		if !ReapVerdict(n, cherryFailed, prMerged, hasUpstream, withinGrace) {
 			switch {
 			case withinGrace:

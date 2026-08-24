@@ -29,7 +29,7 @@ func printHelp() {
 	fmt.Println(b(g("  ✦ WORKTREES")) + d("  — one isolated checkout per window"))
 	fmt.Printf("    %s        %s\n", c("wt new <branch>"), "create a worktree on a new branch from the base")
 	fmt.Printf("    %s              %s\n", c("wt init"), "scaffold a commented .wt.conf for this repo (derived defaults)  "+d("[--force]"))
-	fmt.Printf("    %s              %s\n", c("wt clean"), "list worktrees whose branch already shipped  "+d("(-y to remove them)"))
+	fmt.Printf("    %s              %s\n", c("wt clean"), "list worktrees whose branch already shipped  "+d("(-y to remove; --stale-index reports merged leftover-index ones)"))
 	fmt.Println()
 
 	fmt.Println(b(g("  ✦ CLAIM A UNIT OF WORK")) + d("  — assign issue + worktree + draft PR + record"))

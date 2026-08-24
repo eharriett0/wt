@@ -70,3 +70,29 @@ func TestReapVerdict(t *testing.T) {
 		}
 	}
 }
+
+func TestStaleIndexReportable(t *testing.T) {
+	cases := []struct {
+		name                                 string
+		prState                              string
+		prOK, dirty, staleIndex, grace, want bool
+	}{
+		// Fires (REPORTS — never auto-removes): MERGED PR + dirty index + flag + past grace.
+		{"merged + dirty index + flag → report", "MERGED", true, true, true, false, true},
+		// Must NOT fire — the gates:
+		{"closed PR kept on purpose → NOT reaped (even with flag)", "CLOSED", true, true, true, false, false},
+		{"flag off → never (even merged+dirty)", "MERGED", true, true, false, false, false},
+		{"clean index → nothing to reclaim", "MERGED", true, false, true, false, false},
+		{"within grace → protected", "MERGED", true, true, true, true, false},
+		{"open PR → active, keep", "OPEN", true, true, true, false, false},
+		{"no PR resolved → not shippable, keep", "", false, true, true, false, false},
+		{"unknown state → keep", "SOMETHING", true, true, true, false, false},
+	}
+	for _, tc := range cases {
+		got := StaleIndexReportable(tc.prState, tc.prOK, tc.dirty, tc.staleIndex, tc.grace)
+		if got != tc.want {
+			t.Errorf("%s: StaleIndexReportable(%q,%v,%v,%v,%v) = %v, want %v",
+				tc.name, tc.prState, tc.prOK, tc.dirty, tc.staleIndex, tc.grace, got, tc.want)
+		}
+	}
+}
