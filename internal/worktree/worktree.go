@@ -91,15 +91,20 @@ func dirtyCount(wt string) int {
 
 // StaleIndexReap decides whether `wt clean --stale-index` should force-remove a
 // worktree (#88): the opt-in flag is set, the worktree is NOT within the
-// just-created grace window, its most-recent PR resolved to MERGED or CLOSED
-// (the work already shipped, or was abandoned), AND it has a dirty index — the
-// exact reason a plain clean refuses to touch it (#79). The merged/closed PR is
-// the safety gate for discarding the unshared index. Pure — the testable core.
+// just-created grace window, its most-recent PR resolved to MERGED (the work
+// already shipped, so the leftover index is cruft), AND it has a dirty index —
+// the exact reason a plain clean refuses to touch it (#79). Pure — the core.
+//
+// MERGED-only by design: a CLOSED-unmerged PR's branch is "kept on purpose so
+// the work is recoverable" (#79/#87 operator intent), so force-removing it would
+// discard exactly what the operator is preserving — those stay for a manual
+// `git worktree remove --force` decision. Only a merged PR makes the discard
+// unambiguously safe.
 func StaleIndexReap(prState string, prOK, dirty, staleIndex, withinGrace bool) bool {
 	if !staleIndex || withinGrace || !dirty || !prOK {
 		return false
 	}
-	return prState == "MERGED" || prState == "CLOSED"
+	return prState == "MERGED"
 }
 
 // worktreeAge returns how long ago the worktree at wt was created, via the mtime
@@ -179,11 +184,11 @@ func New(c *config.Config, branch string) (string, error) {
 // local branch) via Remove, skipping any that still have uncommitted changes.
 //
 // staleIndex (#88) additionally offers to FORCE-remove a worktree whose PR is
-// merged/closed but that holds a leftover uncommitted index a plain clean
-// refuses to touch — the #79 unresolvable case (`check` won't stop flagging it,
-// `clean` won't remove it). It's opt-in + list-then-apply, because it discards
-// an unshared index; the merged/closed PR is the gate that says the work
-// already shipped or was abandoned.
+// MERGED but that holds a leftover uncommitted index a plain clean refuses to
+// touch — the #79 unresolvable case (`check` won't stop flagging it, `clean`
+// won't remove it). It's opt-in + list-then-apply, because it discards an
+// unshared index; the merged PR is the gate that says the work already shipped
+// (a CLOSED-PR branch is kept on purpose, so it is deliberately left untouched).
 func Clean(c *config.Config, apply, staleIndex bool) error {
 	ui.Step("fetching origin/%s", c.Base)
 	_ = gitx.Fetch("origin", c.Base)
@@ -224,31 +229,26 @@ func Clean(c *config.Config, apply, staleIndex bool) error {
 		}
 		cherryFailed := cerr != nil
 		// One PR-state read (#88) shared with collide/status/check via ghx —
-		// merged ⇒ shipped (#37 squash), closed ⇒ abandoned (#79). prMerged feeds
-		// the normal reap; the closed case only matters to --stale-index below.
+		// merged ⇒ shipped (#37 squash). Feeds both the normal reap and --stale-index.
 		prNum, prState, prOK := ghx.PRForBranch(br)
 		prMerged := prOK && prState == "MERGED"
 
-		// #88 --stale-index: a merged/closed PR whose worktree holds a leftover
-		// uncommitted index that a plain clean won't remove (#79). Force-remove it
-		// (opt-in, list-then-apply). Placed BEFORE ReapVerdict so it also reclaims
-		// the CLOSED case (which ReapVerdict never reaps) and the dirty-MERGED case
-		// (which ReapVerdict reaps but Remove then refuses for the dirty index).
+		// #88 --stale-index: a MERGED PR whose worktree holds a leftover uncommitted
+		// index that a plain clean won't remove (#79 — ReapVerdict reaps a merged
+		// branch, but Remove then refuses because the index is dirty). Force-remove
+		// it (opt-in, list-then-apply). A CLOSED-PR branch is deliberately NOT
+		// reclaimed here (kept on purpose per the operator).
 		if StaleIndexReap(prState, prOK, !gitx.IsClean(wt), staleIndex, withinGrace) {
-			label := "merged"
-			if prState == "CLOSED" {
-				label = "closed"
-			}
 			if !apply {
-				ui.Warn("%s — PR #%s %s but holds a leftover uncommitted index (%d dirty file(s)); `wt clean --stale-index -y` will FORCE-remove it (discards the unshared index)", br, prNum, label, dirtyCount(wt))
+				ui.Warn("%s — PR #%s merged but holds a leftover uncommitted index (%d dirty file(s)); `wt clean --stale-index -y` will FORCE-remove it (discards the unshared index)", br, prNum, dirtyCount(wt))
 				fmt.Printf("  git worktree remove --force %s && git branch -D %s\n", wt, br)
 				continue
 			}
-			if err := Remove(c, wt, br, true); err != nil { // force: discard the shipped/abandoned index
+			if err := Remove(c, wt, br, true); err != nil { // force: discard the shipped index
 				ui.Warn("skipped %s: %v", br, err)
 				continue
 			}
-			ui.OK("%s — force-removed (PR #%s %s, leftover index discarded)", br, prNum, label)
+			ui.OK("%s — force-removed (PR #%s merged, leftover index discarded)", br, prNum)
 			removed++
 			continue
 		}

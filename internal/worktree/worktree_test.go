@@ -77,10 +77,10 @@ func TestStaleIndexReap(t *testing.T) {
 		prState                              string
 		prOK, dirty, staleIndex, grace, want bool
 	}{
-		// Fires: merged/closed PR + dirty index + flag + past grace.
+		// Fires: MERGED PR + dirty index + flag + past grace.
 		{"merged + dirty index + flag → reap", "MERGED", true, true, true, false, true},
-		{"closed + dirty index + flag → reap", "CLOSED", true, true, true, false, true},
 		// Must NOT fire — the safety gates:
+		{"closed PR kept on purpose → NOT reaped (even with flag)", "CLOSED", true, true, true, false, false},
 		{"flag off → never (even merged+dirty)", "MERGED", true, true, false, false, false},
 		{"clean index → nothing to reclaim", "MERGED", true, false, true, false, false},
 		{"within grace → protected", "MERGED", true, true, true, true, false},
