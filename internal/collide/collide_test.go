@@ -122,6 +122,21 @@ func TestClassifyFacts(t *testing.T) {
 		{"open PR beats closed", LiveFacts{ClosedPR: true, HasOpenPR: true}, 0, LiveOpenPR},
 		// no PR resolved + dirty ⇒ genuinely live editing, still HIGH.
 		{"dirty, no PR → dirty (live work)", LiveFacts{Dirty: true, Unshipped: 3, PRChecked: true}, 0, LiveDirty},
+		// #87: a dirty base-branch checkout far behind origin/base is rot (poisons
+		// every check) ⇒ suppressed. Requires ALL of on-base + dirty + >= threshold.
+		{"base checkout, dirty, far behind → stale base", LiveFacts{OnBaseBranch: true, Dirty: true, BehindBase: StaleBaseBehindThreshold}, 0, LiveStaleBase},
+		{"base checkout, dirty, way behind → stale base", LiveFacts{OnBaseBranch: true, Dirty: true, BehindBase: 144}, 0, LiveStaleBase},
+		// just below threshold → stays LiveDirty (live editing, only slightly behind).
+		{"base checkout, dirty, just below threshold → dirty", LiveFacts{OnBaseBranch: true, Dirty: true, BehindBase: StaleBaseBehindThreshold - 1}, 0, LiveDirty},
+		// current base checkout (dirty but not behind) → live editing, HIGH.
+		{"base checkout, dirty, current → dirty", LiveFacts{OnBaseBranch: true, Dirty: true, BehindBase: 0}, 0, LiveDirty},
+		// clean base checkout far behind → not the poisoning case (no dirty edits to
+		// overlap); falls through to the Unshipped==0 stale branch.
+		{"base checkout, CLEAN, far behind → stale (not stale-base)", LiveFacts{OnBaseBranch: true, BehindBase: 144, Unshipped: 0}, 0, LiveStale},
+		// a non-base dirty branch behind base is NOT stale-base — real feature work.
+		{"feature branch, dirty, far behind → dirty (not stale-base)", LiveFacts{Dirty: true, BehindBase: 144, Unshipped: 3}, 0, LiveDirty},
+		// an OPEN PR on the base checkout still wins (shouldn't co-occur, defensive).
+		{"open PR outranks stale-base", LiveFacts{HasOpenPR: true, OnBaseBranch: true, Dirty: true, BehindBase: 144}, 0, LiveOpenPR},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -151,13 +166,14 @@ func TestLiveness_IsStale(t *testing.T) {
 func TestLiveness_IsSuppressed(t *testing.T) {
 	// Suppressed = dropped from HIGH/exit-3: merged (stale), dormant, closed (#79).
 	for l, want := range map[Liveness]bool{
-		LiveStale:    true,
-		LiveDormant:  true,
-		LiveClosedPR: true,
-		LiveUnmerged: false,
-		LiveDirty:    false,
-		LiveOpenPR:   false,
-		LiveUnknown:  false, // ambiguity is never suppressed
+		LiveStale:     true,
+		LiveDormant:   true,
+		LiveClosedPR:  true,
+		LiveStaleBase: true, // #87: rotted base checkout is suppressed
+		LiveUnmerged:  false,
+		LiveDirty:     false,
+		LiveOpenPR:    false,
+		LiveUnknown:   false, // ambiguity is never suppressed
 	} {
 		if got := l.IsSuppressed(); got != want {
 			t.Errorf("%v.IsSuppressed() = %v, want %v", l, got, want)
@@ -182,6 +198,12 @@ func TestWindowLiveness_Label(t *testing.T) {
 		{"no PR opened (still HIGH)", WindowLiveness{Level: LiveUnmerged}, "commits, no PR opened"},
 		// a plain dirty (no PR) window does NOT get the leftover-edits note.
 		{"dirty live work", WindowLiveness{Level: LiveDirty, Dirty: true}, "uncommitted edits"},
+		// #87: a rotted base checkout says how far behind so a reader dismisses it fast.
+		{"stale base checkout", WindowLiveness{Level: LiveStaleBase, Dirty: true, BehindBase: 144},
+			"base checkout, 144 behind — likely stale"},
+		// a dirty base checkout below the stale threshold stays HIGH but notes the drift.
+		{"dirty base, slightly behind", WindowLiveness{Level: LiveDirty, Dirty: true, BehindBase: 3},
+			"uncommitted edits · 3 behind base"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

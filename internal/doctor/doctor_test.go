@@ -1,6 +1,31 @@
 package doctor
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/eharriett0/wt/internal/collide"
+)
+
+func TestClassifyStaleCheckout(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		behind  int
+		wantSev string
+	}{
+		{"at threshold → warn", collide.StaleBaseBehindThreshold, "warn"},
+		{"far past threshold → warn", 144, "warn"},
+		{"just below threshold → nothing", collide.StaleBaseBehindThreshold - 1, ""},
+		{"current → nothing", 0, ""},
+		{"uncomputable (-1) → nothing (git error never manufactures a warning)", -1, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, sev := classifyStaleCheckout(tc.behind)
+			if sev != tc.wantSev {
+				t.Errorf("classifyStaleCheckout(%d) severity = %q, want %q", tc.behind, sev, tc.wantSev)
+			}
+		})
+	}
+}
 
 func TestClassifyUpstream(t *testing.T) {
 	for _, tc := range []struct {

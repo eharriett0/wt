@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -370,25 +371,37 @@ func realPath(p string) string {
 type Liveness int
 
 const (
-	LiveUnknown  Liveness = iota // couldn't determine (git error) — treated as active
-	LiveStale                    // clean worktree, no open PR, nothing unshipped vs base — noise
-	LiveDormant                  // unmerged commits but no activity for > max-age — parked, suppressed like stale (#7)
-	LiveUnmerged                 // commits not yet on base, no open PR — latent collision
-	LiveDirty                    // uncommitted changes in the worktree — actively editing
-	LiveOpenPR                   // an open PR exists for the branch — active contention
-	LiveClosedPR                 // the branch's PR was CLOSED unmerged — abandoned/superseded, branch kept on purpose (#79)
+	LiveUnknown   Liveness = iota // couldn't determine (git error) — treated as active
+	LiveStale                     // clean worktree, no open PR, nothing unshipped vs base — noise
+	LiveDormant                   // unmerged commits but no activity for > max-age — parked, suppressed like stale (#7)
+	LiveUnmerged                  // commits not yet on base, no open PR — latent collision
+	LiveDirty                     // uncommitted changes in the worktree — actively editing
+	LiveOpenPR                    // an open PR exists for the branch — active contention
+	LiveClosedPR                  // the branch's PR was CLOSED unmerged — abandoned/superseded, branch kept on purpose (#79)
+	LiveStaleBase                 // the base-branch checkout, dirty AND far behind origin/base — rot poisoning every check (#87)
 )
+
+// StaleBaseBehindThreshold is how many commits behind origin/base a dirty
+// base-branch checkout must be before its uncommitted edits are treated as rot
+// (LiveStaleBase, suppressed) rather than live work (#87). A shared `main`
+// checkout that has drifted this far with dirty edits is the classic phantom
+// that overlaps nearly every file — its diff is roughly the inverse of
+// everything that has since landed. Well above "just haven't pulled today" so an
+// actively-worked, slightly-behind base checkout stays visible; the doctor probe
+// (internal/doctor) uses the same threshold so the two agree.
+const StaleBaseBehindThreshold = 20
 
 // IsStale reports whether this level is the definitively-merged/abandoned case.
 func (l Liveness) IsStale() bool { return l == LiveStale }
 
 // IsSuppressed reports whether a collision against a window at this level should
 // be filtered out of the default output. Merged-and-clean (stale), parked past
-// the dormancy threshold (dormant), or CLOSED-PR (#79 — the work already lost
-// its adjudication) all mean the other window won't change the file underneath
-// you right now, so none should surface as HIGH.
+// the dormancy threshold (dormant), CLOSED-PR (#79 — the work already lost its
+// adjudication), or a rotted base checkout (#87 — dirty + far behind, poisoning
+// every check) all mean the other window won't change the file underneath you
+// right now, so none should surface as HIGH.
 func (l Liveness) IsSuppressed() bool {
-	return l == LiveStale || l == LiveDormant || l == LiveClosedPR
+	return l == LiveStale || l == LiveDormant || l == LiveClosedPR || l == LiveStaleBase
 }
 
 // Tag is a short human label for the level.
@@ -408,6 +421,8 @@ func (l Liveness) Tag() string {
 		return "stale: merged / no PR"
 	case LiveClosedPR:
 		return "PR closed"
+	case LiveStaleBase:
+		return "base checkout, likely stale"
 	default:
 		return "unknown"
 	}
@@ -416,12 +431,13 @@ func (l Liveness) Tag() string {
 // WindowLiveness is a window's resolved liveness plus the PR number attached to
 // the deciding level (open / merged / closed) for display, e.g. "[open PR #747]".
 type WindowLiveness struct {
-	Level    Liveness
-	PR       string        // open PR number when Level == LiveOpenPR, else ""
-	MergedPR string        // merged PR number when the branch is shipped (Level LiveStale, #73)
-	ClosedPR string        // closed-unmerged PR number when Level == LiveClosedPR (#79)
-	Dirty    bool          // the worktree also has uncommitted edits — noted on a suppressed level so a reopened-merged/closed branch is legible (#79 comment 2)
-	Age      time.Duration // time since the branch's last commit (0 if unknown)
+	Level      Liveness
+	PR         string        // open PR number when Level == LiveOpenPR, else ""
+	MergedPR   string        // merged PR number when the branch is shipped (Level LiveStale, #73)
+	ClosedPR   string        // closed-unmerged PR number when Level == LiveClosedPR (#79)
+	Dirty      bool          // the worktree also has uncommitted edits — noted on a suppressed level so a reopened-merged/closed branch is legible (#79 comment 2)
+	BehindBase int           // commits behind origin/base; >0 only computed for the base checkout, drives the LiveStaleBase note (#87)
+	Age        time.Duration // time since the branch's last commit (0 if unknown)
 }
 
 // Label is the plain (uncolored) liveness word, e.g. "open PR #747" or
@@ -442,6 +458,11 @@ func (wl WindowLiveness) Label() string {
 	if wl.Level == LiveClosedPR && wl.ClosedPR != "" {
 		base = "PR #" + wl.ClosedPR + " closed"
 	}
+	// #87: a rotted base checkout — say HOW far behind so a reader dismisses it in
+	// one second instead of re-investigating a phantom collision.
+	if wl.Level == LiveStaleBase && wl.BehindBase > 0 {
+		base = "base checkout, " + strconv.Itoa(wl.BehindBase) + " behind — likely stale"
+	}
 	if wl.Age > 0 && (wl.Level == LiveUnmerged || wl.Level == LiveDormant) {
 		base += ", last commit " + HumanAge(wl.Age) + " ago"
 	}
@@ -450,6 +471,11 @@ func (wl WindowLiveness) Label() string {
 	// index, so `check` would flag it forever), say WHY it's still only an FYI.
 	if wl.Dirty && (wl.Level == LiveStale || wl.Level == LiveClosedPR) {
 		base += " · leftover uncommitted edits"
+	}
+	// #87: a dirty base checkout that's behind but below the stale threshold stays
+	// HIGH (live editing), but still note the drift so the reader has context.
+	if wl.Level == LiveDirty && wl.BehindBase > 0 {
+		base += " · " + strconv.Itoa(wl.BehindBase) + " behind base"
 	}
 	return base
 }
@@ -485,19 +511,21 @@ func HumanAge(d time.Duration) string {
 // LiveFacts are the raw observations ClassifyFacts turns into a Liveness. Split
 // out from the I/O so the decision boundary is pure and unit-testable.
 type LiveFacts struct {
-	HasOpenPR bool
-	PRChecked bool // whether PR status was actually resolvable (gh present+authed)
-	Dirty     bool
-	Merged    bool          // a MERGED PR exists for the branch — squash-merged/shipped (#73)
-	ClosedPR  bool          // the branch's most-recent PR was CLOSED unmerged — abandoned/superseded (#79)
-	Unshipped int           // git cherry "+" count; <0 means it could not be computed
-	Age       time.Duration // time since last commit (0 = unknown)
+	HasOpenPR    bool
+	PRChecked    bool // whether PR status was actually resolvable (gh present+authed)
+	Dirty        bool
+	Merged       bool          // a MERGED PR exists for the branch — squash-merged/shipped (#73)
+	ClosedPR     bool          // the branch's most-recent PR was CLOSED unmerged — abandoned/superseded (#79)
+	OnBaseBranch bool          // this window is checked out ON the base branch (only the primary can be) (#87)
+	BehindBase   int           // commits origin/base is ahead of this window (0 = up to date / uncomputed) (#87)
+	Unshipped    int           // git cherry "+" count; <0 means it could not be computed
+	Age          time.Duration // time since last commit (0 = unknown)
 }
 
 // ClassifyFacts maps observations to a Liveness (pure). Precedence, by descending
 // certainty that the OTHER window can still change a file underneath you:
 //
-//	open PR > merged PR > closed PR > dirty worktree > unmerged commits > merged-by-ancestry
+//	open PR > merged PR > closed PR > rotted base checkout > dirty worktree > unmerged commits > merged-by-ancestry
 //
 // The load-bearing ordering change (#79 comment 2): a resolved PR state — merged
 // (#73) OR closed-unmerged (#79) — now outranks a dirty worktree. A shipped or
@@ -525,6 +553,16 @@ func ClassifyFacts(f LiveFacts, maxAge time.Duration) Liveness {
 		// CLOSED-unmerged ⇒ abandoned/superseded, branch kept on purpose. Same
 		// suppression + same reasoning as merged; the row reads "PR #N closed" (#79).
 		return LiveClosedPR
+	case f.OnBaseBranch && f.Dirty && f.BehindBase >= StaleBaseBehindThreshold:
+		// #87: the base-branch checkout (only the primary can be on base — git
+		// forbids the same branch in two worktrees), dirty AND far behind
+		// origin/base. Feature work never lives here in the wt model, so dirty
+		// edits on a badly-drifted base checkout are rot whose diff overlaps nearly
+		// every file — a permanent false HIGH on every path. Suppress it and say
+		// how far behind, so `check` stays usable and the doctor probe (same
+		// threshold) can name it. A base checkout that's dirty but current, or only
+		// slightly behind, stays LiveDirty below (genuine live editing).
+		return LiveStaleBase
 	case f.Dirty:
 		return LiveDirty
 	case f.Unshipped > 0:
@@ -572,7 +610,21 @@ func Classify(w Window, base string, maxAge time.Duration, now time.Time) Window
 	if age, err := gitx.LastCommitAge(w.Worktree, now); err == nil {
 		f.Age = age
 	}
-	wl := WindowLiveness{Level: ClassifyFacts(f, maxAge), Age: f.Age, Dirty: f.Dirty}
+	// #87: only the base-branch checkout can poison every check with a rotted
+	// dirty index. Compute base-distance ONLY for that window (rare — one per
+	// repo) so the common case pays no extra git call. A dirty base checkout
+	// that's far behind origin/base is treated as rot below.
+	f.OnBaseBranch = w.Branch == base
+	if f.OnBaseBranch && f.Dirty {
+		if ref := gitx.ResolveRemoteBase(base); ref != "" {
+			if headSHA, err := gitx.RunDir(w.Worktree, "rev-parse", "HEAD"); err == nil {
+				if n := gitx.BehindCount(strings.TrimSpace(headSHA), ref); n > 0 {
+					f.BehindBase = n
+				}
+			}
+		}
+	}
+	wl := WindowLiveness{Level: ClassifyFacts(f, maxAge), Age: f.Age, Dirty: f.Dirty, BehindBase: f.BehindBase}
 	if wl.Level == LiveOpenPR {
 		wl.PR = pr
 	}
