@@ -46,11 +46,11 @@ type Report struct {
 }
 
 // StaleCheckout flags a worktree checked out ON the base branch that is dirty
-// AND far behind origin/base — the "poisons every check" phantom (#87). Its
-// uncommitted diff is roughly the inverse of everything that has since landed,
-// so `wt check`/`status` report it as an active window overlapping nearly every
-// file. Nothing else surfaces it, so it silently degrades collision detection
-// for as long as it stays dirty.
+// AND far behind origin/base (#87) — very likely rot. Its uncommitted edits
+// surface as an active (HIGH) window in any `wt check`/`status` that touches one
+// of them; `wt check` correctly still flags them (a dirty checkout can hold real
+// work, so they are never hidden), but nothing else nudges you to clean the
+// checkout up. This probe names it so the root cause gets fixed.
 type StaleCheckout struct {
 	Path       string `json:"path"`
 	Branch     string `json:"branch"`      // == base
@@ -497,11 +497,13 @@ func render(rep *Report) {
 		}
 	}
 
-	// Stale base checkout poisoning collision checks (#87): a dirty base-branch
-	// checkout that's fallen far behind origin/base overlaps nearly every file in
-	// `wt check`/`status`. Nothing else names it, so surface it here by name.
+	// Stale base checkout (#87): a dirty base-branch checkout fallen far behind
+	// origin/base surfaces as an active (HIGH) window in every `wt check`/`status`
+	// that touches one of its dirty files, and is very likely rot. `wt check`
+	// still flags it (a dirty checkout can hold real edits — never hidden), so
+	// nothing else nudges you to clean it up; name it here.
 	for _, s := range rep.StaleCheckouts {
-		ui.Warn("base checkout %s is %d commit(s) behind origin/%s with %d dirty file(s) — it is poisoning collision checks (its diff overlaps almost every path). Fix: commit/stash + `git -C %s pull --ff-only`, or move the edits to a `wt new` branch.",
+		ui.Warn("base checkout %s is %d commit(s) behind origin/%s with %d dirty file(s) — likely stale, and its edits show up as HIGH collisions in `wt check`. Fix: commit/stash + `git -C %s pull --ff-only`, or move the edits to a `wt new` branch.",
 			s.Path, s.BehindBase, s.Branch, s.DirtyFiles, s.Path)
 	}
 

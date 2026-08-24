@@ -371,24 +371,27 @@ func realPath(p string) string {
 type Liveness int
 
 const (
-	LiveUnknown   Liveness = iota // couldn't determine (git error) — treated as active
-	LiveStale                     // clean worktree, no open PR, nothing unshipped vs base — noise
-	LiveDormant                   // unmerged commits but no activity for > max-age — parked, suppressed like stale (#7)
-	LiveUnmerged                  // commits not yet on base, no open PR — latent collision
-	LiveDirty                     // uncommitted changes in the worktree — actively editing
-	LiveOpenPR                    // an open PR exists for the branch — active contention
-	LiveClosedPR                  // the branch's PR was CLOSED unmerged — abandoned/superseded, branch kept on purpose (#79)
-	LiveStaleBase                 // the base-branch checkout, dirty AND far behind origin/base — rot poisoning every check (#87)
+	LiveUnknown  Liveness = iota // couldn't determine (git error) — treated as active
+	LiveStale                    // clean worktree, no open PR, nothing unshipped vs base — noise
+	LiveDormant                  // unmerged commits but no activity for > max-age — parked, suppressed like stale (#7)
+	LiveUnmerged                 // commits not yet on base, no open PR — latent collision
+	LiveDirty                    // uncommitted changes in the worktree — actively editing
+	LiveOpenPR                   // an open PR exists for the branch — active contention
+	LiveClosedPR                 // the branch's PR was CLOSED unmerged — abandoned/superseded, branch kept on purpose (#79)
 )
 
 // StaleBaseBehindThreshold is how many commits behind origin/base a dirty
-// base-branch checkout must be before its uncommitted edits are treated as rot
-// (LiveStaleBase, suppressed) rather than live work (#87). A shared `main`
-// checkout that has drifted this far with dirty edits is the classic phantom
-// that overlaps nearly every file — its diff is roughly the inverse of
-// everything that has since landed. Well above "just haven't pulled today" so an
-// actively-worked, slightly-behind base checkout stays visible; the doctor probe
-// (internal/doctor) uses the same threshold so the two agree.
+// base-branch checkout must be before wt flags it as likely-stale (#87). A
+// shared `main` checkout drifted this far with dirty edits is very likely rot a
+// reader wants to dismiss quickly + clean up. It is deliberately NOT suppressed:
+// a dirty checkout can still hold real live edits, and hiding a dirty collision
+// on the default `wt check` path would violate the core "never hide a real
+// collision" invariant (the #87 adversarial review caught exactly this — the
+// operator commits to base directly, and base churns past 20-behind within a day
+// or two of genuine WIP). Instead the count enriches the LiveDirty label
+// ("· N behind base — likely stale") so a reader dismisses it in one second, and
+// the `wt doctor` probe (same threshold) names it so the root cause gets fixed.
+// Well above "just haven't pulled today".
 const StaleBaseBehindThreshold = 20
 
 // IsStale reports whether this level is the definitively-merged/abandoned case.
@@ -396,12 +399,14 @@ func (l Liveness) IsStale() bool { return l == LiveStale }
 
 // IsSuppressed reports whether a collision against a window at this level should
 // be filtered out of the default output. Merged-and-clean (stale), parked past
-// the dormancy threshold (dormant), CLOSED-PR (#79 — the work already lost its
-// adjudication), or a rotted base checkout (#87 — dirty + far behind, poisoning
-// every check) all mean the other window won't change the file underneath you
-// right now, so none should surface as HIGH.
+// the dormancy threshold (dormant), or CLOSED-PR (#79 — the work already lost
+// its adjudication) all mean the other window won't change the file underneath
+// you right now. A DIRTY window is never suppressed — even a badly-drifted base
+// checkout: its uncommitted edits could be real work, so it stays HIGH (just
+// labelled "likely stale"). #87 surfaces the stale base checkout; it never hides
+// it.
 func (l Liveness) IsSuppressed() bool {
-	return l == LiveStale || l == LiveDormant || l == LiveClosedPR || l == LiveStaleBase
+	return l == LiveStale || l == LiveDormant || l == LiveClosedPR
 }
 
 // Tag is a short human label for the level.
@@ -421,8 +426,6 @@ func (l Liveness) Tag() string {
 		return "stale: merged / no PR"
 	case LiveClosedPR:
 		return "PR closed"
-	case LiveStaleBase:
-		return "base checkout, likely stale"
 	default:
 		return "unknown"
 	}
@@ -436,7 +439,7 @@ type WindowLiveness struct {
 	MergedPR   string        // merged PR number when the branch is shipped (Level LiveStale, #73)
 	ClosedPR   string        // closed-unmerged PR number when Level == LiveClosedPR (#79)
 	Dirty      bool          // the worktree also has uncommitted edits — noted on a suppressed level so a reopened-merged/closed branch is legible (#79 comment 2)
-	BehindBase int           // commits behind origin/base; >0 only computed for the base checkout, drives the LiveStaleBase note (#87)
+	BehindBase int           // commits behind origin/base; >0 only computed for a dirty base checkout, enriches the LiveDirty "likely stale" label (#87)
 	Age        time.Duration // time since the branch's last commit (0 if unknown)
 }
 
@@ -458,11 +461,6 @@ func (wl WindowLiveness) Label() string {
 	if wl.Level == LiveClosedPR && wl.ClosedPR != "" {
 		base = "PR #" + wl.ClosedPR + " closed"
 	}
-	// #87: a rotted base checkout — say HOW far behind so a reader dismisses it in
-	// one second instead of re-investigating a phantom collision.
-	if wl.Level == LiveStaleBase && wl.BehindBase > 0 {
-		base = "base checkout, " + strconv.Itoa(wl.BehindBase) + " behind — likely stale"
-	}
 	if wl.Age > 0 && (wl.Level == LiveUnmerged || wl.Level == LiveDormant) {
 		base += ", last commit " + HumanAge(wl.Age) + " ago"
 	}
@@ -472,10 +470,14 @@ func (wl WindowLiveness) Label() string {
 	if wl.Dirty && (wl.Level == LiveStale || wl.Level == LiveClosedPR) {
 		base += " · leftover uncommitted edits"
 	}
-	// #87: a dirty base checkout that's behind but below the stale threshold stays
-	// HIGH (live editing), but still note the drift so the reader has context.
+	// #87: a dirty base checkout that's fallen behind origin/base stays HIGH (its
+	// uncommitted edits could be live work — never hidden), but the drift is
+	// noted so a reader can dismiss likely rot fast. Past the threshold, say so.
 	if wl.Level == LiveDirty && wl.BehindBase > 0 {
 		base += " · " + strconv.Itoa(wl.BehindBase) + " behind base"
+		if wl.BehindBase >= StaleBaseBehindThreshold {
+			base += " — likely stale"
+		}
 	}
 	return base
 }
@@ -511,21 +513,19 @@ func HumanAge(d time.Duration) string {
 // LiveFacts are the raw observations ClassifyFacts turns into a Liveness. Split
 // out from the I/O so the decision boundary is pure and unit-testable.
 type LiveFacts struct {
-	HasOpenPR    bool
-	PRChecked    bool // whether PR status was actually resolvable (gh present+authed)
-	Dirty        bool
-	Merged       bool          // a MERGED PR exists for the branch — squash-merged/shipped (#73)
-	ClosedPR     bool          // the branch's most-recent PR was CLOSED unmerged — abandoned/superseded (#79)
-	OnBaseBranch bool          // this window is checked out ON the base branch (only the primary can be) (#87)
-	BehindBase   int           // commits origin/base is ahead of this window (0 = up to date / uncomputed) (#87)
-	Unshipped    int           // git cherry "+" count; <0 means it could not be computed
-	Age          time.Duration // time since last commit (0 = unknown)
+	HasOpenPR bool
+	PRChecked bool // whether PR status was actually resolvable (gh present+authed)
+	Dirty     bool
+	Merged    bool          // a MERGED PR exists for the branch — squash-merged/shipped (#73)
+	ClosedPR  bool          // the branch's most-recent PR was CLOSED unmerged — abandoned/superseded (#79)
+	Unshipped int           // git cherry "+" count; <0 means it could not be computed
+	Age       time.Duration // time since last commit (0 = unknown)
 }
 
 // ClassifyFacts maps observations to a Liveness (pure). Precedence, by descending
 // certainty that the OTHER window can still change a file underneath you:
 //
-//	open PR > merged PR > closed PR > rotted base checkout > dirty worktree > unmerged commits > merged-by-ancestry
+//	open PR > merged PR > closed PR > dirty worktree > unmerged commits > merged-by-ancestry
 //
 // The load-bearing ordering change (#79 comment 2): a resolved PR state — merged
 // (#73) OR closed-unmerged (#79) — now outranks a dirty worktree. A shipped or
@@ -553,17 +553,12 @@ func ClassifyFacts(f LiveFacts, maxAge time.Duration) Liveness {
 		// CLOSED-unmerged ⇒ abandoned/superseded, branch kept on purpose. Same
 		// suppression + same reasoning as merged; the row reads "PR #N closed" (#79).
 		return LiveClosedPR
-	case f.OnBaseBranch && f.Dirty && f.BehindBase >= StaleBaseBehindThreshold:
-		// #87: the base-branch checkout (only the primary can be on base — git
-		// forbids the same branch in two worktrees), dirty AND far behind
-		// origin/base. Feature work never lives here in the wt model, so dirty
-		// edits on a badly-drifted base checkout are rot whose diff overlaps nearly
-		// every file — a permanent false HIGH on every path. Suppress it and say
-		// how far behind, so `check` stays usable and the doctor probe (same
-		// threshold) can name it. A base checkout that's dirty but current, or only
-		// slightly behind, stays LiveDirty below (genuine live editing).
-		return LiveStaleBase
 	case f.Dirty:
+		// A dirty worktree is live editing — ALWAYS surfaced (HIGH), including a
+		// far-behind base checkout (#87): its uncommitted edits could be real work,
+		// so it is never hidden. The base-drift is carried into the label
+		// ("· N behind base — likely stale"), and `wt doctor` names it — but it is
+		// not suppressed. The #87 review proved suppressing it hides real WIP.
 		return LiveDirty
 	case f.Unshipped > 0:
 		if maxAge > 0 && f.Age > maxAge && f.PRChecked {
@@ -610,21 +605,23 @@ func Classify(w Window, base string, maxAge time.Duration, now time.Time) Window
 	if age, err := gitx.LastCommitAge(w.Worktree, now); err == nil {
 		f.Age = age
 	}
-	// #87: only the base-branch checkout can poison every check with a rotted
-	// dirty index. Compute base-distance ONLY for that window (rare — one per
-	// repo) so the common case pays no extra git call. A dirty base checkout
-	// that's far behind origin/base is treated as rot below.
-	f.OnBaseBranch = w.Branch == base
-	if f.OnBaseBranch && f.Dirty {
+	// #87: for the dirty base-branch checkout (only the primary can be on base —
+	// git forbids the same branch in two worktrees), measure how far behind
+	// origin/base it is. Computed ONLY for that one window (no extra git call in
+	// the common case). It does NOT change the level (a dirty checkout stays
+	// LiveDirty/HIGH — never hidden); it enriches the label so a reader can spot
+	// likely rot, and `wt doctor` names it.
+	behindBase := 0
+	if w.Branch == base && f.Dirty {
 		if ref := gitx.ResolveRemoteBase(base); ref != "" {
 			if headSHA, err := gitx.RunDir(w.Worktree, "rev-parse", "HEAD"); err == nil {
 				if n := gitx.BehindCount(strings.TrimSpace(headSHA), ref); n > 0 {
-					f.BehindBase = n
+					behindBase = n
 				}
 			}
 		}
 	}
-	wl := WindowLiveness{Level: ClassifyFacts(f, maxAge), Age: f.Age, Dirty: f.Dirty, BehindBase: f.BehindBase}
+	wl := WindowLiveness{Level: ClassifyFacts(f, maxAge), Age: f.Age, Dirty: f.Dirty, BehindBase: behindBase}
 	if wl.Level == LiveOpenPR {
 		wl.PR = pr
 	}
