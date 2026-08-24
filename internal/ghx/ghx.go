@@ -181,6 +181,30 @@ func OpenPRForBranch(branch string) (string, bool) {
 	return strings.TrimSpace(out), true
 }
 
+// PRForBranch resolves the branch's MOST-RECENT pull request in a single call —
+// `gh pr list --head <branch> --state all` returns every PR head=branch, newest
+// first, so `.[0]` is the one that decides liveness. Returns (number, state, ok)
+// where state is "OPEN" | "MERGED" | "CLOSED"; ok=false when there is no PR or
+// gh is unavailable. This unifies the open- + merged-lookups (#73) and adds the
+// closed-unmerged case (#79) that a merge-only check misses — a closed-PR branch
+// keeps its remote ref, so it can't be detected from git alone. Best-effort:
+// ("", "", false) on any gh error so callers degrade to git signals.
+func PRForBranch(branch string) (number, state string, ok bool) {
+	if branch == "" || branch == "HEAD" || !Present() || !Authed() {
+		return "", "", false
+	}
+	out, err := run("pr", "list", "--head", branch, "--state", "all",
+		"--json", "number,state", "--jq", `.[0] | "\(.number) \(.state)"`)
+	if err != nil {
+		return "", "", false
+	}
+	fields := strings.Fields(strings.TrimSpace(out))
+	if len(fields) != 2 {
+		return "", "", false
+	}
+	return fields[0], fields[1], true
+}
+
 // PRHeadBranch returns the PR's head branch name (headRefName), for locating
 // the worktree to clean up after a merge.
 func PRHeadBranch(pr string) (string, error) {

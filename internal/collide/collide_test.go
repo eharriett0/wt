@@ -109,8 +109,19 @@ func TestClassifyFacts(t *testing.T) {
 		// a MERGED PR exists ⇒ stale (suppressed), not a false HIGH collision.
 		{"merged PR + unshipped (squash) → stale", LiveFacts{Merged: true, Unshipped: 3, PRChecked: true}, 0, LiveStale},
 		{"merged wins over dormancy age", LiveFacts{Merged: true, Unshipped: 3, Age: 30 * day, PRChecked: true}, day, LiveStale},
-		{"dirty beats merged (branch reopened to edit)", LiveFacts{Merged: true, Dirty: true, Unshipped: 3}, 0, LiveDirty},
+		// #79 comment 2 (REVERSES #73's original dirty>merged): PR state outranks a
+		// leftover dirty index. A merged/closed branch with staged cruft `wt clean`
+		// can't remove must NOT read HIGH — the dirtiness rides the label, not the level.
+		{"merged beats dirty (leftover index, not live work)", LiveFacts{Merged: true, Dirty: true, Unshipped: 3}, 0, LiveStale},
 		{"open PR beats merged (shouldn't co-occur, but PR wins)", LiveFacts{Merged: true, HasOpenPR: true}, 0, LiveOpenPR},
+		// #79: CLOSED-unmerged PR ⇒ suppressed (LiveClosedPR), even with unshipped
+		// commits + a dirty index (the branch is kept on purpose). Open/merged win above.
+		{"closed PR + unshipped → closed (suppressed)", LiveFacts{ClosedPR: true, Unshipped: 3, PRChecked: true}, 0, LiveClosedPR},
+		{"closed PR beats dirty (leftover index)", LiveFacts{ClosedPR: true, Dirty: true, Unshipped: 3}, 0, LiveClosedPR},
+		{"merged beats closed (defensive; shouldn't co-occur)", LiveFacts{Merged: true, ClosedPR: true}, 0, LiveStale},
+		{"open PR beats closed", LiveFacts{ClosedPR: true, HasOpenPR: true}, 0, LiveOpenPR},
+		// no PR resolved + dirty ⇒ genuinely live editing, still HIGH.
+		{"dirty, no PR → dirty (live work)", LiveFacts{Dirty: true, Unshipped: 3, PRChecked: true}, 0, LiveDirty},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -122,17 +133,62 @@ func TestClassifyFacts(t *testing.T) {
 }
 
 func TestLiveness_IsStale(t *testing.T) {
-	// Only LiveStale is suppressed; unknown is surfaced (never hide on ambiguity).
+	// Only LiveStale is the definitively-merged case; the rest are not.
 	for l, wantStale := range map[Liveness]bool{
 		LiveUnknown:  false,
 		LiveStale:    true,
 		LiveUnmerged: false,
 		LiveDirty:    false,
 		LiveOpenPR:   false,
+		LiveClosedPR: false, // closed is suppressed but not "stale/merged"
 	} {
 		if got := l.IsStale(); got != wantStale {
 			t.Errorf("%v.IsStale() = %v, want %v", l, got, wantStale)
 		}
+	}
+}
+
+func TestLiveness_IsSuppressed(t *testing.T) {
+	// Suppressed = dropped from HIGH/exit-3: merged (stale), dormant, closed (#79).
+	for l, want := range map[Liveness]bool{
+		LiveStale:    true,
+		LiveDormant:  true,
+		LiveClosedPR: true,
+		LiveUnmerged: false,
+		LiveDirty:    false,
+		LiveOpenPR:   false,
+		LiveUnknown:  false, // ambiguity is never suppressed
+	} {
+		if got := l.IsSuppressed(); got != want {
+			t.Errorf("%v.IsSuppressed() = %v, want %v", l, got, want)
+		}
+	}
+}
+
+func TestWindowLiveness_Label(t *testing.T) {
+	cases := []struct {
+		name string
+		wl   WindowLiveness
+		want string
+	}{
+		{"merged", WindowLiveness{Level: LiveStale, MergedPR: "84"}, "merged #84"},
+		{"closed PR", WindowLiveness{Level: LiveClosedPR, ClosedPR: "1654"}, "PR #1654 closed"},
+		// #79 comment 2: a shipped/closed branch with a leftover dirty index says WHY
+		// it's still only an FYI, so a reader doesn't re-investigate it as live work.
+		{"merged + leftover index", WindowLiveness{Level: LiveStale, MergedPR: "393", Dirty: true},
+			"merged #393 · leftover uncommitted edits"},
+		{"closed + leftover index", WindowLiveness{Level: LiveClosedPR, ClosedPR: "1654", Dirty: true},
+			"PR #1654 closed · leftover uncommitted edits"},
+		{"no PR opened (still HIGH)", WindowLiveness{Level: LiveUnmerged}, "commits, no PR opened"},
+		// a plain dirty (no PR) window does NOT get the leftover-edits note.
+		{"dirty live work", WindowLiveness{Level: LiveDirty, Dirty: true}, "uncommitted edits"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.wl.Label(); got != c.want {
+				t.Errorf("Label() = %q, want %q", got, c.want)
+			}
+		})
 	}
 }
 
