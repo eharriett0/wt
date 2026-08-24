@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -189,6 +190,54 @@ func PRHeadBranch(pr string) (string, error) {
 // PRTitle returns the PR's title (for the #38 WIP-subject strip).
 func PRTitle(pr string) (string, error) {
 	return run("pr", "view", pr, "--json", "title", "--jq", ".title")
+}
+
+// PRBody returns the PR description body (for the #77 closing-keyword scan).
+func PRBody(pr string) (string, error) {
+	return run("pr", "view", pr, "--json", "body", "--jq", ".body")
+}
+
+// PRCommitText returns all commits' FULL messages (headline + body) joined into
+// one blob. The squash body gh composes is built from these, so the closing-
+// keyword scan must see them — a `Fixes #N` in a commit body fires on merge even
+// when the PR body (and thus closingIssuesReferences) never mentions it (#77
+// trap 2). Best-effort: "" on error / gh unavailable.
+func PRCommitText(pr string) string {
+	out, err := run("pr", "view", pr, "--json", "commits", "--jq",
+		`[.commits[] | .messageHeadline + "\n" + .messageBody] | join("\n\n")`)
+	if err != nil {
+		return ""
+	}
+	return out
+}
+
+// PRClosingIssueNumbers returns the numbers in the PR's GraphQL
+// closingIssuesReferences — what GitHub itself reports the PR will close (from
+// the PR title/body ONLY; blind to the squash commit body). This is GraphQL-only
+// (NOT a `gh pr view --json` field), queried via resource(url:) so no owner/repo
+// split is needed. Best-effort: nil on error / gh unavailable. (#77)
+func PRClosingIssueNumbers(pr string) []int {
+	if !Present() || !Authed() {
+		return nil
+	}
+	url, err := run("pr", "view", pr, "--json", "url", "--jq", ".url")
+	if err != nil || strings.TrimSpace(url) == "" {
+		return nil
+	}
+	out, err := run("api", "graphql",
+		"-f", "query=query($url:URI!){resource(url:$url){... on PullRequest{closingIssuesReferences(first:50){nodes{number}}}}}",
+		"-f", "url="+strings.TrimSpace(url),
+		"--jq", ".data.resource.closingIssuesReferences.nodes[].number")
+	if err != nil || strings.TrimSpace(out) == "" {
+		return nil
+	}
+	var nums []int
+	for _, ln := range strings.Split(out, "\n") {
+		if n, e := strconv.Atoi(strings.TrimSpace(ln)); e == nil {
+			nums = append(nums, n)
+		}
+	}
+	return nums
 }
 
 // PRState returns the PR's state (OPEN / MERGED / CLOSED) for the merge-pr

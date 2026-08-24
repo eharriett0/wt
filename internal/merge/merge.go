@@ -8,6 +8,8 @@ package merge
 import (
 	"fmt"
 	"os"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -205,4 +207,86 @@ func DeWIPTitle(title string) (string, bool) {
 		return strings.TrimSpace(rest), true
 	}
 	return title, false
+}
+
+// ClosingRef is one issue that a body of text will AUTO-CLOSE on merge (#77).
+type ClosingRef struct {
+	Number int    // issue number
+	Repo   string // "" = same-repo (#N or same-repo URL); "owner/repo" = cross-repo
+	Raw    string // the matched span, for display
+}
+
+// closingRefRe matches a GitHub closing keyword immediately followed by an issue
+// reference. The keyword set is exactly GitHub's (close/closes/closed,
+// fix/fixes/fixed, resolve/resolves/resolved). The reference must be #N (same
+// repo), owner/repo#N (cross-repo — TWO path segments required), or a full issue
+// URL. A single-segment `repo#N` has no `/` so it matches nothing here — encoding
+// the real asymmetry that `Closes repo#N` does NOT close but `Closes owner/repo#N`
+// does. A bare `#N` with no keyword is not matched (the reference-without-closing
+// form). Negation ("does not close #N") is IGNORED by GitHub's parser, so `close
+// #N` is (correctly) still matched — surfacing that trap rather than hiding it.
+var closingRefRe = regexp.MustCompile(
+	`(?i)\b(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?):?\s+` +
+		`(?:#(\d+)|([\w.-]+/[\w.-]+)#(\d+)|https?://github\.com/([\w.-]+/[\w.-]+)/issues/(\d+))`)
+
+// ClosingRefs returns the issues a text will auto-close on merge — the same text
+// GitHub's closing-reference resolver sees. Deduplicated by repo#number. Pure.
+func ClosingRefs(text string) []ClosingRef {
+	var out []ClosingRef
+	seen := map[string]bool{}
+	for _, m := range closingRefRe.FindAllStringSubmatch(text, -1) {
+		var repo, num string
+		switch {
+		case m[1] != "": // #N (same repo)
+			num = m[1]
+		case m[2] != "" && m[3] != "": // owner/repo#N
+			repo, num = m[2], m[3]
+		case m[4] != "" && m[5] != "": // full issue URL
+			repo, num = m[4], m[5]
+		}
+		n, err := strconv.Atoi(num)
+		if err != nil {
+			continue
+		}
+		key := repo + "#" + num
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, ClosingRef{Number: n, Repo: repo, Raw: strings.TrimSpace(m[0])})
+	}
+	return out
+}
+
+// SameRepoClosings returns just the same-repo issue numbers a text will close
+// (Repo == ""), sorted — the set whose state a same-repo `gh` query can verify.
+func SameRepoClosings(text string) []int {
+	var nums []int
+	for _, r := range ClosingRefs(text) {
+		if r.Repo == "" {
+			nums = append(nums, r.Number)
+		}
+	}
+	sort.Ints(nums)
+	return nums
+}
+
+// ExtraClosings returns same-repo issue numbers the SQUASH text will close that
+// are NOT in the PR's own closingIssuesReferences (graphNums) — the exact
+// signature of trap 2 (#77): a close keyword in the commit body that the
+// GraphQL closingIssuesReferences query, which only sees the PR title/body,
+// never reports. Sorted. Pure.
+func ExtraClosings(squashText string, graphNums []int) []int {
+	inGraph := map[int]bool{}
+	for _, n := range graphNums {
+		inGraph[n] = true
+	}
+	var extra []int
+	for _, n := range SameRepoClosings(squashText) {
+		if !inGraph[n] {
+			extra = append(extra, n)
+		}
+	}
+	sort.Ints(extra)
+	return extra
 }
