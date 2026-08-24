@@ -60,7 +60,8 @@ func Install(c *config.Config, force bool) error {
 
 	ui.OK("hooks installed in %s", hooksDir)
 	ui.Info("shared across all worktrees of this repo")
-	ui.Info("bypass: HOOK_DISABLE_MAIN_PUSH=1 (push) · HOOK_DISABLE_MULTIWINDOW_CHECK=1 (commit)")
+	ui.Info("pre-push also warns on base-conflict (no-CI PR, #78) + BLOCKS on a HIGH file collision (#74)")
+	ui.Info("bypass: HOOK_DISABLE_MAIN_PUSH=1 (base-push) · WT_SKIP_COLLISION=1 (push collision) · HOOK_DISABLE_MULTIWINDOW_CHECK=1 (commit+push collision)")
 	return nil
 }
 
@@ -112,17 +113,25 @@ func precommitSnippet(self string) string {
 `, self)
 }
 
-// HookPrePush implements `wt _hook pre-push`. Rejects pushes whose target ref
-// is the base branch. Honors HOOK_DISABLE_MAIN_PUSH=1. Reads either the
-// pre-commit-framework env vars or the raw pre-push stdin protocol.
+// HookPrePush implements `wt _hook pre-push`. Three checks, in order of cost:
+//
+//  1. base-branch guard — reject a direct push to the base branch (blocking;
+//     bypass HOOK_DISABLE_MAIN_PUSH=1).
+//  2. base-drift warning (#78) — an offline `git merge-tree` against the
+//     last-known base; a conflict means the PR gets ZERO CI until rebased
+//     (loud WARN, non-blocking), and a clean-but-behind branch gets a one-liner.
+//  3. collision check (#74) — the outgoing paths vs every other active window;
+//     a HIGH overlap is the last moment to avoid a duplicate PR, so it BLOCKS
+//     (bypass WT_SKIP_COLLISION=1).
+//
+// Reads either the pre-commit-framework env vars (base-guard only — no local
+// sha available there) or the raw pre-push stdin protocol (the wt-installed
+// shim, and the plain-`git push`-from-a-worktree case #74/#78 actually target).
 func HookPrePush(c *config.Config, stdin io.Reader) int {
-	if os.Getenv("HOOK_DISABLE_MAIN_PUSH") == "1" {
-		return 0
-	}
 	base := c.Base
 
 	if rb := os.Getenv("PRE_COMMIT_REMOTE_BRANCH"); rb != "" {
-		if rb == "refs/heads/"+base || rb == base {
+		if os.Getenv("HOOK_DISABLE_MAIN_PUSH") != "1" && (rb == "refs/heads/"+base || rb == base) {
 			rejectPush(base)
 			return 1
 		}
@@ -130,12 +139,53 @@ func HookPrePush(c *config.Config, stdin io.Reader) int {
 	}
 
 	code := 0
+	// The window scan (for the collision check) is expensive; load it lazily and
+	// once, only when a non-base line actually needs it.
+	var (
+		ws        []collide.Window
+		root      string
+		scanTried bool
+		scanOK    bool
+	)
 	sc := bufio.NewScanner(stdin)
 	for sc.Scan() {
 		fields := strings.Fields(sc.Text())
 		// <local_ref> <local_sha> <remote_ref> <remote_sha>
-		if len(fields) >= 3 && fields[2] == "refs/heads/"+base {
-			rejectPush(base)
+		if len(fields) < 4 {
+			continue
+		}
+		localSHA, remoteRef, remoteSHA := fields[1], fields[2], fields[3]
+
+		// (1) base-branch guard.
+		if remoteRef == "refs/heads/"+base {
+			if os.Getenv("HOOK_DISABLE_MAIN_PUSH") != "1" {
+				rejectPush(base)
+				code = 1
+			}
+			continue
+		}
+		// A branch deletion (local sha all-zero) pushes nothing — skip 2 & 3.
+		if gitx.AllZeroSHA(localSHA) {
+			continue
+		}
+
+		// (2) base-drift / conflict warning — offline, never blocks.
+		warnBaseDrift(base, localSHA)
+
+		// (3) collision check over the outgoing paths.
+		if collisionSkipped() {
+			continue
+		}
+		if !scanTried {
+			scanTried = true
+			if w, err := collide.Scan(c); err == nil {
+				ws, root, scanOK = w, repoRootOrEmpty(), true
+			}
+		}
+		if !scanOK {
+			continue
+		}
+		if pushCollisionBlocks(c, ws, root, outgoingPaths(base, localSHA, remoteSHA)) {
 			code = 1
 		}
 	}
@@ -146,6 +196,112 @@ func rejectPush(base string) {
 	ui.Err("REJECTED: direct push to %q is blocked by the wt pre-push guard.", base)
 	fmt.Fprintln(os.Stderr, "  Use a branch + PR:  wt new <slug>  →  commit/push  →  gh pr create  →  wt merge-pr <N>")
 	fmt.Fprintln(os.Stderr, "  Bypass (genuine intent — rollback/recovery):  HOOK_DISABLE_MAIN_PUSH=1 git push")
+}
+
+// collisionSkipped reports whether the #74 push collision check is disabled —
+// its own WT_SKIP_COLLISION escape hatch OR the shared HOOK_DISABLE_MULTIWINDOW_CHECK
+// that already silences the pre-commit collision notice (so one silence covers both).
+func collisionSkipped() bool {
+	return os.Getenv("WT_SKIP_COLLISION") == "1" || os.Getenv("HOOK_DISABLE_MULTIWINDOW_CHECK") == "1"
+}
+
+func repoRootOrEmpty() string {
+	r, _ := gitx.RepoRoot()
+	return r
+}
+
+// outgoingPaths returns the repo-relative paths in the commits being pushed. For
+// an update it diffs the remote sha the push is fast-forwarding from; for a
+// brand-new branch (remote sha all-zero) it diffs the last-known base, so the
+// full branch is checked. Best-effort — empty on any git error.
+func outgoingPaths(base, localSHA, remoteSHA string) []string {
+	from := remoteSHA
+	if gitx.AllZeroSHA(remoteSHA) {
+		if b := gitx.ResolveRemoteBase(base); b != "" {
+			from = b
+		} else {
+			from = base
+		}
+	}
+	paths, _ := gitx.RangeChangedPaths(from, localSHA)
+	return paths
+}
+
+// warnBaseDrift runs the offline #78 base-drift check for one outgoing ref. A
+// conflict against the last-known base means the resulting PR receives NO CI at
+// all (GitHub can't build refs/pull/N/merge) — the part nobody knows — so it
+// warns loudly and names the paths. A clean-but-behind branch (the state that
+// becomes a conflict minutes later) gets a single informational line. Never
+// blocks: the fix is a rebase, which blocking the push doesn't help.
+func warnBaseDrift(base, localSHA string) {
+	baseRef := gitx.ResolveRemoteBase(base)
+	if baseRef == "" {
+		return // no base ref locally — nothing to compare against
+	}
+	paths, conflicted, err := gitx.MergeTreeConflicts(baseRef, localSHA)
+	if err != nil {
+		return // merge-tree couldn't run (ancient git / bad ref) — fail open
+	}
+	if conflicted {
+		ui.Warn("this branch CONFLICTS with %s — the resulting PR will receive NO CI at all until rebased.", base)
+		fmt.Fprintln(os.Stderr, ui.Dim("   GitHub can't build refs/pull/N/merge on a conflicting PR, so no workflow ever dispatches"))
+		fmt.Fprintln(os.Stderr, ui.Dim("   (absence of checks is the symptom — indistinguishable from a cold runner pool)."))
+		if len(paths) > 0 {
+			fmt.Fprintln(os.Stderr, ui.Yellow("   conflicting: "+strings.Join(paths, ", ")))
+		}
+		fmt.Fprintln(os.Stderr, ui.Dim("   Fix:  git fetch origin && git rebase origin/"+base))
+		return
+	}
+	if n := gitx.BehindCount(localSHA, baseRef); n > 0 {
+		fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("ℹ️  behind %s by %d commit(s) — rebase soon; this is the state that becomes a conflict.", base, n)))
+	}
+}
+
+// pushCollisionBlocks runs the #74 collision engine over the outgoing paths and
+// reports whether the push should be BLOCKED — true only when an ACTIVE window
+// (open PR / unmerged, not stale/merged) is editing the same non-shared,
+// non-append-only file. Shared docs (CLAUDE.md/MEMORY.md) and append-only paths
+// are downgraded to advisories so they never block. Prints the competing
+// branch(es) + PR and the bypass hint on a hard block.
+func pushCollisionBlocks(c *config.Config, ws []collide.Window, root string, paths []string) bool {
+	if len(paths) == 0 {
+		return false
+	}
+	conflicts := collide.CheckPaths(ws, root, paths)
+	if len(conflicts) == 0 {
+		return false
+	}
+	live := collide.ClassifyWindows(ws, c.Base, collide.ConflictWindowSet(conflicts), c.MaxAge)
+	active, _ := collide.PartitionConflicts(conflicts, live)
+
+	var hard, soft []collide.Conflict
+	for _, cf := range active {
+		if collide.IsSharedDoc(cf.Path, c.SharedDocs) || collide.IsAppendOnly(cf.Path, c.AppendOnlyPaths) {
+			soft = append(soft, cf)
+		} else {
+			hard = append(hard, cf)
+		}
+	}
+	if len(hard) == 0 {
+		if len(soft) > 0 {
+			var names []string
+			for _, cf := range soft {
+				names = append(names, cf.Path)
+			}
+			fmt.Fprintln(os.Stderr, ui.Dim("📝 shared/append-only doc(s) also edited elsewhere (advisory): "+strings.Join(names, ", ")))
+		}
+		return false
+	}
+	ui.Collision("%d outgoing file(s) are ALSO being edited by an active window — pushing now risks a duplicate PR:", len(hard))
+	for _, cf := range hard {
+		fmt.Fprintf(os.Stderr, "   %s  %s %s %s\n", ui.Bold(cf.Path), ui.Dim("← also"), cf.Window, live[cf.Window].Badge())
+	}
+	if len(soft) > 0 {
+		fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("   (+%d shared/append-only overlap(s) — advisory)", len(soft))))
+	}
+	fmt.Fprintln(os.Stderr, ui.Yellow("   Coordinate with that window before pushing (run `wt check` for details)."))
+	fmt.Fprintln(os.Stderr, ui.Dim("   Bypass (you've coordinated): WT_SKIP_COLLISION=1 git push"))
+	return true
 }
 
 // HookPreCommit implements `wt _hook pre-commit`. NEVER blocks (always exit 0).
