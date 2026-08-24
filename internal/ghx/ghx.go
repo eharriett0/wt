@@ -168,17 +168,17 @@ func PRCommitSubjects(pr string) []string {
 // OpenPRForBranch returns the number of an OPEN PR whose head is branch, and
 // whether one exists. Used by collision liveness: a branch with an open PR is
 // active contention; one without is a candidate for "stale" classification.
-// Best-effort — any gh error (offline, unauth) yields ("", false) so callers
-// degrade to git-only signals rather than erroring.
+// Delegates to PRForBranch so EVERY PR-state read in wt (open / merged / closed,
+// across clean / check / status / claim) resolves from the ONE `gh pr list
+// --state all` query — they can never disagree about the same branch (#88). A
+// head has at most one open PR and PRForBranch returns the most-recent, so a
+// branch whose current PR is open is exactly OpenPRForBranch's true case.
+// Best-effort: ("", false) on any gh error so callers degrade to git signals.
 func OpenPRForBranch(branch string) (string, bool) {
-	if branch == "" || branch == "HEAD" {
-		return "", false
+	if n, state, ok := PRForBranch(branch); ok && state == "OPEN" {
+		return n, true
 	}
-	out, err := run("pr", "list", "--head", branch, "--state", "open", "--json", "number", "--jq", ".[0].number // empty")
-	if err != nil || strings.TrimSpace(out) == "" {
-		return "", false
-	}
-	return strings.TrimSpace(out), true
+	return "", false
 }
 
 // PRForBranch resolves the branch's MOST-RECENT pull request in a single call —
@@ -281,16 +281,16 @@ func PRState(pr string) string {
 // and whether one exists. `gh pr list --head` still resolves a merged PR after
 // its branch is deleted (the PR record keeps headRefName), so this detects a
 // squash-merged-then-deleted branch — the case git cherry can't (squash breaks
-// patch-equivalence to base). Best-effort: ("", false) on any error / no gh.
+// patch-equivalence to base). Delegates to PRForBranch (#88) so the merged check
+// shares the single PR-state query with open/closed. Note: this is true only
+// when the branch's MOST-RECENT PR is merged — if the branch was reopened with a
+// newer OPEN/CLOSED PR after an earlier merge, it is (correctly) treated as
+// active/abandoned by that newer PR, not as shipped. Best-effort: ("", false).
 func MergedPRForBranchNum(branch string) (string, bool) {
-	if branch == "" || branch == "HEAD" || !Present() || !Authed() {
-		return "", false
+	if n, state, ok := PRForBranch(branch); ok && state == "MERGED" {
+		return n, true
 	}
-	out, err := run("pr", "list", "--head", branch, "--state", "merged", "--json", "number", "--jq", ".[0].number // empty")
-	if err != nil || strings.TrimSpace(out) == "" {
-		return "", false
-	}
-	return strings.TrimSpace(out), true
+	return "", false
 }
 
 // MergedPRForBranch reports whether branch has a MERGED PR (bool wrapper). Used

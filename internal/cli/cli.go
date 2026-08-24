@@ -163,11 +163,12 @@ func cmdClean(args []string) int {
 	fs := flag.NewFlagSet("clean", flag.ContinueOnError)
 	apply := fs.Bool("y", false, "actually remove the shipped worktrees (default: list only)")
 	fs.BoolVar(apply, "yes", false, "alias for -y")
+	staleIndex := fs.Bool("stale-index", false, "ALSO force-remove worktrees whose PR is merged/closed but hold a leftover uncommitted index that a plain clean refuses to touch (#88)")
 	if err := fs.Parse(args); err != nil {
 		return 64
 	}
 	return withConfig(func(c *config.Config) int {
-		if err := worktree.Clean(c, *apply); err != nil {
+		if err := worktree.Clean(c, *apply, *staleIndex); err != nil {
 			ui.Err("%v", err)
 			return 1
 		}

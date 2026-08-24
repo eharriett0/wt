@@ -73,6 +73,35 @@ func ReapVerdict(unshipped int, cherryFailed, prMerged, hasUpstream, withinGrace
 	return !cherryFailed && unshipped == 0
 }
 
+// dirtyCount counts uncommitted changes in the worktree at wt (porcelain lines),
+// for the --stale-index preview message; 0 on any error.
+func dirtyCount(wt string) int {
+	out, err := gitx.RunDir(wt, "status", "--porcelain")
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, ln := range strings.Split(out, "\n") {
+		if strings.TrimSpace(ln) != "" {
+			n++
+		}
+	}
+	return n
+}
+
+// StaleIndexReap decides whether `wt clean --stale-index` should force-remove a
+// worktree (#88): the opt-in flag is set, the worktree is NOT within the
+// just-created grace window, its most-recent PR resolved to MERGED or CLOSED
+// (the work already shipped, or was abandoned), AND it has a dirty index — the
+// exact reason a plain clean refuses to touch it (#79). The merged/closed PR is
+// the safety gate for discarding the unshared index. Pure — the testable core.
+func StaleIndexReap(prState string, prOK, dirty, staleIndex, withinGrace bool) bool {
+	if !staleIndex || withinGrace || !dirty || !prOK {
+		return false
+	}
+	return prState == "MERGED" || prState == "CLOSED"
+}
+
 // worktreeAge returns how long ago the worktree at wt was created, via the mtime
 // of its `.git` entry (written by `git worktree add`). ok=false when it can't be
 // stat'd — treated by callers as "not fresh" (don't over-protect an unknowable).
@@ -148,7 +177,14 @@ func New(c *config.Config, branch string) (string, error) {
 // base, via git cherry). With apply=false (default) it only LISTS them and
 // prints the remove commands; with apply=true it removes each (worktree +
 // local branch) via Remove, skipping any that still have uncommitted changes.
-func Clean(c *config.Config, apply bool) error {
+//
+// staleIndex (#88) additionally offers to FORCE-remove a worktree whose PR is
+// merged/closed but that holds a leftover uncommitted index a plain clean
+// refuses to touch — the #79 unresolvable case (`check` won't stop flagging it,
+// `clean` won't remove it). It's opt-in + list-then-apply, because it discards
+// an unshared index; the merged/closed PR is the gate that says the work
+// already shipped or was abandoned.
+func Clean(c *config.Config, apply, staleIndex bool) error {
 	ui.Step("fetching origin/%s", c.Base)
 	_ = gitx.Fetch("origin", c.Base)
 	_ = gitx.WorktreePrune() // #42: drop stale metadata for manually-deleted dirs
@@ -187,7 +223,36 @@ func Clean(c *config.Config, apply bool) error {
 			n, cerr = gitx.CountUnshipped(c.Base, "refs/heads/"+br)
 		}
 		cherryFailed := cerr != nil
-		prMerged := ghx.MergedPRForBranch(br) // #37: squash-merged branches read shipped here
+		// One PR-state read (#88) shared with collide/status/check via ghx —
+		// merged ⇒ shipped (#37 squash), closed ⇒ abandoned (#79). prMerged feeds
+		// the normal reap; the closed case only matters to --stale-index below.
+		prNum, prState, prOK := ghx.PRForBranch(br)
+		prMerged := prOK && prState == "MERGED"
+
+		// #88 --stale-index: a merged/closed PR whose worktree holds a leftover
+		// uncommitted index that a plain clean won't remove (#79). Force-remove it
+		// (opt-in, list-then-apply). Placed BEFORE ReapVerdict so it also reclaims
+		// the CLOSED case (which ReapVerdict never reaps) and the dirty-MERGED case
+		// (which ReapVerdict reaps but Remove then refuses for the dirty index).
+		if StaleIndexReap(prState, prOK, !gitx.IsClean(wt), staleIndex, withinGrace) {
+			label := "merged"
+			if prState == "CLOSED" {
+				label = "closed"
+			}
+			if !apply {
+				ui.Warn("%s — PR #%s %s but holds a leftover uncommitted index (%d dirty file(s)); `wt clean --stale-index -y` will FORCE-remove it (discards the unshared index)", br, prNum, label, dirtyCount(wt))
+				fmt.Printf("  git worktree remove --force %s && git branch -D %s\n", wt, br)
+				continue
+			}
+			if err := Remove(c, wt, br, true); err != nil { // force: discard the shipped/abandoned index
+				ui.Warn("skipped %s: %v", br, err)
+				continue
+			}
+			ui.OK("%s — force-removed (PR #%s %s, leftover index discarded)", br, prNum, label)
+			removed++
+			continue
+		}
+
 		if !ReapVerdict(n, cherryFailed, prMerged, hasUpstream, withinGrace) {
 			switch {
 			case withinGrace:
@@ -224,7 +289,11 @@ func Clean(c *config.Config, apply bool) error {
 			ui.OK("removed %d shipped worktree(s)", removed)
 		}
 	} else if removed == 0 {
-		ui.Info("re-run with `wt clean -y` to remove the shipped worktrees listed above")
+		if staleIndex {
+			ui.Info("re-run with `wt clean --stale-index -y` to remove the worktrees listed above (including any leftover-index ones)")
+		} else {
+			ui.Info("re-run with `wt clean -y` to remove the shipped worktrees listed above")
+		}
 	}
 	return nil
 }
