@@ -89,18 +89,22 @@ func dirtyCount(wt string) int {
 	return n
 }
 
-// StaleIndexReap decides whether `wt clean --stale-index` should force-remove a
-// worktree (#88): the opt-in flag is set, the worktree is NOT within the
-// just-created grace window, its most-recent PR resolved to MERGED (the work
-// already shipped, so the leftover index is cruft), AND it has a dirty index —
-// the exact reason a plain clean refuses to touch it (#79). Pure — the core.
+// StaleIndexReportable decides whether `wt clean --stale-index` should REPORT a
+// worktree (#88): the opt-in flag is set, the worktree is past the just-created
+// grace window, its most-recent PR resolved to MERGED, AND it has a dirty index
+// — the exact worktree a plain clean silently leaves in place forever (#79:
+// clean reaps a merged branch, but Remove then refuses the dirty index).
 //
-// MERGED-only by design: a CLOSED-unmerged PR's branch is "kept on purpose so
-// the work is recoverable" (#79/#87 operator intent), so force-removing it would
-// discard exactly what the operator is preserving — those stay for a manual
-// `git worktree remove --force` decision. Only a merged PR makes the discard
-// unambiguously safe.
-func StaleIndexReap(prState string, prOK, dirty, staleIndex, withinGrace bool) bool {
+// Report-ONLY, never auto-remove — the #88 adversarial review proved a
+// force-remove here is a permanent-data-loss footgun: a MERGED PR certifies only
+// that the COMMITTED work shipped; the dirty index could just as well be FRESH
+// post-merge work the operator started in that worktree, which is
+// indistinguishable from stale pre-merge cruft and is not reflog-recoverable
+// once `git worktree remove --force` discards it. So wt surfaces these worktrees
+// + the exact manual command, and the operator inspects the changes and makes
+// the destructive decision themselves. MERGED-only (a CLOSED-PR branch is kept
+// on purpose per #79/#87, so it isn't reported either). Pure — the testable core.
+func StaleIndexReportable(prState string, prOK, dirty, staleIndex, withinGrace bool) bool {
 	if !staleIndex || withinGrace || !dirty || !prOK {
 		return false
 	}
@@ -183,12 +187,14 @@ func New(c *config.Config, branch string) (string, error) {
 // prints the remove commands; with apply=true it removes each (worktree +
 // local branch) via Remove, skipping any that still have uncommitted changes.
 //
-// staleIndex (#88) additionally offers to FORCE-remove a worktree whose PR is
-// MERGED but that holds a leftover uncommitted index a plain clean refuses to
-// touch — the #79 unresolvable case (`check` won't stop flagging it, `clean`
-// won't remove it). It's opt-in + list-then-apply, because it discards an
-// unshared index; the merged PR is the gate that says the work already shipped
-// (a CLOSED-PR branch is kept on purpose, so it is deliberately left untouched).
+// staleIndex (#88) additionally REPORTS (never removes) a worktree whose PR is
+// MERGED but that holds a leftover uncommitted index a plain clean silently
+// leaves forever — the #79 case (`check` won't stop flagging it, `clean` won't
+// remove it). wt deliberately does NOT force-remove it: a MERGED PR only proves
+// the committed work shipped, so the dirty index might be fresh post-merge work
+// (the #88 review), and discarding uncommitted work wt can't prove is cruft is a
+// permanent-loss footgun. It surfaces the worktree + the manual command so the
+// operator inspects the changes and makes the destructive decision themselves.
 func Clean(c *config.Config, apply, staleIndex bool) error {
 	ui.Step("fetching origin/%s", c.Base)
 	_ = gitx.Fetch("origin", c.Base)
@@ -233,23 +239,15 @@ func Clean(c *config.Config, apply, staleIndex bool) error {
 		prNum, prState, prOK := ghx.PRForBranch(br)
 		prMerged := prOK && prState == "MERGED"
 
-		// #88 --stale-index: a MERGED PR whose worktree holds a leftover uncommitted
-		// index that a plain clean won't remove (#79 — ReapVerdict reaps a merged
-		// branch, but Remove then refuses because the index is dirty). Force-remove
-		// it (opt-in, list-then-apply). A CLOSED-PR branch is deliberately NOT
-		// reclaimed here (kept on purpose per the operator).
-		if StaleIndexReap(prState, prOK, !gitx.IsClean(wt), staleIndex, withinGrace) {
-			if !apply {
-				ui.Warn("%s — PR #%s merged but holds a leftover uncommitted index (%d dirty file(s)); `wt clean --stale-index -y` will FORCE-remove it (discards the unshared index)", br, prNum, dirtyCount(wt))
-				fmt.Printf("  git worktree remove --force %s && git branch -D %s\n", wt, br)
-				continue
-			}
-			if err := Remove(c, wt, br, true); err != nil { // force: discard the shipped index
-				ui.Warn("skipped %s: %v", br, err)
-				continue
-			}
-			ui.OK("%s — force-removed (PR #%s merged, leftover index discarded)", br, prNum)
-			removed++
+		// #88 --stale-index: REPORT (never auto-remove) a MERGED-PR worktree that
+		// holds a leftover uncommitted index a plain clean silently leaves forever
+		// (#79). wt won't force-discard it — a MERGED PR only proves the committed
+		// work shipped, and the dirty index could be fresh post-merge work (the #88
+		// review). Surface it + the manual command; the operator inspects + decides.
+		if StaleIndexReportable(prState, prOK, !gitx.IsClean(wt), staleIndex, withinGrace) {
+			ui.Warn("%s — PR #%s merged, but this worktree has a leftover uncommitted index (%d dirty file(s)) so plain clean leaves it. INSPECT it, then if it's stale leftovers (not fresh work) remove it by hand:", br, prNum, dirtyCount(wt))
+			fmt.Printf("  git -C %s status              # confirm what's uncommitted FIRST\n", wt)
+			fmt.Printf("  git worktree remove --force %s && git branch -D %s\n", wt, br)
 			continue
 		}
 
@@ -289,11 +287,7 @@ func Clean(c *config.Config, apply, staleIndex bool) error {
 			ui.OK("removed %d shipped worktree(s)", removed)
 		}
 	} else if removed == 0 {
-		if staleIndex {
-			ui.Info("re-run with `wt clean --stale-index -y` to remove the worktrees listed above (including any leftover-index ones)")
-		} else {
-			ui.Info("re-run with `wt clean -y` to remove the shipped worktrees listed above")
-		}
+		ui.Info("re-run with `wt clean -y` to remove the shipped worktrees listed above")
 	}
 	return nil
 }
