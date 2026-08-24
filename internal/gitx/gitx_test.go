@@ -97,3 +97,44 @@ func TestHunkRanges_BaseFrameCatchesShiftedConflict(t *testing.T) {
 		t.Fatalf("base-side ranges must overlap: A=%+v B=%+v", aOld, bOld)
 	}
 }
+
+func TestAllZeroSHA(t *testing.T) {
+	cases := map[string]bool{
+		"0000000000000000000000000000000000000000":                         true, // 40-hex zero (SHA-1)
+		"0000000000000000000000000000000000000000000000000000000000000000": true, // SHA-256
+		"  0000000000000000000000000000000000000000  ":                     true, // trimmed
+		"be912e0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa":                        false,
+		"0000000000000000000000000000000000000001":                         false,
+		"": false, // empty is NOT the zero sentinel
+	}
+	for in, want := range cases {
+		if got := AllZeroSHA(in); got != want {
+			t.Errorf("AllZeroSHA(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+func TestParseMergeTreeConflictPaths(t *testing.T) {
+	// clean merge output would never reach here (exit 0), but a 1-line blob is
+	// tolerated → no paths.
+	if got := parseMergeTreeConflictPaths("5ca6dbe8a5d360580d5ba525df2d7f3a109b6462"); got != nil {
+		t.Errorf("single-line = %v, want nil", got)
+	}
+	// conflict shape: OID, then conflicted paths, blank line, informational text.
+	out := "0123456789abcdef0123456789abcdef01234567\n" +
+		"internal/hooks/hooks.go\n" +
+		"internal/gitx/gitx.go\n" +
+		"\n" +
+		"Auto-merging internal/hooks/hooks.go\n" +
+		"CONFLICT (content): Merge conflict in internal/hooks/hooks.go\n"
+	got := parseMergeTreeConflictPaths(out)
+	want := []string{"internal/hooks/hooks.go", "internal/gitx/gitx.go"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("paths = %v, want %v", got, want)
+	}
+	// no blank separator (some git versions) → still stops before we mislabel,
+	// but at minimum captures the first path; empty blob → nil.
+	if got := parseMergeTreeConflictPaths(""); got != nil {
+		t.Errorf("empty = %v, want nil", got)
+	}
+}

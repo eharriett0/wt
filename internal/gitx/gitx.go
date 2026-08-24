@@ -3,6 +3,7 @@
 package gitx
 
 import (
+	"fmt"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -291,6 +292,111 @@ func CountUnshipped(base, branchRef string) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// AllZeroSHA reports whether ref is git's all-zero object id — the sentinel a
+// pre-push line carries for the remote side of a brand-new branch (nothing on
+// the remote yet) or the local side of a branch deletion.
+func AllZeroSHA(ref string) bool {
+	ref = strings.TrimSpace(ref)
+	return ref != "" && strings.Trim(ref, "0") == ""
+}
+
+// RangeChangedPaths returns the repo-relative paths changed between two commits
+// (`git diff --name-only from..to`). Used by the pre-push collision check (#74)
+// to scope the check to the OUTGOING commits, not the whole worktree.
+func RangeChangedPaths(from, to string) ([]string, error) {
+	out, err := Run("diff", "--name-only", from+".."+to)
+	if err != nil {
+		return nil, err
+	}
+	var paths []string
+	for _, ln := range strings.Split(out, "\n") {
+		if s := strings.TrimSpace(ln); s != "" {
+			paths = append(paths, s)
+		}
+	}
+	return paths, nil
+}
+
+// ResolveRemoteBase returns the best last-known base ref for offline base-drift
+// checks (#78): the remote-tracking `origin/<base>` if it exists (what the PR
+// will actually merge into), else the local `<base>`, else "" when neither
+// resolves. No network — reads only refs already in the object store.
+func ResolveRemoteBase(base string) string {
+	if base == "" {
+		return ""
+	}
+	for _, ref := range []string{"refs/remotes/origin/" + base, "refs/heads/" + base} {
+		if _, err := Run("rev-parse", "--verify", "--quiet", ref); err == nil {
+			return ref
+		}
+	}
+	return ""
+}
+
+// BehindCount returns how many commits base is ahead of head (`git rev-list
+// --count head..base`) — the "behind main by N" signal (#78). -1 when it can't
+// be computed (bad refs), so the caller can suppress the line rather than lie.
+func BehindCount(head, base string) int {
+	out, err := Run("rev-list", "--count", head+".."+base)
+	if err != nil {
+		return -1
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+// MergeTreeConflicts performs an in-memory 3-way merge of head into base via
+// `git merge-tree --write-tree --name-only` — NO network, NO worktree mutation,
+// NO index touch (git >= 2.38). It returns the conflicting repo-relative paths
+// (empty when clean), whether the merge conflicted, and an error ONLY when
+// merge-tree itself could not run (bad refs / ancient git) so the caller fails
+// open rather than blocking a push on a tooling gap. Backs the #78 "this PR
+// will get NO CI until rebased" warning.
+func MergeTreeConflicts(base, head string) (paths []string, conflicted bool, err error) {
+	cmd := exec.Command("git", "merge-tree", "--write-tree", "--name-only", base, head)
+	out, runErr := cmd.Output()
+	if runErr == nil {
+		return nil, false, nil // exit 0 → clean merge
+	}
+	ee, ok := runErr.(*exec.ExitError)
+	if !ok {
+		return nil, false, runErr // couldn't exec git at all
+	}
+	if ee.ExitCode() != 1 {
+		return nil, false, fmt.Errorf("git merge-tree exit %d", ee.ExitCode())
+	}
+	// Exit 1 = conflicts.
+	return parseMergeTreeConflictPaths(string(out)), true, nil
+}
+
+// parseMergeTreeConflictPaths pulls the conflicted paths out of `git merge-tree
+// --write-tree --name-only` stdout. The format is:
+//
+//	<toplevel-tree-oid>
+//	<conflicted path>...        (one per line)
+//	                            (blank line)
+//	<informational messages>...
+//
+// so we skip line 0 (the tree OID) and take lines up to the first blank line
+// (the separator before informational text). Pure — unit-tested.
+func parseMergeTreeConflictPaths(out string) []string {
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) <= 1 {
+		return nil
+	}
+	var paths []string
+	for _, ln := range lines[1:] {
+		if strings.TrimSpace(ln) == "" {
+			break
+		}
+		paths = append(paths, strings.TrimSpace(ln))
+	}
+	return paths
 }
 
 // TouchedFiles returns the union of (a) uncommitted changes in the worktree at
