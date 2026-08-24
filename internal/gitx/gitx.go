@@ -166,6 +166,42 @@ func WorktreeBranchesUnder(root string) ([]string, error) {
 	return branches, nil
 }
 
+// WorktreeRef is a worktree's path + its checked-out branch ("" if detached).
+type WorktreeRef struct {
+	Path   string
+	Branch string
+}
+
+// WorktreeList returns every worktree of this repo with its checked-out branch.
+// Detached worktrees have Branch == "". (Companion to WorktreePaths /
+// WorktreeBranchesUnder — this one pairs path↔branch, which `wt doctor`'s
+// upstream check needs per-worktree, #76.)
+func WorktreeList() ([]WorktreeRef, error) {
+	out, err := Run("worktree", "list", "--porcelain")
+	if err != nil {
+		return nil, err
+	}
+	var refs []WorktreeRef
+	var cur WorktreeRef
+	flush := func() {
+		if cur.Path != "" {
+			refs = append(refs, cur)
+		}
+		cur = WorktreeRef{}
+	}
+	for _, ln := range strings.Split(out, "\n") {
+		switch {
+		case strings.HasPrefix(ln, "worktree "):
+			flush()
+			cur.Path = strings.TrimSpace(strings.TrimPrefix(ln, "worktree "))
+		case strings.HasPrefix(ln, "branch "):
+			cur.Branch = strings.TrimPrefix(strings.TrimSpace(strings.TrimPrefix(ln, "branch ")), "refs/heads/")
+		}
+	}
+	flush()
+	return refs, nil
+}
+
 // pathUnder reports whether path is root itself or nested under it.
 func pathUnder(path, root string) bool {
 	if path == "" || root == "" {

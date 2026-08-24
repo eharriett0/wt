@@ -15,6 +15,7 @@ import (
 	"github.com/eharriett0/wt/internal/coord"
 	"github.com/eharriett0/wt/internal/ghx"
 	"github.com/eharriett0/wt/internal/gitx"
+	"github.com/eharriett0/wt/internal/hooks"
 	"github.com/eharriett0/wt/internal/ui"
 )
 
@@ -37,6 +38,20 @@ type Report struct {
 
 	Coord     *CoordHealth `json:"coord,omitempty"`
 	Preflight *Preflight   `json:"preflight,omitempty"`
+
+	Upstream       []UpstreamCheck `json:"upstream_checks,omitempty"` // worktree branches tracking the base / no upstream (#76)
+	HooksInstalled *bool           `json:"hooks_installed,omitempty"` // wt pre-push guard present in this repo (#76)
+}
+
+// UpstreamCheck flags a worktree whose branch tracks the BASE ref — a bare
+// `git push` there lands straight on the base (the deploy branch in a
+// merge_is_deploy repo) with no PR/CI/review — or has no upstream at all (#76).
+type UpstreamCheck struct {
+	Path     string `json:"path"`
+	Branch   string `json:"branch"`
+	Upstream string `json:"upstream,omitempty"` // e.g. "origin/main"; "" when none
+	Issue    string `json:"issue"`              // "tracks_base" | "no_upstream"
+	Severity string `json:"severity"`           // "fail" | "warn" | "info"
 }
 
 // DocCheck is one structured_doc's compiled-regex status.
@@ -109,7 +124,78 @@ func build(c *config.Config) *Report {
 	rep.UnknownKeys = unknownKeys(c)
 	rep.Coord = coordHealth(c)
 	rep.Preflight = preflight(c)
+	rep.Upstream = upstreamChecks(c)
+	rep.HooksInstalled = hooksInstalled(c)
+	// A worktree tracking the base branch in a merge_is_deploy repo is a hard
+	// finding — a bare `git push` there ships to prod. That fails doctor.
+	for _, u := range rep.Upstream {
+		if u.Severity == "fail" {
+			rep.Healthy = false
+		}
+	}
 	return rep
+}
+
+// upstreamChecks flags every worktree whose branch tracks the base ref (a bare
+// `git push` lands on the base — prod, in a merge_is_deploy repo) or has no
+// upstream at all. The base branch itself legitimately tracks base, so it's
+// skipped. `wt new` sets upstreams correctly; the broken ones are ad-hoc
+// branches created outside wt (#76).
+func upstreamChecks(c *config.Config) []UpstreamCheck {
+	refs, err := gitx.WorktreeList()
+	if err != nil {
+		return nil
+	}
+	var out []UpstreamCheck
+	for _, r := range refs {
+		if r.Branch == "" || r.Branch == c.Base {
+			continue // detached, or the base branch itself
+		}
+		merge, _ := gitx.RunDir(r.Path, "config", "--get", "branch."+r.Branch+".merge")
+		issue, sev := classifyUpstream(merge, c.Base, c.MergeIsDeploy)
+		if issue == "" {
+			continue // tracks its own remote branch — fine
+		}
+		uc := UpstreamCheck{Path: r.Path, Branch: r.Branch, Issue: issue, Severity: sev}
+		if issue == "tracks_base" {
+			remote, _ := gitx.RunDir(r.Path, "config", "--get", "branch."+r.Branch+".remote")
+			uc.Upstream = c.Base
+			if remote != "" {
+				uc.Upstream = remote + "/" + c.Base
+			}
+		}
+		out = append(out, uc)
+	}
+	return out
+}
+
+// classifyUpstream decides a worktree branch's upstream finding from its git
+// merge ref (branch.<b>.merge, e.g. "refs/heads/main" or "" for no upstream),
+// the base branch, and whether merge_is_deploy is set. Returns ("","") when the
+// branch is fine (tracks its own remote branch). Pure — the testable core of the
+// #76 check.
+func classifyUpstream(mergeRef, base string, mergeIsDeploy bool) (issue, severity string) {
+	if strings.TrimSpace(mergeRef) == "" {
+		return "no_upstream", "info"
+	}
+	if strings.TrimPrefix(mergeRef, "refs/heads/") != base {
+		return "", "" // tracks its own branch — fine
+	}
+	if mergeIsDeploy {
+		return "tracks_base", "fail" // a bare push here ships to prod
+	}
+	return "tracks_base", "warn"
+}
+
+// hooksInstalled reports whether the wt pre-push base-branch guard is present in
+// this repo's shared hooks dir — nil when the git common dir can't be resolved.
+func hooksInstalled(c *config.Config) *bool {
+	common, err := gitx.CommonDir()
+	if err != nil {
+		return nil
+	}
+	v := hooks.PrePushInstalled(common)
+	return &v
 }
 
 func resolvedConfig(c *config.Config) map[string]string {
@@ -307,6 +393,29 @@ func render(rep *Report) {
 		} else {
 			ui.Err("worktree root unusable — %s", p.WorktreeRootNote)
 		}
+	}
+
+	// Worktree upstream sanity (#76): a branch tracking the base ref turns a
+	// reflexive `git push` into a direct push to the base/deploy branch.
+	if len(rep.Upstream) == 0 {
+		ui.OK("worktree upstreams — no branch tracks the base branch")
+	}
+	for _, u := range rep.Upstream {
+		fix := ui.Cyan(fmt.Sprintf("git -C %s branch --unset-upstream", u.Path))
+		switch u.Severity {
+		case "fail":
+			ui.Err("worktree branch %q tracks the base (upstream %s) — a bare `git push` here lands DIRECTLY on the deploy branch (merge_is_deploy: no PR/CI/review). Fix: %s", u.Branch, u.Upstream, fix)
+		case "warn":
+			ui.Warn("worktree branch %q tracks the base (upstream %s) — a bare `git push` here goes to the base branch, not a PR. Fix: %s", u.Branch, u.Upstream, fix)
+		case "info":
+			ui.Info("worktree branch %q has no upstream — a `git push` there prompts rather than landing anywhere", u.Branch)
+		}
+	}
+
+	// Hooks installed? An unguarded repo is how the base-tracking worktrees above
+	// go unnoticed in the first place (#76).
+	if rep.HooksInstalled != nil && !*rep.HooksInstalled {
+		ui.Warn("git hooks not installed in this repo — the pre-push base-branch guard is not active. Run `wt install-hooks`.")
 	}
 
 	if !rep.Healthy {
