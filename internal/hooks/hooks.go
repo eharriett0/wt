@@ -22,6 +22,14 @@ import (
 
 const sentinel = "wt _hook"
 
+// PrePushInstalled reports whether a wt-managed pre-push hook is present in the
+// repo's shared hooks dir — used by `wt doctor` to flag an unguarded repo where
+// the base-branch push guard never ran (#76).
+func PrePushInstalled(commonDir string) bool {
+	b, err := os.ReadFile(filepath.Join(commonDir, "hooks", "pre-push"))
+	return err == nil && strings.Contains(string(b), sentinel)
+}
+
 // Install writes the pre-push + pre-commit shims into the shared hooks dir
 // (covers every worktree of the repo). force overwrites foreign hooks.
 func Install(c *config.Config, force bool) error {
