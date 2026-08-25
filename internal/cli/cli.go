@@ -824,14 +824,17 @@ func parseCheckArgs(args []string) (paths []string, includeStale, showDiff, asJS
 // in the working tree, aren't tracked by git, and aren't touched by any window.
 // A bare basename (no '/' or whitespace) is a legitimate fuzzy suffix query and
 // is never flagged.
-func unknownCheckPaths(root string, paths []string, ws []collide.Window) []string {
+func unknownCheckPaths(paths []string, ws []collide.Window) []string {
 	var out []string
 	for _, p := range paths {
 		p = strings.TrimSpace(p)
 		if p == "" || !strings.ContainsAny(p, "/ \t") {
-			continue // bare basename → fuzzy query, exempt
+			continue // bare single-token basename → fuzzy query, exempt
 		}
-		if _, err := os.Stat(filepath.Join(root, p)); err == nil {
+		// cwd-relative (NOT root-relative): the operator types paths relative to
+		// where they are, and IsTracked (git ls-files) is also cwd-relative, so
+		// both agree from a subdir (#92 review).
+		if _, err := os.Stat(p); err == nil {
 			continue // exists in the working tree
 		}
 		if gitx.IsTracked(p) {
@@ -874,8 +877,8 @@ func cmdCheck(args []string) int {
 		// (no '/' or space) are fuzzy suffix queries and exempt; --allow-missing
 		// opts into checking a genuinely-gone path.
 		if !allowMissing {
-			if unknown := unknownCheckPaths(root, paths, ws); len(unknown) > 0 {
-				ui.Err("wt check: no such path(s) — refusing to report 'clear' for path(s) that don't exist, aren't tracked, and no window is touching: %s. (typo? zsh didn't word-split a $var? use --allow-missing for a deleted/other-branch path.)", strings.Join(unknown, ", "))
+			if unknown := unknownCheckPaths(paths, ws); len(unknown) > 0 {
+				ui.Err("wt check: no such path(s) — refusing to report 'clear' for path(s) that don't exist, aren't tracked, and no window is touching: %s. (typo, or zsh didn't word-split a $var? checking a path you're about to CREATE, or one that's deleted/on another branch? re-run with --allow-missing.)", strings.Join(unknown, ", "))
 				return 64
 			}
 		}

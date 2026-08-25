@@ -58,6 +58,29 @@ func run(dir string, args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
+// StagedFiles returns the paths staged for the IN-PROGRESS commit. It PRESERVES
+// git's ambient environment (unlike run(), which strips GIT_INDEX_FILE) because
+// git points GIT_INDEX_FILE at a TEMPORARY index for a partial commit
+// (`git commit -a` / `-p` / `--only` / `-- <paths>`) — the on-disk index does
+// NOT yet reflect what's being committed. Stripping it makes `git diff --cached`
+// read the stale index and mis-report the staged set, so the pre-commit
+// collision notice would miss (or over-report) collisions (#92 review). This is
+// the invoking worktree's OWN read, so the ambient env is correct here — only
+// the cross-worktree `-C dir` scans need scopedEnv.
+func StagedFiles() ([]string, error) {
+	out, err := exec.Command("git", "diff", "--cached", "--name-only").Output()
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, ln := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if s := strings.TrimSpace(ln); s != "" {
+			files = append(files, s)
+		}
+	}
+	return files, nil
+}
+
 // Run executes git in the current directory.
 func Run(args ...string) (string, error) { return run("", args...) }
 

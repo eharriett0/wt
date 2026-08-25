@@ -410,8 +410,10 @@ func HookPreCommit(c *config.Config) int {
 		return 0
 	}
 
-	staged, _ := gitx.Run("diff", "--cached", "--name-only")
-	stagedFiles := nonEmptyLines(staged)
+	// StagedFiles honors git's hook-provided temporary index (GIT_INDEX_FILE) so
+	// a partial commit (`git commit -a`/-p/--only/pathspec) reports the correct
+	// staged set — a plain env-scoped read would strip it and miss collisions (#92).
+	stagedFiles, _ := gitx.StagedFiles()
 
 	ws, err := collide.Scan(c)
 	if err != nil {
