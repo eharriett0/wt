@@ -265,16 +265,35 @@ func repoRootOrEmpty() string {
 // brand-new branch (remote sha all-zero) it diffs the last-known base, so the
 // full branch is checked. Best-effort — empty on any git error.
 func outgoingPaths(base, localSHA, remoteSHA string) []string {
-	from := remoteSHA
-	if gitx.AllZeroSHA(remoteSHA) {
-		if b := gitx.ResolveRemoteBase(base); b != "" {
-			from = b
-		} else {
-			from = base
-		}
-	}
+	remoteIsAncestor := !gitx.AllZeroSHA(remoteSHA) && gitx.IsAncestor(remoteSHA, localSHA)
+	from := outgoingFrom(base, remoteSHA, remoteIsAncestor, gitx.ResolveRemoteBase(base))
 	paths, _ := gitx.RangeChangedPaths(from, localSHA)
 	return paths
+}
+
+// outgoingFrom decides which ref the outgoing range is measured FROM. Pure, so
+// the three cases are table-testable without a live repo.
+//
+//   - fast-forward update — the remote head IS an ancestor, so remote..local is
+//     exactly the new commits. Use it; it is the most precise answer.
+//   - brand-new branch — remote sha is all-zero; nothing on the remote to diff
+//     against, so measure the whole branch against the base.
+//   - NON-fast-forward (#106) — the remote head is no longer an ancestor, which
+//     is what `git rebase origin/main && git push --force-with-lease` produces.
+//     remote..local would walk THROUGH the base's commits and report every file
+//     the base gained as "outgoing", so the hook blocked on files the pusher had
+//     never touched — and the further behind the branch was, the more it invented.
+//     That contradicted `wt check` on identical input (the equality #92 restored),
+//     and it fired precisely when someone did the recommended thing and rebased.
+//     Measure against the base instead: what this branch contributes over it.
+func outgoingFrom(base, remoteSHA string, remoteIsAncestor bool, resolvedBase string) string {
+	if !gitx.AllZeroSHA(remoteSHA) && remoteIsAncestor {
+		return remoteSHA
+	}
+	if resolvedBase != "" {
+		return resolvedBase
+	}
+	return base
 }
 
 // warnBaseDrift runs the offline #78 base-drift check for one outgoing ref. A

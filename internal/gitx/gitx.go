@@ -369,6 +369,19 @@ func AllZeroSHA(ref string) bool {
 	return ref != "" && strings.Trim(ref, "0") == ""
 }
 
+// IsAncestor reports whether maybeAncestor is an ancestor of descendant
+// (`git merge-base --is-ancestor`). False on any error — including an unknown
+// ref, which is the right default for the caller (#106): if we cannot prove the
+// remote head is still in this branch's history, treat the push as non-ff and
+// measure from the base rather than walking through unrelated commits.
+func IsAncestor(maybeAncestor, descendant string) bool {
+	if strings.TrimSpace(maybeAncestor) == "" || strings.TrimSpace(descendant) == "" {
+		return false
+	}
+	_, err := Run("merge-base", "--is-ancestor", maybeAncestor, descendant)
+	return err == nil
+}
+
 // RangeChangedPaths returns the repo-relative paths changed between two commits
 // (`git diff --name-only from..to`). Used by the pre-push collision check (#74)
 // to scope the check to the OUTGOING commits, not the whole worktree.
