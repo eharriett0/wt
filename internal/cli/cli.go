@@ -104,6 +104,8 @@ func Main(args []string) int {
 		return cmdWhere(rest)
 	case "install-hooks":
 		return cmdInstallHooks(rest)
+	case "install-claude-hook":
+		return cmdInstallClaudeHook(rest)
 	case "announce":
 		return cmdAnnounce(rest)
 	case "inbox":
@@ -978,6 +980,12 @@ func runHook(args []string) int {
 	// config and must always exit 0 (never disrupt the editing session).
 	if args[0] == "todo-write" {
 		return hookTodoWrite(os.Stdin)
+	}
+	// claude-edit is a Claude Code PreToolUse hook (#95): it derives the repo
+	// from its stdin payload's cwd and always exits 0 (advisory), so it too runs
+	// without a pre-loaded config.
+	if args[0] == "claude-edit" {
+		return hookClaudeEdit(os.Stdin)
 	}
 	c, err := config.Load()
 	if err != nil {
