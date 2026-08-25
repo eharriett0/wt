@@ -166,11 +166,12 @@ func cmdClean(args []string) int {
 	apply := fs.Bool("y", false, "actually remove the shipped worktrees (default: list only)")
 	fs.BoolVar(apply, "yes", false, "alias for -y")
 	staleIndex := fs.Bool("stale-index", false, "ALSO report merged-PR worktrees holding a leftover uncommitted index that a plain clean silently leaves (prints the manual remove command; never auto-discards) (#88)")
+	allRoots := fs.Bool("all-roots", false, "ALSO evaluate worktrees outside worktree_root (e.g. a legacy worktree root) — the collision engine scans them and they can block a push that a default clean never clears (#101)")
 	if err := fs.Parse(args); err != nil {
 		return 64
 	}
 	return withConfig(func(c *config.Config) int {
-		if err := worktree.Clean(c, *apply, *staleIndex); err != nil {
+		if err := worktree.Clean(c, *apply, *staleIndex, *allRoots); err != nil {
 			ui.Err("%v", err)
 			return 1
 		}

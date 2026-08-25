@@ -390,13 +390,32 @@ func gradeConflicts(c *config.Config, active []collide.Conflict, root string, ws
 		wtByLabel[w.Label()] = w.Worktree
 	}
 	for _, cf := range active {
-		if collide.IsSharedDoc(cf.Path, c.SharedDocs) || collide.IsAppendOnly(cf.Path, c.AppendOnlyPaths) {
-			soft = append(soft, cf)
-			continue
-		}
 		rangesPath := cf.MatchedFile
 		if rangesPath == "" {
 			rangesPath = cf.Path
+		}
+		if collide.IsSharedDoc(cf.Path, c.SharedDocs) {
+			// #98: a STRUCTURED shared doc (configured section delimiter) grades
+			// by SECTION, exactly as `wt check` does — both windows editing the
+			// SAME section is HARD; disjoint sections stay advisory. Without this
+			// the hooks stopped at the blanket shared-doc advisory, so the one
+			// case a structured doc is configured to catch — two windows in the
+			// same lane of a hand-merged doc — blocked in `wt check` and sailed
+			// straight through the pre-push guard.
+			if delim, isStructured := c.StructuredDocs[filepath.Base(cf.Path)]; isStructured {
+				if shared, graded := collide.SharedSectionsAcross(
+					c.Base, []string{root, wtByLabel[cf.Window]}, rangesPath, delim, collide.RangeFn(ranges),
+				); graded && len(shared) > 0 {
+					hard = append(hard, cf)
+					continue
+				}
+			}
+			soft = append(soft, cf)
+			continue
+		}
+		if collide.IsAppendOnly(cf.Path, c.AppendOnlyPaths) {
+			soft = append(soft, cf)
+			continue
 		}
 		cur := ranges(root, c.Base, rangesPath)
 		other := ranges(wtByLabel[cf.Window], c.Base, rangesPath)

@@ -195,7 +195,41 @@ func New(c *config.Config, branch string) (string, error) {
 // (the #88 review), and discarding uncommitted work wt can't prove is cruft is a
 // permanent-loss footgun. It surfaces the worktree + the manual command so the
 // operator inspects the changes and makes the destructive decision themselves.
-func Clean(c *config.Config, apply, staleIndex bool) error {
+// ManagedByClean reports whether `wt clean` should evaluate a worktree at all.
+//
+// Pure decision behind #101. By default clean only manages worktrees under the
+// configured worktree_root — but the COLLISION ENGINE scans every worktree git
+// knows about. A repo whose worktree_root ever changed (a legacy `<repo>.worktrees`
+// beside the current `<repo>-worktrees`, say) therefore accumulates worktrees that
+// are authoritative enough to hard-block a push and out of scope for the one
+// command whose job is removing worktrees that should no longer matter. Left
+// alone they never age out either, because dormant-branch suppression is gated on
+// max_age, which is unset in a repo with no .wt.conf.
+//
+// Suppressing them in the collision engine instead would be the wrong direction:
+// a worktree outside the root is still a real window that may be actively editing,
+// and a false negative there is worse than the noise. So clean grows the reach.
+func ManagedByClean(wtPath, root string, allRoots bool) bool {
+	return allRoots || under(wtPath, root)
+}
+
+// ReapableBranch reports whether a worktree's branch is even a CANDIDATE for
+// reaping, before any shipped-ness is considered.
+//
+// The base branch is the load-bearing case. A worktree checked out on the base
+// is not shipped work, it is a base checkout — but "patch-equivalent on base" is
+// trivially true for the base itself, so every downstream verdict says "shipped,
+// safe to remove" and the printed command is `git branch -D main`.
+//
+// Surfaced by the #101 e2e: a legacy out-of-root worktree sat on main, and
+// widening clean's reach would have armed a footgun the under-root filter had
+// been hiding by accident rather than by design. Widening a blast radius means
+// re-checking what the old narrowness was silently protecting.
+func ReapableBranch(branch, base string) bool {
+	return branch != "" && branch != "HEAD" && branch != base
+}
+
+func Clean(c *config.Config, apply, staleIndex, allRoots bool) error {
 	ui.Step("fetching origin/%s", c.Base)
 	_ = gitx.Fetch("origin", c.Base)
 	_ = gitx.WorktreePrune() // #42: drop stale metadata for manually-deleted dirs
@@ -211,16 +245,27 @@ func Clean(c *config.Config, apply, staleIndex bool) error {
 
 	now := time.Now()
 	removed := 0
+	skippedOutOfRoot := 0
 	for _, wt := range paths[1:] { // skip primary (index 0)
-		if !under(wt, c.WorktreeRoot) {
-			fmt.Printf("# %s — outside worktree root, never offered for cleanup\n", filepath.Base(wt))
+		if !ManagedByClean(wt, c.WorktreeRoot, allRoots) {
+			skippedOutOfRoot++
+			// Say what to DO about it (#101): the old wording ("never offered for
+			// cleanup") read as a safety refusal, so nobody realised these are
+			// exactly the worktrees that go on blocking pushes forever.
+			fmt.Printf("# %s — outside worktree root; `wt clean --all-roots` evaluates it  (%s)\n", filepath.Base(wt), wt)
 			continue
 		}
 		if !isDir(wt) {
 			continue
 		}
 		br, err := gitx.CurrentBranchIn(wt)
-		if err != nil || br == "" || br == "HEAD" {
+		if err != nil {
+			continue
+		}
+		if !ReapableBranch(br, c.Base) {
+			if br == c.Base {
+				ui.Info("%s — checked out on the base branch, never reaped", filepath.Base(wt))
+			}
 			continue
 		}
 		// #61 safety: freshly-created worktrees are protected by a grace window so
@@ -274,7 +319,9 @@ func Clean(c *config.Config, apply, staleIndex bool) error {
 			continue
 		}
 		// apply: remove it (never force — refuse to discard uncommitted work).
-		if err := Remove(c, wt, br, false); err != nil {
+		// allRoots relaxes ONLY the under-root guard; every data-loss guard above
+		// (grace window, upstream, cherry/PR-merged proof, clean tree) still ran.
+		if err := remove(c, wt, br, false, allRoots); err != nil {
 			ui.Warn("skipped %s: %v", br, err)
 			continue
 		}
@@ -289,6 +336,11 @@ func Clean(c *config.Config, apply, staleIndex bool) error {
 	} else if removed == 0 {
 		ui.Info("re-run with `wt clean -y` to remove the shipped worktrees listed above")
 	}
+	if skippedOutOfRoot > 0 {
+		// The whole point of #101: these still collide, so "clean says nothing to
+		// do" must not read as "nothing can be blocking you".
+		ui.Info("%d worktree(s) live outside %s and were NOT evaluated — the collision engine still scans them, so they can block a push that clean won't clear. Re-run with --all-roots to include them.", skippedOutOfRoot, c.WorktreeRoot)
+	}
 	return nil
 }
 
@@ -302,7 +354,16 @@ func Clean(c *config.Config, apply, staleIndex bool) error {
 //   - a failed branch delete is a warning, not an error (the worktree is
 //     already gone; a lingering local branch is harmless).
 func Remove(c *config.Config, wtPath, branch string, force bool) error {
-	if !under(wtPath, c.WorktreeRoot) {
+	return remove(c, wtPath, branch, force, false)
+}
+
+// remove is Remove with the under-root guard optionally relaxed for `wt clean
+// --all-roots` (#101). allowOutsideRoot ONLY widens which directories are in
+// scope — it never relaxes the uncommitted-work guard, and callers must still
+// have proven the branch shipped. Kept unexported so the safe Remove stays the
+// only entry point everything else can reach.
+func remove(c *config.Config, wtPath, branch string, force, allowOutsideRoot bool) error {
+	if !ManagedByClean(wtPath, c.WorktreeRoot, allowOutsideRoot) {
 		return fmt.Errorf("not under worktree root %s — refusing to remove", c.WorktreeRoot)
 	}
 	if !force && !gitx.IsClean(wtPath) {
@@ -312,6 +373,13 @@ func Remove(c *config.Config, wtPath, branch string, force bool) error {
 		return fmt.Errorf("git worktree remove: %w", err)
 	}
 	ui.OK("removed worktree %s", filepath.Base(wtPath))
+	if branch == c.Base {
+		// Defense in depth alongside Clean's own guard: removing a base checkout
+		// is fine, deleting the base branch is not. `wt release --clean` reaches
+		// here too, so the refusal belongs at the delete, not only at the caller.
+		ui.Info("kept branch %s — it is the base branch", branch)
+		return nil
+	}
 	if branch != "" && branch != "HEAD" {
 		if err := gitx.BranchDelete(branch); err != nil {
 			ui.Warn("branch %s not deleted (harmless): %v", branch, err)

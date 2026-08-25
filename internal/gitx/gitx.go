@@ -402,6 +402,20 @@ func ResolveRemoteBase(base string) string {
 	return ""
 }
 
+// RemoteURL returns the configured URL for a remote ("" when the remote does
+// not exist). Used to work out which forge host this repo actually talks to,
+// so gh-auth checks can be scoped to it rather than assuming github.com (#100).
+func RemoteURL(remote string) string {
+	if remote == "" {
+		remote = "origin"
+	}
+	out, err := Run("remote", "get-url", remote)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
 // BehindCount returns how many commits base is ahead of head (`git rev-list
 // --count head..base`) — the "behind main by N" signal (#78). -1 when it can't
 // be computed (bad refs), so the caller can suppress the line rather than lie.

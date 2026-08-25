@@ -51,12 +51,31 @@ docs live in [README.md](README.md); this file is for working *on* wt.
 - **The hook block predicate MUST equal `wt check`.** Advisory means advisory in
   both; disjoint hunks don't block in either. `pushCollisionBlocks` mirrors
   `buildCheckReport`'s hunk grading on purpose (#92). If you change the grading,
-  change both (or they'll disagree and get bypassed).
+  change both (or they'll disagree and get bypassed). The **structured-doc
+  SECTION grade** is part of that equality (#98) and is single-sourced in
+  `collide.SharedSectionsAcross` — the hooks used to stop at the blanket
+  shared-doc advisory, so the one case `structured_doc` exists to catch (two
+  windows in the same lane) blocked in `check` and sailed through pre-push.
 - **`wt clean` is data-loss-critical.** `ReapVerdict` only reaps a *provably
   shipped* worktree (grace window, upstream, merged PR / cherry). Never
   force-remove a dirty worktree automatically — `--stale-index` is
   **report-only** because a MERGED PR proves only the *committed* work shipped;
-  the dirty index could be fresh post-merge work (#88).
+  the dirty index could be fresh post-merge work (#88). **Never reap a worktree
+  on the BASE branch** (`ReapableBranch`): "patch-equivalent on base" is
+  trivially true for the base itself, so every downstream verdict says shipped
+  and the printed command becomes `git branch -D main` (#101).
+- **Scope-widening re-opens what narrowness was hiding.** The base-branch footgun
+  above was latent for as long as `clean` skipped everything outside
+  `worktree_root` — an accident, not a guard. `--all-roots` (#101) armed it, and
+  the e2e smoke is what caught it. When you widen a blast radius, re-derive which
+  guards were load-bearing *by luck*.
+- **`clean`'s reach and the collision engine's reach must not drift apart.** The
+  engine scans EVERY worktree git knows about; if `clean` manages fewer, the
+  difference is a set of worktrees that can hard-block a push with no in-tool way
+  to clear them — they never age out either, since dormant suppression is gated
+  on `max_age`, unset without a `.wt.conf` (#101). Suppressing them in the engine
+  would be the wrong direction: an out-of-root worktree is still a live window,
+  and a false negative there is worse than the noise.
 - **gitx env-scoping (#92).** `run`/`runRaw` strip `GIT_DIR`/`GIT_INDEX_FILE`/
   `GIT_WORK_TREE`/… (git sets these for a running hook, pinned to the invoking
   worktree) so per-worktree `git -C dir` commands discover from their own dir.
