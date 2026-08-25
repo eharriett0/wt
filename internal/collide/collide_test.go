@@ -416,3 +416,22 @@ func TestIsAppendOnly_DoubleStar(t *testing.T) {
 		t.Error("unrelated path must not match")
 	}
 }
+
+func TestPathTouchedByAny(t *testing.T) {
+	ws := []Window{
+		{Worktree: "/w/1", Touched: []string{"internal/foo.go", "docs/x.md"}},
+		{Worktree: "/w/2", Touched: []string{"cmd/main.go"}},
+	}
+	// exact + suffix + basename all match a touched file (#93 real-path signal).
+	for _, p := range []string{"internal/foo.go", "foo.go", "docs/x.md", "cmd/main.go", "main.go"} {
+		if !PathTouchedByAny(p, ws) {
+			t.Errorf("PathTouchedByAny(%q) = false, want true", p)
+		}
+	}
+	// a typo / genuinely-untouched path matches nothing.
+	for _, p := range []string{"internal/fooo.go", "nope/typo.go", "", "  "} {
+		if PathTouchedByAny(p, ws) {
+			t.Errorf("PathTouchedByAny(%q) = true, want false", p)
+		}
+	}
+}

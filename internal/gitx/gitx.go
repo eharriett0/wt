@@ -4,6 +4,7 @@ package gitx
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -12,6 +13,39 @@ import (
 	"time"
 )
 
+// gitScopeEnvVars are the environment variables git sets for a running hook
+// that PIN a git subprocess to a specific repo/worktree/index — overriding the
+// cwd/`-C dir` discovery every per-worktree command in wt relies on. Under a
+// pre-push/pre-commit hook these are set to the INVOKING worktree, so a
+// collision scan's `git -C otherworktree status` would read the invoking
+// worktree's index instead — making every window look like it holds the
+// pusher's changes (self-reference + phantom dirty-state, #92). We strip them so
+// every git command does clean discovery from its own dir.
+var gitScopeEnvVars = []string{
+	"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX",
+	"GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_NAMESPACE",
+}
+
+// scopedEnv returns the current environment with the repo/worktree-pinning git
+// vars removed, so a git subprocess discovers its repo from cwd / -C dir.
+func scopedEnv() []string {
+	env := os.Environ()
+	out := env[:0:0]
+	for _, kv := range env {
+		drop := false
+		for _, v := range gitScopeEnvVars {
+			if strings.HasPrefix(kv, v+"=") {
+				drop = true
+				break
+			}
+		}
+		if !drop {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
 // run executes git with args in dir ("" = current dir) and returns trimmed
 // stdout. stderr is discarded; callers branch on err.
 func run(dir string, args ...string) (string, error) {
@@ -19,6 +53,7 @@ func run(dir string, args ...string) (string, error) {
 	if dir != "" {
 		cmd.Dir = dir
 	}
+	cmd.Env = scopedEnv()
 	out, err := cmd.Output()
 	return strings.TrimSpace(string(out)), err
 }
@@ -37,6 +72,7 @@ func runRaw(dir string, args ...string) (string, error) {
 	if dir != "" {
 		cmd.Dir = dir
 	}
+	cmd.Env = scopedEnv()
 	out, err := cmd.Output()
 	return string(out), err
 }
@@ -278,6 +314,14 @@ func IsInsideWorktree(dir string) bool {
 	return err == nil && strings.TrimSpace(out) == "true"
 }
 
+// IsTracked reports whether path is known to git — tracked in the index (so a
+// path deleted in the working tree but still in git returns true). Used by
+// `wt check` to distinguish a deleted/renamed path from a typo (#93).
+func IsTracked(path string) bool {
+	_, err := Run("ls-files", "--error-unmatch", "--", path)
+	return err == nil
+}
+
 // CountUnshipped counts cherry "+" lines (commits with no patch-equivalent on
 // base). Zero means the branch is fully shipped (squash-merge safe).
 func CountUnshipped(base, branchRef string) (int, error) {
@@ -359,6 +403,7 @@ func BehindCount(head, base string) int {
 // will get NO CI until rebased" warning.
 func MergeTreeConflicts(base, head string) (paths []string, conflicted bool, err error) {
 	cmd := exec.Command("git", "merge-tree", "--write-tree", "--name-only", base, head)
+	cmd.Env = scopedEnv()
 	out, runErr := cmd.Output()
 	if runErr == nil {
 		return nil, false, nil // exit 0 → clean merge

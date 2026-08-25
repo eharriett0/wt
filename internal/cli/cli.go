@@ -780,7 +780,7 @@ func taggedWindows(windows []string, live map[string]collide.WindowLiveness) []s
 // returned as unknownFlag so the caller REJECTS it instead of silently treating
 // a typo as a path — a mistyped flag must never produce a false "clear" (#30).
 // Everything after a "--" is a path (so a genuine '-'-prefixed filename works).
-func parseCheckArgs(args []string) (paths []string, includeStale, showDiff, asJSON, blocking bool, maxAge, unknownFlag string) {
+func parseCheckArgs(args []string) (paths []string, includeStale, showDiff, asJSON, blocking, allowMissing bool, maxAge, unknownFlag string) {
 	afterDashes := false
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -799,6 +799,8 @@ func parseCheckArgs(args []string) (paths []string, includeStale, showDiff, asJS
 			asJSON = true
 		case a == "--blocking" || a == "-blocking":
 			blocking = true
+		case a == "--allow-missing" || a == "-allow-missing":
+			allowMissing = true
 		case a == "--max-age" || a == "-max-age": // value in the next token (#48)
 			if i+1 < len(args) {
 				maxAge = args[i+1]
@@ -817,16 +819,42 @@ func parseCheckArgs(args []string) (paths []string, includeStale, showDiff, asJS
 	return
 }
 
+// unknownCheckPaths returns the requested paths that are almost certainly typos
+// (#93): they look like a real path (contain '/' or whitespace) yet don't exist
+// in the working tree, aren't tracked by git, and aren't touched by any window.
+// A bare basename (no '/' or whitespace) is a legitimate fuzzy suffix query and
+// is never flagged.
+func unknownCheckPaths(root string, paths []string, ws []collide.Window) []string {
+	var out []string
+	for _, p := range paths {
+		p = strings.TrimSpace(p)
+		if p == "" || !strings.ContainsAny(p, "/ \t") {
+			continue // bare basename → fuzzy query, exempt
+		}
+		if _, err := os.Stat(filepath.Join(root, p)); err == nil {
+			continue // exists in the working tree
+		}
+		if gitx.IsTracked(p) {
+			continue // deleted-but-tracked path (legit)
+		}
+		if collide.PathTouchedByAny(p, ws) {
+			continue // a window is genuinely touching it (collision / other-branch path)
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
 func cmdCheck(args []string) int {
 	// paths are positional and flags may appear anywhere (a plain flag.Parse
 	// would stop at the first positional), so we scan manually.
-	paths, includeStale, showDiff, asJSON, blocking, maxAge, unknownFlag := parseCheckArgs(args)
+	paths, includeStale, showDiff, asJSON, blocking, allowMissing, maxAge, unknownFlag := parseCheckArgs(args)
 	if unknownFlag != "" {
-		ui.Err("wt check: unknown flag %q — a typo'd flag must not be checked as a path (that would falsely report 'clear'). Known: --include-stale --show-diff --json --blocking. Use `--` to check a path that starts with '-'.", unknownFlag)
+		ui.Err("wt check: unknown flag %q — a typo'd flag must not be checked as a path (that would falsely report 'clear'). Known: --include-stale --show-diff --json --blocking --allow-missing. Use `--` to check a path that starts with '-'.", unknownFlag)
 		return 64
 	}
 	if len(paths) == 0 {
-		ui.Err("usage: wt check [--include-stale] [--show-diff] [--json] [--blocking] <path> [path...]")
+		ui.Err("usage: wt check [--include-stale] [--show-diff] [--json] [--blocking] [--allow-missing] <path> [path...]")
 		return 64
 	}
 	return withConfig(func(c *config.Config) int {
@@ -840,6 +868,17 @@ func cmdCheck(args []string) int {
 			return 1
 		}
 		root, _ := gitx.RepoRoot()
+		// #93: refuse a path that doesn't exist in the working tree, isn't tracked
+		// by git, and isn't touched by any window — a typo (or a zsh non-word-split
+		// single arg) that would otherwise falsely report '✓ clear'. Bare basenames
+		// (no '/' or space) are fuzzy suffix queries and exempt; --allow-missing
+		// opts into checking a genuinely-gone path.
+		if !allowMissing {
+			if unknown := unknownCheckPaths(root, paths, ws); len(unknown) > 0 {
+				ui.Err("wt check: no such path(s) — refusing to report 'clear' for path(s) that don't exist, aren't tracked, and no window is touching: %s. (typo? zsh didn't word-split a $var? use --allow-missing for a deleted/other-branch path.)", strings.Join(unknown, ", "))
+				return 64
+			}
+		}
 		entries := buildCheckReport(c, ws, root, paths, includeStale)
 		if asJSON {
 			return renderCheckJSON(entries, includeStale)
