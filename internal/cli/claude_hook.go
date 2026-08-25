@@ -174,10 +174,20 @@ func hookClaudeEdit(r io.Reader) int {
 	// overlap fires with the "overlapping" wording. When the region can't be
 	// located (Write, or old_string not uniquely found), keep it but word it as a
 	// file-level heads-up instead of overstating a hunk overlap it can't compute.
+	// The pending-edit re-grade is only FRAME-SAFE when this worktree's file is
+	// unchanged vs base: then the agent's pending edit, located by line number in
+	// the on-disk file, is in the same (base) line frame as e.OtherRanges
+	// (ChangedRanges → base-side hunk coords). If the current file has already
+	// diverged from base, the frames skew by the net line-delta above the edit, so
+	// re-grading could DROP a real overlap — there we keep the entry and word it
+	// file-level instead of silently suppressing it.
+	curEmpty := len(gitx.ChangedRanges(root, c.Base, rel)) == 0
 	var pending []gitx.LineRange
 	pendingOK := false
-	if data, err := os.ReadFile(filepath.Join(root, rel)); err == nil {
-		pending, pendingOK = claudeEditRanges(b, string(data))
+	if curEmpty {
+		if data, err := os.ReadFile(filepath.Join(root, rel)); err == nil {
+			pending, pendingOK = claudeEditRanges(b, string(data))
+		}
 	}
 
 	var high []CheckEntry
@@ -188,10 +198,11 @@ func hookClaudeEdit(r io.Reader) int {
 		}
 		if pendingOK && len(e.OtherRanges) > 0 {
 			if collide.ConflictSeverity(pending, e.OtherRanges, false) != collide.SevHigh {
-				continue // pending edit is disjoint from the other window — not a real overlap
+				continue // frame-safe (cur empty): pending disjoint from other → not a real overlap
 			}
+			// confirmed overlap in a shared frame → keep, "OVERLAPS" wording
 		} else {
-			fileLevel = true // couldn't confirm hunk overlap → honest file-level wording
+			fileLevel = true // couldn't confirm a frame-safe hunk overlap → file-level wording
 		}
 		high = append(high, e)
 	}
