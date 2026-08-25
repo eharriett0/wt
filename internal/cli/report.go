@@ -76,6 +76,19 @@ type CheckEntry struct {
 	OtherRanges    []gitx.LineRange `json:"other_ranges,omitempty"`
 	OverlapSpans   []gitx.LineRange `json:"overlap_spans,omitempty"`
 	SharedSections []string         `json:"shared_sections,omitempty"` // #22: same section(s) both windows edit → HIGH
+	AlreadyMerged  bool             `json:"already_merged,omitempty"`  // #109: other window's blob == origin/base — stale index, not a live collision
+}
+
+// alreadyMerged reports whether the other window's content for path is byte-
+// identical to origin/base — already-merged work sitting in a stale index, not a
+// live collision (#109). Fails safe: unknown (no upstream ref, unreadable blob)
+// → false, so the collision keeps its normal grade.
+func alreadyMerged(otherWorktree, base, path string) bool {
+	if otherWorktree == "" {
+		return false
+	}
+	merged, known := collide.PathMatchesUpstream(otherWorktree, base, path)
+	return known && merged
 }
 
 // buildCheckReport classifies + hunk-grades every conflict for the requested
@@ -91,9 +104,24 @@ func buildCheckReport(c *config.Config, ws []collide.Window, currentWorktree str
 		wl := live[cf.Window]
 		e := CheckEntry{Path: cf.Path, Window: cf.Window, Liveness: wl.Label()}
 
+		// Use the resolved repo-relative file (cf.MatchedFile) for hunk / blob
+		// lookup — cf.Path may be a basename that git pathspec can't resolve for a
+		// nested file.
+		rangesPath := cf.MatchedFile
+		if rangesPath == "" {
+			rangesPath = cf.Path
+		}
+		otherWt := byLabel[cf.Window].Worktree
+
 		switch {
 		case wl.Level.IsSuppressed():
 			e.Category, e.Severity = CatStale, "low"
+		case alreadyMerged(otherWt, c.Base, rangesPath):
+			// #109: a stale index/worktree holding ALREADY-MERGED content (blob
+			// identical to origin/base) is not a live collision — nothing unmerged
+			// to clash with. Surface it (still listed) as informational, not HIGH,
+			// so it's distinguishable from a real one instead of blocking on nothing.
+			e.Category, e.Severity, e.AlreadyMerged = CatFYI, "low", true
 		case collide.IsSharedDoc(cf.Path, c.SharedDocs):
 			e.Category, e.Severity = CatAdvisory, "low"
 			// #22: a STRUCTURED shared doc (configured section delimiter) grades
@@ -101,30 +129,18 @@ func buildCheckReport(c *config.Config, ws []collide.Window, currentWorktree str
 			// sections stay advisory. Falls back to the blanket advisory when it
 			// can't section-grade (not structured / bad regexp / doc untracked).
 			if delim, isStructured := c.StructuredDocs[filepath.Base(cf.Path)]; isStructured {
-				rel := cf.MatchedFile
-				if rel == "" {
-					rel = cf.Path
-				}
-				other := byLabel[cf.Window].Worktree
-				if shared, graded := sharedSectionsAcross(c, []string{currentWorktree, other}, rel, delim); graded && len(shared) > 0 {
+				if shared, graded := sharedSectionsAcross(c, []string{currentWorktree, otherWt}, rangesPath, delim); graded && len(shared) > 0 {
 					e.Category, e.Severity = CatBlocking, "HIGH"
 					e.SharedSections = shared
 				}
 			}
 		default:
 			appendOnly := collide.IsAppendOnly(cf.Path, c.AppendOnlyPaths)
-			// Use the resolved repo-relative file (cf.MatchedFile) for hunk
-			// lookup — cf.Path may be a basename that git pathspec can't resolve
-			// for a nested file.
-			rangesPath := cf.MatchedFile
-			if rangesPath == "" {
-				rangesPath = cf.Path
-			}
 			var cur, other []gitx.LineRange
 			if !appendOnly {
 				cur = gitx.ChangedRanges(currentWorktree, c.Base, rangesPath)
-				if w, ok := byLabel[cf.Window]; ok {
-					other = gitx.ChangedRanges(w.Worktree, c.Base, rangesPath)
+				if otherWt != "" {
+					other = gitx.ChangedRanges(otherWt, c.Base, rangesPath)
 				}
 			}
 			e.OtherRanges = other
@@ -242,6 +258,13 @@ func printCheckAdvisories(advisory, fyi []CheckEntry, showDiff bool) {
 		}
 	}
 	for _, e := range fyi {
+		if e.AlreadyMerged {
+			// #109: not a real collision — the other window's content for this path
+			// is byte-identical to the upstream base (already-merged work in a stale
+			// index). Still listed so it stays visible, not silently dropped.
+			fmt.Fprintln(os.Stderr, "   "+ui.Dim(fmt.Sprintf("%s ← %s [%s] · content identical to upstream base — already merged", e.Path, e.Window, e.Liveness)))
+			continue
+		}
 		msg := "disjoint hunks"
 		if len(e.OtherRanges) == 0 {
 			msg = "append-only / low-risk"

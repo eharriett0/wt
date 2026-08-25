@@ -399,6 +399,28 @@ func RangeChangedPaths(from, to string) ([]string, error) {
 	return paths, nil
 }
 
+// WorktreeBlob returns the git blob hash of the WORKING-TREE file at path inside
+// worktree (`git hash-object`), and whether it could be hashed. Lets a caller
+// compare a window's on-disk content against a ref without a diff (#109).
+func WorktreeBlob(worktree, path string) (string, bool) {
+	out, err := RunDir(worktree, "hash-object", "--", path)
+	if err != nil || out == "" {
+		return "", false
+	}
+	return out, true
+}
+
+// RefBlob returns the git blob hash of path at ref inside worktree (`ref:path`),
+// and whether it resolved. ref "" reads the STAGED blob (`:path`). Absent ref or
+// path → ("", false) via --verify --quiet, so the caller fails safe (#109).
+func RefBlob(worktree, ref, path string) (string, bool) {
+	out, err := RunDir(worktree, "rev-parse", "--verify", "--quiet", ref+":"+path)
+	if err != nil || out == "" {
+		return "", false
+	}
+	return out, true
+}
+
 // ResolveRemoteBase returns the best last-known base ref for offline base-drift
 // checks (#78): the remote-tracking `origin/<base>` if it exists (what the PR
 // will actually merge into), else the local `<base>`, else "" when neither
