@@ -131,6 +131,58 @@ func TestDedupConflicts(t *testing.T) {
 	}
 }
 
+// TestOutgoingFrom is the #106 regression: which ref the pushed range is
+// measured FROM.
+//
+// The bug was that a NON-fast-forward push — plain `git rebase origin/main &&
+// git push --force-with-lease` — kept using the old remote head, so the range
+// walked through the base's commits and reported every file the BASE gained as
+// outgoing. The hook then blocked on files the pusher had never touched, it
+// contradicted `wt check` on identical input, and it got worse the further
+// behind the branch had been. Rebasing onto current main is what armed it.
+func TestOutgoingFrom(t *testing.T) {
+	const zero = "0000000000000000000000000000000000000000"
+	cases := []struct {
+		name             string
+		remoteSHA        string
+		remoteIsAncestor bool
+		resolvedBase     string
+		want             string
+	}{
+		{
+			// Fast-forward: remote..local is EXACTLY the new commits, and is more
+			// precise than base..local. Must not regress to the base.
+			"fast-forward uses the remote head", "abc123", true, "refs/remotes/origin/main", "abc123",
+		},
+		{
+			"brand-new branch measures against the resolved base", zero, false, "refs/remotes/origin/main", "refs/remotes/origin/main",
+		},
+		{
+			// THE FIX.
+			"force-push after rebase measures against the base, not the stale remote head",
+			"abc123", false, "refs/remotes/origin/main", "refs/remotes/origin/main",
+		},
+		{
+			// A remote sha we cannot prove is an ancestor is treated as non-ff.
+			// Failing that way round is right: it over-scopes to the branch's own
+			// diff, rather than inventing files from unrelated history.
+			"unprovable ancestry falls back to the base", "deadbeef", false, "refs/remotes/origin/main", "refs/remotes/origin/main",
+		},
+		{
+			"no resolvable remote base falls back to the bare base name", zero, false, "", "main",
+		},
+		{
+			"force-push with no resolvable remote base still uses the base name", "abc123", false, "", "main",
+		},
+	}
+	for _, tc := range cases {
+		if got := outgoingFrom("main", tc.remoteSHA, tc.remoteIsAncestor, tc.resolvedBase); got != tc.want {
+			t.Errorf("%s: outgoingFrom(base=main, remote=%q, isAncestor=%v, resolved=%q) = %q, want %q",
+				tc.name, tc.remoteSHA, tc.remoteIsAncestor, tc.resolvedBase, got, tc.want)
+		}
+	}
+}
+
 // structuredDoc is laid out so line numbers map to known sections:
 //
 //	1 "# Title"   2 "intro"   3 ""        → preamble ""
