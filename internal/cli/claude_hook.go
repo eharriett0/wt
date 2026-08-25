@@ -46,11 +46,14 @@ func parseClaudeEdit(b []byte) (cwd, file string, relevant bool) {
 	return p.CWD, f, f != ""
 }
 
-// claudeDecision shapes the hook's stdout JSON from the HIGH collisions on the
-// edited file. No collision → ("", false). Advisory (default) → additionalContext
-// (the agent sees it, proceeds). block=true → permissionDecision "deny" (hard
-// stop). Pure — the testable core.
-func claudeDecision(file string, high []CheckEntry, block bool) (string, bool) {
+// claudeDecision shapes the hook's stdout JSON from the collisions kept for the
+// edited file. No collision → ("", false). fileLevel=true means the overlap
+// couldn't be confirmed against the agent's PENDING edit (a Write, or the edit
+// region couldn't be located), so the wording is an honest FILE-LEVEL heads-up
+// that never claims hunk overlap — it can't then contradict `wt check` the way
+// the old always-"overlapping hunks" message did (#108). Advisory (default) →
+// additionalContext; block=true → permissionDecision "deny". Pure.
+func claudeDecision(file string, high []CheckEntry, block, fileLevel bool) (string, bool) {
 	if len(high) == 0 {
 		return "", false
 	}
@@ -63,9 +66,16 @@ func claudeDecision(file string, high []CheckEntry, block bool) (string, bool) {
 		seen[e.Window] = true
 		who = append(who, fmt.Sprintf("%s [%s]", e.Window, e.Liveness))
 	}
-	msg := fmt.Sprintf("wt collision: %s is also being edited by %s (overlapping hunks). "+
-		"Another live window is in this file — coordinate before editing to avoid a merge conflict / duplicate PR. "+
-		"If you've already coordinated, set WT_SKIP_COLLISION=1.", file, strings.Join(who, ", "))
+	var msg string
+	if fileLevel {
+		msg = fmt.Sprintf("wt: %s is also being edited by %s — file-level heads-up (hunk overlap not computed; run `wt check %s` for line-level detail). "+
+			"Coordinate before editing to avoid a merge conflict / duplicate PR. If you've already coordinated, set WT_SKIP_COLLISION=1.",
+			file, strings.Join(who, ", "), file)
+	} else {
+		msg = fmt.Sprintf("wt collision: your edit OVERLAPS a region of %s that %s is also editing. "+
+			"Coordinate before editing to avoid a merge conflict / duplicate PR. If you've already coordinated, set WT_SKIP_COLLISION=1.",
+			file, strings.Join(who, ", "))
+	}
 
 	var out struct {
 		HookSpecificOutput struct {
@@ -154,16 +164,114 @@ func hookClaudeEdit(r io.Reader) int {
 		return 0
 	}
 	entries := buildCheckReport(c, ws, root, []string{rel}, false)
-	var high []CheckEntry
-	for _, e := range entries {
-		if e.Category == CatBlocking {
-			high = append(high, e)
+
+	// #108: the hook fires at PRE-edit time, so buildCheckReport's "current" side
+	// (this worktree's diff vs base) doesn't yet include the edit the agent is
+	// ABOUT to make — an empty current side fail-safes to HIGH, so the hook
+	// reported "overlapping hunks" on files it hadn't touched, contradicting
+	// `wt check`. Re-grade each HIGH against the agent's ACTUAL pending edit range
+	// (located from old_string): a disjoint pending edit is dropped; only a real
+	// overlap fires with the "overlapping" wording. When the region can't be
+	// located (Write, or old_string not uniquely found), keep it but word it as a
+	// file-level heads-up instead of overstating a hunk overlap it can't compute.
+	// The pending-edit re-grade is only FRAME-SAFE when this worktree's file is
+	// unchanged vs base: then the agent's pending edit, located by line number in
+	// the on-disk file, is in the same (base) line frame as e.OtherRanges
+	// (ChangedRanges → base-side hunk coords). If the current file has already
+	// diverged from base, the frames skew by the net line-delta above the edit, so
+	// re-grading could DROP a real overlap — there we keep the entry and word it
+	// file-level instead of silently suppressing it.
+	curEmpty := len(gitx.ChangedRanges(root, c.Base, rel)) == 0
+	var pending []gitx.LineRange
+	pendingOK := false
+	if curEmpty {
+		if data, err := os.ReadFile(filepath.Join(root, rel)); err == nil {
+			pending, pendingOK = claudeEditRanges(b, string(data))
 		}
 	}
-	if out, has := claudeDecision(rel, high, os.Getenv("WT_CLAUDE_HOOK_BLOCK") == "1"); has {
+
+	var high []CheckEntry
+	fileLevel := false
+	for _, e := range entries {
+		if e.Category != CatBlocking {
+			continue
+		}
+		if pendingOK && len(e.OtherRanges) > 0 {
+			if collide.ConflictSeverity(pending, e.OtherRanges, false) != collide.SevHigh {
+				continue // frame-safe (cur empty): pending disjoint from other → not a real overlap
+			}
+			// confirmed overlap in a shared frame → keep, "OVERLAPS" wording
+		} else {
+			fileLevel = true // couldn't confirm a frame-safe hunk overlap → file-level wording
+		}
+		high = append(high, e)
+	}
+
+	if out, has := claudeDecision(rel, high, os.Getenv("WT_CLAUDE_HOOK_BLOCK") == "1", fileLevel); has {
 		fmt.Println(out)
 	}
 	return 0
+}
+
+// locateRange finds old in content and returns the 1-based inclusive line range
+// it spans. ok=false when old is empty, absent, or occurs more than once
+// (ambiguous — Edit requires a unique old_string, but be safe). Pure.
+func locateRange(content, old string) (gitx.LineRange, bool) {
+	if old == "" || strings.Count(content, old) != 1 {
+		return gitx.LineRange{}, false
+	}
+	i := strings.Index(content, old)
+	start := 1 + strings.Count(content[:i], "\n")
+	// end = line of the LAST character: a trailing "\n" terminates its own line,
+	// it doesn't extend the range into the next one ("line2\n" spans line 2 only).
+	end := start + strings.Count(old, "\n")
+	if strings.HasSuffix(old, "\n") {
+		end--
+	}
+	return gitx.LineRange{Start: start, End: end}, true
+}
+
+// claudeEditRanges returns the line ranges a pending Edit/MultiEdit will touch,
+// by locating each old_string in the CURRENT (pre-edit) file content. ok=false
+// for Write (whole-file, no region), or any old_string that can't be uniquely
+// located — the caller then falls back to a file-level heads-up rather than claim
+// a hunk overlap it can't compute. Pure — the testable core.
+func claudeEditRanges(raw []byte, content string) ([]gitx.LineRange, bool) {
+	var p struct {
+		ToolName  string `json:"tool_name"`
+		ToolInput struct {
+			OldString string `json:"old_string"`
+			Edits     []struct {
+				OldString string `json:"old_string"`
+			} `json:"edits"`
+		} `json:"tool_input"`
+	}
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return nil, false
+	}
+	var olds []string
+	switch p.ToolName {
+	case "Edit":
+		olds = []string{p.ToolInput.OldString}
+	case "MultiEdit":
+		for _, e := range p.ToolInput.Edits {
+			olds = append(olds, e.OldString)
+		}
+	default:
+		return nil, false // Write / unknown → no locatable region
+	}
+	if len(olds) == 0 {
+		return nil, false
+	}
+	var ranges []gitx.LineRange
+	for _, old := range olds {
+		r, ok := locateRange(content, old)
+		if !ok {
+			return nil, false // ambiguous / not found → file-level fallback
+		}
+		ranges = append(ranges, r)
+	}
+	return ranges, true
 }
 
 // claudeHookSnippet is the .claude/settings.json entry that wires the hook.
