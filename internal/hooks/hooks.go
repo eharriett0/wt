@@ -20,7 +20,24 @@ import (
 	"github.com/eharriett0/wt/internal/ui"
 )
 
-const sentinel = "wt _hook"
+// sentinel is the marker every wt-managed shim carries in its comment line. It
+// is matched to decide "is this hook ours?" for idempotent overwrite + doctor
+// detection. It MUST be a literal substring of the shim body — the previous
+// value "wt _hook" was NOT (the shim's exec line is `exec "…/wt" _hook …`, i.e.
+// `wt" _hook`, so the quote broke the substring), which made doctor report wt's
+// own hooks as "not installed" and made re-install treat them as foreign (#91).
+const sentinel = "wt-managed hook"
+
+// shimStatus is the outcome of installing one hook, so Install can report
+// honestly instead of printing a green ✓ after skipping everything (#91).
+type shimStatus int
+
+const (
+	shimInstalled shimStatus = iota // no prior hook — wrote fresh
+	shimRefreshed                   // prior hook was ours — overwrote (idempotent)
+	shimReplaced                    // prior foreign hook backed up + replaced (--force)
+	shimSkipped                     // prior foreign hook left in place (no --force)
+)
 
 // PrePushInstalled reports whether a wt-managed pre-push hook is present in the
 // repo's shared hooks dir — used by `wt doctor` to flag an unguarded repo where
@@ -46,43 +63,76 @@ func Install(c *config.Config, force bool) error {
 		self = "wt"
 	}
 
-	if err := writeShim(filepath.Join(hooksDir, "pre-push"), self, "pre-push", force); err != nil {
+	var installed, refreshed, skipped int
+	tally := func(st shimStatus) {
+		switch st {
+		case shimInstalled:
+			installed++
+		case shimRefreshed, shimReplaced:
+			refreshed++
+		case shimSkipped:
+			skipped++
+		}
+	}
+
+	st, err := writeShim(filepath.Join(hooksDir, "pre-push"), self, "pre-push", force)
+	if err != nil {
 		return err
 	}
+	tally(st)
 
 	if frameworkPresent(c.Root, hooksDir) {
 		ui.Warn("pre-commit framework detected — not clobbering pre-commit hook")
 		ui.Info("add this to .pre-commit-config.yaml instead:")
 		fmt.Print(precommitSnippet(self))
-	} else if err := writeShim(filepath.Join(hooksDir, "pre-commit"), self, "pre-commit", force); err != nil {
-		return err
+	} else {
+		st, err := writeShim(filepath.Join(hooksDir, "pre-commit"), self, "pre-commit", force)
+		if err != nil {
+			return err
+		}
+		tally(st)
 	}
 
-	ui.OK("hooks installed in %s", hooksDir)
+	// Honest outcome (#91): only claim ✓ when something was actually written, and
+	// never a green ✓ after skipping every hook.
+	switch {
+	case installed+refreshed == 0 && skipped > 0:
+		ui.Warn("nothing installed — %d foreign hook(s) already present in %s (use --force to back up + replace)", skipped, hooksDir)
+		return nil
+	case installed == 0 && refreshed > 0 && skipped == 0:
+		ui.OK("hooks already wt-managed + refreshed in %s", hooksDir)
+	default:
+		ui.OK("hooks installed in %s", hooksDir)
+		if skipped > 0 {
+			ui.Warn("...but skipped %d foreign hook(s) (use --force to back up + replace)", skipped)
+		}
+	}
 	ui.Info("shared across all worktrees of this repo")
 	ui.Info("pre-push also warns on base-conflict (no-CI PR, #78) + BLOCKS on a HIGH file collision (#74)")
 	ui.Info("bypass: HOOK_DISABLE_MAIN_PUSH=1 (base-push) · WT_SKIP_COLLISION=1 (push collision) · HOOK_DISABLE_MULTIWINDOW_CHECK=1 (commit+push collision)")
 	return nil
 }
 
-func writeShim(path, self, hook string, force bool) error {
+func writeShim(path, self, hook string, force bool) (shimStatus, error) {
 	body := fmt.Sprintf("#!/bin/sh\n# wt-managed hook — multi-window coordination (see `wt help`).\nexec %q _hook %s \"$@\"\n", self, hook)
 
+	status := shimInstalled
 	if existing, err := os.ReadFile(path); err == nil {
 		if strings.Contains(string(existing), sentinel) {
-			// ours — idempotent overwrite (refresh the binary path).
+			status = shimRefreshed // ours — idempotent overwrite (refresh the binary path)
 		} else if force {
 			_ = os.WriteFile(path+".bak", existing, 0o755)
 			ui.Warn("backed up existing %s hook to %s.bak", hook, filepath.Base(path))
+			status = shimReplaced
 		} else {
 			ui.Warn("a non-wt %s hook already exists at %s — skipping (use --force to back up + replace)", hook, path)
-			return nil
+			return shimSkipped, nil
 		}
 	}
 	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
-		return err
+		return status, err
 	}
-	return nil
+	return status, nil
 }
 
 func frameworkPresent(root, hooksDir string) bool {
@@ -274,34 +324,82 @@ func pushCollisionBlocks(c *config.Config, ws []collide.Window, root string, pat
 	live := collide.ClassifyWindows(ws, c.Base, collide.ConflictWindowSet(conflicts), c.MaxAge)
 	active, _ := collide.PartitionConflicts(conflicts, live)
 
+	// worktree path per window label — needed for hunk-range lookup so the hook
+	// grades collisions the SAME way `wt check` does (#92).
+	wtByLabel := map[string]string{}
+	for _, w := range ws {
+		wtByLabel[w.Label()] = w.Worktree
+	}
+
 	var hard, soft []collide.Conflict
 	for _, cf := range active {
+		// Shared docs (CLAUDE.md/MEMORY.md) + append-only paths are advisory — a
+		// cross-window touch there is expected, same as `wt check`.
 		if collide.IsSharedDoc(cf.Path, c.SharedDocs) || collide.IsAppendOnly(cf.Path, c.AppendOnlyPaths) {
 			soft = append(soft, cf)
-		} else {
+			continue
+		}
+		// #92: hunk-level grade, IDENTICAL to `wt check`'s default branch —
+		// OVERLAPPING line ranges are HIGH (block), disjoint hunks in the same file
+		// are advisory (FYI, do NOT block). Previously the hook blocked on ANY
+		// overlap, so it disagreed with its own diagnostic command.
+		rangesPath := cf.MatchedFile
+		if rangesPath == "" {
+			rangesPath = cf.Path
+		}
+		cur := gitx.ChangedRanges(root, c.Base, rangesPath)
+		other := gitx.ChangedRanges(wtByLabel[cf.Window], c.Base, rangesPath)
+		if collide.ConflictSeverity(cur, other, false) == collide.SevHigh {
 			hard = append(hard, cf)
+		} else {
+			soft = append(soft, cf) // disjoint hunks → advisory, not blocking
 		}
 	}
 	if len(hard) == 0 {
 		if len(soft) > 0 {
-			var names []string
-			for _, cf := range soft {
-				names = append(names, cf.Path)
-			}
-			fmt.Fprintln(os.Stderr, ui.Dim("📝 shared/append-only doc(s) also edited elsewhere (advisory): "+strings.Join(names, ", ")))
+			fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("📝 %d advisory overlap(s) (shared docs / append-only / disjoint hunks) — not blocking", len(soft))))
 		}
 		return false
 	}
-	ui.Collision("%d outgoing file(s) are ALSO being edited by an active window — pushing now risks a duplicate PR:", len(hard))
-	for _, cf := range hard {
+	files := distinctPaths(hard)
+	ui.Collision("%d outgoing file(s) have an OVERLAPPING edit by an active window — pushing now risks a duplicate PR:", len(files))
+	for _, cf := range dedupConflicts(hard) {
 		fmt.Fprintf(os.Stderr, "   %s  %s %s %s\n", ui.Bold(cf.Path), ui.Dim("← also"), cf.Window, live[cf.Window].Badge())
 	}
 	if len(soft) > 0 {
-		fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("   (+%d shared/append-only overlap(s) — advisory)", len(soft))))
+		fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("   (+%d advisory overlap(s) — shared/append-only/disjoint)", len(soft))))
 	}
 	fmt.Fprintln(os.Stderr, ui.Yellow("   Coordinate with that window before pushing (run `wt check` for details)."))
 	fmt.Fprintln(os.Stderr, ui.Dim("   Bypass (you've coordinated): WT_SKIP_COLLISION=1 git push"))
 	return true
+}
+
+// distinctPaths returns the unique file paths across the conflicts.
+func distinctPaths(cs []collide.Conflict) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, cf := range cs {
+		if !seen[cf.Path] {
+			seen[cf.Path] = true
+			out = append(out, cf.Path)
+		}
+	}
+	return out
+}
+
+// dedupConflicts removes duplicate (path, window) rows so a file touched by the
+// same window isn't printed twice (#92 — the report repeated one path N times).
+func dedupConflicts(cs []collide.Conflict) []collide.Conflict {
+	seen := map[string]bool{}
+	var out []collide.Conflict
+	for _, cf := range cs {
+		key := cf.Path + "\x00" + cf.Window
+		if !seen[key] {
+			seen[key] = true
+			out = append(out, cf)
+		}
+	}
+	return out
 }
 
 // HookPreCommit implements `wt _hook pre-commit`. NEVER blocks (always exit 0).
@@ -312,8 +410,10 @@ func HookPreCommit(c *config.Config) int {
 		return 0
 	}
 
-	staged, _ := gitx.Run("diff", "--cached", "--name-only")
-	stagedFiles := nonEmptyLines(staged)
+	// StagedFiles honors git's hook-provided temporary index (GIT_INDEX_FILE) so
+	// a partial commit (`git commit -a`/-p/--only/pathspec) reports the correct
+	// staged set — a plain env-scoped read would strip it and miss collisions (#92).
+	stagedFiles, _ := gitx.StagedFiles()
 
 	ws, err := collide.Scan(c)
 	if err != nil {

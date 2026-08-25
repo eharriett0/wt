@@ -177,6 +177,25 @@ func CheckPaths(ws []Window, currentWorktree string, paths []string) []Conflict 
 	return out
 }
 
+// PathTouchedByAny reports whether requested path p matches ANY window's touched
+// set (exact / suffix / basename) — including the current window. Used by
+// `wt check` to tell a real path (a live collision target, or a path that exists
+// only on another window's branch) from a typo, so it can refuse to report
+// 'clear' for a nonexistent path (#93) without false-refusing a path another
+// window is genuinely editing.
+func PathTouchedByAny(p string, ws []Window) bool {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return false
+	}
+	for _, w := range ws {
+		if _, ok := matchTouched(p, w.Touched); ok {
+			return true
+		}
+	}
+	return false
+}
+
 // matchTouched reports whether requested path p matches any touched file — by
 // exact repo-relative path, path suffix, or basename — and returns the actual
 // matched touched file (repo-relative), preferring an exact match.

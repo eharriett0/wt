@@ -138,3 +138,27 @@ func TestParseMergeTreeConflictPaths(t *testing.T) {
 		t.Errorf("empty = %v, want nil", got)
 	}
 }
+
+func TestScopedEnv(t *testing.T) {
+	t.Setenv("GIT_DIR", "/some/.git")
+	t.Setenv("GIT_INDEX_FILE", "/some/.git/index")
+	t.Setenv("GIT_WORK_TREE", "/some")
+	t.Setenv("WT_KEEP_ME", "yes")
+	env := scopedEnv()
+	has := func(prefix string) bool {
+		for _, kv := range env {
+			if len(kv) >= len(prefix) && kv[:len(prefix)] == prefix {
+				return true
+			}
+		}
+		return false
+	}
+	for _, dropped := range []string{"GIT_DIR=", "GIT_INDEX_FILE=", "GIT_WORK_TREE="} {
+		if has(dropped) {
+			t.Errorf("scopedEnv did not strip %s", dropped)
+		}
+	}
+	if !has("WT_KEEP_ME=") {
+		t.Error("scopedEnv wrongly stripped a non-git var")
+	}
+}
