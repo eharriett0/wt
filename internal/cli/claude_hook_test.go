@@ -35,7 +35,7 @@ func TestParseClaudeEdit(t *testing.T) {
 
 func TestClaudeDecision(t *testing.T) {
 	// no HIGH → nothing emitted
-	if out, has := claudeDecision("a.go", nil, false); has || out != "" {
+	if out, has := claudeDecision("a.go", nil, false, false); has || out != "" {
 		t.Errorf("empty: %q,%v", out, has)
 	}
 	high := []CheckEntry{
@@ -43,8 +43,8 @@ func TestClaudeDecision(t *testing.T) {
 		{Path: "a.go", Window: "#42", Liveness: "uncommitted edits"}, // dup window
 		{Path: "a.go", Window: "feat/x", Liveness: "open PR #7"},
 	}
-	// advisory → additionalContext, no permissionDecision
-	out, has := claudeDecision("a.go", high, false)
+	// advisory (confirmed overlap) → additionalContext, no permissionDecision
+	out, has := claudeDecision("a.go", high, false, false)
 	if !has {
 		t.Fatal("advisory: expected output")
 	}
@@ -70,8 +70,12 @@ func TestClaudeDecision(t *testing.T) {
 	if strings.Count(adv.HSO.AdditionalContext, "#42") != 1 {
 		t.Error("window #42 should be deduped")
 	}
+	// confirmed overlap wording asserts an overlap; file-level must NOT (#108)
+	if !strings.Contains(adv.HSO.AdditionalContext, "OVERLAPS") {
+		t.Errorf("confirmed-overlap message should say it overlaps: %q", adv.HSO.AdditionalContext)
+	}
 	// block → permissionDecision deny
-	out, _ = claudeDecision("a.go", high, true)
+	out, _ = claudeDecision("a.go", high, true, false)
 	var blk struct {
 		HSO struct {
 			PermissionDecision       string `json:"permissionDecision"`
@@ -83,6 +87,76 @@ func TestClaudeDecision(t *testing.T) {
 	}
 	if blk.HSO.PermissionDecision != "deny" || blk.HSO.PermissionDecisionReason == "" {
 		t.Errorf("block: %+v", blk.HSO)
+	}
+
+	// #108: file-level wording must NOT claim hunk overlap (would contradict wt check)
+	fl, _ := claudeDecision("a.go", high, false, true)
+	var flOut struct {
+		HSO struct {
+			AdditionalContext string `json:"additionalContext"`
+		} `json:"hookSpecificOutput"`
+	}
+	if err := json.Unmarshal([]byte(fl), &flOut); err != nil {
+		t.Fatalf("file-level JSON: %v", err)
+	}
+	if strings.Contains(flOut.HSO.AdditionalContext, "OVERLAPS") || strings.Contains(flOut.HSO.AdditionalContext, "overlapping hunks") {
+		t.Errorf("file-level message must not claim overlap: %q", flOut.HSO.AdditionalContext)
+	}
+	if !strings.Contains(flOut.HSO.AdditionalContext, "file-level") {
+		t.Errorf("file-level message should say file-level: %q", flOut.HSO.AdditionalContext)
+	}
+}
+
+func TestLocateRange(t *testing.T) {
+	content := "line1\nline2\nline3\nline4\n" // lines 1..4
+	cases := []struct {
+		name      string
+		old       string
+		wantStart int
+		wantEnd   int
+		wantOK    bool
+	}{
+		{"single line", "line2\n", 2, 2, true},
+		{"multi line span", "line2\nline3\n", 2, 3, true},
+		{"first line", "line1\n", 1, 1, true},
+		{"empty old_string → not localizable", "", 0, 0, false},
+		{"absent → not localizable", "nope", 0, 0, false},
+		{"ambiguous (appears twice) → not localizable", "line", 0, 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, ok := locateRange(content, tc.old)
+			if ok != tc.wantOK || (ok && (r.Start != tc.wantStart || r.End != tc.wantEnd)) {
+				t.Fatalf("locateRange(%q) = (%+v, %v), want (L%d-%d, %v)", tc.old, r, ok, tc.wantStart, tc.wantEnd, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestClaudeEditRanges(t *testing.T) {
+	content := "a\nb\nc\nd\ne\nf\n" // 6 lines
+	// Edit locates its old_string
+	raw := `{"tool_name":"Edit","tool_input":{"file_path":"x","old_string":"b\n","new_string":"B\n"}}`
+	if r, ok := claudeEditRanges([]byte(raw), content); !ok || len(r) != 1 || r[0].Start != 2 || r[0].End != 2 {
+		t.Errorf("Edit: (%+v, %v)", r, ok)
+	}
+	// MultiEdit unions all locatable ranges
+	multi := `{"tool_name":"MultiEdit","tool_input":{"file_path":"x","edits":[{"old_string":"b\n"},{"old_string":"e\n"}]}}`
+	if r, ok := claudeEditRanges([]byte(multi), content); !ok || len(r) != 2 {
+		t.Errorf("MultiEdit: (%+v, %v)", r, ok)
+	}
+	// Write has no locatable region → file-level fallback
+	if _, ok := claudeEditRanges([]byte(`{"tool_name":"Write","tool_input":{"file_path":"x","content":"whole"}}`), content); ok {
+		t.Error("Write should not be localizable")
+	}
+	// an old_string not in the file → not localizable (file-level fallback)
+	if _, ok := claudeEditRanges([]byte(`{"tool_name":"Edit","tool_input":{"old_string":"zzz\n"}}`), content); ok {
+		t.Error("absent old_string should not be localizable")
+	}
+	// a MultiEdit where one edit can't be located → whole thing falls back
+	mixed := `{"tool_name":"MultiEdit","tool_input":{"edits":[{"old_string":"b\n"},{"old_string":"zzz\n"}]}}`
+	if _, ok := claudeEditRanges([]byte(mixed), content); ok {
+		t.Error("MultiEdit with an unlocatable edit should fall back")
 	}
 }
 
