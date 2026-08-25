@@ -404,13 +404,15 @@ func ConflictSeverity(current, other []gitx.LineRange, appendOnly bool) Severity
 // caller fails safe (keep the collision HIGH — never clear on can't-tell). A
 // differing worktree or index is real content → merged=false, known=true. Pure.
 func mergedVerdict(up string, upOK bool, wt string, wtOK bool, staged string, stagedOK bool) (merged, known bool) {
-	if !upOK || !wtOK {
+	// The INDEX blob is required, not optional: a path that IS a live conflict
+	// (in the other window's touched set) but has NO index entry (stagedOK=false)
+	// is a STAGED DELETION — a divergent change from upstream, not already-merged.
+	// So clear only when upstream, worktree, AND index all resolve and all equal
+	// upstream; a missing/unreadable index → known=false → the collision stays HIGH.
+	if !upOK || !wtOK || !stagedOK {
 		return false, false
 	}
-	if wt != up {
-		return false, true
-	}
-	if stagedOK && staged != up {
+	if wt != up || staged != up {
 		return false, true
 	}
 	return true, true

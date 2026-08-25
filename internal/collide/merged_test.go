@@ -19,7 +19,7 @@ func TestMergedVerdict(t *testing.T) {
 		wantMerged, wantKnown bool
 	}{
 		{"worktree + index both equal upstream → already merged", up, true, up, true, up, true, true, true},
-		{"worktree equals upstream, path not staged → already merged", up, true, up, true, "", false, true, true},
+		{"a conflict path with NO index entry (staged deletion) → unknown, keep HIGH", up, true, up, true, "", false, false, false},
 		{"worktree differs from upstream → real content", up, true, other, true, up, true, false, true},
 		{"worktree equals but index differs → real content", up, true, up, true, other, true, false, true},
 		{"no upstream ref for the path → unknown (keep HIGH)", "", false, up, true, up, true, false, false},
