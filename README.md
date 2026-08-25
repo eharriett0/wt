@@ -18,6 +18,21 @@ out to `git` and `gh`). Works in any git repo on any machine.
 go install github.com/eharriett0/wt@latest
 ```
 
+Or via Homebrew. Note the tap is `eharriett0/homebrew-tap` but `brew trust`
+takes the short form `eharriett0/tap` — Homebrew requires trusting a third-party
+tap before it will load its formula, so a fresh machine needs the `trust` line:
+
+```
+brew tap eharriett0/homebrew-tap
+brew trust eharriett0/tap    # required for third-party taps; without it `brew install` refuses to load the formula
+brew install wt              # later: brew upgrade wt
+wt version
+```
+
+The formula builds from source, so it pulls the `go` formula and will **upgrade
+an existing Homebrew Go** as a build dependency — harmless for `wt`, but worth
+knowing if you have other Go work on the machine.
+
 ## The core: collision awareness
 
 The headline problem with several windows in one repo isn't "did two of us grab
