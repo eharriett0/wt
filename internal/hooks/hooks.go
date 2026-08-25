@@ -324,37 +324,10 @@ func pushCollisionBlocks(c *config.Config, ws []collide.Window, root string, pat
 	live := collide.ClassifyWindows(ws, c.Base, collide.ConflictWindowSet(conflicts), c.MaxAge)
 	active, _ := collide.PartitionConflicts(conflicts, live)
 
-	// worktree path per window label — needed for hunk-range lookup so the hook
-	// grades collisions the SAME way `wt check` does (#92).
-	wtByLabel := map[string]string{}
-	for _, w := range ws {
-		wtByLabel[w.Label()] = w.Worktree
-	}
-
-	var hard, soft []collide.Conflict
-	for _, cf := range active {
-		// Shared docs (CLAUDE.md/MEMORY.md) + append-only paths are advisory — a
-		// cross-window touch there is expected, same as `wt check`.
-		if collide.IsSharedDoc(cf.Path, c.SharedDocs) || collide.IsAppendOnly(cf.Path, c.AppendOnlyPaths) {
-			soft = append(soft, cf)
-			continue
-		}
-		// #92: hunk-level grade, IDENTICAL to `wt check`'s default branch —
-		// OVERLAPPING line ranges are HIGH (block), disjoint hunks in the same file
-		// are advisory (FYI, do NOT block). Previously the hook blocked on ANY
-		// overlap, so it disagreed with its own diagnostic command.
-		rangesPath := cf.MatchedFile
-		if rangesPath == "" {
-			rangesPath = cf.Path
-		}
-		cur := gitx.ChangedRanges(root, c.Base, rangesPath)
-		other := gitx.ChangedRanges(wtByLabel[cf.Window], c.Base, rangesPath)
-		if collide.ConflictSeverity(cur, other, false) == collide.SevHigh {
-			hard = append(hard, cf)
-		} else {
-			soft = append(soft, cf) // disjoint hunks → advisory, not blocking
-		}
-	}
+	// Grade IDENTICALLY to `wt check` + pre-commit (#92, #97): shared-docs +
+	// append-only are advisory; a code file blocks only when the two windows'
+	// changed line-ranges OVERLAP (disjoint hunks stay advisory).
+	hard, soft := gradeConflicts(c, active, root, ws, gitx.ChangedRanges)
 	if len(hard) == 0 {
 		if len(soft) > 0 {
 			fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("📝 %d advisory overlap(s) (shared docs / append-only / disjoint hunks) — not blocking", len(soft))))
@@ -402,6 +375,40 @@ func dedupConflicts(cs []collide.Conflict) []collide.Conflict {
 	return out
 }
 
+// rangeFn fetches a worktree's changed line-ranges for a file vs base — injected
+// so the pure grading decision is unit-testable without a live repo.
+type rangeFn func(worktree, base, path string) []gitx.LineRange
+
+// gradeConflicts splits active conflicts into hard (real overlap) vs soft
+// (advisory) using the SAME rule as `wt check` + the pre-push guard: shared-docs
+// and append-only paths are advisory, and a code file is HARD only when the two
+// windows' changed line-ranges OVERLAP — disjoint hunks in the same file stay
+// advisory. Single-source so pre-push and pre-commit can never disagree (#92, #97).
+func gradeConflicts(c *config.Config, active []collide.Conflict, root string, ws []collide.Window, ranges rangeFn) (hard, soft []collide.Conflict) {
+	wtByLabel := make(map[string]string, len(ws))
+	for _, w := range ws {
+		wtByLabel[w.Label()] = w.Worktree
+	}
+	for _, cf := range active {
+		if collide.IsSharedDoc(cf.Path, c.SharedDocs) || collide.IsAppendOnly(cf.Path, c.AppendOnlyPaths) {
+			soft = append(soft, cf)
+			continue
+		}
+		rangesPath := cf.MatchedFile
+		if rangesPath == "" {
+			rangesPath = cf.Path
+		}
+		cur := ranges(root, c.Base, rangesPath)
+		other := ranges(wtByLabel[cf.Window], c.Base, rangesPath)
+		if collide.ConflictSeverity(cur, other, false) == collide.SevHigh {
+			hard = append(hard, cf)
+		} else {
+			soft = append(soft, cf)
+		}
+	}
+	return hard, soft
+}
+
 // HookPreCommit implements `wt _hook pre-commit`. NEVER blocks (always exit 0).
 // It surfaces FILE-LEVEL collisions: staged files that another window is also
 // touching. Falls back to an informational "other claims exist" note.
@@ -428,24 +435,19 @@ func HookPreCommit(c *config.Config) int {
 			// every commit against long-dead branches that touched the same file.
 			live := collide.ClassifyWindows(ws, c.Base, collide.ConflictWindowSet(conflicts), c.MaxAge)
 			active, stale := collide.PartitionConflicts(conflicts, live)
-			// Shared docs (CLAUDE.md/MEMORY.md) are append-heavy and edited by
-			// nearly every window — downgrade them to an advisory so the notice
-			// only sounds the alarm on real code overlaps.
-			var hard, soft []collide.Conflict
-			for _, cf := range active {
-				if collide.IsSharedDoc(cf.Path, c.SharedDocs) {
-					soft = append(soft, cf)
-				} else {
-					hard = append(hard, cf)
-				}
-			}
+			// Grade IDENTICALLY to the pre-push guard + `wt check` (#97): shared-docs
+			// and append-only paths are advisory, and a code file is "hard" only when
+			// the two windows' changed line-ranges OVERLAP — disjoint hunks stay
+			// advisory. Unlike pre-push this NEVER blocks; it's an awareness notice.
+			hard, soft := gradeConflicts(c, active, root, ws, gitx.ChangedRanges)
 			if len(hard) > 0 {
-				ui.Collision("%d staged file(s) are ALSO being edited by an active window:", len(hard))
-				for _, cf := range hard {
+				files := distinctPaths(hard)
+				ui.Collision("%d staged file(s) have an OVERLAPPING edit by an active window:", len(files))
+				for _, cf := range dedupConflicts(hard) {
 					fmt.Fprintf(os.Stderr, "   %s  %s %s %s\n", ui.Bold(cf.Path), ui.Dim("← also"), cf.Window, live[cf.Window].Badge())
 				}
 				if len(soft) > 0 {
-					fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("   (+%d shared-doc overlap(s) — advisory)", len(soft))))
+					fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("   (+%d advisory overlap(s) — shared / append-only / disjoint)", len(soft))))
 				}
 				if len(stale) > 0 {
 					fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("   (+%d on stale branch(es) — merged / no open PR — ignored)", len(stale))))
@@ -455,11 +457,8 @@ func HookPreCommit(c *config.Config) int {
 				return 0
 			}
 			if len(soft) > 0 {
-				var names []string
-				for _, cf := range soft {
-					names = append(names, cf.Path)
-				}
-				fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("📝 shared doc(s) also edited in another window (advisory; coordinate sections): %s", strings.Join(names, ", "))))
+				files := distinctPaths(soft)
+				fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("📝 %d file(s) also edited in another window (advisory — shared / append-only / disjoint hunks): %s", len(files), strings.Join(files, ", "))))
 			}
 		}
 	}
