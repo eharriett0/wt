@@ -5,8 +5,11 @@ each other. `wt` gives each window its own worktree, lets a window *claim* a
 unit of work so the others can see it, and — the core — tells you when two
 windows are **editing the same lines**, before that becomes a merge conflict.
 It distinguishes real conflicts (overlapping hunks) from parallel appends to the
-same file, quiets down dormant branches, cleans up worktrees when work ships,
-and can gate merges in repos where merge == deploy-to-prod.
+same file, quiets down dormant and merged branches, cleans up worktrees when
+work ships, and can gate merges in repos where merge == deploy-to-prod. It works
+whether the windows are humans or AI agents — and a Claude Code hook can surface
+collisions to the **agents doing the editing**, not just to you (see
+[Agents](#agents-claude-code)).
 
 Repo-agnostic, single static binary, zero third-party dependencies (it shells
 out to `git` and `gh`). Works in any git repo on any machine.
@@ -70,15 +73,33 @@ report only the live ones. Each colliding window is classified:
 |---|---|---|
 | Open PR for the branch | **active** | `[open PR #123]` |
 | Uncommitted changes in the worktree | **active** | `[uncommitted edits]` |
-| Commits not yet on base, no PR | **active** (latent) | `[commits, no PR, last commit 4d ago]` |
+| Commits not yet on base, never opened a PR | **active** (latent) | `[commits, no PR opened, last commit 4d ago]` |
+| Merged PR (incl. squash-merged + deleted branch) | **stale** → suppressed | `[merged #84]` |
+| Closed-unmerged PR (kept on purpose) | **stale** → suppressed | `[PR #1654 closed]` |
 | Commits, no PR, idle past `max_age` | **dormant** → suppressed | `[dormant, last commit 12d ago]` |
 | Clean worktree, no PR, nothing unshipped | **stale** → suppressed | `[stale: merged / no PR]` |
+
+PR state is resolved with a single `gh pr list --state all`, so a **squash-merged
+branch** (which `git cherry` can't detect as shipped, and whose branch is often
+deleted) is correctly suppressed as `merged #N` rather than lighting up as a
+false HIGH. A **closed-but-unmerged** PR's branch is kept on purpose (recoverable
+diff), so it's suppressed too and labelled `PR #N closed`. PR state also
+**outranks a leftover dirty index**: a merged/closed branch that still carries
+staged cruft `wt clean` won't remove reads stale (with a `· leftover uncommitted
+edits` note), not a permanent HIGH.
 
 The last-commit age is always shown on unmerged/dormant windows. **Dormancy** is
 opt-in: set `max_age` (e.g. `4d`, `2w`, `36h`) and an unmerged-but-idle branch —
 one you'd otherwise have to confirm out-of-band was abandoned — is suppressed
 just like a merged one. A dirty or open-PR branch is never dormant (it's active
 by definition).
+
+A **dirty base-branch checkout far behind `origin/base`** — the shared `main`
+checkout everyone forgot to pull, whose stale edits then "overlap" almost
+everything — stays HIGH (its uncommitted edits *could* be real work, so it's
+never hidden) but is labelled `[uncommitted edits · N behind base — likely
+stale]` so you can dismiss it at a glance, and `wt doctor` names it so you fix
+the root cause.
 
 Without this, hot shared files (a top-level `CLAUDE.md`, a central policy file)
 light up against every long-dead branch that ever touched them, training you to
@@ -98,13 +119,13 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 |---|---|
 | `wt status [--json]` | All windows + files each touches + severity-graded overlaps. `[--blocking]` = only HIGH, exit 3 (a gate). `[--max-age D]` |
 | `wt status --epic <id>` | Aggregate an epic's claims + live PR states across sibling repos |
-| `wt check <paths…>` | Is another window touching these paths? `[--show-diff] [--json] [--include-stale] [--max-age D]` (exit 3 = HIGH) |
+| `wt check <paths…>` | Is another window touching these paths? `[--show-diff] [--json] [--blocking] [--include-stale] [--allow-missing] [--max-age D]` (exit 3 = HIGH). `--blocking` prints only HIGH (a scriptable gate). Refuses a path that doesn't exist, isn't tracked, and no window is touching — a typo must never falsely report "clear" (`--allow-missing` opts into a deleted/other-branch/about-to-create path) |
 | `wt where <issue\|branch>` | Print that window's worktree path — `cd $(wt where 42)` |
 | `wt new <branch>` | Create a worktree on a new branch from the base branch |
-| `wt clean [-y]` | List worktrees whose branch already shipped (incl. squash-merged PRs); `-y` removes them. Never reaps a just-created worktree (grace window), a never-pushed branch (no upstream = unshared work), or a dirty one |
+| `wt clean [-y]` | List worktrees whose branch already shipped (incl. squash-merged PRs); `-y` removes them. Never reaps a just-created worktree (grace window), a never-pushed branch (no upstream = unshared work), or a dirty one. `[--stale-index]` also **reports** (never auto-removes) a merged-PR worktree holding a leftover uncommitted index a plain clean can't touch, and prints the manual remove command |
 | `wt claim <issue>` | Assign a GitHub issue, make a worktree, open a draft PR, record the claim `[--force] [--no-pr] [--epic <id>]` |
 | `wt release <issue>` | Drop the claim. `[--clean]` also removes the worktree when the branch is abandoned (clean tree, no live PR, WIP-only commits) |
-| `wt merge-pr <pr>` | Guarded squash-merge (PR-state precheck, strips a `WIP:` subject), then auto-removes the worktree + claim `[--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin]` |
+| `wt merge-pr <pr>` | Guarded squash-merge (PR-state precheck, strips a `WIP:` subject, refuses an empty/placeholder-only PR), then auto-removes the worktree + claim. Lints the closing keywords the squash will fire (PR body **and** commit bodies) and verifies issue state after `[--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok]` |
 | `wt todos` | What every window is working on (mirrors each window's TODO list) |
 | **— cross-window coordination —** | |
 | `wt announce "<msg>"` | Tell other windows a change is starting `[--hold "merge-main,…"] [--issue N]` |
@@ -115,8 +136,9 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 | `wt prune-coord` | GC the coordination log — drop resolved handshakes + aged block reservations `[--block-max-age D]` |
 | `wt block-id <file>` | Atomically reserve the next append-log id so two windows never grab the same `NEWEST-N`. `--written N` marks a reservation done (clears the banner; frees it if never written) `[--pattern] [--format]` |
 | `wt append <doc> --section H "txt"` | Locked, section-scoped append to a structured shared doc (parallel adds can't clobber) |
-| `wt install-hooks` | Install pre-push (base-branch guard) + pre-commit (collision notice) `[--force]` |
-| `wt doctor` | Check git/gh and show the resolved config |
+| `wt install-hooks` | Install pre-push (base guard + collision check + base-conflict warning) + pre-commit (collision notice) `[--force]` |
+| `wt install-claude-hook` | Wire a Claude Code **PreToolUse** hook so the AI agents doing the editing get collision-checked per edit `[--write]` (see [Agents](#agents-claude-code)) |
+| `wt doctor` | Check git/gh + all resolved config + structured-doc regex + coordination-log health + preflight, and flag worktrees that track the base branch, a stale far-behind base checkout, and whether the hooks are installed `[--json]` |
 | `wt version` | Print the version |
 | `wt help` | Colorful overview |
 
@@ -181,14 +203,56 @@ in one view.
 `wt install-hooks` writes two thin shims into the repo's shared hooks dir
 (covers all worktrees):
 
-- **pre-push** — rejects a direct push to the base branch (`main`/`master`/…).
-  Bypass: `HOOK_DISABLE_MAIN_PUSH=1 git push`.
-- **pre-commit** — non-blocking collision notice (file overlaps with other
+- **pre-push** — three checks, in cost order:
+  - rejects a direct push to the base branch (`main`/`master`/…) — bypass
+    `HOOK_DISABLE_MAIN_PUSH=1 git push`;
+  - warns (offline, via `git merge-tree`) when the branch **conflicts with
+    base** — a conflicting PR gets *zero* CI runs (GitHub can't build
+    `refs/pull/N/merge`), which looks identical to a cold runner pool; a
+    clean-but-behind branch gets a one-line "behind by N";
+  - **blocks** (last moment before a duplicate PR) when the *outgoing* paths
+    overlap another active window's live hunks — same HIGH grading as
+    `wt check`. Bypass: `WT_SKIP_COLLISION=1 git push`.
+- **pre-commit** — non-blocking collision notice (staged files overlapping other
   windows). Bypass: `HOOK_DISABLE_MULTIWINDOW_CHECK=1`.
+
+Both hooks strip git's ambient `GIT_DIR`/`GIT_INDEX_FILE`/`GIT_WORK_TREE` before
+the cross-worktree scan (git sets those for a running hook, pinned to the
+invoking worktree — without stripping them every window looks like it holds the
+invoking worktree's changes), while preserving them for the invoking worktree's
+own staged read so a partial commit (`git commit -a`/`-p`/`--only`) is graded
+correctly.
 
 If your repo uses the [pre-commit](https://pre-commit.com) framework, `wt`
 detects it and prints a `repo: local` snippet to add instead of clobbering the
 framework's managed hook.
+
+## Agents (Claude Code)
+
+The whole point of the collision engine is worktree-creator-agnostic: `wt
+status`/`check` enumerate `git worktree list`, so a worktree an agent spawns
+(Claude Code's native `--worktree`, say) is visible to `wt` for free. But the
+usual failure mode is that the *agents doing the editing* never run `wt check`.
+
+`wt install-claude-hook` closes that. It wires a Claude Code **PreToolUse** hook
+(matcher `Edit|Write|MultiEdit`) that runs the same collision grading as
+`wt check` on the file an agent is about to touch:
+
+```
+wt install-claude-hook            # prints the .claude/settings.json snippet
+wt install-claude-hook --write    # merges it in (never clobbers existing hooks)
+```
+
+- **Advisory by default** — a HIGH cross-worktree overlap is returned to the
+  agent as context (`additionalContext`), so it *sees* the collision and can
+  coordinate, without being halted.
+- **`WT_CLAUDE_HOOK_BLOCK=1`** turns a HIGH into a hard `deny`.
+- **Cheap** — a repo with ≤1 worktree is skipped instantly (solo repos pay
+  nothing per edit). Bypass with `WT_SKIP_COLLISION=1`; fail-open on any error
+  (a coordination nicety must never disrupt the session).
+
+So when the agent in worktree A goes to edit the exact hunk of `foo.go` that
+worktree B is live-editing, it's told — instead of both landing competing PRs.
 
 ## Configuration
 
