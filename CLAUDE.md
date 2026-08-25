@@ -108,6 +108,13 @@ version via `-ldflags -X …cli.Version=`). To ship:
    push.
 4. `brew update && brew upgrade wt`; verify `wt version`.
 
+**Fresh-machine install** (the person the install docs are actually for) needs a
+`trust` step first — Homebrew refuses to load a formula from an untrusted
+third-party tap: `brew tap eharriett0/homebrew-tap && brew trust eharriett0/tap
+&& brew install wt`. Note the tap is `eharriett0/homebrew-tap` but `brew trust`
+takes the short `eharriett0/tap`. The source build also pulls/upgrades the `go`
+formula as a build dependency (#105).
+
 The formula supports `head "…", branch: "main"` for `--HEAD` builds.
 
 ## gh / tooling gotchas
