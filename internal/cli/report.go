@@ -11,7 +11,6 @@ import (
 	"github.com/eharriett0/wt/internal/collide"
 	"github.com/eharriett0/wt/internal/config"
 	"github.com/eharriett0/wt/internal/gitx"
-	"github.com/eharriett0/wt/internal/section"
 	"github.com/eharriett0/wt/internal/ui"
 )
 
@@ -297,49 +296,13 @@ type StatusOverlap struct {
 	SharedSections []string         `json:"shared_sections,omitempty"` // #22: same section(s) ≥2 windows edit → HIGH
 }
 
-// sharedSectionsAcross returns the section headings edited by ≥2 of the given
-// worktrees for the structured doc at repo-relative path rel (partitioned by the
-// delimiter regexp). Empty → every window touches DISJOINT sections (safe,
-// advisory); non-empty → a same-section collision (HIGH). graded=false when it
-// can't section-grade at all (bad regexp, or the doc is unreadable/untracked in
-// every worktree — e.g. an out-of-repo memory doc) so the caller falls back to
-// the blanket shared-doc advisory. This is the #22 upgrade: it reuses the same
-// per-worktree ChangedRanges the hunk grader already computes, mapped onto
-// sections (heading text is the stable cross-worktree identity).
+// sharedSectionsAcross is a thin adapter over collide.SharedSectionsAcross,
+// which is where the #22 section grade now lives so `wt check` and both git
+// hooks single-source it (#98) — the hooks previously stopped at the blanket
+// shared-doc advisory, so a same-section collision blocked here and sailed
+// through the pre-push guard.
 func sharedSectionsAcross(c *config.Config, worktrees []string, rel, delimiter string) (shared []string, graded bool) {
-	re, err := section.Compile(delimiter)
-	if err != nil {
-		return nil, false
-	}
-	count := map[string]int{}
-	var order []string
-	any := false
-	for _, wt := range worktrees {
-		content, rerr := os.ReadFile(filepath.Join(wt, rel))
-		if rerr != nil {
-			continue // this worktree lacks the doc; others may still grade
-		}
-		any = true
-		heads := section.EditedHeadings(
-			section.Parse(string(content), re),
-			gitx.ChangedRanges(wt, c.Base, rel),
-		)
-		for _, h := range heads {
-			if count[h] == 0 {
-				order = append(order, h)
-			}
-			count[h]++
-		}
-	}
-	if !any {
-		return nil, false
-	}
-	for _, h := range order {
-		if count[h] >= 2 {
-			shared = append(shared, h)
-		}
-	}
-	return shared, true
+	return collide.SharedSectionsAcross(c.Base, worktrees, rel, delimiter, gitx.ChangedRanges)
 }
 
 // gradeStatusOverlaps hunk-grades the ACTIVE overlaps (already partitioned).

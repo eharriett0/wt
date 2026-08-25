@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+
+	"github.com/eharriett0/wt/internal/gitx"
 )
 
 func run(args ...string) (string, error) {
@@ -23,11 +25,74 @@ func Present() bool {
 	return err == nil
 }
 
-// Authed reports whether gh has an authenticated account.
-func Authed() bool {
-	cmd := exec.Command("gh", "auth", "status")
-	return cmd.Run() == nil
+// hostFromRemoteURL extracts the forge host from a git remote URL. Handles the
+// three forms git emits: scp-style SSH (`git@host:owner/repo.git`), a real URL
+// (`https://host/owner/repo`, `ssh://git@host:22/owner/repo`), and a bare local
+// path (no host — returns ""). Pure, so the parsing is testable without a repo.
+func hostFromRemoteURL(u string) string {
+	u = strings.TrimSpace(u)
+	if u == "" {
+		return ""
+	}
+	// scp-style: [user@]host:path — no "//" and the colon precedes any slash.
+	if !strings.Contains(u, "://") {
+		colon := strings.Index(u, ":")
+		slash := strings.Index(u, "/")
+		if colon <= 0 || (slash >= 0 && slash < colon) {
+			return "" // local path like /srv/repo.git or ../repo
+		}
+		hostPart := u[:colon]
+		if at := strings.LastIndex(hostPart, "@"); at >= 0 {
+			hostPart = hostPart[at+1:]
+		}
+		return hostPart
+	}
+	rest := u[strings.Index(u, "://")+3:]
+	if slash := strings.Index(rest, "/"); slash >= 0 {
+		rest = rest[:slash]
+	}
+	if at := strings.LastIndex(rest, "@"); at >= 0 {
+		rest = rest[at+1:] // strip user[:password]@
+	}
+	if colon := strings.LastIndex(rest, ":"); colon >= 0 {
+		rest = rest[:colon] // strip :port
+	}
+	return rest
 }
+
+// RepoHost returns the forge host this repo's origin points at, or "" when it
+// can't be determined (no origin, or a local-path remote) — in which case the
+// caller should fall back to gh's own default rather than guessing.
+func RepoHost() string { return hostFromRemoteURL(gitx.RemoteURL("origin")) }
+
+// authStatusArgs builds the `gh auth status` argv, scoped to host when known.
+// Split out so the scoping is unit-testable without invoking gh. (#100)
+func authStatusArgs(host string) []string {
+	args := []string{"auth", "status"}
+	if host != "" {
+		args = append(args, "--hostname", host)
+	}
+	return args
+}
+
+// AuthedFor reports whether gh has an authenticated account FOR host.
+func AuthedFor(host string) bool {
+	return exec.Command("gh", authStatusArgs(host)...).Run() == nil
+}
+
+// Authed reports whether gh is authenticated for the host THIS repo uses.
+//
+// It is deliberately host-scoped (#100): bare `gh auth status` exits non-zero if
+// ANY configured host fails, so one unreachable extra host — an enterprise
+// instance behind a VPN, a stale entry — made doctor report "NOT authenticated"
+// on a machine whose github.com login was perfectly fine. That is the #91 shape:
+// a warning that can't distinguish "you are broken" from "the check is broken",
+// and whose obvious remedy (`gh auth login`) re-authenticates the wrong host.
+//
+// Scoping also fixes the mirror-image false NEGATIVE: a repo hosted on an
+// enterprise instance used to pass because github.com happened to be authed,
+// while the host it actually needs was not.
+func Authed() bool { return AuthedFor(RepoHost()) }
 
 // CurrentUser returns the authenticated login.
 func CurrentUser() (string, error) { return run("api", "user", "--jq", ".login") }

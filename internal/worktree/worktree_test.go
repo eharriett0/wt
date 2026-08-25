@@ -1,6 +1,13 @@
 package worktree
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/eharriett0/wt/internal/config"
+)
 
 func TestShippedVerdict(t *testing.T) {
 	// merged PR → shipped regardless of cherry (the #37 core)
@@ -94,5 +101,95 @@ func TestStaleIndexReportable(t *testing.T) {
 			t.Errorf("%s: StaleIndexReportable(%q,%v,%v,%v,%v) = %v, want %v",
 				tc.name, tc.prState, tc.prOK, tc.dirty, tc.staleIndex, tc.grace, got, tc.want)
 		}
+	}
+}
+
+// TestManagedByClean is the #101 decision: which worktrees `wt clean` will even
+// look at. The bug it fixes is a scope MISMATCH — the collision engine scans
+// every worktree git knows about, so a worktree outside worktree_root could
+// hard-block a push while clean refused to manage it, with no in-tool way to
+// clear it. A repo whose worktree_root ever changed accumulates these forever.
+func TestManagedByClean(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "repo-worktrees")   // configured worktree_root
+	legacy := filepath.Join(dir, "repo.worktrees") // an older convention, still registered with git
+	inRoot := filepath.Join(root, "feat-a")
+	outOfRoot := filepath.Join(legacy, "feat-b")
+	for _, d := range []string{inRoot, outOfRoot} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cases := []struct {
+		name     string
+		path     string
+		allRoots bool
+		want     bool
+	}{
+		{"in-root is managed by default", inRoot, false, true},
+		{"in-root is managed with --all-roots too", inRoot, true, true},
+		{"out-of-root is SKIPPED by default (the pre-#101 behaviour, preserved)", outOfRoot, false, false},
+		{"out-of-root is managed with --all-roots (the fix)", outOfRoot, true, true},
+
+		// A sibling directory whose name merely PREFIXES the root must not be
+		// treated as inside it — "…/repo-worktrees-old" is not under
+		// "…/repo-worktrees". This is what a naive strings.HasPrefix would get
+		// wrong, and getting it wrong here means removing the wrong worktree.
+		{"prefix-sibling is not inside the root", filepath.Join(dir, "repo-worktrees-old", "x"), false, false},
+
+		// The root itself is not a worktree to reap; Clean skips index 0 anyway,
+		// but the predicate should not claim a parent is "inside" its child.
+		{"a parent of the root is not inside it", dir, false, false},
+	}
+	for _, tc := range cases {
+		if got := ManagedByClean(tc.path, root, tc.allRoots); got != tc.want {
+			t.Errorf("%s: ManagedByClean(%q, root, allRoots=%v) = %v, want %v",
+				tc.name, tc.path, tc.allRoots, got, tc.want)
+		}
+	}
+}
+
+// TestReapableBranch guards the footgun the #101 e2e exposed: a worktree checked
+// out on the BASE branch is trivially "patch-equivalent on base", so every
+// downstream verdict says shipped and clean prints `git branch -D main`. It had
+// been hidden only because such worktrees happened to sit outside worktree_root
+// and were never evaluated — an accident, not a guard.
+func TestReapableBranch(t *testing.T) {
+	cases := []struct {
+		branch, base string
+		want         bool
+	}{
+		{"feat-x", "main", true},
+		{"main", "main", false},    // the base branch itself — NEVER reap
+		{"trunk", "trunk", false},  // base is configurable; the rule follows it
+		{"main", "trunk", true},    // "main" is only special when it IS the base
+		{"HEAD", "main", false},    // detached
+		{"", "main", false},        // unresolvable
+		{"mainline", "main", true}, // a name that merely CONTAINS the base is fine
+	}
+	for _, tc := range cases {
+		if got := ReapableBranch(tc.branch, tc.base); got != tc.want {
+			t.Errorf("ReapableBranch(%q, base=%q) = %v, want %v", tc.branch, tc.base, got, tc.want)
+		}
+	}
+}
+
+// Remove must keep refusing an out-of-root path — the relaxation is reachable
+// only through the unexported remove() that `wt clean --all-roots` calls, so an
+// unrelated caller can never widen its own blast radius by accident.
+func TestRemoveStillRefusesOutOfRoot(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "wts")
+	outside := filepath.Join(dir, "elsewhere", "feat-x")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := Remove(&config.Config{WorktreeRoot: root}, outside, "feat-x", false)
+	if err == nil {
+		t.Fatal("Remove must refuse a path outside worktree_root")
+	}
+	if !strings.Contains(err.Error(), "not under worktree root") {
+		t.Errorf("unexpected error: %v", err)
 	}
 }

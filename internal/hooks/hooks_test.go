@@ -1,6 +1,8 @@
 package hooks
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -126,5 +128,140 @@ func TestDedupConflicts(t *testing.T) {
 	got := dedupConflicts(in)
 	if len(got) != 2 { // (a,x) and (a,y) — the duplicate (a,x) collapses
 		t.Fatalf("dedupConflicts len = %d, want 2", len(got))
+	}
+}
+
+// structuredDoc is laid out so line numbers map to known sections:
+//
+//	1 "# Title"   2 "intro"   3 ""        → preamble ""
+//	4 "## Alpha"  5 "a1"      6 "a2"  7 "" → "## Alpha"
+//	8 "## Beta"   9 "b1"     10 "b2"       → "## Beta"
+const structuredDoc = "# Title\nintro\n\n## Alpha\na1\na2\n\n## Beta\nb1\nb2\n"
+
+// twoWorktrees writes the same structured doc into a self/ and other/ dir and
+// returns their paths, so the section grade runs against real files.
+func twoWorktrees(t *testing.T) (self, other string) {
+	t.Helper()
+	dir := t.TempDir()
+	self, other = filepath.Join(dir, "self"), filepath.Join(dir, "other")
+	for _, wt := range []string{self, other} {
+		if err := os.MkdirAll(wt, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(wt, "CLAUDE.md"), []byte(structuredDoc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return self, other
+}
+
+// TestGradeConflictsStructuredDoc is the #98 regression.
+//
+// Before the fix the hooks stopped at "shared doc → advisory", so the ONE case a
+// structured_doc is configured to catch — two windows editing the same lane of a
+// hand-merged doc — blocked in `wt check` and sailed through the pre-push guard.
+//
+// Note the ranges in the same-section case are DISJOINT (line 5 vs line 6). That
+// is deliberate: it proves the SECTION grade is what fires, not the hunk grade,
+// which would call disjoint lines advisory.
+func TestGradeConflictsStructuredDoc(t *testing.T) {
+	self, other := twoWorktrees(t)
+	ws := []collide.Window{{Branch: "winA", Worktree: other}}
+	conflict := collide.Conflict{Path: "CLAUDE.md", Window: "winA"}
+
+	cases := []struct {
+		name       string
+		structured map[string]string
+		cur, other []gitx.LineRange
+		wantHard   bool
+	}{
+		{
+			"same section is HARD even when the line ranges are disjoint",
+			map[string]string{"CLAUDE.md": "^## "},
+			[]gitx.LineRange{rng(5, 5)}, []gitx.LineRange{rng(6, 6)}, true,
+		},
+		{
+			"disjoint sections stay advisory",
+			map[string]string{"CLAUDE.md": "^## "},
+			[]gitx.LineRange{rng(5, 5)}, []gitx.LineRange{rng(9, 9)}, false,
+		},
+		{
+			"both in the preamble is HARD (the preamble is a real lane)",
+			map[string]string{"CLAUDE.md": "^## "},
+			[]gitx.LineRange{rng(1, 1)}, []gitx.LineRange{rng(2, 2)}, true,
+		},
+		{
+			"NOT configured as structured — blanket shared-doc advisory as before",
+			nil,
+			[]gitx.LineRange{rng(5, 5)}, []gitx.LineRange{rng(5, 5)}, false,
+		},
+		{
+			"unparseable delimiter falls back to advisory, never to a hard block",
+			map[string]string{"CLAUDE.md": "^## ("},
+			[]gitx.LineRange{rng(5, 5)}, []gitx.LineRange{rng(5, 5)}, false,
+		},
+		{
+			"a delimiter matching a DIFFERENT doc leaves this one advisory",
+			map[string]string{"MEMORY.md": "^## "},
+			[]gitx.LineRange{rng(5, 5)}, []gitx.LineRange{rng(5, 5)}, false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &config.Config{Base: "main", SharedDocs: []string{"CLAUDE.md"}, StructuredDocs: tc.structured}
+			ranges := func(worktree, base, path string) []gitx.LineRange {
+				if worktree == self {
+					return tc.cur
+				}
+				return tc.other
+			}
+			hard, soft := gradeConflicts(c, []collide.Conflict{conflict}, self, ws, ranges)
+			gotHard := len(hard) == 1
+			if gotHard != tc.wantHard {
+				t.Fatalf("hard=%v want %v (hard=%d soft=%d)", gotHard, tc.wantHard, len(hard), len(soft))
+			}
+			if len(hard)+len(soft) != 1 {
+				t.Fatalf("conflict must be graded exactly once: hard=%d soft=%d", len(hard), len(soft))
+			}
+		})
+	}
+}
+
+// A structured doc that exists in NEITHER worktree cannot be section-graded, so
+// it must fall back to the blanket advisory rather than fail into a hard block —
+// the out-of-repo memory-doc case.
+func TestGradeConflictsStructuredDocUngradable(t *testing.T) {
+	dir := t.TempDir()
+	self, other := filepath.Join(dir, "self"), filepath.Join(dir, "other")
+	c := &config.Config{
+		Base:           "main",
+		SharedDocs:     []string{"CLAUDE.md"},
+		StructuredDocs: map[string]string{"CLAUDE.md": "^## "},
+	}
+	ws := []collide.Window{{Branch: "winA", Worktree: other}}
+	hard, soft := gradeConflicts(c,
+		[]collide.Conflict{{Path: "CLAUDE.md", Window: "winA"}}, self, ws,
+		stubRanges([]gitx.LineRange{rng(5, 5)}, []gitx.LineRange{rng(5, 5)}),
+	)
+	if len(hard) != 0 || len(soft) != 1 {
+		t.Fatalf("ungradable structured doc must stay advisory: hard=%d soft=%d", len(hard), len(soft))
+	}
+}
+
+// An append-only path must stay advisory even if it is ALSO named as a
+// structured doc — the section grade must not promote it past append-only.
+func TestGradeConflictsAppendOnlyBeatsSection(t *testing.T) {
+	self, other := twoWorktrees(t)
+	c := &config.Config{
+		Base:            "main",
+		AppendOnlyPaths: []string{"CLAUDE.md"},
+		StructuredDocs:  map[string]string{"CLAUDE.md": "^## "},
+	}
+	ws := []collide.Window{{Branch: "winA", Worktree: other}}
+	ranges := func(worktree, base, path string) []gitx.LineRange { return []gitx.LineRange{rng(5, 5)} }
+	hard, soft := gradeConflicts(c, []collide.Conflict{{Path: "CLAUDE.md", Window: "winA"}}, self, ws, ranges)
+	if len(hard) != 0 || len(soft) != 1 {
+		t.Fatalf("append-only must stay advisory: hard=%d soft=%d", len(hard), len(soft))
 	}
 }
