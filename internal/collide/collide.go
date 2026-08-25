@@ -396,6 +396,44 @@ func ConflictSeverity(current, other []gitx.LineRange, appendOnly bool) Severity
 	return SevFYI
 }
 
+// mergedVerdict decides, from the three blob hashes, whether a window holds
+// nothing UNMERGED for a path — i.e. its content is already merged and sitting in
+// a stale index/worktree, not a real collision (#109). merged=true requires the
+// working tree to equal upstream AND, if the path is staged, the index to equal
+// it too. known=false when upstream or the worktree blob can't be read, so the
+// caller fails safe (keep the collision HIGH — never clear on can't-tell). A
+// differing worktree or index is real content → merged=false, known=true. Pure.
+func mergedVerdict(up string, upOK bool, wt string, wtOK bool, staged string, stagedOK bool) (merged, known bool) {
+	// The INDEX blob is required, not optional: a path that IS a live conflict
+	// (in the other window's touched set) but has NO index entry (stagedOK=false)
+	// is a STAGED DELETION — a divergent change from upstream, not already-merged.
+	// So clear only when upstream, worktree, AND index all resolve and all equal
+	// upstream; a missing/unreadable index → known=false → the collision stays HIGH.
+	if !upOK || !wtOK || !stagedOK {
+		return false, false
+	}
+	if wt != up || staged != up {
+		return false, true
+	}
+	return true, true
+}
+
+// PathMatchesUpstream reports whether the file at path in worktree is byte-
+// identical to origin/<base>:<path> (falling back to <base>:<path>) — i.e. the
+// window's content for this path is already merged, not a live collision (#109).
+// known=false when there's no upstream ref for the path or the blob can't be
+// hashed; callers MUST fail safe (treat not-known as NOT merged, keep HIGH).
+// Blob-hash only — no diff, no network.
+func PathMatchesUpstream(worktree, base, path string) (merged, known bool) {
+	up, upOK := gitx.RefBlob(worktree, "origin/"+base, path)
+	if !upOK {
+		up, upOK = gitx.RefBlob(worktree, base, path)
+	}
+	wt, wtOK := gitx.WorktreeBlob(worktree, path)
+	staged, stagedOK := gitx.RefBlob(worktree, "", path)
+	return mergedVerdict(up, upOK, wt, wtOK, staged, stagedOK)
+}
+
 // OverlapSeverity grades a status overlap on one file touched by several
 // windows, given each window's ranges (pure). append-only ⇒ FYI. Otherwise:
 // if ANY participating window has no computable ranges (untracked/binary/diff

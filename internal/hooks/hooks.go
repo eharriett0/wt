@@ -413,6 +413,13 @@ func gradeConflicts(c *config.Config, active []collide.Conflict, root string, ws
 		if rangesPath == "" {
 			rangesPath = cf.Path
 		}
+		// #109: an already-merged path — the other window's content is byte-identical
+		// to the upstream base (stale index / worktree) — is not a live collision.
+		// Advisory, never blocks; matches `wt check`'s already-merged downgrade.
+		if merged, known := collide.PathMatchesUpstream(wtByLabel[cf.Window], c.Base, rangesPath); known && merged {
+			soft = append(soft, cf)
+			continue
+		}
 		if collide.IsSharedDoc(cf.Path, c.SharedDocs) {
 			// #98: a STRUCTURED shared doc (configured section delimiter) grades
 			// by SECTION, exactly as `wt check` does — both windows editing the
