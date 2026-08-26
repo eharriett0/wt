@@ -420,6 +420,13 @@ func gradeConflicts(c *config.Config, active []collide.Conflict, root string, ws
 			soft = append(soft, cf)
 			continue
 		}
+		// #113: the other window's claim on this path is an UNTRACKED file — nothing
+		// committed/staged there, so it can't be pushed and can't collide until
+		// committed. Advisory, never blocks; matches `wt check`'s untracked downgrade.
+		if gitx.IsUntracked(wtByLabel[cf.Window], rangesPath) {
+			soft = append(soft, cf)
+			continue
+		}
 		if collide.IsSharedDoc(cf.Path, c.SharedDocs) {
 			// #98: a STRUCTURED shared doc (configured section delimiter) grades
 			// by SECTION, exactly as `wt check` does — both windows editing the

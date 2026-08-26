@@ -399,6 +399,38 @@ func RangeChangedPaths(from, to string) ([]string, error) {
 	return paths, nil
 }
 
+// IsUntracked reports whether path exists in worktree but is NOT tracked by git
+// ("?? path" in porcelain) — a new file never added/staged/committed there. Such
+// a file has no diff and cannot be pushed, so it can't cause a merge collision
+// until it's actually committed (#113). Scoped to the one path; "" worktree or
+// any git error → false (fail-safe: don't claim untracked when we can't tell).
+func IsUntracked(worktree, path string) bool {
+	if worktree == "" {
+		return false
+	}
+	out, err := runRaw(worktree, "status", "--porcelain", "--untracked-files=all", "--", path)
+	if err != nil {
+		return false
+	}
+	// PURELY untracked only: every porcelain line for the path must be "?? ". A
+	// coexisting index-side line means a pushable staged change is ALSO present —
+	// e.g. `git rm --cached foo` (file kept on disk) emits BOTH "D  foo" (a staged,
+	// committable deletion) and "?? foo". That deletion can collide (delete/modify)
+	// with another window's edit, so it must NOT be downgraded (mirrors the #109
+	// staged-deletion lesson). Any non-"?? " line → not purely untracked → false.
+	sawUntracked := false
+	for _, ln := range strings.Split(out, "\n") {
+		if ln == "" {
+			continue
+		}
+		if !strings.HasPrefix(ln, "?? ") {
+			return false
+		}
+		sawUntracked = true
+	}
+	return sawUntracked
+}
+
 // WorktreeBlob returns the git blob hash of the WORKING-TREE file at path inside
 // worktree (`git hash-object`), and whether it could be hashed. Lets a caller
 // compare a window's on-disk content against a ref without a diff (#109).

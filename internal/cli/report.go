@@ -77,6 +77,7 @@ type CheckEntry struct {
 	OverlapSpans   []gitx.LineRange `json:"overlap_spans,omitempty"`
 	SharedSections []string         `json:"shared_sections,omitempty"` // #22: same section(s) both windows edit → HIGH
 	AlreadyMerged  bool             `json:"already_merged,omitempty"`  // #109: other window's blob == origin/base — stale index, not a live collision
+	Untracked      bool             `json:"untracked,omitempty"`       // #113: other window's claim is an untracked file — no committed content to collide with
 }
 
 // alreadyMerged reports whether the other window's content for path is byte-
@@ -89,6 +90,13 @@ func alreadyMerged(otherWorktree, base, path string) bool {
 	}
 	merged, known := collide.PathMatchesUpstream(otherWorktree, base, path)
 	return known && merged
+}
+
+// untrackedInOther reports whether the other window's claim on path is an
+// untracked file (never added/staged/committed there) — nothing that can be
+// pushed, so it can't collide until committed (#113).
+func untrackedInOther(otherWorktree, path string) bool {
+	return otherWorktree != "" && gitx.IsUntracked(otherWorktree, path)
 }
 
 // buildCheckReport classifies + hunk-grades every conflict for the requested
@@ -122,6 +130,13 @@ func buildCheckReport(c *config.Config, ws []collide.Window, currentWorktree str
 			// to clash with. Surface it (still listed) as informational, not HIGH,
 			// so it's distinguishable from a real one instead of blocking on nothing.
 			e.Category, e.Severity, e.AlreadyMerged = CatFYI, "low", true
+		case untrackedInOther(otherWt, rangesPath):
+			// #113: the other window's only claim on this path is an UNTRACKED file
+			// — never added/staged/committed there, so it has no diff and can't be
+			// pushed. It cannot collide until it's committed (at which point it
+			// grades normally). Advisory, still listed, labelled untracked — not a
+			// permanent HIGH on a phantom "uncommitted edits" line range.
+			e.Category, e.Severity, e.Untracked = CatFYI, "low", true
 		case collide.IsSharedDoc(cf.Path, c.SharedDocs):
 			e.Category, e.Severity = CatAdvisory, "low"
 			// #22: a STRUCTURED shared doc (configured section delimiter) grades
@@ -263,6 +278,12 @@ func printCheckAdvisories(advisory, fyi []CheckEntry, showDiff bool) {
 			// is byte-identical to the upstream base (already-merged work in a stale
 			// index). Still listed so it stays visible, not silently dropped.
 			fmt.Fprintln(os.Stderr, "   "+ui.Dim(fmt.Sprintf("%s ← %s [%s] · content identical to upstream base — already merged", e.Path, e.Window, e.Liveness)))
+			continue
+		}
+		if e.Untracked {
+			// #113: the other window's claim is an untracked file — no committed
+			// content to collide with (it can't be pushed until it's committed).
+			fmt.Fprintln(os.Stderr, "   "+ui.Dim(fmt.Sprintf("%s ← %s [%s] · untracked there — nothing committed to collide with", e.Path, e.Window, e.Liveness)))
 			continue
 		}
 		msg := "disjoint hunks"
