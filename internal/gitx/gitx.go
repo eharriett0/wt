@@ -412,12 +412,23 @@ func IsUntracked(worktree, path string) bool {
 	if err != nil {
 		return false
 	}
+	// PURELY untracked only: every porcelain line for the path must be "?? ". A
+	// coexisting index-side line means a pushable staged change is ALSO present —
+	// e.g. `git rm --cached foo` (file kept on disk) emits BOTH "D  foo" (a staged,
+	// committable deletion) and "?? foo". That deletion can collide (delete/modify)
+	// with another window's edit, so it must NOT be downgraded (mirrors the #109
+	// staged-deletion lesson). Any non-"?? " line → not purely untracked → false.
+	sawUntracked := false
 	for _, ln := range strings.Split(out, "\n") {
-		if strings.HasPrefix(ln, "?? ") {
-			return true
+		if ln == "" {
+			continue
 		}
+		if !strings.HasPrefix(ln, "?? ") {
+			return false
+		}
+		sawUntracked = true
 	}
-	return false
+	return sawUntracked
 }
 
 // WorktreeBlob returns the git blob hash of the WORKING-TREE file at path inside

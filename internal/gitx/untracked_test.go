@@ -47,6 +47,17 @@ func TestIsUntracked(t *testing.T) {
 		t.Error("a modified tracked file must be IsUntracked=false")
 	}
 
+	// STAGED DELETION with the file kept on disk (`git rm --cached`): porcelain
+	// emits BOTH "D  del.py" (a staged, pushable deletion) and "?? del.py". That
+	// deletion can collide (delete/modify), so it must read false — NOT downgraded.
+	write("del.py", "keep me\n")
+	runGit(t, dir, "add", "del.py")
+	runGit(t, dir, "commit", "-qm", "add del")
+	runGit(t, dir, "rm", "--cached", "-q", "del.py") // index: deleted; worktree: file remains → "D " + "??"
+	if IsUntracked(dir, "del.py") {
+		t.Error("a staged deletion (D + ??) must be IsUntracked=false — the deletion is pushable")
+	}
+
 	// empty worktree arg → false (fail-safe)
 	if IsUntracked("", "anything") {
 		t.Error("empty worktree must be IsUntracked=false")
