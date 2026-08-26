@@ -399,6 +399,27 @@ func RangeChangedPaths(from, to string) ([]string, error) {
 	return paths, nil
 }
 
+// IsUntracked reports whether path exists in worktree but is NOT tracked by git
+// ("?? path" in porcelain) — a new file never added/staged/committed there. Such
+// a file has no diff and cannot be pushed, so it can't cause a merge collision
+// until it's actually committed (#113). Scoped to the one path; "" worktree or
+// any git error → false (fail-safe: don't claim untracked when we can't tell).
+func IsUntracked(worktree, path string) bool {
+	if worktree == "" {
+		return false
+	}
+	out, err := runRaw(worktree, "status", "--porcelain", "--untracked-files=all", "--", path)
+	if err != nil {
+		return false
+	}
+	for _, ln := range strings.Split(out, "\n") {
+		if strings.HasPrefix(ln, "?? ") {
+			return true
+		}
+	}
+	return false
+}
+
 // WorktreeBlob returns the git blob hash of the WORKING-TREE file at path inside
 // worktree (`git hash-object`), and whether it could be hashed. Lets a caller
 // compare a window's on-disk content against a ref without a diff (#109).
