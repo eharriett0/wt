@@ -90,9 +90,29 @@ Installed hooks are thin shims (`exec "…/wt" _hook <name>`) — all logic is i
 binary. The **sentinel** that marks a wt-managed shim is the comment `wt-managed
 hook` (NOT `wt _hook` — the quoted path renders `wt" _hook`, which broke
 detection in v0.1.8, #91). `runHook` dispatches: git hooks (`pre-push`,
-`pre-commit`) and Claude Code hooks (`todo-write` PostToolUse, `claude-edit`
-PreToolUse). Claude Code hooks derive the repo from the payload's `cwd` and
-**always exit 0** (advisory; a coordination nicety must never break the session).
+`pre-commit`), Claude Code hooks (`todo-write` PostToolUse, `claude-edit`
+PreToolUse), and the Codex hook (`codex-context` UserPromptSubmit). Agent hooks
+derive the repo from the payload's `cwd` and **always exit 0** (advisory; a
+coordination nicety must never break the session).
+
+**Codex is different from Claude Code — build on `UserPromptSubmit`, not a
+per-edit hook.** Codex's `PreToolUse` fires on the **shell tool only**
+(`apply_patch`/Edit edits don't fire it) and only acts on `deny`, not advisory
+context (openai/codex#19385) — so the Claude-style per-edit advisory can't be
+replicated. `wt _hook codex-context` is a **UserPromptSubmit** hook (the surface
+that *does* inject `additionalContext`): each turn it emits the cross-window
+overlap summary from the SAME `collide.Overlaps` + `gradeStatusOverlaps` machinery
+`wt status` uses, excluding the current window (`collide.LabelForWorktree`). It's
+silent unless another live window overlaps a file. Key facts: `.codex/hooks.json`
+uses the **same nested shape** as Claude's `.claude/settings.json`
+(`{hooks:{UserPromptSubmit:[{hooks:[{type,command}]}]}}`, no matcher); Codex hooks
+are **opt-in** via `[features] hooks = true` in `~/.codex/config.toml` (the
+installer prints this reminder — it does NOT edit config.toml). The output JSON is
+`{hookSpecificOutput:{hookEventName:"UserPromptSubmit", additionalContext:…}}`.
+The awareness is coarse (per prompt, not per edit) because that's all Codex
+exposes — but the git `pre-push`/`pre-commit` guards + the worktree-based engine
+are already agent-agnostic, so a Codex window is a first-class window and its
+commits/pushes already hit the guards regardless.
 
 ## Release
 
