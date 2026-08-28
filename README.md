@@ -7,9 +7,9 @@ windows are **editing the same lines**, before that becomes a merge conflict.
 It distinguishes real conflicts (overlapping hunks) from parallel appends to the
 same file, quiets down dormant and merged branches, cleans up worktrees when
 work ships, and can gate merges in repos where merge == deploy-to-prod. It works
-whether the windows are humans or AI agents — and a Claude Code hook can surface
-collisions to the **agents doing the editing**, not just to you (see
-[Agents](#agents-claude-code)).
+whether the windows are humans or AI agents — and Claude Code / Codex hooks can
+surface collisions to the **agents doing the editing**, not just to you (see
+[Agents](#agents-claude-code--codex)).
 
 Repo-agnostic, single static binary, zero third-party dependencies (it shells
 out to `git` and `gh`). Works in any git repo on any machine.
@@ -152,7 +152,8 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 | `wt block-id <file>` | Atomically reserve the next append-log id so two windows never grab the same `NEWEST-N`. `--written N` marks a reservation done (clears the banner; frees it if never written) `[--pattern] [--format]` |
 | `wt append <doc> --section H "txt"` | Locked, section-scoped append to a structured shared doc (parallel adds can't clobber) |
 | `wt install-hooks` | Install pre-push (base guard + collision check + base-conflict warning) + pre-commit (collision notice) `[--force]` |
-| `wt install-claude-hook` | Wire a Claude Code **PreToolUse** hook so the AI agents doing the editing get collision-checked per edit `[--write]` (see [Agents](#agents-claude-code)) |
+| `wt install-claude-hook` | Wire a Claude Code **PreToolUse** hook so the AI agents doing the editing get collision-checked per edit `[--write]` (see [Agents](#agents-claude-code--codex)) |
+| `wt install-codex-hook` | Wire a Codex **UserPromptSubmit** hook so it gets multi-window collision awareness each turn `[--write]` (see [Agents](#agents-claude-code--codex)) |
 | `wt doctor` | Check git/gh + all resolved config + structured-doc regex + coordination-log health + preflight, and flag worktrees that track the base branch, a stale far-behind base checkout, and whether the hooks are installed `[--json]` |
 | `wt version` | Print the version |
 | `wt help` | Colorful overview |
@@ -242,7 +243,7 @@ If your repo uses the [pre-commit](https://pre-commit.com) framework, `wt`
 detects it and prints a `repo: local` snippet to add instead of clobbering the
 framework's managed hook.
 
-## Agents (Claude Code)
+## Agents (Claude Code + Codex)
 
 The whole point of the collision engine is worktree-creator-agnostic: `wt
 status`/`check` enumerate `git worktree list`, so a worktree an agent spawns
@@ -268,6 +269,39 @@ wt install-claude-hook --write    # merges it in (never clobbers existing hooks)
 
 So when the agent in worktree A goes to edit the exact hunk of `foo.go` that
 worktree B is live-editing, it's told — instead of both landing competing PRs.
+
+### Codex
+
+Codex is already a first-class window with **zero** extra setup: the collision
+engine enumerates `git worktree list`, so a worktree Codex is working in shows in
+`wt status`, and Codex's `git commit` / `git push` (run through its shell tool)
+trip `wt`'s pre-commit / pre-push guards like anyone else's. What Codex *can't* do
+is a Claude-style per-edit hook — its `PreToolUse` fires on the **shell tool
+only** (`apply_patch` edits don't fire it) and only acts on `deny`, not advisory
+context ([openai/codex#19385](https://github.com/openai/codex/issues/19385)). So
+`wt install-codex-hook` uses the surface Codex *does* have —
+**`UserPromptSubmit`**, which injects `additionalContext` — to tell Codex, each
+turn, which files other live windows are editing:
+
+```
+wt install-codex-hook             # prints the .codex/hooks.json snippet
+wt install-codex-hook --write     # merges it into .codex/hooks.json
+```
+
+Codex hooks are **opt-in** — enable them once in `~/.codex/config.toml`:
+
+```toml
+[features]
+hooks = true
+```
+
+- Injected **only when** another live window overlaps a file (silent otherwise),
+  with the current window excluded and a `wt check <file>` reminder.
+- Fail-open; `WT_SKIP_COLLISION=1` to silence; ≤1-worktree repos skipped.
+
+The awareness is proactive-but-coarse (per prompt, not per edit) because that's
+what Codex exposes — but the pre-push guard is the hard gate for both agents, so
+nothing lands a competing push regardless of which agent is driving.
 
 ## Configuration
 

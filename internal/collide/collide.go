@@ -463,6 +463,18 @@ func sameWorktree(a, b string) bool {
 	return a == b || realPath(a) == realPath(b)
 }
 
+// LabelForWorktree returns the label of the window whose worktree is worktree
+// (symlink-normalized), or "" if none — used to exclude the CURRENT window from
+// cross-window summaries (e.g. the Codex awareness hook, #codex).
+func LabelForWorktree(ws []Window, worktree string) string {
+	for _, w := range ws {
+		if sameWorktree(w.Worktree, worktree) {
+			return w.Label()
+		}
+	}
+	return ""
+}
+
 func realPath(p string) string {
 	if r, err := filepath.EvalSymlinks(p); err == nil {
 		return r

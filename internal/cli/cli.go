@@ -106,6 +106,8 @@ func Main(args []string) int {
 		return cmdInstallHooks(rest)
 	case "install-claude-hook":
 		return cmdInstallClaudeHook(rest)
+	case "install-codex-hook":
+		return cmdInstallCodexHook(rest)
 	case "announce":
 		return cmdAnnounce(rest)
 	case "inbox":
@@ -987,6 +989,12 @@ func runHook(args []string) int {
 	// without a pre-loaded config.
 	if args[0] == "claude-edit" {
 		return hookClaudeEdit(os.Stdin)
+	}
+	// codex-context is a Codex CLI UserPromptSubmit hook: it derives the repo from
+	// its stdin payload's cwd and always exits 0 (advisory context), so it too runs
+	// without a pre-loaded config.
+	if args[0] == "codex-context" {
+		return hookCodexContext(os.Stdin)
 	}
 	c, err := config.Load()
 	if err != nil {
