@@ -19,6 +19,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/eharriett0/wt/internal/collide"
@@ -72,7 +73,15 @@ func codexContextMessage(overlaps []StatusOverlap, currentLabel string) (msg str
 		if o.Severity == "HIGH" {
 			grade = "overlapping hunks — HIGH"
 		}
-		lines = append(lines, fmt.Sprintf("  %s — also being edited by %s (%s)", o.File, strings.Join(others, ", "), grade))
+		// "also" only when THIS window is one of the participants; otherwise it's a
+		// heads-up about a file two OTHER windows are contesting (don't imply this
+		// window is editing it — and if the current window can't be identified,
+		// currentLabel is "" and we stay with the neutral phrasing).
+		verb := "being edited by"
+		if currentLabel != "" && slices.Contains(o.Windows, currentLabel) {
+			verb = "also being edited by"
+		}
+		lines = append(lines, fmt.Sprintf("  %s — %s %s (%s)", o.File, verb, strings.Join(others, ", "), grade))
 	}
 	if len(lines) == 0 {
 		return "", false

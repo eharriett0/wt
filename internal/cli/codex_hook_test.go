@@ -43,8 +43,9 @@ func TestCodexContextMessage(t *testing.T) {
 	}
 
 	ov := []StatusOverlap{
-		{File: "foo.go", Windows: []string{"#1", "feat/x"}, Severity: "HIGH"},
-		{File: "bar.go", Windows: []string{"feat/y", "#1"}, Severity: "low"},
+		{File: "foo.go", Windows: []string{"#1", "feat/x"}, Severity: "HIGH"},   // #1 participates → "also"
+		{File: "bar.go", Windows: []string{"feat/y", "#1"}, Severity: "low"},    // #1 participates → "also"
+		{File: "baz.go", Windows: []string{"feat/y", "feat/z"}, Severity: "low"}, // #1 NOT a participant → no "also"
 	}
 	msg, has := codexContextMessage(ov, "#1")
 	if !has {
@@ -53,7 +54,7 @@ func TestCodexContextMessage(t *testing.T) {
 	if strings.Contains(msg, "#1") {
 		t.Errorf("current window #1 must be excluded from the message: %q", msg)
 	}
-	if !strings.Contains(msg, "feat/x") || !strings.Contains(msg, "feat/y") {
+	if !strings.Contains(msg, "feat/x") || !strings.Contains(msg, "feat/y") || !strings.Contains(msg, "feat/z") {
 		t.Errorf("other windows missing: %q", msg)
 	}
 	if !strings.Contains(msg, "foo.go") || !strings.Contains(msg, "HIGH") {
@@ -64,6 +65,13 @@ func TestCodexContextMessage(t *testing.T) {
 	}
 	if !strings.Contains(msg, "wt check") {
 		t.Errorf("missing the `wt check` reminder: %q", msg)
+	}
+	// wording accuracy: "also" only where the current window participates
+	if !strings.Contains(msg, "foo.go — also being edited by feat/x") {
+		t.Errorf("participant overlap should say 'also being edited by': %q", msg)
+	}
+	if !strings.Contains(msg, "baz.go — being edited by feat/y, feat/z") {
+		t.Errorf("non-participant overlap should NOT say 'also': %q", msg)
 	}
 }
 
