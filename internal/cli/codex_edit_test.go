@@ -121,6 +121,31 @@ func TestParseCodexPatch_Move(t *testing.T) {
 	}
 }
 
+func TestParseCodexPatch_BareBlankContextLine(t *testing.T) {
+	// apply_patch sometimes emits a blank CONTEXT line without a leading space
+	// (bare ""). It must be captured so a hunk spanning a blank line still
+	// locates (#117 review #2). The trailing "" from the final newline must NOT
+	// pollute the last hunk.
+	patch := "*** Update File: x.go\n@@\n a\n\n-b\n+B\n"
+	files := parseCodexPatch(patch)
+	if len(files) != 1 || len(files[0].hunks) != 1 {
+		t.Fatalf("parse=%+v", files)
+	}
+	h := files[0].hunks[0]
+	// pre-image: ["a", "", "b"] — blank line preserved; "b" removed at offset 2.
+	if strings.Join(h.preImage, "|") != "a||b" {
+		t.Errorf("pre-image=%q want a||b", strings.Join(h.preImage, "|"))
+	}
+	if len(h.removed) != 1 || h.removed[0] != 2 {
+		t.Errorf("removed=%v want [2]", h.removed)
+	}
+	// It locates against real blank-line-containing content, ranging only "b".
+	ranges, ok := patchRangesInFile(files[0], "a\n\nb\nc\n")
+	if !ok || len(ranges) != 1 || ranges[0].Start != 3 || ranges[0].End != 3 {
+		t.Errorf("locate blank-context hunk: ok=%v ranges=%v want line 3", ok, ranges)
+	}
+}
+
 func TestContiguousRuns(t *testing.T) {
 	cases := []struct {
 		in   []int
@@ -229,19 +254,19 @@ func decodeDecision(t *testing.T, s string) (ctx, decision, reason string) {
 }
 
 func TestCodexEditDecision(t *testing.T) {
-	entries := []CheckEntry{
-		{Path: "a.go", Window: "win-b", Liveness: "live"},
-		{Path: "a.go", Window: "win-b", Liveness: "live"}, // dup path → collapse
-		{Path: "d.go", Window: "win-c", Liveness: "live"},
+	confirmed := []codexGradedEntry{
+		{entry: CheckEntry{Path: "a.go", Window: "win-b", Liveness: "live"}, confirmed: true},
+		{entry: CheckEntry{Path: "a.go", Window: "win-b", Liveness: "live"}, confirmed: true}, // dup → collapse
+		{entry: CheckEntry{Path: "d.go", Window: "win-c", Liveness: "live"}, confirmed: true},
 	}
 
 	// Empty → no output.
-	if _, has := codexEditDecision(nil, false, false); has {
+	if _, has := codexEditDecision(nil, false); has {
 		t.Error("empty high should not emit")
 	}
 
-	// Advisory, confirmed HIGH wording, additionalContext (deny=false).
-	out, has := codexEditDecision(entries, false, true)
+	// All-confirmed advisory: OVERLAPS header, additionalContext (deny=false).
+	out, has := codexEditDecision(confirmed, false)
 	if !has {
 		t.Fatal("expected output")
 	}
@@ -250,7 +275,7 @@ func TestCodexEditDecision(t *testing.T) {
 		t.Errorf("advisory must not set permissionDecision, got %q", dec)
 	}
 	if !strings.Contains(ctx, "OVERLAPS hunks") {
-		t.Errorf("confirmed wording missing:\n%s", ctx)
+		t.Errorf("all-confirmed header missing:\n%s", ctx)
 	}
 	if !strings.Contains(ctx, "a.go") || !strings.Contains(ctx, "d.go") {
 		t.Errorf("both files should appear:\n%s", ctx)
@@ -258,21 +283,50 @@ func TestCodexEditDecision(t *testing.T) {
 	if strings.Count(ctx, "a.go") != 1 {
 		t.Errorf("a.go should appear once (deduped):\n%s", ctx)
 	}
-
-	// File-level (unconfirmed) wording.
-	out, _ = codexEditDecision(entries, false, false)
-	ctx, _, _ = decodeDecision(t, out)
-	if !strings.Contains(ctx, "hunk overlap not computed") {
-		t.Errorf("file-level wording missing:\n%s", ctx)
+	if !strings.Contains(ctx, "overlapping hunks") {
+		t.Errorf("confirmed line tag missing:\n%s", ctx)
 	}
 
-	// Deny mode → permissionDecision deny + reason (never additionalContext).
-	out, _ = codexEditDecision(entries, true, true)
+	// All file-level: neutral header + per-line "hunk overlap not computed".
+	fileLevel := []codexGradedEntry{{entry: CheckEntry{Path: "a.go", Window: "win-b", Liveness: "live"}}}
+	out, _ = codexEditDecision(fileLevel, false)
+	ctx, _, _ = decodeDecision(t, out)
+	if strings.Contains(ctx, "OVERLAPS hunks") {
+		t.Errorf("file-level must not use the OVERLAPS header:\n%s", ctx)
+	}
+	if !strings.Contains(ctx, "hunk overlap not computed") {
+		t.Errorf("file-level tag missing:\n%s", ctx)
+	}
+
+	// Mixed confirmed + file-level: NEUTRAL header, each line tagged accurately —
+	// the unverified file must NOT be labeled "overlapping hunks" (#117 review).
+	mixed := []codexGradedEntry{
+		{entry: CheckEntry{Path: "a.go", Window: "win-b", Liveness: "live"}, confirmed: true},
+		{entry: CheckEntry{Path: "b.go", Window: "win-c", Liveness: "live"}, confirmed: false},
+	}
+	out, _ = codexEditDecision(mixed, true) // deny justified by the confirmed a.go
 	ctx, dec, reason := decodeDecision(t, out)
 	if dec != "deny" {
-		t.Errorf("deny mode: decision=%q want deny", dec)
+		t.Errorf("mixed w/ a confirmed HIGH under deny → decision=%q want deny", dec)
 	}
-	if reason == "" || ctx != "" {
-		t.Errorf("deny should carry reason (not additionalContext): reason=%q ctx=%q", reason, ctx)
+	body := reason
+	if strings.Contains(body, "OVERLAPS hunks") {
+		t.Errorf("mixed batch must use the neutral header, not OVERLAPS:\n%s", body)
+	}
+	// a.go tagged confirmed, b.go tagged file-level.
+	for _, w := range []string{"a.go", "overlapping hunks", "b.go", "hunk overlap not computed"} {
+		if !strings.Contains(body, w) {
+			t.Errorf("mixed body missing %q:\n%s", w, body)
+		}
+	}
+	if ctx != "" {
+		t.Errorf("deny must carry the reason, not additionalContext: ctx=%q", ctx)
+	}
+
+	// Deny mode with a confirmed batch → permissionDecision deny + reason.
+	out, _ = codexEditDecision(confirmed, true)
+	ctx, dec, reason = decodeDecision(t, out)
+	if dec != "deny" || reason == "" || ctx != "" {
+		t.Errorf("deny: decision=%q reason=%q ctx=%q", dec, reason, ctx)
 	}
 }

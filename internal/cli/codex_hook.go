@@ -226,7 +226,13 @@ func parseCodexPatch(patch string) []codexPatchFile {
 		flushFile()
 		cur = &codexPatchFile{path: strings.TrimSpace(strings.TrimPrefix(ln, prefix))}
 	}
-	for _, ln := range strings.Split(patch, "\n") {
+	lines := strings.Split(patch, "\n")
+	// Drop the single trailing "" a terminating newline produces, so it isn't
+	// mistaken for a blank context line appended to the last open hunk.
+	if n := len(lines); n > 0 && lines[n-1] == "" {
+		lines = lines[:n-1]
+	}
+	for _, ln := range lines {
 		switch {
 		case strings.HasPrefix(ln, "*** Update File: "):
 			start(ln, "*** Update File: ")
@@ -253,6 +259,10 @@ func parseCodexPatch(patch string) []codexPatchFile {
 			pre = append(pre, ln[1:]) // removed line — present in the current file
 		case strings.HasPrefix(ln, " "):
 			pre = append(pre, ln[1:]) // context line — present in the current file
+		case ln == "":
+			// blank context line emitted WITHOUT a leading space (an apply_patch
+			// quirk); reached only inside an open hunk (cur==nil is caught above).
+			pre = append(pre, "")
 		}
 	}
 	flushFile()
@@ -371,11 +381,14 @@ func hookCodexEdit(r io.Reader) int {
 	byPath := map[string]codexPatchFile{}
 	for _, f := range files {
 		byPath[f.path] = f
+		if f.newPath != "" {
+			byPath[f.newPath] = f // a move grades the destination too (#117 review)
+		}
 	}
 
 	entries := buildCheckReport(c, ws, root, paths, false)
-	var high []CheckEntry
-	confirmed := false
+	var high []codexGradedEntry
+	anyConfirmed := false
 	for _, e := range entries {
 		if e.Category != CatBlocking {
 			continue
@@ -383,19 +396,28 @@ func hookCodexEdit(r io.Reader) int {
 		// Re-grade against the patch's ACTUAL hunks, but only when frame-safe: the
 		// hunk line numbers (located in the on-disk file) match e.OtherRanges'
 		// base frame only when this worktree's file is unchanged vs base (#108).
-		relPath := e.Path
-		if pending, ok := pendingPatchRanges(byPath, relPath, root, c.Base); ok && len(e.OtherRanges) > 0 {
+		conf := false
+		if pending, ok := pendingPatchRanges(byPath, e.Path, root, c.Base); ok && len(e.OtherRanges) > 0 {
 			if collide.ConflictSeverity(pending, e.OtherRanges, false) != collide.SevHigh {
 				continue // patch hunks are disjoint from the other window — no overlap
 			}
-			confirmed = true // frame-safe, real overlapping hunks
+			conf = true // frame-safe, real overlapping hunks
+			anyConfirmed = true
 		}
-		high = append(high, e)
+		high = append(high, codexGradedEntry{entry: e, confirmed: conf})
 	}
-	if out, has := codexEditDecision(high, os.Getenv("WT_CODEX_HOOK_BLOCK") == "1" && confirmed, confirmed); has {
+	if out, has := codexEditDecision(high, os.Getenv("WT_CODEX_HOOK_BLOCK") == "1" && anyConfirmed); has {
 		fmt.Println(out)
 	}
 	return 0
+}
+
+// codexGradedEntry pairs a blocking CheckEntry with whether its overlap was
+// frame-safe hunk-CONFIRMED (vs a file-level heads-up), so a multi-file patch
+// can word each line accurately (#117 review).
+type codexGradedEntry struct {
+	entry     CheckEntry
+	confirmed bool
 }
 
 // pendingPatchRanges returns the patch's edited ranges for relPath, but ONLY when
@@ -418,31 +440,39 @@ func pendingPatchRanges(byPath map[string]codexPatchFile, relPath, root, base st
 }
 
 // codexEditDecision shapes the PreToolUse stdout JSON. deny=true → permissionDecision
-// "deny" (only ever passed for a CONFIRMED HIGH); else additionalContext. confirmed
-// picks accurate wording (overlapping hunks vs file-level heads-up). Pure.
-func codexEditDecision(high []CheckEntry, deny, confirmed bool) (string, bool) {
+// "deny" (only ever passed when the batch has ≥1 CONFIRMED HIGH); else
+// additionalContext. Each file is tagged per-entry — "overlapping hunks" (frame-safe
+// confirmed) vs "hunk overlap not computed" (file-level heads-up) — so a mixed
+// multi-file patch never overstates hunk overlap on an unverified file (#117 review).
+// Pure.
+func codexEditDecision(high []codexGradedEntry, deny bool) (string, bool) {
 	if len(high) == 0 {
 		return "", false
 	}
 	seen := map[string]bool{}
 	var lines []string
-	for _, e := range high {
+	anyConfirmed, anyFileLevel := false, false
+	for _, g := range high {
+		e := g.entry
 		if seen[e.Path] {
 			continue
 		}
 		seen[e.Path] = true
-		lines = append(lines, fmt.Sprintf("  %s — also being edited by %s [%s]", e.Path, e.Window, e.Liveness))
+		tag := "hunk overlap not computed — run `wt check`"
+		if g.confirmed {
+			tag = "overlapping hunks"
+			anyConfirmed = true
+		} else {
+			anyFileLevel = true
+		}
+		lines = append(lines, fmt.Sprintf("  %s — also being edited by %s [%s] (%s)", e.Path, e.Window, e.Liveness, tag))
 	}
-	var msg string
-	if confirmed {
-		msg = "wt collision: your apply_patch OVERLAPS hunks another live window is editing:\n" +
-			strings.Join(lines, "\n") +
-			"\nCoordinate before applying to avoid a merge conflict / duplicate PR. (Set WT_SKIP_COLLISION=1 to silence.)"
-	} else {
-		msg = "wt: your apply_patch touches file(s) another live window is editing (hunk overlap not computed — run `wt check` for line-level detail):\n" +
-			strings.Join(lines, "\n") +
-			"\nCoordinate before applying to avoid a merge conflict / duplicate PR. (Set WT_SKIP_COLLISION=1 to silence.)"
+	header := "wt: your apply_patch touches file(s) another live window is editing:"
+	if anyConfirmed && !anyFileLevel {
+		header = "wt collision: your apply_patch OVERLAPS hunks another live window is editing:"
 	}
+	msg := header + "\n" + strings.Join(lines, "\n") +
+		"\nCoordinate before applying to avoid a merge conflict / duplicate PR. (Set WT_SKIP_COLLISION=1 to silence.)"
 	var out struct {
 		HookSpecificOutput struct {
 			HookEventName            string `json:"hookEventName"`
