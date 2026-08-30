@@ -108,6 +108,8 @@ func Main(args []string) int {
 		return cmdInstallClaudeHook(rest)
 	case "install-codex-hook":
 		return cmdInstallCodexHook(rest)
+	case "mcp":
+		return cmdMCP(rest)
 	case "announce":
 		return cmdAnnounce(rest)
 	case "inbox":

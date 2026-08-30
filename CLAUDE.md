@@ -124,6 +124,27 @@ or `{…permissionDecision:"deny", permissionDecisionReason:…}` (block). The
 worktree-based engine + git `pre-push`/`pre-commit` guards are already
 agent-agnostic, so a Codex window is first-class regardless of the hooks.
 
+## MCP (`wt mcp`, #115)
+
+`wt mcp` (`internal/cli/mcp.go`) is a **stdio MCP server** for chat-style agents
+(Claude Desktop, Cursor, …) — the third agent-integration surface after Claude/Codex
+hooks. It speaks newline-delimited JSON-RPC 2.0 on stdin/stdout (hand-rolled, zero
+deps): `initialize` (echoes the client's `protocolVersion`, advertises `tools`),
+`tools/list`, `tools/call`, `ping`; a request with **no `id`** is a notification →
+no response (e.g. `notifications/initialized`). Responses are **compact** JSON + `\n`
+(never `MarshalIndent` — an embedded newline would break the client's line reader; the
+pretty JSON lives INSIDE the tool result's text string, where `\n` is escaped). Read
+loop is `bufio.Scanner` with an 8MB buffer so one malformed line yields `-32700` and
+the stream **continues** (doesn't desync). Four **read-only** tools —
+`wt_status` / `wt_check` / `wt_todos` / `wt_where` — each single-source the SAME
+`collide.Scan` + `buildStatusPayload`/`buildCheckReport`+`buildCheckPayload` +
+`gradeStatusOverlaps` + `todos.ForWorktree` the CLI uses (payload builders extracted
+in `report.go` so JSON can't drift from `wt status/check --json`). Tool-level failures
+(not-in-repo, bad args, scan error) return `{isError:true}` results, NOT JSON-RPC
+protocol errors, so the model sees them. **v1 is read-only** — no tool mutates state
+(claim/announce/merge stay in the CLI + git hooks). The server runs in the client's
+cwd (`config.Load()` derives the repo); it never chdirs.
+
 ## Release
 
 `wt` is installed via the Homebrew tap `eharriett0/homebrew-tap` (formula

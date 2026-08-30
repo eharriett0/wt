@@ -315,6 +315,30 @@ The awareness is proactive-but-coarse (per prompt, not per edit) because that's
 what Codex exposes — but the pre-push guard is the hard gate for both agents, so
 nothing lands a competing push regardless of which agent is driving.
 
+### Any MCP client — `wt mcp`
+
+For chat-style agents that speak [MCP](https://modelcontextprotocol.io) (Claude
+Desktop, Cursor, and others) rather than shell hooks, `wt mcp` runs a stdio
+server exposing wt's **read-only** surface as tools, so the agent can ask "who
+else is in this file?" mid-conversation:
+
+- **`wt_status`** — every active window + graded cross-window overlaps
+- **`wt_check`** — before editing given paths: is another live window in them?
+- **`wt_todos`** — what each window is working on
+- **`wt_where`** — resolve an issue/branch to its worktree path
+
+Each tool single-sources the SAME `collide.Scan` / `buildCheckReport` /
+`gradeStatusOverlaps` pipeline the CLI uses, so the data never drifts from
+`wt status --json`. Point your client at the command (run in the repo directory):
+
+```jsonc
+// e.g. an MCP client config
+{ "mcpServers": { "wt": { "command": "wt", "args": ["mcp"] } } }
+```
+
+v1 is read-only by design — no tool mutates state; the write surface (claim,
+announce, merge) stays in the CLI + git hooks.
+
 ## Configuration
 
 Zero-config works by derivation. Override via a repo-root `.wt.conf`
