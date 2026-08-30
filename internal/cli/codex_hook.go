@@ -159,17 +159,335 @@ func emitCodexContext(msg string) {
 	}
 }
 
+// ---- edit-time hook (#117) ---------------------------------------------------
+
+// parseCodexEdit extracts (cwd, patch, relevant) from a Codex PreToolUse payload.
+// Relevant only for apply_patch, whose tool_input.command carries the patch text;
+// Bash/other tools return relevant=false (git commit/push already hit wt's git
+// guards, and parsing arbitrary shell for edit targets is unreliable). Pure.
+func parseCodexEdit(b []byte) (cwd, patch string, relevant bool) {
+	var p struct {
+		CWD       string `json:"cwd"`
+		ToolName  string `json:"tool_name"`
+		ToolInput struct {
+			Command string `json:"command"`
+		} `json:"tool_input"`
+	}
+	if err := json.Unmarshal(b, &p); err != nil {
+		return "", "", false
+	}
+	if p.ToolName != "apply_patch" {
+		return p.CWD, "", false
+	}
+	return strings.TrimSpace(p.CWD), p.ToolInput.Command, p.ToolInput.Command != ""
+}
+
+// codexHunk is one apply_patch hunk. preImage is the ordered context+removed
+// lines (all present in the CURRENT file — used to locate the hunk via
+// locateRange); removed holds the offsets into preImage that are actually
+// removed (leading '-'), so we can range the MODIFIED lines precisely and NOT
+// the surrounding context (which anchors the hunk but isn't a change — including
+// it would false-flag edits merely adjacent to another window's, defeating wt's
+// -U0 exact-hunk grading; #117 review).
+type codexHunk struct {
+	preImage []string
+	removed  []int
+}
+
+// codexPatchFile is one file section of an apply_patch payload: its repo-relative
+// path (+ move destination) and its Update hunks.
+type codexPatchFile struct {
+	path    string
+	newPath string
+	hunks   []codexHunk
+}
+
+// parseCodexPatch parses an apply_patch payload into its file sections. Pure —
+// the testable core. Best-effort: it never errors, it just extracts what it can.
+func parseCodexPatch(patch string) []codexPatchFile {
+	var files []codexPatchFile
+	var cur *codexPatchFile
+	var pre []string
+	var rem []int
+	flushHunk := func() {
+		if cur != nil && len(pre) > 0 {
+			cur.hunks = append(cur.hunks, codexHunk{preImage: pre, removed: rem})
+		}
+		pre, rem = nil, nil
+	}
+	flushFile := func() {
+		flushHunk()
+		if cur != nil {
+			files = append(files, *cur)
+			cur = nil
+		}
+	}
+	start := func(ln, prefix string) {
+		flushFile()
+		cur = &codexPatchFile{path: strings.TrimSpace(strings.TrimPrefix(ln, prefix))}
+	}
+	for _, ln := range strings.Split(patch, "\n") {
+		switch {
+		case strings.HasPrefix(ln, "*** Update File: "):
+			start(ln, "*** Update File: ")
+		case strings.HasPrefix(ln, "*** Add File: "):
+			start(ln, "*** Add File: ")
+		case strings.HasPrefix(ln, "*** Delete File: "):
+			start(ln, "*** Delete File: ")
+		case strings.HasPrefix(ln, "*** Move File: "):
+			start(ln, "*** Move File: ")
+		case strings.HasPrefix(ln, "*** Move to: "):
+			if cur != nil {
+				cur.newPath = strings.TrimSpace(strings.TrimPrefix(ln, "*** Move to: "))
+			}
+		case strings.HasPrefix(ln, "***"):
+			// Begin/End Patch + any other control line — not file content
+		case ln == "@@" || strings.HasPrefix(ln, "@@ "):
+			flushHunk() // hunk boundary — the @@ header isn't file content
+		case cur == nil:
+			// preamble noise
+		case strings.HasPrefix(ln, "+"):
+			// added line — NOT in the current file; skip
+		case strings.HasPrefix(ln, "-"):
+			rem = append(rem, len(pre))
+			pre = append(pre, ln[1:]) // removed line — present in the current file
+		case strings.HasPrefix(ln, " "):
+			pre = append(pre, ln[1:]) // context line — present in the current file
+		}
+	}
+	flushFile()
+	return files
+}
+
+// patchPaths returns every repo-relative path an apply_patch touches (update /
+// add / delete targets + move destinations), deduped. Pure.
+func patchPaths(files []codexPatchFile) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(p string) {
+		if p != "" && !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	for _, f := range files {
+		add(f.path)
+		add(f.newPath)
+	}
+	return out
+}
+
+// contiguousRuns groups increasing offsets into [first,last] runs. Pure.
+func contiguousRuns(offsets []int) [][2]int {
+	if len(offsets) == 0 {
+		return nil
+	}
+	var runs [][2]int
+	s, e := offsets[0], offsets[0]
+	for _, o := range offsets[1:] {
+		if o == e+1 {
+			e = o
+			continue
+		}
+		runs = append(runs, [2]int{s, e})
+		s, e = o, o
+	}
+	return append(runs, [2]int{s, e})
+}
+
+// patchRangesInFile locates each hunk's pre-image in content, then ranges only
+// the REMOVED lines within it — matching wt's -U0 exact-hunk grading. Pure-add
+// hunks (no removed lines) modify no existing line, so they contribute no range
+// (an insertion adjacent to another window's edit isn't a conflict). ok=false
+// when a hunk can't be uniquely located, or nothing is a real modification — the
+// caller then falls back to a file-level advisory. Frame-safety (content ==
+// base) is the caller's job (the #108 lesson). Reuses locateRange.
+func patchRangesInFile(f codexPatchFile, content string) ([]gitx.LineRange, bool) {
+	var ranges []gitx.LineRange
+	for _, h := range f.hunks {
+		if len(h.preImage) == 0 {
+			continue
+		}
+		r, ok := locateRange(content, strings.Join(h.preImage, "\n"))
+		if !ok {
+			return nil, false
+		}
+		if len(h.removed) == 0 {
+			continue // pure addition — no existing line modified
+		}
+		for _, run := range contiguousRuns(h.removed) {
+			ranges = append(ranges, gitx.LineRange{Start: r.Start + run[0], End: r.Start + run[1]})
+		}
+	}
+	if len(ranges) == 0 {
+		return nil, false
+	}
+	return ranges, true
+}
+
+// hookCodexEdit implements `wt _hook codex-edit` — a Codex PreToolUse hook on
+// apply_patch. It grades the patch's target files with the SAME engine as
+// `wt check`, re-graded against the patch's actual hunks when frame-safe (the
+// #108 lesson), and emits additionalContext on a HIGH overlap — or, under
+// WT_CODEX_HOOK_BLOCK=1, a `deny` for a CONFIRMED HIGH only. Always exits 0
+// (fail-open); disjoint / no-overlap / ≤1-worktree stay silent.
+func hookCodexEdit(r io.Reader) int {
+	if os.Getenv("WT_SKIP_COLLISION") == "1" || os.Getenv("HOOK_DISABLE_MULTIWINDOW_CHECK") == "1" {
+		return 0
+	}
+	b, err := io.ReadAll(r)
+	if err != nil {
+		return 0
+	}
+	cwd, patch, relevant := parseCodexEdit(b)
+	if !relevant {
+		return 0
+	}
+	if cwd != "" {
+		if err := os.Chdir(cwd); err != nil {
+			return 0
+		}
+	}
+	if paths, err := gitx.WorktreePaths(); err != nil || len(paths) <= 1 {
+		return 0
+	}
+	c, err := config.Load()
+	if err != nil {
+		return 0
+	}
+	root, err := gitx.RepoRoot()
+	if err != nil {
+		return 0
+	}
+	ws, err := collide.Scan(c)
+	if err != nil {
+		return 0
+	}
+	files := parseCodexPatch(patch)
+	paths := patchPaths(files)
+	if len(paths) == 0 {
+		return 0
+	}
+	byPath := map[string]codexPatchFile{}
+	for _, f := range files {
+		byPath[f.path] = f
+	}
+
+	entries := buildCheckReport(c, ws, root, paths, false)
+	var high []CheckEntry
+	confirmed := false
+	for _, e := range entries {
+		if e.Category != CatBlocking {
+			continue
+		}
+		// Re-grade against the patch's ACTUAL hunks, but only when frame-safe: the
+		// hunk line numbers (located in the on-disk file) match e.OtherRanges'
+		// base frame only when this worktree's file is unchanged vs base (#108).
+		relPath := e.Path
+		if pending, ok := pendingPatchRanges(byPath, relPath, root, c.Base); ok && len(e.OtherRanges) > 0 {
+			if collide.ConflictSeverity(pending, e.OtherRanges, false) != collide.SevHigh {
+				continue // patch hunks are disjoint from the other window — no overlap
+			}
+			confirmed = true // frame-safe, real overlapping hunks
+		}
+		high = append(high, e)
+	}
+	if out, has := codexEditDecision(high, os.Getenv("WT_CODEX_HOOK_BLOCK") == "1" && confirmed, confirmed); has {
+		fmt.Println(out)
+	}
+	return 0
+}
+
+// pendingPatchRanges returns the patch's edited ranges for relPath, but ONLY when
+// this worktree's file is unchanged vs base (frame-safe) — otherwise the located
+// line numbers don't share e.OtherRanges' base frame. ok=false → the caller keeps
+// the entry as a file-level advisory rather than risk a wrong grade.
+func pendingPatchRanges(byPath map[string]codexPatchFile, relPath, root, base string) ([]gitx.LineRange, bool) {
+	f, ok := byPath[relPath]
+	if !ok || len(f.hunks) == 0 {
+		return nil, false
+	}
+	if len(gitx.ChangedRanges(root, base, relPath)) != 0 {
+		return nil, false // this worktree already diverged for the path — not frame-safe
+	}
+	data, err := os.ReadFile(filepath.Join(root, relPath))
+	if err != nil {
+		return nil, false
+	}
+	return patchRangesInFile(f, string(data))
+}
+
+// codexEditDecision shapes the PreToolUse stdout JSON. deny=true → permissionDecision
+// "deny" (only ever passed for a CONFIRMED HIGH); else additionalContext. confirmed
+// picks accurate wording (overlapping hunks vs file-level heads-up). Pure.
+func codexEditDecision(high []CheckEntry, deny, confirmed bool) (string, bool) {
+	if len(high) == 0 {
+		return "", false
+	}
+	seen := map[string]bool{}
+	var lines []string
+	for _, e := range high {
+		if seen[e.Path] {
+			continue
+		}
+		seen[e.Path] = true
+		lines = append(lines, fmt.Sprintf("  %s — also being edited by %s [%s]", e.Path, e.Window, e.Liveness))
+	}
+	var msg string
+	if confirmed {
+		msg = "wt collision: your apply_patch OVERLAPS hunks another live window is editing:\n" +
+			strings.Join(lines, "\n") +
+			"\nCoordinate before applying to avoid a merge conflict / duplicate PR. (Set WT_SKIP_COLLISION=1 to silence.)"
+	} else {
+		msg = "wt: your apply_patch touches file(s) another live window is editing (hunk overlap not computed — run `wt check` for line-level detail):\n" +
+			strings.Join(lines, "\n") +
+			"\nCoordinate before applying to avoid a merge conflict / duplicate PR. (Set WT_SKIP_COLLISION=1 to silence.)"
+	}
+	var out struct {
+		HookSpecificOutput struct {
+			HookEventName            string `json:"hookEventName"`
+			AdditionalContext        string `json:"additionalContext,omitempty"`
+			PermissionDecision       string `json:"permissionDecision,omitempty"`
+			PermissionDecisionReason string `json:"permissionDecisionReason,omitempty"`
+		} `json:"hookSpecificOutput"`
+	}
+	out.HookSpecificOutput.HookEventName = "PreToolUse"
+	if deny {
+		out.HookSpecificOutput.PermissionDecision = "deny"
+		out.HookSpecificOutput.PermissionDecisionReason = msg
+	} else {
+		out.HookSpecificOutput.AdditionalContext = msg
+	}
+	j, err := json.Marshal(out)
+	if err != nil {
+		return "", false
+	}
+	return string(j), true
+}
+
 // codexHookCommand is the command Codex runs for the UserPromptSubmit hook.
 const codexHookCommand = "wt _hook codex-context"
 
-// codexHookSnippet is the .codex/hooks.json entry that wires the hook (same
-// nested shape Codex shares with Claude Code; UserPromptSubmit takes no matcher).
+// codexEditHookCommand is the command Codex runs for the PreToolUse edit hook.
+const codexEditHookCommand = "wt _hook codex-edit"
+
+// codexHookSnippet is the .codex/hooks.json entry that wires both hooks (same
+// nested shape Codex shares with Claude Code): UserPromptSubmit for the per-turn
+// coordination snapshot, PreToolUse (matcher apply_patch) for edit-time checks.
 const codexHookSnippet = `{
   "hooks": {
     "UserPromptSubmit": [
       {
         "hooks": [
           { "type": "command", "command": "wt _hook codex-context" }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "apply_patch",
+        "hooks": [
+          { "type": "command", "command": "wt _hook codex-edit" }
         ]
       }
     ]
@@ -187,9 +505,11 @@ func cmdInstallCodexHook(args []string) int {
 		}
 	}
 	if !write {
-		ui.Info("add this to .codex/hooks.json (project) so Codex gets multi-window collision awareness each turn:")
+		ui.Info("add this to .codex/hooks.json (project) so Codex gets multi-window collision awareness:")
+		ui.Info("  • UserPromptSubmit — per-turn snapshot of who's touching what")
+		ui.Info("  • PreToolUse (apply_patch) — edit-time overlap check before each patch")
 		fmt.Println(codexHookSnippet)
-		ui.Info("or run `wt install-codex-hook --write` to merge it automatically")
+		ui.Info("or run `wt install-codex-hook --write` to merge both automatically")
 		printCodexOptIn()
 		return 0
 	}
@@ -201,7 +521,7 @@ func cmdInstallCodexHook(args []string) int {
 			return 1
 		}
 		if !changed {
-			ui.OK("Codex UserPromptSubmit hook already wired in %s", path)
+			ui.OK("Codex hooks (UserPromptSubmit + PreToolUse) already wired in %s", path)
 			printCodexOptIn()
 			return 0
 		}
@@ -213,7 +533,7 @@ func cmdInstallCodexHook(args []string) int {
 			ui.Err("install-codex-hook: %v", err)
 			return 1
 		}
-		ui.OK("wired the Codex awareness hook into %s", path)
+		ui.OK("wired the Codex awareness hooks (UserPromptSubmit + PreToolUse) into %s", path)
 		printCodexOptIn()
 		return 0
 	})
@@ -221,9 +541,10 @@ func cmdInstallCodexHook(args []string) int {
 
 // printCodexOptIn reminds the operator that Codex hooks are opt-in via config.toml.
 func printCodexOptIn() {
-	ui.Info("Codex hooks are opt-in — enable them once in ~/.codex/config.toml:")
+	ui.Info("Codex hooks are enabled by default (definitions still require trust/review on first run).")
+	ui.Info("To turn them off entirely, set in ~/.codex/config.toml:")
 	fmt.Println("  [features]")
-	fmt.Println("  hooks = true")
+	fmt.Println("  hooks = false")
 }
 
 // mergeCodexHook reads .codex/hooks.json (a fresh {} if absent), ensures a
@@ -241,27 +562,40 @@ func mergeCodexHook(path string) (out []byte, changed bool, err error) {
 	if hooks == nil {
 		hooks = map[string]any{}
 	}
-	ups, _ := hooks["UserPromptSubmit"].([]any)
-
-	// already present? (any UserPromptSubmit group whose inner hooks run our command)
-	for _, g := range ups {
-		gm, _ := g.(map[string]any)
-		inner, _ := gm["hooks"].([]any)
-		for _, h := range inner {
-			hm, _ := h.(map[string]any)
-			if cmd, _ := hm["command"].(string); cmd == codexHookCommand {
-				return nil, false, nil
-			}
-		}
+	c1 := ensureCodexEntry(hooks, "UserPromptSubmit", "", codexHookCommand)
+	c2 := ensureCodexEntry(hooks, "PreToolUse", "apply_patch", codexEditHookCommand)
+	if !c1 && !c2 {
+		return nil, false, nil
 	}
-	entry := map[string]any{
-		"hooks": []any{map[string]any{"type": "command", "command": codexHookCommand}},
-	}
-	hooks["UserPromptSubmit"] = append(ups, entry)
 	root["hooks"] = hooks
 	b, err := json.MarshalIndent(root, "", "  ")
 	if err != nil {
 		return nil, false, err
 	}
 	return append(b, '\n'), true, nil
+}
+
+// ensureCodexEntry adds a {matcher?, hooks:[{type,command}]} group under event
+// iff no existing group already runs command (idempotent; preserves whatever
+// else the operator has wired). Returns whether it mutated hooks.
+func ensureCodexEntry(hooks map[string]any, event, matcher, command string) bool {
+	list, _ := hooks[event].([]any)
+	for _, g := range list {
+		gm, _ := g.(map[string]any)
+		inner, _ := gm["hooks"].([]any)
+		for _, h := range inner {
+			hm, _ := h.(map[string]any)
+			if cmd, _ := hm["command"].(string); cmd == command {
+				return false
+			}
+		}
+	}
+	entry := map[string]any{
+		"hooks": []any{map[string]any{"type": "command", "command": command}},
+	}
+	if matcher != "" {
+		entry["matcher"] = matcher
+	}
+	hooks[event] = append(list, entry)
+	return true
 }

@@ -96,8 +96,11 @@ func TestMergeCodexHook_FreshAndIdempotent(t *testing.T) {
 	if err != nil || !changed {
 		t.Fatalf("fresh: changed=%v err=%v", changed, err)
 	}
-	if !strings.Contains(string(out), codexHookCommand) || !strings.Contains(string(out), "UserPromptSubmit") {
-		t.Errorf("fresh output missing entry:\n%s", out)
+	s := string(out)
+	for _, want := range []string{codexHookCommand, "UserPromptSubmit", codexEditHookCommand, "PreToolUse", "apply_patch"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("fresh output missing %q:\n%s", want, s)
+		}
 	}
 	if err := os.WriteFile(path, out, 0o644); err != nil {
 		t.Fatal(err)

@@ -91,28 +91,38 @@ binary. The **sentinel** that marks a wt-managed shim is the comment `wt-managed
 hook` (NOT `wt _hook` — the quoted path renders `wt" _hook`, which broke
 detection in v0.1.8, #91). `runHook` dispatches: git hooks (`pre-push`,
 `pre-commit`), Claude Code hooks (`todo-write` PostToolUse, `claude-edit`
-PreToolUse), and the Codex hook (`codex-context` UserPromptSubmit). Agent hooks
-derive the repo from the payload's `cwd` and **always exit 0** (advisory; a
-coordination nicety must never break the session).
+PreToolUse), and the Codex hooks (`codex-context` UserPromptSubmit, `codex-edit`
+PreToolUse). Agent hooks derive the repo from the payload's `cwd` and **always
+exit 0** (advisory / fail-open; a coordination nicety must never break the session).
 
-**Codex is different from Claude Code — build on `UserPromptSubmit`, not a
-per-edit hook.** Codex's `PreToolUse` fires on the **shell tool only**
-(`apply_patch`/Edit edits don't fire it) and only acts on `deny`, not advisory
-context (openai/codex#19385) — so the Claude-style per-edit advisory can't be
-replicated. `wt _hook codex-context` is a **UserPromptSubmit** hook (the surface
-that *does* inject `additionalContext`): each turn it emits the cross-window
-overlap summary from the SAME `collide.Overlaps` + `gradeStatusOverlaps` machinery
-`wt status` uses, excluding the current window (`collide.LabelForWorktree`). It's
-silent unless another live window overlaps a file. Key facts: `.codex/hooks.json`
-uses the **same nested shape** as Claude's `.claude/settings.json`
-(`{hooks:{UserPromptSubmit:[{hooks:[{type,command}]}]}}`, no matcher); Codex hooks
-are **opt-in** via `[features] hooks = true` in `~/.codex/config.toml` (the
-installer prints this reminder — it does NOT edit config.toml). The output JSON is
-`{hookSpecificOutput:{hookEventName:"UserPromptSubmit", additionalContext:…}}`.
-The awareness is coarse (per prompt, not per edit) because that's all Codex
-exposes — but the git `pre-push`/`pre-commit` guards + the worktree-based engine
-are already agent-agnostic, so a Codex window is a first-class window and its
-commits/pushes already hit the guards regardless.
+**Codex now gets BOTH a per-turn hook AND a per-edit hook (#117).** Codex's
+`PreToolUse` fires on `apply_patch` and supports both `additionalContext` and
+`permissionDecision:"deny"` — so `wt install-codex-hook` wires two hooks:
+- `wt _hook codex-context` (**UserPromptSubmit**): each turn emits the cross-window
+  overlap summary from the SAME `collide.Overlaps` + `gradeStatusOverlaps` machinery
+  `wt status` uses, excluding the current window (`collide.LabelForWorktree`).
+- `wt _hook codex-edit` (**PreToolUse**, matcher `apply_patch`): parses the patch's
+  `*** {Update|Add|Delete|Move} File:` targets, grades them via `buildCheckReport`
+  (the same grader as `wt check`), then RE-grades each `CatBlocking` entry against
+  the patch's actual hunks — localized in the current file via `locateRange`
+  (`parseCodexPatch` → per-hunk pre-image of context+removed lines) — but **only
+  when frame-safe** (this worktree's file is unchanged vs base, i.e.
+  `ChangedRanges(root,base,path)` empty; the #108 lesson). A disjoint patch to a
+  shared file therefore stays silent. Emits `additionalContext` on overlap;
+  `WT_CODEX_HOOK_BLOCK=1` upgrades a **confirmed** HIGH (frame-safe hunk overlap) to
+  `deny` — a file-level-only match never denies.
+
+Key facts: `.codex/hooks.json` uses the **same nested shape** as Claude's
+`.claude/settings.json` (`{hooks:{UserPromptSubmit:[{hooks:[…]}],PreToolUse:[{matcher:"apply_patch",hooks:[…]}]}}`);
+`mergeCodexHook` installs both idempotently (`ensureCodexEntry` skips any event
+whose inner hooks already run the command, preserving other tools). Codex hooks are
+**enabled by default** now (hook *definitions* still require trust/review on first
+run) — disable entirely via `[features] hooks = false` in `~/.codex/config.toml`
+(the installer prints this; it does NOT edit config.toml). PreToolUse output JSON is
+`{hookSpecificOutput:{hookEventName:"PreToolUse", additionalContext:…}}` (advisory)
+or `{…permissionDecision:"deny", permissionDecisionReason:…}` (block). The
+worktree-based engine + git `pre-push`/`pre-commit` guards are already
+agent-agnostic, so a Codex window is first-class regardless of the hooks.
 
 ## Release
 

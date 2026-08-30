@@ -275,28 +275,40 @@ worktree B is live-editing, it's told — instead of both landing competing PRs.
 Codex is already a first-class window with **zero** extra setup: the collision
 engine enumerates `git worktree list`, so a worktree Codex is working in shows in
 `wt status`, and Codex's `git commit` / `git push` (run through its shell tool)
-trip `wt`'s pre-commit / pre-push guards like anyone else's. What Codex *can't* do
-is a Claude-style per-edit hook — its `PreToolUse` fires on the **shell tool
-only** (`apply_patch` edits don't fire it) and only acts on `deny`, not advisory
-context ([openai/codex#19385](https://github.com/openai/codex/issues/19385)). So
-`wt install-codex-hook` uses the surface Codex *does* have —
-**`UserPromptSubmit`**, which injects `additionalContext` — to tell Codex, each
-turn, which files other live windows are editing:
+trip `wt`'s pre-commit / pre-push guards like anyone else's. On top of that,
+`wt install-codex-hook` wires **two** hooks so Codex gets the same collision
+awareness a Claude window does:
+
+- **`UserPromptSubmit`** (`wt _hook codex-context`) — injects `additionalContext`
+  each turn naming which files other live windows are editing.
+- **`PreToolUse`** on `apply_patch` (`wt _hook codex-edit`) — grades the pending
+  patch's target files with the same engine as `wt check`, and injects
+  `additionalContext` when a hunk overlaps another live window. Codex's
+  `PreToolUse` now fires on `apply_patch` and supports both advisory context and
+  `permissionDecision: "deny"`.
 
 ```
-wt install-codex-hook             # prints the .codex/hooks.json snippet
-wt install-codex-hook --write     # merges it into .codex/hooks.json
+wt install-codex-hook             # prints the .codex/hooks.json snippet (both hooks)
+wt install-codex-hook --write     # merges both into .codex/hooks.json (idempotent)
 ```
 
-Codex hooks are **opt-in** — enable them once in `~/.codex/config.toml`:
+Codex hooks are **enabled by default** (hook *definitions* still require
+trust/review on first run). To turn them off entirely, set in
+`~/.codex/config.toml`:
 
 ```toml
 [features]
-hooks = true
+hooks = false
 ```
 
-- Injected **only when** another live window overlaps a file (silent otherwise),
-  with the current window excluded and a `wt check <file>` reminder.
+- Both hooks are injected **only when** another live window overlaps a file
+  (silent otherwise), with the current window excluded and a `wt check <file>`
+  reminder.
+- The edit hook re-grades against the patch's actual hunks when it's frame-safe
+  (this worktree's file is unchanged vs base), so a **disjoint** patch to a shared
+  file stays silent — no crying wolf on parallel appends.
+- Advisory by default. Set `WT_CODEX_HOOK_BLOCK=1` to have the edit hook `deny`
+  a **confirmed** HIGH overlap (a heads-up-only file-level match never denies).
 - Fail-open; `WT_SKIP_COLLISION=1` to silence; ≤1-worktree repos skipped.
 
 The awareness is proactive-but-coarse (per prompt, not per edit) because that's

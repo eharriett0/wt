@@ -996,6 +996,12 @@ func runHook(args []string) int {
 	if args[0] == "codex-context" {
 		return hookCodexContext(os.Stdin)
 	}
+	// codex-edit is a Codex CLI PreToolUse hook on apply_patch (#117): it derives
+	// the repo from its stdin payload's cwd and always exits 0 (fail-open), so it
+	// too runs without a pre-loaded config.
+	if args[0] == "codex-edit" {
+		return hookCodexEdit(os.Stdin)
+	}
 	c, err := config.Load()
 	if err != nil {
 		// Outside a repo somehow — don't block git operations.
