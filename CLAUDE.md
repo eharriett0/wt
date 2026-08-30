@@ -91,28 +91,59 @@ binary. The **sentinel** that marks a wt-managed shim is the comment `wt-managed
 hook` (NOT `wt _hook` — the quoted path renders `wt" _hook`, which broke
 detection in v0.1.8, #91). `runHook` dispatches: git hooks (`pre-push`,
 `pre-commit`), Claude Code hooks (`todo-write` PostToolUse, `claude-edit`
-PreToolUse), and the Codex hook (`codex-context` UserPromptSubmit). Agent hooks
-derive the repo from the payload's `cwd` and **always exit 0** (advisory; a
-coordination nicety must never break the session).
+PreToolUse), and the Codex hooks (`codex-context` UserPromptSubmit, `codex-edit`
+PreToolUse). Agent hooks derive the repo from the payload's `cwd` and **always
+exit 0** (advisory / fail-open; a coordination nicety must never break the session).
 
-**Codex is different from Claude Code — build on `UserPromptSubmit`, not a
-per-edit hook.** Codex's `PreToolUse` fires on the **shell tool only**
-(`apply_patch`/Edit edits don't fire it) and only acts on `deny`, not advisory
-context (openai/codex#19385) — so the Claude-style per-edit advisory can't be
-replicated. `wt _hook codex-context` is a **UserPromptSubmit** hook (the surface
-that *does* inject `additionalContext`): each turn it emits the cross-window
-overlap summary from the SAME `collide.Overlaps` + `gradeStatusOverlaps` machinery
-`wt status` uses, excluding the current window (`collide.LabelForWorktree`). It's
-silent unless another live window overlaps a file. Key facts: `.codex/hooks.json`
-uses the **same nested shape** as Claude's `.claude/settings.json`
-(`{hooks:{UserPromptSubmit:[{hooks:[{type,command}]}]}}`, no matcher); Codex hooks
-are **opt-in** via `[features] hooks = true` in `~/.codex/config.toml` (the
-installer prints this reminder — it does NOT edit config.toml). The output JSON is
-`{hookSpecificOutput:{hookEventName:"UserPromptSubmit", additionalContext:…}}`.
-The awareness is coarse (per prompt, not per edit) because that's all Codex
-exposes — but the git `pre-push`/`pre-commit` guards + the worktree-based engine
-are already agent-agnostic, so a Codex window is a first-class window and its
-commits/pushes already hit the guards regardless.
+**Codex now gets BOTH a per-turn hook AND a per-edit hook (#117).** Codex's
+`PreToolUse` fires on `apply_patch` and supports both `additionalContext` and
+`permissionDecision:"deny"` — so `wt install-codex-hook` wires two hooks:
+- `wt _hook codex-context` (**UserPromptSubmit**): each turn emits the cross-window
+  overlap summary from the SAME `collide.Overlaps` + `gradeStatusOverlaps` machinery
+  `wt status` uses, excluding the current window (`collide.LabelForWorktree`).
+- `wt _hook codex-edit` (**PreToolUse**, matcher `apply_patch`): parses the patch's
+  `*** {Update|Add|Delete|Move} File:` targets, grades them via `buildCheckReport`
+  (the same grader as `wt check`), then RE-grades each `CatBlocking` entry against
+  the patch's actual hunks — localized in the current file via `locateRange`
+  (`parseCodexPatch` → per-hunk pre-image of context+removed lines) — but **only
+  when frame-safe** (this worktree's file is unchanged vs base, i.e.
+  `ChangedRanges(root,base,path)` empty; the #108 lesson). A disjoint patch to a
+  shared file therefore stays silent. Emits `additionalContext` on overlap;
+  `WT_CODEX_HOOK_BLOCK=1` upgrades a **confirmed** HIGH (frame-safe hunk overlap) to
+  `deny` — a file-level-only match never denies.
+
+Key facts: `.codex/hooks.json` uses the **same nested shape** as Claude's
+`.claude/settings.json` (`{hooks:{UserPromptSubmit:[{hooks:[…]}],PreToolUse:[{matcher:"apply_patch",hooks:[…]}]}}`);
+`mergeCodexHook` installs both idempotently (`ensureCodexEntry` skips any event
+whose inner hooks already run the command, preserving other tools). Codex hooks are
+**enabled by default** now (hook *definitions* still require trust/review on first
+run) — disable entirely via `[features] hooks = false` in `~/.codex/config.toml`
+(the installer prints this; it does NOT edit config.toml). PreToolUse output JSON is
+`{hookSpecificOutput:{hookEventName:"PreToolUse", additionalContext:…}}` (advisory)
+or `{…permissionDecision:"deny", permissionDecisionReason:…}` (block). The
+worktree-based engine + git `pre-push`/`pre-commit` guards are already
+agent-agnostic, so a Codex window is first-class regardless of the hooks.
+
+## MCP (`wt mcp`, #115)
+
+`wt mcp` (`internal/cli/mcp.go`) is a **stdio MCP server** for chat-style agents
+(Claude Desktop, Cursor, …) — the third agent-integration surface after Claude/Codex
+hooks. It speaks newline-delimited JSON-RPC 2.0 on stdin/stdout (hand-rolled, zero
+deps): `initialize` (echoes the client's `protocolVersion`, advertises `tools`),
+`tools/list`, `tools/call`, `ping`; a request with **no `id`** is a notification →
+no response (e.g. `notifications/initialized`). Responses are **compact** JSON + `\n`
+(never `MarshalIndent` — an embedded newline would break the client's line reader; the
+pretty JSON lives INSIDE the tool result's text string, where `\n` is escaped). Read
+loop is `bufio.Scanner` with an 8MB buffer so one malformed line yields `-32700` and
+the stream **continues** (doesn't desync). Four **read-only** tools —
+`wt_status` / `wt_check` / `wt_todos` / `wt_where` — each single-source the SAME
+`collide.Scan` + `buildStatusPayload`/`buildCheckReport`+`buildCheckPayload` +
+`gradeStatusOverlaps` + `todos.ForWorktree` the CLI uses (payload builders extracted
+in `report.go` so JSON can't drift from `wt status/check --json`). Tool-level failures
+(not-in-repo, bad args, scan error) return `{isError:true}` results, NOT JSON-RPC
+protocol errors, so the model sees them. **v1 is read-only** — no tool mutates state
+(claim/announce/merge stay in the CLI + git hooks). The server runs in the client's
+cwd (`config.Load()` derives the repo); it never chdirs.
 
 ## Release
 

@@ -304,25 +304,34 @@ func printOtherHunks(e CheckEntry) {
 	fmt.Fprintln(os.Stderr, "        "+ui.Dim(e.Window+" edits: "+spansString(e.OtherRanges)))
 }
 
-func renderCheckJSON(entries []CheckEntry, includeStale bool) int {
-	type payload struct {
-		Blocking bool         `json:"blocking"`
-		Entries  []CheckEntry `json:"entries"`
-	}
-	blocking := false
-	shown := make([]CheckEntry, 0, len(entries))
+// CheckPayload is the JSON shape of `wt check --json` — single-sourced so the
+// MCP server (#115) returns byte-identical data.
+type CheckPayload struct {
+	Blocking bool         `json:"blocking"`
+	Entries  []CheckEntry `json:"entries"`
+}
+
+// buildCheckPayload filters stale entries (unless includeStale) and computes the
+// blocking flag. Pure.
+func buildCheckPayload(entries []CheckEntry, includeStale bool) CheckPayload {
+	p := CheckPayload{Entries: make([]CheckEntry, 0, len(entries))}
 	for _, e := range entries {
 		if e.Category == CatStale && !includeStale {
 			continue
 		}
 		if e.Category == CatBlocking {
-			blocking = true
+			p.Blocking = true
 		}
-		shown = append(shown, e)
+		p.Entries = append(p.Entries, e)
 	}
-	b, _ := json.MarshalIndent(payload{Blocking: blocking, Entries: shown}, "", "  ")
+	return p
+}
+
+func renderCheckJSON(entries []CheckEntry, includeStale bool) int {
+	p := buildCheckPayload(entries, includeStale)
+	b, _ := json.MarshalIndent(p, "", "  ")
 	fmt.Println(string(b))
-	if blocking {
+	if p.Blocking {
 		return 3
 	}
 	return 0
@@ -395,32 +404,43 @@ func gradeStatusOverlaps(c *config.Config, ws []collide.Window, active []collide
 	return out
 }
 
-// renderStatusJSON emits the window list + graded overlaps as JSON.
-func renderStatusJSON(ws []collide.Window, graded []StatusOverlap, benignCount int) int {
-	type win struct {
-		Label    string   `json:"label"`
-		Branch   string   `json:"branch"`
-		Issue    string   `json:"issue,omitempty"`
-		Title    string   `json:"title,omitempty"`
-		Worktree string   `json:"worktree"`
-		Touched  []string `json:"touched"`
-	}
-	type payload struct {
-		Blocking    bool            `json:"blocking"`
-		Windows     []win           `json:"windows"`
-		Overlaps    []StatusOverlap `json:"overlaps"`
-		BenignCount int             `json:"benign_count"`
-	}
-	p := payload{Overlaps: graded, BenignCount: benignCount}
+// StatusWindow is one window in the `wt status --json` payload.
+type StatusWindow struct {
+	Label    string   `json:"label"`
+	Branch   string   `json:"branch"`
+	Issue    string   `json:"issue,omitempty"`
+	Title    string   `json:"title,omitempty"`
+	Worktree string   `json:"worktree"`
+	Touched  []string `json:"touched"`
+}
+
+// StatusPayload is the JSON shape of `wt status --json` — single-sourced so the
+// MCP server (#115) returns byte-identical data.
+type StatusPayload struct {
+	Blocking    bool            `json:"blocking"`
+	Windows     []StatusWindow  `json:"windows"`
+	Overlaps    []StatusOverlap `json:"overlaps"`
+	BenignCount int             `json:"benign_count"`
+}
+
+// buildStatusPayload assembles the window list + graded overlaps + blocking
+// flag. Pure.
+func buildStatusPayload(ws []collide.Window, graded []StatusOverlap, benignCount int) StatusPayload {
+	p := StatusPayload{Overlaps: graded, BenignCount: benignCount}
 	for _, w := range ws {
-		p.Windows = append(p.Windows, win{w.Label(), w.Branch, w.Issue, w.Title, w.Worktree, w.Touched})
+		p.Windows = append(p.Windows, StatusWindow{w.Label(), w.Branch, w.Issue, w.Title, w.Worktree, w.Touched})
 	}
 	for _, o := range graded {
 		if o.Category == CatBlocking {
 			p.Blocking = true
 		}
 	}
-	b, _ := json.MarshalIndent(p, "", "  ")
+	return p
+}
+
+// renderStatusJSON emits the window list + graded overlaps as JSON.
+func renderStatusJSON(ws []collide.Window, graded []StatusOverlap, benignCount int) int {
+	b, _ := json.MarshalIndent(buildStatusPayload(ws, graded, benignCount), "", "  ")
 	fmt.Println(string(b))
 	return 0
 }

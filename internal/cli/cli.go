@@ -108,6 +108,8 @@ func Main(args []string) int {
 		return cmdInstallClaudeHook(rest)
 	case "install-codex-hook":
 		return cmdInstallCodexHook(rest)
+	case "mcp":
+		return cmdMCP(rest)
 	case "announce":
 		return cmdAnnounce(rest)
 	case "inbox":
@@ -995,6 +997,12 @@ func runHook(args []string) int {
 	// without a pre-loaded config.
 	if args[0] == "codex-context" {
 		return hookCodexContext(os.Stdin)
+	}
+	// codex-edit is a Codex CLI PreToolUse hook on apply_patch (#117): it derives
+	// the repo from its stdin payload's cwd and always exits 0 (fail-open), so it
+	// too runs without a pre-loaded config.
+	if args[0] == "codex-edit" {
+		return hookCodexEdit(os.Stdin)
 	}
 	c, err := config.Load()
 	if err != nil {
