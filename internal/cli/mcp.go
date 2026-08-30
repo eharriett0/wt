@@ -22,8 +22,10 @@ import (
 // pipeline the CLI uses, so the data can never drift from `wt status --json` etc.
 // v1 is read-only by design: no tool mutates state.
 func cmdMCP(_ []string) int {
-	sc := bufio.NewScanner(os.Stdin)
-	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024) // MCP messages are one-line; allow large args
+	// bufio.Reader (not Scanner) so an arbitrarily long line never silently
+	// terminates the server (Scanner caps token size), and a final line without a
+	// trailing newline is still processed (#115 review).
+	rd := bufio.NewReader(os.Stdin)
 	out := bufio.NewWriter(os.Stdout)
 	defer out.Flush()
 
@@ -37,25 +39,25 @@ func cmdMCP(_ []string) int {
 		out.Flush()
 	}
 
-	for sc.Scan() {
-		line := bytes.TrimSpace(sc.Bytes())
-		if len(line) == 0 {
-			continue
+	for {
+		raw, err := rd.ReadBytes('\n')
+		if line := bytes.TrimSpace(raw); len(line) > 0 {
+			var req rpcRequest
+			switch {
+			case json.Unmarshal(line, &req) != nil:
+				writeResp(rpcResponse{JSONRPC: "2.0", ID: json.RawMessage("null"),
+					Error: &rpcError{Code: -32700, Message: "parse error"}})
+			case len(req.ID) == 0:
+				// JSON-RPC notification (no id) — no response (e.g.
+				// notifications/initialized).
+			default:
+				writeResp(dispatchRPC(req)) // a request (even id:null) gets a reply
+			}
 		}
-		var req rpcRequest
-		if err := json.Unmarshal(line, &req); err != nil {
-			writeResp(rpcResponse{JSONRPC: "2.0", ID: json.RawMessage("null"),
-				Error: &rpcError{Code: -32700, Message: "parse error"}})
-			continue
+		if err != nil {
+			return 0 // EOF or a stdin read error — the peer is gone; stop.
 		}
-		// A JSON-RPC notification has no id — no response (e.g.
-		// notifications/initialized). A request (even id:null) gets a reply.
-		if len(req.ID) == 0 {
-			continue
-		}
-		writeResp(dispatchRPC(req))
 	}
-	return 0
 }
 
 type rpcRequest struct {
@@ -141,8 +143,9 @@ func mcpToolDescriptors() []map[string]any {
 			"description": "Before editing: is any other live window touching these paths? Returns per-path " +
 				"grading (HIGH overlapping hunks vs disjoint/advisory). Read-only.",
 			"inputSchema": obj(map[string]any{
-				"paths":         map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "repo-relative paths (or bare basenames) to check"},
-				"include_stale": map[string]any{"type": "boolean", "description": "include merged/dormant windows"},
+				"paths":           map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "repo-relative paths (or bare basenames) to check"},
+				"include_stale":   map[string]any{"type": "boolean", "description": "include merged/dormant windows"},
+				"include_missing": map[string]any{"type": "boolean", "description": "check a path that doesn't exist yet (one you're about to create); otherwise a nonexistent path is refused, not reported clear"},
 			}, "paths"),
 		},
 		{
@@ -192,13 +195,14 @@ func runMCPTool(name string, args json.RawMessage) (string, bool) {
 		return mcpStatus(c, a.Blocking)
 	case "wt_check":
 		var a struct {
-			Paths        []string `json:"paths"`
-			IncludeStale bool     `json:"include_stale"`
+			Paths          []string `json:"paths"`
+			IncludeStale   bool     `json:"include_stale"`
+			IncludeMissing bool     `json:"include_missing"`
 		}
 		if err := json.Unmarshal(args, &a); err != nil || len(a.Paths) == 0 {
 			return "wt_check requires a non-empty `paths` array", true
 		}
-		return mcpCheck(c, a.Paths, a.IncludeStale)
+		return mcpCheck(c, a.Paths, a.IncludeStale, a.IncludeMissing)
 	case "wt_todos":
 		return mcpTodos(c)
 	case "wt_where":
@@ -244,10 +248,21 @@ func mcpStatus(c *config.Config, blocking bool) (string, bool) {
 	return jsonText(p), false
 }
 
-func mcpCheck(c *config.Config, paths []string, includeStale bool) (string, bool) {
+func mcpCheck(c *config.Config, paths []string, includeStale, allowMissing bool) (string, bool) {
 	ws, err := collide.Scan(c)
 	if err != nil {
 		return "scan failed: " + err.Error(), true
+	}
+	// #93: refuse to report "clear" for a path that doesn't exist, isn't tracked,
+	// and no window touches — a typo must NOT read as a false all-clear (the exact
+	// failure this tool exists to prevent). Mirrors `wt check`'s guard so the MCP
+	// answer can't diverge from `wt check --json`.
+	if !allowMissing {
+		if unk := unknownCheckPaths(paths, ws); len(unk) > 0 {
+			return "no such path(s) — refusing to report 'clear' for path(s) that don't exist, " +
+				"aren't tracked, and no window is touching: " + strings.Join(unk, ", ") +
+				" (typo? or a path you're about to CREATE — re-call with include_missing:true).", true
+		}
 	}
 	root, _ := gitx.RepoRoot()
 	entries := buildCheckReport(c, ws, root, paths, includeStale)

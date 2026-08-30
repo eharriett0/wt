@@ -57,6 +57,11 @@ func TestMCPToolDescriptors(t *testing.T) {
 			if len(req) != 1 || req[0] != "paths" {
 				t.Errorf("wt_check required=%v want [paths]", req)
 			}
+			// #93 guard has an escape hatch — include_missing must be advertised.
+			props, _ := sch["properties"].(map[string]any)
+			if _, ok := props["include_missing"]; !ok {
+				t.Errorf("wt_check schema missing include_missing: %v", props)
+			}
 		case "wt_where":
 			if len(req) != 1 || req[0] != "target" {
 				t.Errorf("wt_where required=%v want [target]", req)
