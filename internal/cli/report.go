@@ -355,7 +355,7 @@ type StatusOverlap struct {
 // shared-doc advisory, so a same-section collision blocked here and sailed
 // through the pre-push guard.
 func sharedSectionsAcross(c *config.Config, worktrees []string, rel, delimiter string) (shared []string, graded bool) {
-	return collide.SharedSectionsAcross(c.Base, worktrees, rel, delimiter, gitx.ChangedRanges)
+	return collide.SharedSectionsAcross(c.Base, worktrees, rel, delimiter, gitx.ChangedRangesNew)
 }
 
 // gradeStatusOverlaps hunk-grades the ACTIVE overlaps (already partitioned).

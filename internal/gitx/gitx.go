@@ -696,12 +696,31 @@ func parseHunkRangesWith(diff string, re *regexp.Regexp) []LineRange {
 // where cross-window base comparison is meaningless anyway), degrade to the
 // NEW-side uncommitted hunks so a single window still self-reports.
 func ChangedRanges(dir, base, file string) []LineRange {
+	return changedRangesWith(dir, base, file, parseHunkRangesOld)
+}
+
+// ChangedRangesNew is ChangedRanges but NEW-frame (current/`+` side). Use it to
+// attribute a window's diff to its OWN current-content sections (#22 structured
+// docs), where the section spans are parsed from the current file and so must
+// share the current frame — base-frame ranges mis-attribute a section whenever an
+// earlier edit shifts line counts (#123). NOT for cross-window line grading:
+// that needs the base frame (ChangedRanges) so two windows' ranges are comparable
+// (#108).
+func ChangedRangesNew(dir, base, file string) []LineRange {
+	return changedRangesWith(dir, base, file, parseHunkRanges)
+}
+
+// changedRangesWith is the shared body of ChangedRanges / ChangedRangesNew;
+// `parse` selects which side of each hunk (old vs new) the base-diff case reads.
+// The base-less fallback is always NEW-side (there is no base to be old-relative
+// to) so a single window still self-reports.
+func changedRangesWith(dir, base, file string, parse func(string) []LineRange) []LineRange {
 	for _, ref := range []string{"origin/" + base, base} {
 		if _, err := RunDir(dir, "rev-parse", "--verify", "--quiet", ref+"^{commit}"); err != nil {
 			continue
 		}
 		if out, err := runRaw(dir, "diff", "-U0", ref, "--", file); err == nil {
-			return parseHunkRangesOld(out)
+			return parse(out)
 		}
 		return nil
 	}

@@ -165,3 +165,27 @@ func mustCompile(t *testing.T, pat string) *regexp.Regexp {
 	}
 	return r
 }
+
+// #123: section spans are parsed from CURRENT content (current frame), so
+// attribution must use current-frame (new-side) ranges. A late-section edit
+// whose base-frame line landed in an EARLIER section is mis-attributed under
+// base-frame ranges but correct under new-frame — the frame mismatch that
+// silently downgraded a same-section HIGH to advisory.
+func TestEditedHeadings_FrameMattersOnShiftedDoc(t *testing.T) {
+	// Current content after an early insert shifted Beta down:
+	//   1 ## Alpha  2 a1  3 a2-NEW  4 a3-NEW  5 ## Beta  6 b1-EDIT
+	re := regexp.MustCompile("^## ")
+	secs := Parse("## Alpha\na1\na2-NEW\na3-NEW\n## Beta\nb1-EDIT\n", re)
+
+	// NEW-frame: the Beta edit at its CURRENT line 6 → correctly ## Beta.
+	got := EditedHeadings(secs, []gitx.LineRange{{Start: 6, End: 6}})
+	if len(got) != 1 || got[0] != "## Beta" {
+		t.Errorf("new-frame range [6,6] should attribute to ## Beta, got %v", got)
+	}
+	// BASE-frame: the same edit at its BASE line 4 lands in ## Alpha's current
+	// span — the mis-attribution the fix prevents.
+	got = EditedHeadings(secs, []gitx.LineRange{{Start: 4, End: 4}})
+	if len(got) != 1 || got[0] != "## Alpha" {
+		t.Errorf("base-frame range [4,4] mis-attributes to ## Alpha (the bug), got %v", got)
+	}
+}
