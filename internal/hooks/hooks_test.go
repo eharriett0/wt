@@ -280,6 +280,36 @@ func TestGradeConflictsStructuredDoc(t *testing.T) {
 	}
 }
 
+// #123: the section grade must use the NEW-frame sectionRanges, not the
+// base-frame ranges used for line grading. This pins that wiring so an accidental
+// swap of the two args (here, or at the prod call sites) is caught: sectionRanges
+// puts both windows in ## Alpha (same section → HARD), while the line-grade ranges
+// put them in DIFFERENT sections — a swap would flip the verdict to advisory.
+func TestGradeConflictsStructuredDoc_UsesSectionRangesNotLineRanges(t *testing.T) {
+	self, other := twoWorktrees(t)
+	ws := []collide.Window{{Branch: "winA", Worktree: other}}
+	c := &config.Config{Base: "main", SharedDocs: []string{"CLAUDE.md"}, StructuredDocs: map[string]string{"CLAUDE.md": "^## "}}
+
+	// base-frame ranges (line grade) — DIFFERENT sections: self ## Beta, other ## Alpha.
+	lineRanges := func(worktree, base, path string) []gitx.LineRange {
+		if worktree == self {
+			return []gitx.LineRange{rng(9, 9)} // ## Beta
+		}
+		return []gitx.LineRange{rng(5, 5)} // ## Alpha
+	}
+	// new-frame ranges (section grade) — SAME section: both ## Alpha.
+	sectionRanges := func(worktree, base, path string) []gitx.LineRange {
+		if worktree == self {
+			return []gitx.LineRange{rng(5, 5)} // ## Alpha
+		}
+		return []gitx.LineRange{rng(6, 6)} // ## Alpha
+	}
+	hard, soft := gradeConflicts(c, []collide.Conflict{{Path: "CLAUDE.md", Window: "winA"}}, self, ws, lineRanges, sectionRanges)
+	if len(hard) != 1 || len(soft) != 0 {
+		t.Fatalf("section grade must use sectionRanges (same section → HARD); a swap uses lineRanges (different sections → advisory): hard=%d soft=%d", len(hard), len(soft))
+	}
+}
+
 // A structured doc that exists in NEITHER worktree cannot be section-graded, so
 // it must fall back to the blanket advisory rather than fail into a hard block —
 // the out-of-repo memory-doc case.
