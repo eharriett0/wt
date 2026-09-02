@@ -235,7 +235,7 @@ func HookPrePush(c *config.Config, stdin io.Reader) int {
 		if !scanOK {
 			continue
 		}
-		if pushCollisionBlocks(c, ws, root, outgoingPaths(base, localSHA, remoteSHA)) {
+		if pushCollisionBlocks(c, ws, root, outgoingPaths(root, base, localSHA, remoteSHA)) {
 			code = 1
 		}
 	}
@@ -264,10 +264,10 @@ func repoRootOrEmpty() string {
 // an update it diffs the remote sha the push is fast-forwarding from; for a
 // brand-new branch (remote sha all-zero) it diffs the last-known base, so the
 // full branch is checked. Best-effort — empty on any git error.
-func outgoingPaths(base, localSHA, remoteSHA string) []string {
+func outgoingPaths(root, base, localSHA, remoteSHA string) []string {
 	remoteIsAncestor := !gitx.AllZeroSHA(remoteSHA) && gitx.IsAncestor(remoteSHA, localSHA)
 	from := outgoingFrom(base, remoteSHA, remoteIsAncestor, gitx.ResolveRemoteBase(base))
-	paths, _ := gitx.RangeChangedPaths(from, localSHA)
+	paths, _ := gitx.RangeChangedPaths(root, from, localSHA)
 	return paths
 }
 
