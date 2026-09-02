@@ -24,6 +24,7 @@ import (
 
 	"github.com/eharriett0/wt/internal/collide"
 	"github.com/eharriett0/wt/internal/config"
+	"github.com/eharriett0/wt/internal/coord"
 	"github.com/eharriett0/wt/internal/gitx"
 	"github.com/eharriett0/wt/internal/ui"
 )
@@ -97,10 +98,14 @@ func codexContextMessage(overlaps []StatusOverlap, currentLabel string) (msg str
 	return msg, true
 }
 
-// hookCodexContext implements `wt _hook codex-context` — a Codex UserPromptSubmit
-// hook. Reads the payload from r, derives the repo from its cwd, and prints the
-// cross-window collision awareness as additionalContext. Always exits 0 (fail-open).
-func hookCodexContext(r io.Reader) int {
+// hookAgentContext implements the per-turn UserPromptSubmit hooks
+// (`wt _hook codex-context` / `wt _hook claude-context` — both agents share the
+// cwd-in / additionalContext-out shape). Reads the payload from r, derives the
+// repo from its cwd, and injects the multi-window awareness the window should see
+// this turn: cross-window file overlaps PLUS un-acked coordination signals (holds
+// + announcements) from other windows. Always exits 0 (fail-open); silent when
+// there's nothing to say or the repo has ≤1 worktree.
+func hookAgentContext(r io.Reader) int {
 	if os.Getenv("WT_SKIP_COLLISION") == "1" || os.Getenv("HOOK_DISABLE_MULTIWINDOW_CHECK") == "1" {
 		return 0
 	}
@@ -117,7 +122,8 @@ func hookCodexContext(r io.Reader) int {
 			return 0
 		}
 	}
-	// Cheap on the common case: a repo with ≤1 worktree can't collide.
+	// Cheap on the common case: a repo with ≤1 worktree is not multi-window, so
+	// there are no other windows to collide with OR to have posted coordination.
 	if paths, err := gitx.WorktreePaths(); err != nil || len(paths) <= 1 {
 		return 0
 	}
@@ -137,15 +143,66 @@ func hookCodexContext(r io.Reader) int {
 	live := collide.ClassifyWindows(ws, c.Base, collide.OverlapWindowSet(ov), c.MaxAge)
 	active, _ := collide.PartitionOverlaps(ov, live)
 	graded := gradeStatusOverlaps(c, ws, active)
+
+	var parts []string
 	if msg, has := codexContextMessage(graded, collide.LabelForWorktree(ws, root)); has {
-		emitCodexContext(msg)
+		parts = append(parts, msg)
+	}
+	// Coordination signals — un-acked holds + announcements from other windows.
+	// Fail-open: a coord read error just omits this block (never breaks the turn).
+	if logPath, self := coordCtx(c); logPath != "" {
+		if recs, rerr := coord.Load(logPath); rerr == nil {
+			if msg, has := coordContextMessage(coord.Inbox(recs, self)); has {
+				parts = append(parts, msg)
+			}
+		}
+	}
+	if len(parts) > 0 {
+		emitAgentContext(strings.Join(parts, "\n\n"))
 	}
 	return 0
 }
 
-// emitCodexContext prints the UserPromptSubmit additionalContext JSON that Codex
-// injects into the model's context.
-func emitCodexContext(msg string) {
+// coordContextMessage renders the un-acked coordination signals from OTHER
+// windows for the per-turn context: active HOLDS (an op another window asked you
+// to avoid until all-clear) + plain announcements. inbox is already self-excluded
+// and un-acked (coord.Inbox). Holds come first (they survive the cap); the full
+// record id is shown so `wt ack <id>` copy-pastes. Pure; has=false when empty.
+func coordContextMessage(inbox []coord.Record) (msg string, has bool) {
+	var holds, notes []string
+	for _, r := range inbox {
+		who := r.Window
+		if who == "" {
+			who = "another window"
+		}
+		suffix := ""
+		if m := strings.TrimSpace(r.Message); m != "" {
+			suffix = " — " + m
+		}
+		if len(r.Hold) > 0 {
+			holds = append(holds, fmt.Sprintf("  ⚠ HOLD %s [%s]%s (wt ack %s)", who, strings.Join(r.Hold, ","), suffix, r.ID))
+		} else {
+			notes = append(notes, fmt.Sprintf("  %s%s (wt ack %s)", who, suffix, r.ID))
+		}
+	}
+	if len(holds) == 0 && len(notes) == 0 {
+		return "", false
+	}
+	lines := append([]string{}, holds...)
+	lines = append(lines, notes...)
+	if len(lines) > codexMaxOverlapLines {
+		extra := len(lines) - codexMaxOverlapLines
+		lines = append(lines[:codexMaxOverlapLines:codexMaxOverlapLines], fmt.Sprintf("  …and %d more", extra))
+	}
+	msg = "wt coordination — un-acked signals from other windows (respect any HOLD before that op):\n" +
+		strings.Join(lines, "\n") +
+		"\nSee `wt inbox` for detail; `wt ack <id>` to acknowledge. (Set WT_SKIP_COLLISION=1 to silence.)"
+	return msg, true
+}
+
+// emitAgentContext prints the UserPromptSubmit additionalContext JSON that Codex
+// and Claude Code both inject into the model's context.
+func emitAgentContext(msg string) {
 	var out struct {
 		HookSpecificOutput struct {
 			HookEventName     string `json:"hookEventName"`
@@ -592,8 +649,8 @@ func mergeCodexHook(path string) (out []byte, changed bool, err error) {
 	if hooks == nil {
 		hooks = map[string]any{}
 	}
-	c1 := ensureCodexEntry(hooks, "UserPromptSubmit", "", codexHookCommand)
-	c2 := ensureCodexEntry(hooks, "PreToolUse", "apply_patch", codexEditHookCommand)
+	c1 := ensureHookEntry(hooks, "UserPromptSubmit", "", codexHookCommand)
+	c2 := ensureHookEntry(hooks, "PreToolUse", "apply_patch", codexEditHookCommand)
 	if !c1 && !c2 {
 		return nil, false, nil
 	}
@@ -605,10 +662,11 @@ func mergeCodexHook(path string) (out []byte, changed bool, err error) {
 	return append(b, '\n'), true, nil
 }
 
-// ensureCodexEntry adds a {matcher?, hooks:[{type,command}]} group under event
+// ensureHookEntry adds a {matcher?, hooks:[{type,command}]} group under event
+// (shared by the codex + claude installs)
 // iff no existing group already runs command (idempotent; preserves whatever
 // else the operator has wired). Returns whether it mutated hooks.
-func ensureCodexEntry(hooks map[string]any, event, matcher, command string) bool {
+func ensureHookEntry(hooks map[string]any, event, matcher, command string) bool {
 	list, _ := hooks[event].([]any)
 	for _, g := range list {
 		gm, _ := g.(map[string]any)

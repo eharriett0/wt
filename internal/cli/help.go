@@ -69,7 +69,7 @@ func printHelp() {
 
 	fmt.Println(b("  ✦ SETUP"))
 	fmt.Printf("    %s        %s\n", c("wt install-hooks"), "install pre-push (base-branch guard) + pre-commit (collision notice)")
-	fmt.Printf("    %s %s\n", c("wt install-claude-hook"), "wire a Claude Code PreToolUse hook so AGENTS get collision-checked per edit  "+d("[--write]"))
+	fmt.Printf("    %s %s\n", c("wt install-claude-hook"), "wire Claude Code hooks (per-edit collision-check + per-turn overlaps + coordination)  "+d("[--write]"))
 	fmt.Printf("    %s  %s\n", c("wt install-codex-hook"), "wire Codex hooks (per-turn + per-edit apply_patch) for multi-window collision awareness  "+d("[--write]"))
 	fmt.Printf("    %s                 %s\n", c("wt mcp"), "stdio MCP server exposing read-only tools (wt_status/check/todos/where) to any MCP client")
 	fmt.Printf("    %s              %s\n", c("wt doctor"), "check git/gh + all resolved config + structured-doc regex + coord-log health + preflight  "+d("[--json]"))

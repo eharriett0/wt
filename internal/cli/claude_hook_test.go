@@ -179,8 +179,11 @@ func TestMergeClaudeHook_FreshAndIdempotent(t *testing.T) {
 	if err != nil || !changed {
 		t.Fatalf("fresh: changed=%v err=%v", changed, err)
 	}
-	if !strings.Contains(string(out), claudeHookCommand) || !strings.Contains(string(out), "Edit|Write|MultiEdit") {
-		t.Errorf("fresh output missing entry:\n%s", out)
+	s := string(out)
+	for _, want := range []string{claudeHookCommand, "Edit|Write|MultiEdit", claudeContextCommand, "UserPromptSubmit"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("fresh output missing %q:\n%s", want, s)
+		}
 	}
 	// write it, then a second merge is a no-op (idempotent)
 	if err := os.WriteFile(path, out, 0o644); err != nil {

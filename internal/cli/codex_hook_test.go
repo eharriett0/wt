@@ -5,7 +5,65 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/eharriett0/wt/internal/coord"
 )
+
+func TestCoordContextMessage(t *testing.T) {
+	// empty inbox → nothing to say
+	if _, has := coordContextMessage(nil); has {
+		t.Error("empty inbox → no message")
+	}
+
+	inbox := []coord.Record{
+		{ID: "id-hold", Window: "feat/x", Message: "rolling main", Hold: []string{"merge-main", "rebase"}},
+		{ID: "id-note", Window: "feat/y", Message: "fyi: renamed pkg"},
+		{ID: "id-bare", Window: "feat/z"}, // no message
+	}
+	msg, has := coordContextMessage(inbox)
+	if !has {
+		t.Fatal("expected a message")
+	}
+	// hold rendered with its ops + ack id + comes first (before the plain note)
+	if !strings.Contains(msg, "HOLD feat/x [merge-main,rebase]") {
+		t.Errorf("hold ops missing: %q", msg)
+	}
+	if !strings.Contains(msg, "wt ack id-hold") {
+		t.Errorf("hold ack id missing: %q", msg)
+	}
+	if strings.Index(msg, "id-hold") > strings.Index(msg, "id-note") {
+		t.Errorf("holds must come before plain announcements: %q", msg)
+	}
+	// plain announcement + a message-less one
+	if !strings.Contains(msg, "feat/y — fyi: renamed pkg (wt ack id-note)") {
+		t.Errorf("announcement rendering off: %q", msg)
+	}
+	if !strings.Contains(msg, "feat/z (wt ack id-bare)") {
+		t.Errorf("message-less announcement rendering off: %q", msg)
+	}
+	if !strings.Contains(msg, "wt inbox") {
+		t.Errorf("missing the `wt inbox` reminder: %q", msg)
+	}
+}
+
+func TestCoordContextMessage_Caps(t *testing.T) {
+	var inbox []coord.Record
+	// one hold first, then many notes → the hold must survive the cap
+	inbox = append(inbox, coord.Record{ID: "keep", Window: "w0", Hold: []string{"merge-main"}})
+	for i := 0; i < codexMaxOverlapLines+5; i++ {
+		inbox = append(inbox, coord.Record{ID: fmt.Sprintf("n%d", i), Window: fmt.Sprintf("w%d", i+1), Message: "note"})
+	}
+	msg, has := coordContextMessage(inbox)
+	if !has {
+		t.Fatal("expected a message")
+	}
+	if !strings.Contains(msg, "…and 6 more") {
+		t.Errorf("expected the cap summary line: %q", msg)
+	}
+	if !strings.Contains(msg, "HOLD w0") {
+		t.Errorf("the hold must survive the cap (holds first): %q", msg)
+	}
+}
 
 func TestParseCodexCwd(t *testing.T) {
 	if cwd, ok := parseCodexCwd([]byte(`{"cwd":"/repo","session_id":"x","prompt":"hi"}`)); !ok || cwd != "/repo" {

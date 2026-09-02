@@ -274,7 +274,9 @@ func claudeEditRanges(raw []byte, content string) ([]gitx.LineRange, bool) {
 	return ranges, true
 }
 
-// claudeHookSnippet is the .claude/settings.json entry that wires the hook.
+// claudeHookSnippet is the .claude/settings.json entry that wires both hooks:
+// PreToolUse (per-edit collision check) + UserPromptSubmit (per-turn multi-window
+// awareness — overlaps + un-acked coordination holds/announcements).
 const claudeHookSnippet = `{
   "hooks": {
     "PreToolUse": [
@@ -284,11 +286,22 @@ const claudeHookSnippet = `{
           { "type": "command", "command": "wt _hook claude-edit" }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "wt _hook claude-context" }
+        ]
+      }
     ]
   }
 }`
 
 const claudeHookCommand = "wt _hook claude-edit"
+
+// claudeContextCommand is the UserPromptSubmit hook — the per-turn multi-window
+// awareness snapshot (shares hookAgentContext with codex-context).
+const claudeContextCommand = "wt _hook claude-context"
 
 // cmdInstallClaudeHook prints (or, with --write, merges) the PreToolUse hook
 // entry into the project's .claude/settings.json (#95).
@@ -300,9 +313,11 @@ func cmdInstallClaudeHook(args []string) int {
 		}
 	}
 	if !write {
-		ui.Info("add this to .claude/settings.json (project) to collision-check every agent edit (#95):")
+		ui.Info("add this to .claude/settings.json (project) so Claude Code gets multi-window collision awareness:")
+		ui.Info("  • PreToolUse — collision-check every agent edit (#95)")
+		ui.Info("  • UserPromptSubmit — per-turn snapshot of file overlaps + coordination holds/announcements")
 		fmt.Println(claudeHookSnippet)
-		ui.Info("or run `wt install-claude-hook --write` to merge it automatically")
+		ui.Info("or run `wt install-claude-hook --write` to merge both automatically")
 		ui.Info("advisory by default; WT_CLAUDE_HOOK_BLOCK=1 makes a HIGH collision a hard deny; WT_SKIP_COLLISION=1 bypasses")
 		return 0
 	}
@@ -314,7 +329,7 @@ func cmdInstallClaudeHook(args []string) int {
 			return 1
 		}
 		if !changed {
-			ui.OK("Claude Code PreToolUse hook already wired in %s", path)
+			ui.OK("Claude Code hooks (PreToolUse + UserPromptSubmit) already wired in %s", path)
 			return 0
 		}
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -325,7 +340,7 @@ func cmdInstallClaudeHook(args []string) int {
 			ui.Err("install-claude-hook: %v", err)
 			return 1
 		}
-		ui.OK("wired the collision hook into %s", path)
+		ui.OK("wired the Claude collision hooks (PreToolUse + UserPromptSubmit) into %s", path)
 		ui.Info("advisory by default; WT_CLAUDE_HOOK_BLOCK=1 makes a HIGH collision a hard deny")
 		return 0
 	})
@@ -346,24 +361,11 @@ func mergeClaudeHook(path string) (out []byte, changed bool, err error) {
 	if hooks == nil {
 		hooks = map[string]any{}
 	}
-	pre, _ := hooks["PreToolUse"].([]any)
-
-	// already present? (any PreToolUse group whose inner hooks run our command)
-	for _, g := range pre {
-		gm, _ := g.(map[string]any)
-		inner, _ := gm["hooks"].([]any)
-		for _, h := range inner {
-			hm, _ := h.(map[string]any)
-			if cmd, _ := hm["command"].(string); cmd == claudeHookCommand {
-				return nil, false, nil
-			}
-		}
+	c1 := ensureHookEntry(hooks, "PreToolUse", "Edit|Write|MultiEdit", claudeHookCommand)
+	c2 := ensureHookEntry(hooks, "UserPromptSubmit", "", claudeContextCommand)
+	if !c1 && !c2 {
+		return nil, false, nil
 	}
-	entry := map[string]any{
-		"matcher": "Edit|Write|MultiEdit",
-		"hooks":   []any{map[string]any{"type": "command", "command": claudeHookCommand}},
-	}
-	hooks["PreToolUse"] = append(pre, entry)
 	root["hooks"] = hooks
 	b, err := json.MarshalIndent(root, "", "  ")
 	if err != nil {
