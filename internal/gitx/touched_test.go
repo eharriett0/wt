@@ -145,3 +145,40 @@ func TestRangeChangedPaths_AheadOfBaseUnchanged(t *testing.T) {
 		t.Errorf("expected exactly [a.go b.go], got %v", paths)
 	}
 }
+
+func rangeCovers(rs []LineRange, line int) bool {
+	for _, r := range rs {
+		if r.Start <= line && line <= r.End {
+			return true
+		}
+	}
+	return false
+}
+
+// ChangedRangesNew reports a change at its CURRENT-file line (new frame); the
+// same change appears at a DIFFERENT (base-file) line via ChangedRanges. A late
+// edit whose line shifted because of an earlier insert must not be confused
+// across frames — the #123 section-grade bug used base-frame ranges against
+// current-frame section spans.
+func TestChangedRangesNew_NewFrameDiffersFromBaseFrame(t *testing.T) {
+	dir := gitRepo(t)
+	writeFile(t, dir, "doc.md", "line1\nline2\nline3\nTARGET\n")
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "commit", "-qm", "base")
+	// Insert 2 lines early (shifts TARGET from base line 4 → current line 6) and
+	// change TARGET.
+	writeFile(t, dir, "doc.md", "line1\nINS-A\nINS-B\nline2\nline3\nTARGET-EDIT\n")
+
+	newF := ChangedRangesNew(dir, "main", "doc.md")
+	baseF := ChangedRanges(dir, "main", "doc.md")
+
+	if !rangeCovers(newF, 6) {
+		t.Errorf("ChangedRangesNew should cover current line 6 (TARGET's new position): %v", newF)
+	}
+	if rangeCovers(newF, 4) {
+		t.Errorf("ChangedRangesNew should NOT report base line 4 (unchanged 'line2' in the current file): %v", newF)
+	}
+	if !rangeCovers(baseF, 4) {
+		t.Errorf("ChangedRanges should cover base line 4 (TARGET's base position): %v", baseF)
+	}
+}

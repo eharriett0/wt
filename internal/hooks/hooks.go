@@ -346,7 +346,7 @@ func pushCollisionBlocks(c *config.Config, ws []collide.Window, root string, pat
 	// Grade IDENTICALLY to `wt check` + pre-commit (#92, #97): shared-docs +
 	// append-only are advisory; a code file blocks only when the two windows'
 	// changed line-ranges OVERLAP (disjoint hunks stay advisory).
-	hard, soft := gradeConflicts(c, active, root, ws, gitx.ChangedRanges)
+	hard, soft := gradeConflicts(c, active, root, ws, gitx.ChangedRanges, gitx.ChangedRangesNew)
 	if len(hard) == 0 {
 		if len(soft) > 0 {
 			fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf("📝 %d advisory overlap(s) (shared docs / append-only / disjoint hunks) — not blocking", len(soft))))
@@ -403,7 +403,11 @@ type rangeFn func(worktree, base, path string) []gitx.LineRange
 // and append-only paths are advisory, and a code file is HARD only when the two
 // windows' changed line-ranges OVERLAP — disjoint hunks in the same file stay
 // advisory. Single-source so pre-push and pre-commit can never disagree (#92, #97).
-func gradeConflicts(c *config.Config, active []collide.Conflict, root string, ws []collide.Window, ranges rangeFn) (hard, soft []collide.Conflict) {
+// ranges is BASE-frame (line grading — two windows' ranges must share the base
+// frame to be comparable, #108); sectionRanges is NEW-frame (attributing a diff
+// to its own current-content sections, #123). Same fn in tests, different in
+// production (gitx.ChangedRanges vs gitx.ChangedRangesNew).
+func gradeConflicts(c *config.Config, active []collide.Conflict, root string, ws []collide.Window, ranges, sectionRanges rangeFn) (hard, soft []collide.Conflict) {
 	wtByLabel := make(map[string]string, len(ws))
 	for _, w := range ws {
 		wtByLabel[w.Label()] = w.Worktree
@@ -437,7 +441,7 @@ func gradeConflicts(c *config.Config, active []collide.Conflict, root string, ws
 			// straight through the pre-push guard.
 			if delim, isStructured := c.StructuredDocs[filepath.Base(cf.Path)]; isStructured {
 				if shared, graded := collide.SharedSectionsAcross(
-					c.Base, []string{root, wtByLabel[cf.Window]}, rangesPath, delim, collide.RangeFn(ranges),
+					c.Base, []string{root, wtByLabel[cf.Window]}, rangesPath, delim, collide.RangeFn(sectionRanges),
 				); graded && len(shared) > 0 {
 					hard = append(hard, cf)
 					continue
@@ -491,7 +495,7 @@ func HookPreCommit(c *config.Config) int {
 			// and append-only paths are advisory, and a code file is "hard" only when
 			// the two windows' changed line-ranges OVERLAP — disjoint hunks stay
 			// advisory. Unlike pre-push this NEVER blocks; it's an awareness notice.
-			hard, soft := gradeConflicts(c, active, root, ws, gitx.ChangedRanges)
+			hard, soft := gradeConflicts(c, active, root, ws, gitx.ChangedRanges, gitx.ChangedRangesNew)
 			if len(hard) > 0 {
 				files := distinctPaths(hard)
 				ui.Collision("%d staged file(s) have an OVERLAPPING edit by an active window:", len(files))

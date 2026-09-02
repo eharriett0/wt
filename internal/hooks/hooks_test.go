@@ -74,7 +74,7 @@ func TestGradeConflicts(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			hard, soft := gradeConflicts(tc.cfg, []collide.Conflict{tc.conflict}, testRoot, ws, stubRanges(tc.cur, tc.other))
+			hard, soft := gradeConflicts(tc.cfg, []collide.Conflict{tc.conflict}, testRoot, ws, stubRanges(tc.cur, tc.other), stubRanges(tc.cur, tc.other))
 			gotHard := len(hard) == 1 && len(soft) == 0
 			gotSoft := len(soft) == 1 && len(hard) == 0
 			if tc.wantHard && !gotHard {
@@ -98,7 +98,7 @@ func TestGradeConflicts_UsesMatchedFileForRangeLookup(t *testing.T) {
 		return []gitx.LineRange{rng(1, 3)}
 	}
 	cf := collide.Conflict{Path: "foo.go", Window: "winA", MatchedFile: "pkg/nested/foo.go"}
-	gradeConflicts(&config.Config{Base: "main"}, []collide.Conflict{cf}, testRoot, ws, rf)
+	gradeConflicts(&config.Config{Base: "main"}, []collide.Conflict{cf}, testRoot, ws, rf, rf)
 	if len(gotPaths) == 0 {
 		t.Fatal("range fn never called")
 	}
@@ -268,7 +268,7 @@ func TestGradeConflictsStructuredDoc(t *testing.T) {
 				}
 				return tc.other
 			}
-			hard, soft := gradeConflicts(c, []collide.Conflict{conflict}, self, ws, ranges)
+			hard, soft := gradeConflicts(c, []collide.Conflict{conflict}, self, ws, ranges, ranges)
 			gotHard := len(hard) == 1
 			if gotHard != tc.wantHard {
 				t.Fatalf("hard=%v want %v (hard=%d soft=%d)", gotHard, tc.wantHard, len(hard), len(soft))
@@ -277,6 +277,36 @@ func TestGradeConflictsStructuredDoc(t *testing.T) {
 				t.Fatalf("conflict must be graded exactly once: hard=%d soft=%d", len(hard), len(soft))
 			}
 		})
+	}
+}
+
+// #123: the section grade must use the NEW-frame sectionRanges, not the
+// base-frame ranges used for line grading. This pins that wiring so an accidental
+// swap of the two args (here, or at the prod call sites) is caught: sectionRanges
+// puts both windows in ## Alpha (same section → HARD), while the line-grade ranges
+// put them in DIFFERENT sections — a swap would flip the verdict to advisory.
+func TestGradeConflictsStructuredDoc_UsesSectionRangesNotLineRanges(t *testing.T) {
+	self, other := twoWorktrees(t)
+	ws := []collide.Window{{Branch: "winA", Worktree: other}}
+	c := &config.Config{Base: "main", SharedDocs: []string{"CLAUDE.md"}, StructuredDocs: map[string]string{"CLAUDE.md": "^## "}}
+
+	// base-frame ranges (line grade) — DIFFERENT sections: self ## Beta, other ## Alpha.
+	lineRanges := func(worktree, base, path string) []gitx.LineRange {
+		if worktree == self {
+			return []gitx.LineRange{rng(9, 9)} // ## Beta
+		}
+		return []gitx.LineRange{rng(5, 5)} // ## Alpha
+	}
+	// new-frame ranges (section grade) — SAME section: both ## Alpha.
+	sectionRanges := func(worktree, base, path string) []gitx.LineRange {
+		if worktree == self {
+			return []gitx.LineRange{rng(5, 5)} // ## Alpha
+		}
+		return []gitx.LineRange{rng(6, 6)} // ## Alpha
+	}
+	hard, soft := gradeConflicts(c, []collide.Conflict{{Path: "CLAUDE.md", Window: "winA"}}, self, ws, lineRanges, sectionRanges)
+	if len(hard) != 1 || len(soft) != 0 {
+		t.Fatalf("section grade must use sectionRanges (same section → HARD); a swap uses lineRanges (different sections → advisory): hard=%d soft=%d", len(hard), len(soft))
 	}
 }
 
@@ -295,6 +325,7 @@ func TestGradeConflictsStructuredDocUngradable(t *testing.T) {
 	hard, soft := gradeConflicts(c,
 		[]collide.Conflict{{Path: "CLAUDE.md", Window: "winA"}}, self, ws,
 		stubRanges([]gitx.LineRange{rng(5, 5)}, []gitx.LineRange{rng(5, 5)}),
+		stubRanges([]gitx.LineRange{rng(5, 5)}, []gitx.LineRange{rng(5, 5)}),
 	)
 	if len(hard) != 0 || len(soft) != 1 {
 		t.Fatalf("ungradable structured doc must stay advisory: hard=%d soft=%d", len(hard), len(soft))
@@ -312,7 +343,7 @@ func TestGradeConflictsAppendOnlyBeatsSection(t *testing.T) {
 	}
 	ws := []collide.Window{{Branch: "winA", Worktree: other}}
 	ranges := func(worktree, base, path string) []gitx.LineRange { return []gitx.LineRange{rng(5, 5)} }
-	hard, soft := gradeConflicts(c, []collide.Conflict{{Path: "CLAUDE.md", Window: "winA"}}, self, ws, ranges)
+	hard, soft := gradeConflicts(c, []collide.Conflict{{Path: "CLAUDE.md", Window: "winA"}}, self, ws, ranges, ranges)
 	if len(hard) != 0 || len(soft) != 1 {
 		t.Fatalf("append-only must stay advisory: hard=%d soft=%d", len(hard), len(soft))
 	}
