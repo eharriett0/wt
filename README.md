@@ -152,7 +152,7 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 | `wt block-id <file>` | Atomically reserve the next append-log id so two windows never grab the same `NEWEST-N`. `--written N` marks a reservation done (clears the banner; frees it if never written) `[--pattern] [--format]` |
 | `wt append <doc> --section H "txt"` | Locked, section-scoped append to a structured shared doc (parallel adds can't clobber) |
 | `wt install-hooks` | Install pre-push (base guard + collision check + base-conflict warning) + pre-commit (collision notice) `[--force]` |
-| `wt install-claude-hook` | Wire a Claude Code **PreToolUse** hook so the AI agents doing the editing get collision-checked per edit `[--write]` (see [Agents](#agents-claude-code--codex)) |
+| `wt install-claude-hook` | Wire Claude Code hooks (**PreToolUse** per-edit + **UserPromptSubmit** per-turn overlaps + coordination) `[--write]` (see [Agents](#agents-claude-code--codex)) |
 | `wt install-codex-hook` | Wire a Codex **UserPromptSubmit** hook so it gets multi-window collision awareness each turn `[--write]` (see [Agents](#agents-claude-code--codex)) |
 | `wt doctor` | Check git/gh + all resolved config + structured-doc regex + coordination-log health + preflight, and flag worktrees that track the base branch, a stale far-behind base checkout, and whether the hooks are installed `[--json]` |
 | `wt version` | Print the version |
@@ -250,25 +250,31 @@ status`/`check` enumerate `git worktree list`, so a worktree an agent spawns
 (Claude Code's native `--worktree`, say) is visible to `wt` for free. But the
 usual failure mode is that the *agents doing the editing* never run `wt check`.
 
-`wt install-claude-hook` closes that. It wires a Claude Code **PreToolUse** hook
-(matcher `Edit|Write|MultiEdit`) that runs the same collision grading as
-`wt check` on the file an agent is about to touch:
+`wt install-claude-hook` closes that. It wires **two** Claude Code hooks:
+
+- **`PreToolUse`** (matcher `Edit|Write|MultiEdit`) — runs the same collision
+  grading as `wt check` on the file an agent is about to touch.
+- **`UserPromptSubmit`** (`wt _hook claude-context`) — each turn, injects a
+  snapshot of what other live windows are doing: cross-window file overlaps
+  **plus** un-acked coordination signals — a `merge-main` hold another window
+  placed, or an announcement you haven't acked (each with a `wt ack <id>`).
 
 ```
-wt install-claude-hook            # prints the .claude/settings.json snippet
-wt install-claude-hook --write    # merges it in (never clobbers existing hooks)
+wt install-claude-hook            # prints the .claude/settings.json snippet (both hooks)
+wt install-claude-hook --write    # merges both in (never clobbers existing hooks)
 ```
 
 - **Advisory by default** — a HIGH cross-worktree overlap is returned to the
   agent as context (`additionalContext`), so it *sees* the collision and can
   coordinate, without being halted.
-- **`WT_CLAUDE_HOOK_BLOCK=1`** turns a HIGH into a hard `deny`.
+- **`WT_CLAUDE_HOOK_BLOCK=1`** turns a HIGH (per-edit) into a hard `deny`.
 - **Cheap** — a repo with ≤1 worktree is skipped instantly (solo repos pay
-  nothing per edit). Bypass with `WT_SKIP_COLLISION=1`; fail-open on any error
+  nothing). Bypass with `WT_SKIP_COLLISION=1`; fail-open on any error
   (a coordination nicety must never disrupt the session).
 
 So when the agent in worktree A goes to edit the exact hunk of `foo.go` that
-worktree B is live-editing, it's told — instead of both landing competing PRs.
+worktree B is live-editing, it's told — instead of both landing competing PRs;
+and if B has announced a hold on `merge-main`, A sees it before it merges.
 
 ### Codex
 
@@ -280,7 +286,9 @@ trip `wt`'s pre-commit / pre-push guards like anyone else's. On top of that,
 awareness a Claude window does:
 
 - **`UserPromptSubmit`** (`wt _hook codex-context`) — injects `additionalContext`
-  each turn naming which files other live windows are editing.
+  each turn: which files other live windows are editing, plus un-acked
+  coordination signals (a `merge-main` hold or an announcement from another
+  window). Same builder as the Claude `claude-context` hook.
 - **`PreToolUse`** on `apply_patch` (`wt _hook codex-edit`) — grades the pending
   patch's target files with the same engine as `wt check`, and injects
   `additionalContext` when a hunk overlaps another live window. Codex's
