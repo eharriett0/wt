@@ -214,6 +214,37 @@ func TestMergeClaudeHook_PreservesExisting(t *testing.T) {
 	}
 }
 
+// The upgrade path: an existing user whose settings.json has ONLY the old
+// PreToolUse claude-edit hook (installed by a wt version before the context hook
+// existed) re-runs install-claude-hook. It must ADD only the UserPromptSubmit
+// entry — not duplicate the PreToolUse one — and report changed.
+func TestMergeClaudeHook_AddsContextToPreToolUseOnly(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/settings.json"
+	existing := `{"hooks":{"PreToolUse":[{"matcher":"Edit|Write|MultiEdit","hooks":[{"type":"command","command":"wt _hook claude-edit"}]}]}}`
+	if err := os.WriteFile(path, []byte(existing), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, changed, err := mergeClaudeHook(path)
+	if err != nil || !changed {
+		t.Fatalf("partial upgrade should add the context hook: changed=%v err=%v", changed, err)
+	}
+	s := string(out)
+	if !strings.Contains(s, "UserPromptSubmit") || !strings.Contains(s, claudeContextCommand) {
+		t.Errorf("did not add the UserPromptSubmit context hook:\n%s", s)
+	}
+	if n := strings.Count(s, claudeHookCommand); n != 1 {
+		t.Errorf("PreToolUse claude-edit must appear exactly once (not duplicated), got %d:\n%s", n, s)
+	}
+	// second run is now a full no-op
+	if err := os.WriteFile(path, out, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, changed, err := mergeClaudeHook(path); err != nil || changed {
+		t.Errorf("both hooks present → no-op: changed=%v err=%v", changed, err)
+	}
+}
+
 func TestMergeClaudeHook_RefusesGarbage(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/settings.json"
