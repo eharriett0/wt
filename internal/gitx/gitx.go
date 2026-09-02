@@ -382,11 +382,24 @@ func IsAncestor(maybeAncestor, descendant string) bool {
 	return err == nil
 }
 
-// RangeChangedPaths returns the repo-relative paths changed between two commits
-// (`git diff --name-only from..to`). Used by the pre-push collision check (#74)
-// to scope the check to the OUTGOING commits, not the whole worktree.
-func RangeChangedPaths(from, to string) ([]string, error) {
-	out, err := Run("diff", "--name-only", from+".."+to)
+// RangeChangedPaths returns the repo-relative paths this branch CONTRIBUTES over
+// `from` — `git diff --name-only from...to` (THREE-dot: the diff since the
+// merge-base, i.e. what `to` added, ignoring whatever `from` advanced by). Used
+// by the pre-push collision check (#74) to scope the check to the OUTGOING
+// commits, not the whole worktree.
+//
+// Three-dot is load-bearing. With two-dot (`from..to`), a branch BEHIND `from`
+// (you branched, base moved on, you did NOT rebase) diffs base's tree against
+// yours and reports every file base gained as an outgoing change (a reversal),
+// so the guard blocked on files the pusher never touched — the more behind, the
+// more it invented — contradicting `wt check`/`status`, which scope with
+// three-dot (TouchedFiles, "committed-on-branch vs base since merge-base"). This
+// is the #106 family for the not-rebased case: #106 moved the `from` ref to base,
+// but two-dot still diverged whenever base wasn't already an ancestor of `to`.
+// For a fast-forward (from is an ancestor of to) three-dot == two-dot, so the FF
+// case is unchanged. Runs in dir (empty → cwd). Best-effort.
+func RangeChangedPaths(dir, from, to string) ([]string, error) {
+	out, err := RunDir(dir, "diff", "--name-only", from+"..."+to)
 	if err != nil {
 		return nil, err
 	}

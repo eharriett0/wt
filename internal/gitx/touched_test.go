@@ -73,3 +73,75 @@ func TestTouchedFiles_RenameRecordsBothPaths(t *testing.T) {
 		t.Errorf("expected NEW path new.go in touched set, got %v", got)
 	}
 }
+
+// writeFile is a tiny helper for the range-scope tests below.
+func writeFile(t *testing.T, dir, rel, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, rel), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The pre-push outgoing scope must be THREE-dot (diff since the merge-base), so a
+// branch BEHIND base — you branched, base moved on, you did NOT rebase — is scoped
+// to only what the branch itself added, never the files base advanced by. Two-dot
+// (base..head) diffs the two trees directly and reports base's divergent files as
+// outgoing (reversals), which is exactly the pre-push guard's false-HIGH block on
+// files the pusher never touched.
+func TestRangeChangedPaths_BehindBaseScopesToBranchContributionOnly(t *testing.T) {
+	dir := gitRepo(t) // main @ empty init
+	writeFile(t, dir, "base.txt", "base\n")
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "commit", "-qm", "base") // <- the eventual merge-base
+
+	runGit(t, dir, "checkout", "-q", "-b", "feature")
+	writeFile(t, dir, "feature.txt", "feat\n")
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "commit", "-qm", "feature")
+
+	// main advances with an UNRELATED file; feature does NOT rebase → it is behind.
+	runGit(t, dir, "checkout", "-q", "main")
+	writeFile(t, dir, "main-advanced.txt", "adv\n")
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "commit", "-qm", "advance")
+
+	paths, err := RangeChangedPaths(dir, "main", "feature")
+	if err != nil {
+		t.Fatalf("RangeChangedPaths: %v", err)
+	}
+	if !touchedContains(paths, "feature.txt") {
+		t.Errorf("branch's own file missing from outgoing scope: %v", paths)
+	}
+	if touchedContains(paths, "main-advanced.txt") {
+		t.Errorf("two-dot regression: base's advanced file must NOT be attributed to the push: %v", paths)
+	}
+	if len(paths) != 1 {
+		t.Errorf("outgoing scope should be exactly [feature.txt], got %v", paths)
+	}
+}
+
+// The common case (branch AHEAD of base, base is the merge-base) is unchanged by
+// three-dot: it still reports exactly the branch's commits.
+func TestRangeChangedPaths_AheadOfBaseUnchanged(t *testing.T) {
+	dir := gitRepo(t)
+	writeFile(t, dir, "base.txt", "base\n")
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "commit", "-qm", "base")
+
+	runGit(t, dir, "checkout", "-q", "-b", "feature")
+	writeFile(t, dir, "a.go", "package a\n")
+	writeFile(t, dir, "b.go", "package b\n")
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "commit", "-qm", "feature work")
+
+	paths, err := RangeChangedPaths(dir, "main", "feature")
+	if err != nil {
+		t.Fatalf("RangeChangedPaths: %v", err)
+	}
+	if !touchedContains(paths, "a.go") || !touchedContains(paths, "b.go") {
+		t.Errorf("ahead-of-base scope should list the branch's files, got %v", paths)
+	}
+	if len(paths) != 2 {
+		t.Errorf("expected exactly [a.go b.go], got %v", paths)
+	}
+}
