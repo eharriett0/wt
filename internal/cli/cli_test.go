@@ -178,6 +178,33 @@ func TestAnyDeployPath(t *testing.T) {
 		{"* stays within a segment", []string{"doc/README.md"}, []string{"*.md"}, false},
 		{"whitespace trimmed both sides", []string{"  infrastructure/x.yaml  "}, []string{"  infrastructure/**  "}, true},
 		{"blank entries ignored", []string{"", "  ", "doc/z.md"}, deploy, false},
+
+		// #119: `!glob` excludes. The driver is a README living inside a subtree
+		// that otherwise deploys — CI already skips markdown there, so the gate
+		// was demanding a prod ack for a change that could not apply.
+		{"excluded md only → not a deploy",
+			[]string{"modules/vm/README.md"},
+			[]string{"modules/**", "!modules/**/*.md"}, false},
+		{"excluded md alongside a real change → still a deploy",
+			[]string{"modules/vm/README.md", "modules/vm/main.tf"},
+			[]string{"modules/**", "!modules/**/*.md"}, true},
+		{"exclusion is scoped, does not leak to another subtree",
+			[]string{"infrastructure/notes.md"},
+			[]string{"infrastructure/**", "modules/**", "!modules/**/*.md"}, true},
+		{"non-excluded type inside the subtree still gates",
+			[]string{"modules/vm/policy.json"},
+			[]string{"modules/**", "!modules/**/*.md"}, true},
+		{"exclusion whitespace trimmed after the bang",
+			[]string{"modules/vm/README.md"},
+			[]string{"modules/**", "! modules/**/*.md"}, false},
+		// ⚠ fail CLOSED: a list that only ever removes must not read as
+		// "nothing deploys" — that would turn one typo into a disabled prod gate.
+		{"exclusions-only fails closed",
+			[]string{"doc/z.md"},
+			[]string{"!modules/**/*.md"}, true},
+		{"bare bang is not an exclusion",
+			[]string{"modules/vm/README.md"},
+			[]string{"modules/**", "!"}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

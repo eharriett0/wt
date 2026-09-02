@@ -467,15 +467,57 @@ func deployGateApplies(c *config.Config, pr string) bool {
 // collide.MatchDoubleStar so `**` spans path segments ("infrastructure/**" matches
 // a deeply-nested file) while `*` stays within one segment — the same matcher the
 // append-only globs use (#31), so deploy-path globs behave identically.
+//
+// A glob may be prefixed with `!` to EXCLUDE (#119). A file is a deploy path when
+// it matches at least one positive glob and no exclusion. That covers the case a
+// positive-only list cannot express: a subtree deploys, but one file class inside
+// it demonstrably cannot. The concrete driver was a README living beside the
+// modules it documents — the CI that applies that subtree already skips markdown,
+// so the gate was firing on a change that could not deploy.
+//
+// ⚠ Exclusions are the safe direction to be wrong in, and the reason to prefer
+// them over enumerating what DOES deploy. A file type nobody thought of still
+// matches the broad positive glob and still gates; under positive enumeration it
+// would silently stop gating, which is the failure that is never noticed.
+//
+// ⚠ Fails CLOSED when a list is exclusions-only. `len(globs) == 0` already means
+// "whole repo is a deploy surface" to the caller, so a list that removes without
+// ever adding must not quietly mean "nothing ever deploys" — that turns a typo
+// into a disabled prod gate.
 func anyDeployPath(files, globs []string) bool {
+	var include, exclude []string
+	for _, g := range globs {
+		if g = strings.TrimSpace(g); g == "" {
+			continue
+		}
+		if strings.HasPrefix(g, "!") {
+			if ex := strings.TrimSpace(g[1:]); ex != "" {
+				exclude = append(exclude, ex)
+			}
+			continue
+		}
+		include = append(include, g)
+	}
+	if len(include) == 0 {
+		return len(exclude) > 0 // exclusions-only → fail closed, gate everything
+	}
 	for _, f := range files {
 		if f = strings.TrimSpace(f); f == "" {
 			continue
 		}
-		for _, g := range globs {
-			if g = strings.TrimSpace(g); g != "" && collide.MatchDoubleStar(g, f) {
-				return true
-			}
+		if !matchesAny(include, f) || matchesAny(exclude, f) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// matchesAny reports whether name matches at least one of the globs.
+func matchesAny(globs []string, name string) bool {
+	for _, g := range globs {
+		if collide.MatchDoubleStar(g, name) {
+			return true
 		}
 	}
 	return false
