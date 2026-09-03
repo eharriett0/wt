@@ -184,11 +184,19 @@ func WorktreeAdd(path, branch, base string) error {
 // origin/<branch> (which materializes a local tracking branch). Unlike
 // WorktreeAdd it NEVER creates a branch from base: adopting someone else's or a
 // previous session's PR branch must land on that exact branch, not a fresh fork
-// of it. Fails "invalid reference" when the branch is neither local nor a
-// unique remote — the caller turns that into a clear not-found. (#134)
+// of it. On failure — the branch is absent, OR (common for adopt) already
+// checked out in another worktree — the error carries git's own stderr so the
+// caller can surface the real reason instead of a bare "exit status 128". (#134)
 func WorktreeAdopt(path, branch string) error {
-	_, err := Run("worktree", "add", path, branch)
-	return err
+	cmd := exec.Command("git", "worktree", "add", path, branch)
+	cmd.Env = scopedEnv()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		if msg := strings.TrimSpace(string(out)); msg != "" {
+			return fmt.Errorf("%w: %s", err, msg)
+		}
+		return err
+	}
+	return nil
 }
 
 // LocalBranchExists reports whether refs/heads/<branch> exists.

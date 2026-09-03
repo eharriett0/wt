@@ -203,7 +203,10 @@ func Adopt(c *config.Config, branch string) (string, error) {
 
 	ui.Step("attaching worktree at %s to existing branch %s", wtDir, branch)
 	if err := gitx.WorktreeAdopt(wtDir, branch); err != nil {
-		return "", fmt.Errorf("branch %q not found locally or on origin (git worktree add: %w)", branch, err)
+		// Don't assert "not found": the branch may be checked out in another
+		// worktree (common for adopt), or absent locally and on origin. The
+		// error already carries git's own stderr with the real reason. (#134)
+		return "", fmt.Errorf("could not attach a worktree to branch %q — it may be checked out in another worktree, or absent locally and on origin: %w", branch, err)
 	}
 
 	linkSharedFiles(c, wtDir)

@@ -355,7 +355,7 @@ func SlugFromTitle(title string) string {
 	return strings.TrimRight(s, "-")
 }
 
-var branchIssueRe = regexp.MustCompile(`^(\d+)`)
+var branchIssueRe = regexp.MustCompile(`^\d+`)
 
 // issueFromBranch recovers the issue number a branch encodes — the inverse of
 // BranchName (prefix + issue [+ -slug]). Returns "" when the branch isn't

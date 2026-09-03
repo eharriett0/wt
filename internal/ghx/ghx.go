@@ -356,10 +356,16 @@ func OpenPRsReferencingIssue(n string) []IssuePRRef {
 	if err != nil || strings.TrimSpace(url) == "" {
 		return nil
 	}
+	// first:100 caps the timeline scan — for a presence check that's ample (an
+	// open PR is rarely the 101st cross-reference on an issue). isCrossRepository
+	// drops a same-numbered PR in ANOTHER repo that happens to mention owner/repo#n,
+	// which would otherwise false-refuse the claim AND mislead `wt adopt n` onto an
+	// unrelated branch. The `... on PullRequest{}` fragment yields {} for Issue
+	// sources; `.state=="OPEN"` then drops them (and any CLOSED/MERGED PR).
 	out, err := run("api", "graphql",
-		"-f", "query=query($url:URI!){resource(url:$url){... on Issue{timelineItems(itemTypes:[CROSS_REFERENCED_EVENT],first:100){nodes{... on CrossReferencedEvent{source{... on PullRequest{number headRefName isDraft url state}}}}}}}}",
+		"-f", "query=query($url:URI!){resource(url:$url){... on Issue{timelineItems(itemTypes:[CROSS_REFERENCED_EVENT],first:100){nodes{... on CrossReferencedEvent{isCrossRepository source{... on PullRequest{number headRefName isDraft url state}}}}}}}}",
 		"-f", "url="+strings.TrimSpace(url),
-		"--jq", `.data.resource.timelineItems.nodes[]? | .source // empty | select(.state=="OPEN") | [(.number|tostring),(.headRefName // ""),(.isDraft|tostring),(.url // "")] | @tsv`)
+		"--jq", `.data.resource.timelineItems.nodes[]? | select(.isCrossRepository == false) | .source // empty | select(.state=="OPEN") | [(.number|tostring),(.headRefName // ""),(.isDraft|tostring),(.url // "")] | @tsv`)
 	if err != nil {
 		return nil
 	}
