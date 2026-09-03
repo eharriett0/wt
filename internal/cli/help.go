@@ -39,12 +39,13 @@ func printHelp() {
 	fmt.Println()
 
 	fmt.Println(b(g("  ✦ MERGE")) + d("  — guarded squash that refuses empty/placeholder-only PRs"))
-	fmt.Printf("    %s     %s\n", c("wt merge-pr <pr>"), "guarded squash (surfaces head branch) + auto-remove worktree  "+d("[--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok]"))
+	fmt.Printf("    %s     %s\n", c("wt merge-pr <pr>"), "guarded squash (surfaces head branch) + auto-remove worktree  "+d("[--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok] [--no-close-check]"))
 	fmt.Println("    " + d("set ") + c("merge_is_deploy") + d(" for GitOps repos (merge auto-applies to prod): refuses"))
 	fmt.Println("    " + d("a draft PR, banners the deploy, and requires a typed confirm / --confirm-deploy."))
 	fmt.Println("    " + d("scope it with ") + c("merge_is_deploy_paths") + d(" (globs, ** ok) so the gate skips docs/CI/scripts-only PRs."))
 	fmt.Println("    " + d("prefix a glob with ") + c("!") + d(" to carve out a class that can't deploy inside one that can (e.g. a README beside the code it documents)."))
 	fmt.Println("    " + d("--admin forwards to gh pr merge to bypass a required-review branch (keeps the guard)."))
+	fmt.Println("    " + d("--no-close-check skips the close-keyword lint + post-merge issue-state verify (#77) for a PR that intentionally closes nothing."))
 	fmt.Println()
 
 	fmt.Println(b(y("  ✦ CROSS-WINDOW COORDINATION")) + d("  — hand off disruptive changes (incidents, rolls, deploys)"))
@@ -82,8 +83,9 @@ func printHelp() {
 	fmt.Println()
 
 	fmt.Println(d("  Config: derived defaults → repo-root .wt.conf → env. Keys/vars: base, prefix,"))
-	fmt.Println(d("  worktree_root, active_work, link_files, claim_open_pr, shared_docs,"))
-	fmt.Println(d("  append_only_paths, max_age (e.g. 4d/2w), merge_is_deploy[_paths]  (env = WT_<UPPER>)."))
+	fmt.Println(d("  worktree_root, active_work, link_files, claim_open_pr, shared_docs, append_only_paths,"))
+	fmt.Println(d("  structured_doc.<name>, max_age (e.g. 4d/2w), hold_max_age, coord_issue,"))
+	fmt.Println(d("  merge_is_deploy[_paths] (! excludes)  (env = WT_<UPPER>)."))
 	fmt.Println(d("  Color off: NO_COLOR=1.   More: https://github.com/eharriett0/wt"))
 	fmt.Println()
 }
