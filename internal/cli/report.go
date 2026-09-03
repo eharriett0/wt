@@ -409,36 +409,44 @@ func gradeStatusOverlaps(c *config.Config, ws []collide.Window, active []collide
 			}
 		default:
 			appendOnly := collide.IsAppendOnly(o.File, c.AppendOnlyPaths)
-			// #122: a window whose change to this file already landed on base (via
-			// a different branch's squash) isn't genuinely contesting it — its
-			// "range" is base's own change. Drop such windows; if fewer than two
-			// remain live, the file isn't contested.
-			var rangesByWindow [][]gitx.LineRange
-			liveWindows := 0
+			type windowRanges struct {
+				w  collide.Window
+				rs []gitx.LineRange
+			}
+			var all []windowRanges
 			if !appendOnly {
 				for _, label := range o.Windows {
-					w, ok := byLabel[label]
-					if !ok {
-						continue
+					if w, ok := byLabel[label]; ok {
+						all = append(all, windowRanges{w, gitx.ChangedRanges(w.Worktree, c.Base, o.File)})
 					}
-					if subsumedByBase(w.Worktree, c.Base, o.File) {
-						continue
-					}
-					liveWindows++
-					rangesByWindow = append(rangesByWindow, gitx.ChangedRanges(w.Worktree, c.Base, o.File))
 				}
 			}
-			sev := collide.OverlapSeverity(rangesByWindow, appendOnly)
-			so.OverlapSpans = allPairSpans(rangesByWindow)
-			switch {
-			case !appendOnly && liveWindows < 2:
-				// fewer than two windows genuinely contest this file — the rest had
-				// their change already on base (#122).
-				so.Category, so.Severity, so.Subsumed = CatFYI, "low", true
-			case sev == collide.SevHigh:
-				so.Category, so.Severity = CatBlocking, "HIGH"
-			default:
+			allRanges := make([][]gitx.LineRange, len(all))
+			for i, x := range all {
+				allRanges[i] = x.rs
+			}
+			if collide.OverlapSeverity(allRanges, appendOnly) != collide.SevHigh {
+				so.OverlapSpans = allPairSpans(allRanges)
 				so.Category, so.Severity = CatFYI, "low"
+				break
+			}
+			// Would be HIGH — only NOW pay for the #122 subsumption check: a window
+			// whose change to this file already landed on base (via a different
+			// branch's squash) isn't genuinely contesting it (its "range" is base's
+			// own change). Drop such windows; if fewer than two remain, not contested.
+			var live [][]gitx.LineRange
+			for _, x := range all {
+				if subsumedByBase(x.w.Worktree, c.Base, o.File) {
+					continue
+				}
+				live = append(live, x.rs)
+			}
+			if len(live) < 2 {
+				so.OverlapSpans = allPairSpans(allRanges)
+				so.Category, so.Severity, so.Subsumed = CatFYI, "low", true
+			} else {
+				so.OverlapSpans = allPairSpans(live)
+				so.Category, so.Severity = CatBlocking, "HIGH"
 			}
 		}
 		out = append(out, so)

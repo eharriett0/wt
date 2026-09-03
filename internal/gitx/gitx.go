@@ -724,6 +724,9 @@ func ChangedRangesNew(dir, base, file string) []LineRange {
 // (a missed collision is worse than a noisy one). known=false when it couldn't be
 // evaluated at all.
 func FileChangeSubsumed(worktree, base, path string) (subsumed, known bool) {
+	if worktree == "" {
+		return false, false // no worktree to evaluate — fail-safe (keep the collision)
+	}
 	baseRef := "origin/" + base
 	if _, err := RunDir(worktree, "rev-parse", "--verify", "--quiet", baseRef+"^{commit}"); err != nil {
 		baseRef = base
