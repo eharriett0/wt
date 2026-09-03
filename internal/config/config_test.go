@@ -157,7 +157,11 @@ func TestParseAge(t *testing.T) {
 		{"2w", 14 * day, true},
 		{"36h", 36 * time.Hour, true},
 		{"90m", 90 * time.Minute, true},
-		{"7", 7 * day, true}, // bare int → days
+		{"7", 7 * day, true},              // bare int → days
+		{"1.5d", 36 * time.Hour, true},    // fractional days (parseAgeRaw's ParseFloat path)
+		{"0.5w", 84 * time.Hour, true},    // fractional weeks (0.5 × 168h)
+		{"0", 0, false},                   // zero rejected — the positive-only guard (distinct from hold_max_age, where 0 = never-expire)
+		{"-3d", 0, false},                 // negative rejected by the same guard (would silently disable dormancy suppression)
 		{"", 0, false},
 		{"garbage", 0, false},
 	}

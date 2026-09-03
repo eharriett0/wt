@@ -140,7 +140,7 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 | `wt clean [-y]` | List worktrees whose branch already shipped (incl. squash-merged PRs); `-y` removes them. Never reaps a just-created worktree (grace window), a never-pushed branch (no upstream = unshared work), or a dirty one. `[--stale-index]` also **reports** (never auto-removes) a merged-PR worktree holding a leftover uncommitted index a plain clean can't touch, and prints the manual remove command. `[--all-roots]` additionally evaluates worktrees **outside** `worktree_root` — the collision engine scans those, so a legacy worktree root can hard-block pushes that a default clean never clears (all the data-loss guards still apply) |
 | `wt claim <issue>` | Assign a GitHub issue, make a worktree, open a draft PR, record the claim `[--force] [--no-pr] [--epic <id>]` |
 | `wt release <issue>` | Drop the claim. `[--clean]` also removes the worktree when the branch is abandoned (clean tree, no live PR, WIP-only commits) |
-| `wt merge-pr <pr>` | Guarded squash-merge (PR-state precheck, strips a `WIP:` subject, refuses an empty/placeholder-only PR), then auto-removes the worktree + claim. Lints the closing keywords the squash will fire (PR body **and** commit bodies) and verifies issue state after `[--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok]` |
+| `wt merge-pr <pr>` | Guarded squash-merge (PR-state precheck, strips a `WIP:` subject, refuses an empty/placeholder-only PR), then auto-removes the worktree + claim. Lints the closing keywords the squash will fire (PR body **and** commit bodies) and verifies issue state after (skip both with `--no-close-check` for a PR that closes nothing) `[--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok] [--no-close-check]` |
 | `wt todos` | What every window is working on (mirrors each window's TODO list) |
 | **— cross-window coordination —** | |
 | `wt announce "<msg>"` | Tell other windows a change is starting `[--hold "merge-main,…"] [--issue N]` |
@@ -153,7 +153,7 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 | `wt append <doc> --section H "txt"` | Locked, section-scoped append to a structured shared doc (parallel adds can't clobber) |
 | `wt install-hooks` | Install pre-push (base guard + collision check + base-conflict warning) + pre-commit (collision notice) `[--force]` |
 | `wt install-claude-hook` | Wire Claude Code hooks (**PreToolUse** per-edit + **UserPromptSubmit** per-turn overlaps + coordination) `[--write]` (see [Agents](#agents-claude-code--codex)) |
-| `wt install-codex-hook` | Wire a Codex **UserPromptSubmit** hook so it gets multi-window collision awareness each turn `[--write]` (see [Agents](#agents-claude-code--codex)) |
+| `wt install-codex-hook` | Wire Codex hooks (**UserPromptSubmit** per-turn awareness + coordination, and a **PreToolUse** `apply_patch` check that can deny a colliding edit) `[--write]` (see [Agents](#agents-claude-code--codex)) |
 | `wt doctor` | Check git/gh + all resolved config + structured-doc regex + coordination-log health + preflight, and flag worktrees that track the base branch, a stale far-behind base checkout, and whether the hooks are installed `[--json]` |
 | `wt version` | Print the version |
 | `wt help` | Colorful overview |
