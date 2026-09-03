@@ -329,6 +329,87 @@ func PRClosingIssueNumbers(pr string) []int {
 	return nums
 }
 
+// IssuePRRef is an OPEN pull request that cross-references an issue, drawn from
+// the issue's timeline. (#134)
+type IssuePRRef struct {
+	Number      int
+	HeadRefName string
+	IsDraft     bool
+	URL         string
+}
+
+// OpenPRsReferencingIssue returns every OPEN pull request whose body
+// cross-references issue #n — the SUPERSET of closingIssuesReferences. GitHub
+// records a CROSS_REFERENCED_EVENT on the issue for ANY `#n` mention in a PR
+// body regardless of keyword, so this catches a plain `Refs #n` (which is NEVER
+// a linked/closing reference, so `gh pr view --json closingIssuesReferences`
+// reports []) exactly as well as `Closes #n`. That gap is the #134 bug: claim
+// had no existing-PR check at all, so a hand-opened `Refs #n` PR was invisible
+// and a second `wt claim n` silently duplicated it. Best-effort: nil on error /
+// gh unavailable, so the caller proceeds exactly as before. (#134)
+func OpenPRsReferencingIssue(n string) []IssuePRRef {
+	if !Present() || !Authed() {
+		return nil
+	}
+	// resource(url:) sidesteps an owner/repo split (mirrors PRClosingIssueNumbers).
+	url, err := run("issue", "view", n, "--json", "url", "--jq", ".url")
+	if err != nil || strings.TrimSpace(url) == "" {
+		return nil
+	}
+	// first:100 caps the timeline scan — for a presence check that's ample (an
+	// open PR is rarely the 101st cross-reference on an issue). isCrossRepository
+	// drops a same-numbered PR in ANOTHER repo that happens to mention owner/repo#n,
+	// which would otherwise false-refuse the claim AND mislead `wt adopt n` onto an
+	// unrelated branch. The `... on PullRequest{}` fragment yields {} for Issue
+	// sources; `.state=="OPEN"` then drops them (and any CLOSED/MERGED PR).
+	out, err := run("api", "graphql",
+		"-f", "query=query($url:URI!){resource(url:$url){... on Issue{timelineItems(itemTypes:[CROSS_REFERENCED_EVENT],first:100){nodes{... on CrossReferencedEvent{isCrossRepository source{... on PullRequest{number headRefName isDraft url state}}}}}}}}",
+		"-f", "url="+strings.TrimSpace(url),
+		"--jq", `.data.resource.timelineItems.nodes[]? | select(.isCrossRepository == false) | .source // empty | select(.state=="OPEN") | [(.number|tostring),(.headRefName // ""),(.isDraft|tostring),(.url // "")] | @tsv`)
+	if err != nil {
+		return nil
+	}
+	return parseCrossRefPRs(out)
+}
+
+// parseCrossRefPRs parses OpenPRsReferencingIssue's tab-separated
+// (number, headRefName, isDraft, url) lines, deduping by PR number (one PR can
+// raise several cross-reference events on the same issue). Pure, for testing.
+func parseCrossRefPRs(out string) []IssuePRRef {
+	var refs []IssuePRRef
+	seen := map[int]bool{}
+	for _, ln := range strings.Split(out, "\n") {
+		ln = strings.TrimRight(ln, "\r")
+		if strings.TrimSpace(ln) == "" {
+			continue
+		}
+		f := strings.Split(ln, "\t")
+		if len(f) < 4 {
+			continue
+		}
+		num, e := strconv.Atoi(strings.TrimSpace(f[0]))
+		if e != nil || num <= 0 || seen[num] {
+			continue
+		}
+		seen[num] = true
+		refs = append(refs, IssuePRRef{Number: num, HeadRefName: f[1], IsDraft: f[2] == "true", URL: f[3]})
+	}
+	return refs
+}
+
+// PRURL returns the PR's html URL (best-effort, empty on error / gh
+// unavailable). Used by `wt adopt` to record the adopted PR in active-work. (#134)
+func PRURL(pr string) string {
+	if !Present() || !Authed() {
+		return ""
+	}
+	out, err := run("pr", "view", pr, "--json", "url", "--jq", ".url")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
 // PRState returns the PR's state (OPEN / MERGED / CLOSED) for the merge-pr
 // precheck (#39). Empty on error / gh unavailable, so the caller fails open.
 func PRState(pr string) string {

@@ -64,6 +64,35 @@ func Claim(c *config.Config, issue string, force, openPR bool, epic string) erro
 		return fmt.Errorf("already assigned")
 	}
 
+	// #134: the assign-check above only catches wt-claim-created PRs (claim
+	// assigns the issue). A PR opened by hand — `gh pr create`, or `wt new` +
+	// PR — that references the issue as `Refs #N` leaves it UNASSIGNED and is
+	// NEVER a linked/closing reference, so pre-#134 a second `wt claim` sailed
+	// past every guard and silently opened a DUPLICATE draft PR on a fresh
+	// branch. Refuse instead: name the PR and point at `wt adopt`, which lands a
+	// registered worktree on its branch. --force (already past the assign-check)
+	// opens another deliberately. Best-effort — detection nil on gh error means
+	// we fall through to the pre-#134 create-new behavior, never a hard block.
+	if !force {
+		if prs := ghx.OpenPRsReferencingIssue(issue); len(prs) > 0 {
+			p := prs[0]
+			draft := ""
+			if p.IsDraft {
+				draft = " (draft)"
+			}
+			ui.Warn("issue #%s already has open PR #%d%s on branch %q", issue, p.Number, draft, p.HeadRefName)
+			if p.URL != "" {
+				ui.Info("   %s", p.URL)
+			}
+			if len(prs) > 1 {
+				ui.Warn("   (+%d more open PR(s) reference #%s)", len(prs)-1, issue)
+			}
+			ui.Step("get its worktree:  wt adopt %d", p.Number)
+			ui.Step("or open another:   wt claim %s --force", issue)
+			return fmt.Errorf("open PR #%d already references #%s (adopt it, or --force)", p.Number, issue)
+		}
+	}
+
 	if err := ghx.IssueAddAssigneeMe(issue); err != nil {
 		return fmt.Errorf("assign issue: %w", err)
 	}
@@ -121,6 +150,74 @@ func Claim(c *config.Config, issue string, force, openPR bool, epic string) erro
 // clean, it ALSO removes the worktree when the branch is abandoned — clean tree,
 // no open/merged PR, only WIP placeholder commits (#42) — so releasing actually
 // frees the slot instead of leaving an orphan `wt clean` can never sweep.
+// Adopt puts a wt-registered worktree on an EXISTING branch instead of forking
+// a new one — resolving a PR number to its head branch, or taking a branch name
+// as-is — and records it in active-work exactly like Claim. It's the actionable
+// half of the #134 refusal: when `wt claim` finds an in-flight PR it points here
+// instead of opening a duplicate. It does NOT assign the issue, push, or open a
+// PR — the branch (and usually its PR) already exist. (#134)
+func Adopt(c *config.Config, target, epic string) error {
+	if strings.TrimSpace(target) == "" {
+		return fmt.Errorf("usage: wt adopt <branch|pr#>")
+	}
+	branch := target
+	prURL := ""
+	if issueRe.MatchString(target) { // a PR number → resolve its head branch
+		b, err := ghx.PRHeadBranch(target)
+		if err != nil || strings.TrimSpace(b) == "" {
+			return fmt.Errorf("resolve PR #%s head branch (is gh authed? `wt doctor`): %w", target, err)
+		}
+		branch = strings.TrimSpace(b)
+		prURL = ghx.PRURL(target)
+	}
+
+	wtDir, err := worktree.Adopt(c, branch)
+	if err != nil {
+		return err
+	}
+
+	// Section identity: the issue the branch encodes (prefix+digits), else the
+	// branch name — so UpsertSection stays idempotent for both PR-branch and
+	// bare-branch adoptions instead of colliding on an empty "#".
+	issue := issueFromBranch(c.Prefix, branch)
+	ident := issue
+	if ident == "" {
+		ident = branch
+	}
+	title := ""
+	if issue != "" {
+		title, _ = ghx.IssueTitle(issue)
+	}
+	if prURL == "" {
+		if n, ok := ghx.OpenPRForBranch(branch); ok {
+			prURL = ghx.PRURL(n)
+		}
+	}
+
+	entry := activework.Entry{
+		Issue: ident, Title: title, Branch: branch, Worktree: wtDir,
+		PRURL: prURL, Window: windowID(), Epic: epic, When: time.Now(),
+	}
+	if err := activework.Write(c.ActiveWork, activework.UpsertSection(activework.Read(c.ActiveWork), entry)); err != nil {
+		ui.Warn("active-work update failed (continuing): %v", err)
+	} else {
+		ui.OK("recorded adoption in active-work")
+	}
+
+	ui.Banner(fmt.Sprintf("Adopted %s", branch))
+	if issue != "" {
+		ui.Info("issue:    #%s", issue)
+	}
+	ui.Info("branch:   %s", branch)
+	ui.Info("worktree: %s", wtDir)
+	if prURL != "" {
+		ui.Info("PR:       %s", prURL)
+	}
+	fmt.Println()
+	ui.Step("cd %s", wtDir)
+	return nil
+}
+
 func Release(c *config.Config, issue string, clean bool) error {
 	if !issueRe.MatchString(issue) {
 		return fmt.Errorf("issue must be a positive integer, got %q", issue)
@@ -256,6 +353,16 @@ func SlugFromTitle(title string) string {
 		s = s[:40]
 	}
 	return strings.TrimRight(s, "-")
+}
+
+var branchIssueRe = regexp.MustCompile(`^\d+`)
+
+// issueFromBranch recovers the issue number a branch encodes — the inverse of
+// BranchName (prefix + issue [+ -slug]). Returns "" when the branch isn't
+// issue-shaped (a bare `spike/x`, or a branch without the configured prefix),
+// so `wt adopt` can still register it, keyed by branch instead. (#134)
+func issueFromBranch(prefix, branch string) string {
+	return branchIssueRe.FindString(strings.TrimPrefix(branch, prefix))
 }
 
 // BranchName builds prefix+issue[-slug].

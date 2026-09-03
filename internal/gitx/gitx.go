@@ -179,6 +179,26 @@ func WorktreeAdd(path, branch, base string) error {
 	return err
 }
 
+// WorktreeAdopt attaches a worktree at path to an EXISTING branch — a local
+// refs/heads/<branch> or, via git worktree-add's DWIM, a lone remote
+// origin/<branch> (which materializes a local tracking branch). Unlike
+// WorktreeAdd it NEVER creates a branch from base: adopting someone else's or a
+// previous session's PR branch must land on that exact branch, not a fresh fork
+// of it. On failure — the branch is absent, OR (common for adopt) already
+// checked out in another worktree — the error carries git's own stderr so the
+// caller can surface the real reason instead of a bare "exit status 128". (#134)
+func WorktreeAdopt(path, branch string) error {
+	cmd := exec.Command("git", "worktree", "add", path, branch)
+	cmd.Env = scopedEnv()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		if msg := strings.TrimSpace(string(out)); msg != "" {
+			return fmt.Errorf("%w: %s", err, msg)
+		}
+		return err
+	}
+	return nil
+}
+
 // LocalBranchExists reports whether refs/heads/<branch> exists.
 func LocalBranchExists(branch string) bool {
 	_, err := Run("rev-parse", "--verify", "--quiet", "refs/heads/"+branch)

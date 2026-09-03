@@ -38,3 +38,25 @@ func TestBranchName(t *testing.T) {
 		t.Errorf("custom prefix BranchName = %q", got)
 	}
 }
+
+// #134: issueFromBranch inverts BranchName so `wt adopt` can key the active-work
+// record by the issue a PR branch encodes — and returns "" (record-by-branch)
+// when the branch isn't issue-shaped.
+func TestIssueFromBranch(t *testing.T) {
+	cases := []struct {
+		prefix, branch, want string
+	}{
+		{"feat-", "feat-134-claim-dup", "134"}, // prefix + issue + slug
+		{"feat-", "feat-134", "134"},           // prefix + issue, no slug
+		{"feat-", "feat-9", "9"},
+		{"feat-", "spike/x", ""},        // non-issue branch → "" (adopt keys by branch)
+		{"feat-", "hotfix-2-thing", ""}, // different prefix, no leading digits after trim
+		{"", "51-bare", "51"},           // empty prefix, issue-led branch
+		{"feat-", "feat-abc", ""},       // prefix but no digits
+	}
+	for _, c := range cases {
+		if got := issueFromBranch(c.prefix, c.branch); got != c.want {
+			t.Errorf("issueFromBranch(%q, %q) = %q, want %q", c.prefix, c.branch, got, c.want)
+		}
+	}
+}

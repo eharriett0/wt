@@ -143,14 +143,8 @@ func New(c *config.Config, branch string) (string, error) {
 		ui.Step("cd %s", wtDir)
 		return wtDir, nil
 	}
-	// Reconcile stale state: prune git's admin metadata, and clear a leftover
-	// empty dir so `git worktree add` doesn't refuse with "already exists" (#62).
-	_ = gitx.WorktreePrune()
-	if isDir(wtDir) && !gitx.IsInsideWorktree(wtDir) {
-		if err := os.Remove(wtDir); err != nil { // only succeeds if empty — never nukes files
-			return "", fmt.Errorf("stale worktree dir %s exists but isn't a git worktree and isn't empty; remove it and retry: %w", wtDir, err)
-		}
-		ui.Step("cleared stale empty worktree dir %s", wtDir)
+	if err := reconcileWorktreeDir(wtDir); err != nil {
+		return "", err
 	}
 
 	ui.Step("fetching origin/%s", c.Base)
@@ -168,6 +162,77 @@ func New(c *config.Config, branch string) (string, error) {
 		return "", fmt.Errorf("git worktree add: %w", err)
 	}
 
+	linkSharedFiles(c, wtDir)
+	ui.OK("worktree ready")
+	ui.Step("cd %s", wtDir)
+	return wtDir, nil
+}
+
+// Adopt attaches a worktree to an EXISTING branch — a colleague's or a previous
+// session's PR branch — instead of forking a fresh one from base. It's the
+// missing primitive behind #134: without it, picking up an in-flight PR branch
+// meant a raw `git worktree add` that sidesteps wt's own registration, so claim
+// could only ever create-new (and duplicated). It fetches origin/<branch> first
+// so a branch living only on the remote materializes as a local tracking branch,
+// then worktree-adds it (WorktreeAdopt — never `-b`, so it lands on that exact
+// branch). Same live-worktree short-circuit + stale-dir reconcile + link_files
+// wiring as New. (#134)
+func Adopt(c *config.Config, branch string) (string, error) {
+	slug := strings.ReplaceAll(branch, "/", "-")
+	wtDir := filepath.Join(c.WorktreeRoot, slug)
+
+	if isValidWorktree(wtDir) {
+		ui.OK("worktree already exists at %s", wtDir)
+		ui.Step("cd %s", wtDir)
+		return wtDir, nil
+	}
+	if err := reconcileWorktreeDir(wtDir); err != nil {
+		return "", err
+	}
+
+	ui.Step("fetching origin/%s", branch)
+	if err := gitx.Fetch("origin", branch); err != nil {
+		// Not fatal: the branch may be purely local, or origin may be offline —
+		// WorktreeAdopt still succeeds on a local ref and errors clearly otherwise.
+		ui.Warn("git fetch origin %s failed (trying local refs): %v", branch, err)
+	}
+
+	if err := os.MkdirAll(c.WorktreeRoot, 0o755); err != nil {
+		return "", fmt.Errorf("mkdir worktree root: %w", err)
+	}
+
+	ui.Step("attaching worktree at %s to existing branch %s", wtDir, branch)
+	if err := gitx.WorktreeAdopt(wtDir, branch); err != nil {
+		// Don't assert "not found": the branch may be checked out in another
+		// worktree (common for adopt), or absent locally and on origin. The
+		// error already carries git's own stderr with the real reason. (#134)
+		return "", fmt.Errorf("could not attach a worktree to branch %q — it may be checked out in another worktree, or absent locally and on origin: %w", branch, err)
+	}
+
+	linkSharedFiles(c, wtDir)
+	ui.OK("worktree ready")
+	ui.Step("cd %s", wtDir)
+	return wtDir, nil
+}
+
+// reconcileWorktreeDir prunes git's worktree admin metadata and clears a
+// leftover EMPTY dir at wtDir so `git worktree add` won't refuse "already
+// exists" (#62). os.Remove only succeeds on an empty dir, so it never nukes
+// files.
+func reconcileWorktreeDir(wtDir string) error {
+	_ = gitx.WorktreePrune()
+	if isDir(wtDir) && !gitx.IsInsideWorktree(wtDir) {
+		if err := os.Remove(wtDir); err != nil {
+			return fmt.Errorf("stale worktree dir %s exists but isn't a git worktree and isn't empty; remove it and retry: %w", wtDir, err)
+		}
+		ui.Step("cleared stale empty worktree dir %s", wtDir)
+	}
+	return nil
+}
+
+// linkSharedFiles symlinks each configured link_file from the main checkout into
+// wtDir. Best-effort — a symlink that can't be created is silently skipped.
+func linkSharedFiles(c *config.Config, wtDir string) {
 	for _, f := range c.LinkFiles {
 		src := filepath.Join(c.Root, f)
 		if fileExists(src) {
@@ -176,10 +241,6 @@ func New(c *config.Config, branch string) (string, error) {
 			}
 		}
 	}
-
-	ui.OK("worktree ready")
-	ui.Step("cd %s", wtDir)
-	return wtDir, nil
 }
 
 // Clean finds worktrees whose branch is fully shipped (patch-equivalent on the

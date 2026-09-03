@@ -86,3 +86,35 @@ func TestAuthStatusArgs(t *testing.T) {
 		t.Errorf("enterprise host must scope to itself: got %q", ghe)
 	}
 }
+
+// #134: parseCrossRefPRs turns the timeline cross-ref jq's TSV into refs. The
+// jq already filters to OPEN PullRequest sources; this layer must dedup by PR
+// number (one PR can raise several cross-reference events on the same issue),
+// parse the draft flag, drop blank/short lines, and skip non-numeric ids.
+func TestParseCrossRefPRs(t *testing.T) {
+	out := strings.Join([]string{
+		"42\tfeat-42-thing\tfalse\thttps://x/pull/42",
+		"42\tfeat-42-thing\tfalse\thttps://x/pull/42", // dup event, same PR → collapse
+		"7\tfix-7\ttrue\thttps://x/pull/7",            // draft
+		"",                                            // blank
+		"notanum\tbad\tfalse\thttp://x",               // non-numeric id → skip
+		"9\tshort",                                    // too few fields → skip
+	}, "\n")
+
+	got := parseCrossRefPRs(out)
+	if len(got) != 2 {
+		t.Fatalf("parseCrossRefPRs returned %d refs, want 2 (deduped): %+v", len(got), got)
+	}
+	if got[0].Number != 42 || got[0].HeadRefName != "feat-42-thing" || got[0].IsDraft {
+		t.Errorf("ref[0] = %+v, want {42 feat-42-thing draft=false}", got[0])
+	}
+	if got[1].Number != 7 || !got[1].IsDraft {
+		t.Errorf("ref[1] = %+v, want {7 draft=true}", got[1])
+	}
+	if got[0].URL != "https://x/pull/42" {
+		t.Errorf("ref[0].URL = %q, want the PR url", got[0].URL)
+	}
+	if r := parseCrossRefPRs(""); r != nil {
+		t.Errorf("empty input → %v, want nil (no PR references)", r)
+	}
+}
