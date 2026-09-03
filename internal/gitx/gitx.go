@@ -179,6 +179,18 @@ func WorktreeAdd(path, branch, base string) error {
 	return err
 }
 
+// WorktreeAdopt attaches a worktree at path to an EXISTING branch — a local
+// refs/heads/<branch> or, via git worktree-add's DWIM, a lone remote
+// origin/<branch> (which materializes a local tracking branch). Unlike
+// WorktreeAdd it NEVER creates a branch from base: adopting someone else's or a
+// previous session's PR branch must land on that exact branch, not a fresh fork
+// of it. Fails "invalid reference" when the branch is neither local nor a
+// unique remote — the caller turns that into a clear not-found. (#134)
+func WorktreeAdopt(path, branch string) error {
+	_, err := Run("worktree", "add", path, branch)
+	return err
+}
+
 // LocalBranchExists reports whether refs/heads/<branch> exists.
 func LocalBranchExists(branch string) bool {
 	_, err := Run("rev-parse", "--verify", "--quiet", "refs/heads/"+branch)

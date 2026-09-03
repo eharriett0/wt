@@ -90,6 +90,8 @@ func Main(args []string) int {
 		return cmdClean(rest)
 	case "claim":
 		return cmdClaim(rest)
+	case "adopt":
+		return cmdAdopt(rest)
 	case "release":
 		return cmdRelease(rest)
 	case "merge-pr":
@@ -232,6 +234,27 @@ func cmdClaim(args []string) int {
 		peerHoldBanner(c)
 		openPR := c.ClaimOpenPR && !*noPR
 		if err := claim.Claim(c, pos[0], *force, openPR, *epic); err != nil {
+			ui.Err("%v", err)
+			return 1
+		}
+		return 0
+	})
+}
+
+func cmdAdopt(args []string) int {
+	fs := flag.NewFlagSet("adopt", flag.ContinueOnError)
+	epic := fs.String("epic", "", "tag this adoption with a cross-repo epic id (wt status --epic)")
+	pos, _, err := parseInterspersed(fs, args)
+	if err != nil {
+		return 64
+	}
+	if len(pos) < 1 {
+		ui.Err("usage: wt adopt <branch|pr#> [--epic <id>]")
+		return 64
+	}
+	return withConfig(func(c *config.Config) int {
+		peerHoldBanner(c)
+		if err := claim.Adopt(c, pos[0], *epic); err != nil {
 			ui.Err("%v", err)
 			return 1
 		}
