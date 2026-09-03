@@ -456,11 +456,20 @@ func gradeConflicts(c *config.Config, active []collide.Conflict, root string, ws
 		}
 		cur := ranges(root, c.Base, rangesPath)
 		other := ranges(wtByLabel[cf.Window], c.Base, rangesPath)
-		if collide.ConflictSeverity(cur, other, false) == collide.SevHigh {
-			hard = append(hard, cf)
-		} else {
+		if collide.ConflictSeverity(cur, other, false) != collide.SevHigh {
 			soft = append(soft, cf)
+			continue
 		}
+		// #122: the overlap may be base's OWN change to the file, mis-attributed to
+		// a branch whose change already landed via a different branch's squash. If
+		// the other window's change to this file is already on base (a clean 3-way
+		// merge into base is a no-op), it isn't contesting it. Fail-safe: an
+		// undeterminable check keeps the hard block.
+		if s, known := gitx.FileChangeSubsumed(wtByLabel[cf.Window], c.Base, rangesPath); known && s {
+			soft = append(soft, cf)
+			continue
+		}
+		hard = append(hard, cf)
 	}
 	return hard, soft
 }

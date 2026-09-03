@@ -710,6 +710,77 @@ func ChangedRangesNew(dir, base, file string) []LineRange {
 	return changedRangesWith(dir, base, file, parseHunkRanges)
 }
 
+// FileChangeSubsumed reports whether the worktree's branch contributes NOTHING
+// new to base for path — its change to that file is already present on base, so
+// the file is NOT contested even though the branch's commit history reads as
+// unshipped (e.g. the branch's work landed via a DIFFERENT branch's squash and it
+// never had its own PR, so neither PR-state nor `git cherry` can see it — #122).
+//
+// It 3-way merges the branch's CURRENT file (theirs — the worktree blob, so
+// uncommitted edits count as live) into base (ours) using their merge-base as the
+// ancestor: a CLEAN merge that reproduces base byte-for-byte means the branch adds
+// nothing. Fail-safe: any unresolved ref/blob, a merge conflict, or a merge that
+// changes base returns subsumed=false — an undeterminable case stays a collision
+// (a missed collision is worse than a noisy one). known=false when it couldn't be
+// evaluated at all.
+func FileChangeSubsumed(worktree, base, path string) (subsumed, known bool) {
+	if worktree == "" {
+		return false, false // no worktree to evaluate — fail-safe (keep the collision)
+	}
+	baseRef := "origin/" + base
+	if _, err := RunDir(worktree, "rev-parse", "--verify", "--quiet", baseRef+"^{commit}"); err != nil {
+		baseRef = base
+		if _, err := RunDir(worktree, "rev-parse", "--verify", "--quiet", baseRef+"^{commit}"); err != nil {
+			return false, false
+		}
+	}
+	mb, err := RunDir(worktree, "merge-base", baseRef, "HEAD")
+	if err != nil || mb == "" {
+		return false, false
+	}
+	// Untrimmed (runRaw): file content is newline-sensitive — trimming would break
+	// both the merge and the byte comparison.
+	ours, err := runRaw(worktree, "show", baseRef+":"+path)
+	if err != nil {
+		return false, false // base lacks the file — the branch adds a new one → contested
+	}
+	theirs, err := os.ReadFile(filepath.Join(worktree, path))
+	if err != nil {
+		return false, false // no worktree file (staged deletion etc.) → contested
+	}
+	ancestor, aerr := runRaw(worktree, "show", mb+":"+path)
+	if aerr != nil {
+		ancestor = "" // file added since the merge-base → empty ancestor (add/add)
+	}
+
+	dir, err := os.MkdirTemp("", "wt-subsumed-")
+	if err != nil {
+		return false, false
+	}
+	defer os.RemoveAll(dir)
+	write := func(name, content string) (string, bool) {
+		p := filepath.Join(dir, name)
+		if werr := os.WriteFile(p, []byte(content), 0o600); werr != nil {
+			return "", false
+		}
+		return p, true
+	}
+	oursP, ok1 := write("ours", ours)
+	ancP, ok2 := write("anc", ancestor)
+	theirsP, ok3 := write("theirs", string(theirs))
+	if !ok1 || !ok2 || !ok3 {
+		return false, false
+	}
+	// git merge-file -p prints the merged result; a non-zero exit (returned as
+	// err) means a conflict → not subsumed. A clean merge that equals ours means
+	// the branch's change is already on base.
+	merged, err := runRaw(worktree, "merge-file", "-p", "-q", oursP, ancP, theirsP)
+	if err != nil {
+		return false, true // conflict → contested, but determinably so
+	}
+	return merged == ours, true
+}
+
 // changedRangesWith is the shared body of ChangedRanges / ChangedRangesNew;
 // `parse` selects which side of each hunk (old vs new) the base-diff case reads.
 // The base-less fallback is always NEW-side (there is no base to be old-relative

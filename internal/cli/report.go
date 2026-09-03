@@ -78,6 +78,19 @@ type CheckEntry struct {
 	SharedSections []string         `json:"shared_sections,omitempty"` // #22: same section(s) both windows edit → HIGH
 	AlreadyMerged  bool             `json:"already_merged,omitempty"`  // #109: other window's blob == origin/base — stale index, not a live collision
 	Untracked      bool             `json:"untracked,omitempty"`       // #113: other window's claim is an untracked file — no committed content to collide with
+	Subsumed       bool             `json:"subsumed,omitempty"`        // #122: the other window's change to this file is already on base (landed elsewhere) — not contested
+}
+
+// subsumedByBase reports whether the other window's change to path is already
+// present on base (a clean 3-way merge into base is a no-op), so the file is not
+// contested — a branch whose work landed via a DIFFERENT branch's squash (#122).
+// Fail-safe: undeterminable → false (keeps the collision).
+func subsumedByBase(otherWorktree, base, path string) bool {
+	if otherWorktree == "" {
+		return false
+	}
+	s, known := gitx.FileChangeSubsumed(otherWorktree, base, path)
+	return known && s
 }
 
 // alreadyMerged reports whether the other window's content for path is byte-
@@ -161,10 +174,15 @@ func buildCheckReport(c *config.Config, ws []collide.Window, currentWorktree str
 			e.OtherRanges = other
 			sev := collide.ConflictSeverity(cur, other, appendOnly)
 			e.OverlapSpans = collide.OverlappingSpans(cur, other)
-			if sev == collide.SevHigh {
-				e.Category, e.Severity = CatBlocking, "HIGH"
-			} else {
+			switch {
+			case sev != collide.SevHigh:
 				e.Category, e.Severity = CatFYI, "low"
+			case subsumedByBase(otherWt, c.Base, rangesPath):
+				// #122: the phantom "overlap" is base's OWN change to this file,
+				// mis-attributed to a branch whose change already landed elsewhere.
+				e.Category, e.Severity, e.Subsumed = CatFYI, "low", true
+			default:
+				e.Category, e.Severity = CatBlocking, "HIGH"
 			}
 		}
 		if e.Category == CatStale && !includeStale {
@@ -286,6 +304,13 @@ func printCheckAdvisories(advisory, fyi []CheckEntry, showDiff bool) {
 			fmt.Fprintln(os.Stderr, "   "+ui.Dim(fmt.Sprintf("%s ← %s [%s] · untracked there — nothing committed to collide with", e.Path, e.Window, e.Liveness)))
 			continue
 		}
+		if e.Subsumed {
+			// #122: the other window's change to this file is already on base (its
+			// work landed via a different branch's squash) — the "overlap" was
+			// base's own change mis-attributed to it. Not contested.
+			fmt.Fprintln(os.Stderr, "   "+ui.Dim(fmt.Sprintf("%s ← %s [%s] · change already on base (landed elsewhere) — not contested", e.Path, e.Window, e.Liveness)))
+			continue
+		}
 		msg := "disjoint hunks"
 		if len(e.OtherRanges) == 0 {
 			msg = "append-only / low-risk"
@@ -347,6 +372,7 @@ type StatusOverlap struct {
 	Severity       string           `json:"severity"`
 	OverlapSpans   []gitx.LineRange `json:"overlap_spans,omitempty"`
 	SharedSections []string         `json:"shared_sections,omitempty"` // #22: same section(s) ≥2 windows edit → HIGH
+	Subsumed       bool             `json:"subsumed,omitempty"`        // #122: <2 windows genuinely contest it (others' change already on base)
 }
 
 // sharedSectionsAcross is a thin adapter over collide.SharedSectionsAcross,
@@ -383,20 +409,44 @@ func gradeStatusOverlaps(c *config.Config, ws []collide.Window, active []collide
 			}
 		default:
 			appendOnly := collide.IsAppendOnly(o.File, c.AppendOnlyPaths)
-			var rangesByWindow [][]gitx.LineRange
+			type windowRanges struct {
+				w  collide.Window
+				rs []gitx.LineRange
+			}
+			var all []windowRanges
 			if !appendOnly {
 				for _, label := range o.Windows {
 					if w, ok := byLabel[label]; ok {
-						rangesByWindow = append(rangesByWindow, gitx.ChangedRanges(w.Worktree, c.Base, o.File))
+						all = append(all, windowRanges{w, gitx.ChangedRanges(w.Worktree, c.Base, o.File)})
 					}
 				}
 			}
-			sev := collide.OverlapSeverity(rangesByWindow, appendOnly)
-			so.OverlapSpans = allPairSpans(rangesByWindow)
-			if sev == collide.SevHigh {
-				so.Category, so.Severity = CatBlocking, "HIGH"
-			} else {
+			allRanges := make([][]gitx.LineRange, len(all))
+			for i, x := range all {
+				allRanges[i] = x.rs
+			}
+			if collide.OverlapSeverity(allRanges, appendOnly) != collide.SevHigh {
+				so.OverlapSpans = allPairSpans(allRanges)
 				so.Category, so.Severity = CatFYI, "low"
+				break
+			}
+			// Would be HIGH — only NOW pay for the #122 subsumption check: a window
+			// whose change to this file already landed on base (via a different
+			// branch's squash) isn't genuinely contesting it (its "range" is base's
+			// own change). Drop such windows; if fewer than two remain, not contested.
+			var live [][]gitx.LineRange
+			for _, x := range all {
+				if subsumedByBase(x.w.Worktree, c.Base, o.File) {
+					continue
+				}
+				live = append(live, x.rs)
+			}
+			if len(live) < 2 {
+				so.OverlapSpans = allPairSpans(allRanges)
+				so.Category, so.Severity, so.Subsumed = CatFYI, "low", true
+			} else {
+				so.OverlapSpans = allPairSpans(live)
+				so.Category, so.Severity = CatBlocking, "HIGH"
 			}
 		}
 		out = append(out, so)

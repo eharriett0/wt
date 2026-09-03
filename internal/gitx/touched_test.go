@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -180,5 +181,56 @@ func TestChangedRangesNew_NewFrameDiffersFromBaseFrame(t *testing.T) {
 	}
 	if !rangeCovers(baseF, 4) {
 		t.Errorf("ChangedRanges should cover base line 4 (TARGET's base position): %v", baseF)
+	}
+}
+
+// FileChangeSubsumed: a branch whose change to a file already landed on base (via
+// a different branch's squash) contributes nothing new → subsumed; a branch that
+// changes a line base didn't → not subsumed; an unresolvable base → known=false
+// (fail-safe: stays a collision). #122.
+func TestFileChangeSubsumed(t *testing.T) {
+	dir := gitRepo(t)
+	writeFile(t, dir, "f.txt", "a\nb\nc\nd\ne\n")
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "commit", "-qm", "C0")
+	c0, _ := Run("-C", dir, "rev-parse", "HEAD")
+
+	// orphan forks at C0 and changes line 3 (its real work).
+	runGit(t, dir, "checkout", "-q", "-b", "orphan")
+	writeFile(t, dir, "f.txt", "a\nb\nC-ORPHAN\nd\ne\n")
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "commit", "-qm", "orphan")
+
+	// main gains orphan's line-3 change (landed elsewhere) AND changes line 5.
+	runGit(t, dir, "checkout", "-q", "main")
+	writeFile(t, dir, "f.txt", "a\nb\nC-ORPHAN\nd\nE-LANDED\n")
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "commit", "-qm", "landed")
+
+	// Evaluate from the orphan worktree.
+	runGit(t, dir, "checkout", "-q", "orphan")
+	if subsumed, known := FileChangeSubsumed(dir, "main", "f.txt"); !known || !subsumed {
+		t.Errorf("orphan's landed change should be subsumed: subsumed=%v known=%v", subsumed, known)
+	}
+
+	// A branch that changes line 2 (base did NOT) is genuinely contested.
+	runGit(t, dir, "checkout", "-q", "-b", "real", strings.TrimSpace(c0))
+	writeFile(t, dir, "f.txt", "a\nB-REAL\nc\nd\ne\n")
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "commit", "-qm", "real")
+	if subsumed, known := FileChangeSubsumed(dir, "main", "f.txt"); !known || subsumed {
+		t.Errorf("real branch adds a line-2 change → not subsumed: subsumed=%v known=%v", subsumed, known)
+	}
+
+	// Fail-safe: an unresolvable base ref → known=false (stays a collision).
+	if subsumed, known := FileChangeSubsumed(dir, "no-such-base", "f.txt"); known || subsumed {
+		t.Errorf("unresolvable base must be known=false: subsumed=%v known=%v", subsumed, known)
+	}
+	// Base lacks the file (branch adds a brand-new one) → known=false.
+	writeFile(t, dir, "new-only.txt", "x\n")
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "commit", "-qm", "add new")
+	if subsumed, known := FileChangeSubsumed(dir, "main", "new-only.txt"); known || subsumed {
+		t.Errorf("base lacking the file must be known=false: subsumed=%v known=%v", subsumed, known)
 	}
 }
