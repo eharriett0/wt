@@ -31,7 +31,7 @@ func TestMCPInitialize_DefaultsWhenNoVersion(t *testing.T) {
 
 func TestMCPToolDescriptors(t *testing.T) {
 	tools := mcpToolDescriptors()
-	want := map[string]bool{"wt_status": false, "wt_check": false, "wt_todos": false, "wt_where": false}
+	want := map[string]bool{"wt_status": false, "wt_check": false, "wt_todos": false, "wt_where": false, "wt_inbox": false, "wt_holds": false}
 	for _, tl := range tools {
 		name, _ := tl["name"].(string)
 		if _, ok := want[name]; !ok {

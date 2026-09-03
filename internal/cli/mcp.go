@@ -9,14 +9,17 @@ import (
 
 	"github.com/eharriett0/wt/internal/collide"
 	"github.com/eharriett0/wt/internal/config"
+	"github.com/eharriett0/wt/internal/coord"
 	"github.com/eharriett0/wt/internal/gitx"
 	"github.com/eharriett0/wt/internal/todos"
 )
 
 // cmdMCP runs a stdio MCP (Model Context Protocol) server exposing wt's
-// READ-ONLY surface as tools — wt_status / wt_check / wt_todos / wt_where — so a
-// chat-style agent (Claude Desktop, Cursor, any MCP client) can ask "who else is
-// touching this file?" without shelling out. It speaks newline-delimited
+// READ-ONLY surface as tools — wt_status / wt_check / wt_todos / wt_where (the
+// collision half) + wt_inbox / wt_holds (the coordination half) — so a chat-style
+// agent (Claude Desktop, Cursor, any MCP client) can ask "who else is touching
+// this file?" or "is there a hold on merge-main?" without shelling out. It speaks
+// newline-delimited
 // JSON-RPC 2.0 over stdin/stdout (the MCP stdio transport) and single-sources
 // every answer on the SAME collide.Scan / buildCheckReport / gradeStatusOverlaps
 // pipeline the CLI uses, so the data can never drift from `wt status --json` etc.
@@ -117,7 +120,9 @@ func mcpInitialize(params json.RawMessage) map[string]any {
 			"Call wt_status to see every active window + graded file overlaps, " +
 			"wt_check before editing paths to see if another live window is in them, " +
 			"wt_todos for what each window is working on, wt_where to resolve an " +
-			"issue/branch to its worktree path.",
+			"issue/branch to its worktree path, wt_inbox for un-acked announcements " +
+			"from other windows, and wt_holds before advising a merge/rebase (another " +
+			"window may hold that operation).",
 	}
 }
 
@@ -159,6 +164,18 @@ func mcpToolDescriptors() []map[string]any {
 			"inputSchema": obj(map[string]any{
 				"target": map[string]any{"type": "string", "description": "issue number (e.g. 42 or #42) or branch name"},
 			}, "target"),
+		},
+		{
+			"name": "wt_inbox",
+			"description": "Un-acked coordination announcements from OTHER windows (a window signalling a " +
+				"disruptive change — an incident, a roll, a deploy). Each carries an id to `wt ack`. Read-only, local.",
+			"inputSchema": obj(map[string]any{}),
+		},
+		{
+			"name": "wt_holds",
+			"description": "Active HOLDS from other windows — an operation (e.g. merge-main, rebase) another " +
+				"window asked you to avoid until it posts all-clear. Check before advising a merge/rebase. Read-only, local.",
+			"inputSchema": obj(map[string]any{}),
 		},
 	}
 }
@@ -213,6 +230,10 @@ func runMCPTool(name string, args json.RawMessage) (string, bool) {
 			return "wt_where requires a `target` (issue number or branch)", true
 		}
 		return mcpWhere(c, a.Target)
+	case "wt_inbox":
+		return mcpInbox(c)
+	case "wt_holds":
+		return mcpHolds(c)
 	default:
 		return "unknown tool: " + name, true
 	}
@@ -297,6 +318,53 @@ type mcpTodoWindow struct {
 	PendingN   int      `json:"pending_count"`
 	Updated    string   `json:"updated,omitempty"`
 	HasTodos   bool     `json:"has_todos"`
+}
+
+// mcpCoordRecord is one coordination-log record in the wt_inbox / wt_holds result.
+type mcpCoordRecord struct {
+	ID      string   `json:"id"`
+	Window  string   `json:"window"`
+	Message string   `json:"message,omitempty"`
+	Hold    []string `json:"hold,omitempty"`
+	Issue   int      `json:"issue,omitempty"`
+	TS      string   `json:"ts,omitempty"`
+}
+
+func toMCPCoord(r coord.Record) mcpCoordRecord {
+	return mcpCoordRecord{ID: r.ID, Window: r.Window, Message: r.Message, Hold: r.Hold, Issue: r.Issue, TS: r.TS}
+}
+
+// mcpInbox returns un-acked announcements from other windows (coord.Inbox).
+// Local-only — it never folds in the GitHub-issue mirror, so the tool does no
+// network I/O. A missing coordination log is an empty inbox, not an error.
+func mcpInbox(c *config.Config) (string, bool) {
+	logPath, self := coordCtx(c)
+	recs, err := coord.Load(logPath)
+	if err != nil {
+		return "could not read coordination log: " + err.Error(), true
+	}
+	box := coord.Inbox(recs, self)
+	out := make([]mcpCoordRecord, 0, len(box))
+	for _, r := range box {
+		out = append(out, toMCPCoord(r))
+	}
+	return jsonText(map[string]any{"self": self, "inbox": out}), false
+}
+
+// mcpHolds returns the active holds from other windows (coord.PendingHolds) — the
+// subset of the inbox carrying a hold on some operation. Local-only.
+func mcpHolds(c *config.Config) (string, bool) {
+	logPath, self := coordCtx(c)
+	recs, err := coord.Load(logPath)
+	if err != nil {
+		return "could not read coordination log: " + err.Error(), true
+	}
+	holds := coord.PendingHolds(recs, self)
+	out := make([]mcpCoordRecord, 0, len(holds))
+	for _, r := range holds {
+		out = append(out, toMCPCoord(r))
+	}
+	return jsonText(map[string]any{"self": self, "holds": out}), false
 }
 
 func mcpTodos(c *config.Config) (string, bool) {
