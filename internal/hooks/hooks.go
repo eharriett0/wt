@@ -204,7 +204,7 @@ func HookPrePush(c *config.Config, stdin io.Reader) int {
 		if len(fields) < 4 {
 			continue
 		}
-		localSHA, remoteRef, remoteSHA := fields[1], fields[2], fields[3]
+		localSHA, remoteRef := fields[1], fields[2]
 
 		// (1) base-branch guard.
 		if remoteRef == "refs/heads/"+base {
@@ -235,7 +235,7 @@ func HookPrePush(c *config.Config, stdin io.Reader) int {
 		if !scanOK {
 			continue
 		}
-		if pushCollisionBlocks(c, ws, root, outgoingPaths(root, base, localSHA, remoteSHA)) {
+		if pushCollisionBlocks(c, ws, root, outgoingPaths(root, base, localSHA)) {
 			code = 1
 		}
 	}
@@ -260,36 +260,38 @@ func repoRootOrEmpty() string {
 	return r
 }
 
-// outgoingPaths returns the repo-relative paths in the commits being pushed. For
-// an update it diffs the remote sha the push is fast-forwarding from; for a
-// brand-new branch (remote sha all-zero) it diffs the last-known base, so the
-// full branch is checked. Best-effort — empty on any git error.
-func outgoingPaths(root, base, localSHA, remoteSHA string) []string {
-	remoteIsAncestor := !gitx.AllZeroSHA(remoteSHA) && gitx.IsAncestor(remoteSHA, localSHA)
-	from := outgoingFrom(base, remoteSHA, remoteIsAncestor, gitx.ResolveRemoteBase(base))
+// outgoingPaths returns the repo-relative paths this branch CONTRIBUTES over the
+// base — a three-dot `origin/<base>...HEAD` diff. That is history-shape-
+// invariant: a plain fast-forward, a rebase + force-push (#106), OR a
+// `git merge origin/<base>` refresh (#136) all reduce to exactly the branch's
+// own files, because merge-base(origin/<base>, HEAD) collapses any base commits
+// — including ones dragged in by a merge commit — out of the diff. Best-effort:
+// empty on any git error. A file whose three-dot diff is empty can never be an
+// overlap, whatever the branch history looks like.
+func outgoingPaths(root, base, localSHA string) []string {
+	from := outgoingFrom(base, gitx.ResolveRemoteBase(base))
 	paths, _ := gitx.RangeChangedPaths(root, from, localSHA)
 	return paths
 }
 
-// outgoingFrom decides which ref the outgoing range is measured FROM. Pure, so
-// the three cases are table-testable without a live repo.
+// outgoingFrom picks the ref the outgoing three-dot range is measured FROM: the
+// resolved remote base (origin/<base>) when it exists, else the bare base name.
+// It is ALWAYS the base — never the remote branch head.
 //
-//   - fast-forward update — the remote head IS an ancestor, so remote..local is
-//     exactly the new commits. Use it; it is the most precise answer.
-//   - brand-new branch — remote sha is all-zero; nothing on the remote to diff
-//     against, so measure the whole branch against the base.
-//   - NON-fast-forward (#106) — the remote head is no longer an ancestor, which
-//     is what `git rebase origin/main && git push --force-with-lease` produces.
-//     remote..local would walk THROUGH the base's commits and report every file
-//     the base gained as "outgoing", so the hook blocked on files the pusher had
-//     never touched — and the further behind the branch was, the more it invented.
-//     That contradicted `wt check` on identical input (the equality #92 restored),
-//     and it fired precisely when someone did the recommended thing and rebased.
-//     Measure against the base instead: what this branch contributes over it.
-func outgoingFrom(base, remoteSHA string, remoteIsAncestor bool, resolvedBase string) string {
-	if !gitx.AllZeroSHA(remoteSHA) && remoteIsAncestor {
-		return remoteSHA
-	}
+// Measuring from the remote head once looked "more precise" for a fast-forward
+// (remote..local is exactly the new commits), but it leaked the base's own files
+// in two history shapes that both keep the remote head an ancestor:
+//   - #106 force-push after rebase — remote..local walked THROUGH the base's
+//     commits and reported every file the base had gained.
+//   - #136 `git merge origin/<base>` to refresh — the merge commit drags the
+//     base's files onto the branch tip, so remote...local (which degenerates to
+//     two-dot when remote is an ancestor) reports them as outgoing and blames an
+//     innocent window and its PR — loudest exactly when the repo is busy.
+//
+// The base is the only history-shape-invariant answer, and it matches what
+// `wt check` / `wt status` compute (the #92 equality). Pure, so the two cases
+// are table-testable without a repo.
+func outgoingFrom(base, resolvedBase string) string {
 	if resolvedBase != "" {
 		return resolvedBase
 	}

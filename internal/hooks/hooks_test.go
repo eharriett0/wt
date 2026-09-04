@@ -2,8 +2,10 @@ package hooks
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/eharriett0/wt/internal/collide"
@@ -141,45 +143,118 @@ func TestDedupConflicts(t *testing.T) {
 // contradicted `wt check` on identical input, and it got worse the further
 // behind the branch had been. Rebasing onto current main is what armed it.
 func TestOutgoingFrom(t *testing.T) {
-	const zero = "0000000000000000000000000000000000000000"
 	cases := []struct {
-		name             string
-		remoteSHA        string
-		remoteIsAncestor bool
-		resolvedBase     string
-		want             string
+		name         string
+		resolvedBase string
+		want         string
 	}{
-		{
-			// Fast-forward: remote..local is EXACTLY the new commits, and is more
-			// precise than base..local. Must not regress to the base.
-			"fast-forward uses the remote head", "abc123", true, "refs/remotes/origin/main", "abc123",
-		},
-		{
-			"brand-new branch measures against the resolved base", zero, false, "refs/remotes/origin/main", "refs/remotes/origin/main",
-		},
-		{
-			// THE FIX.
-			"force-push after rebase measures against the base, not the stale remote head",
-			"abc123", false, "refs/remotes/origin/main", "refs/remotes/origin/main",
-		},
-		{
-			// A remote sha we cannot prove is an ancestor is treated as non-ff.
-			// Failing that way round is right: it over-scopes to the branch's own
-			// diff, rather than inventing files from unrelated history.
-			"unprovable ancestry falls back to the base", "deadbeef", false, "refs/remotes/origin/main", "refs/remotes/origin/main",
-		},
-		{
-			"no resolvable remote base falls back to the bare base name", zero, false, "", "main",
-		},
-		{
-			"force-push with no resolvable remote base still uses the base name", "abc123", false, "", "main",
-		},
+		// The outgoing range is ALWAYS measured from the base — never the remote
+		// branch head. That is what makes it history-shape-invariant: a rebase +
+		// force-push (#106) and a `git merge origin/<base>` refresh (#136) both
+		// keep the remote head an ancestor, so measuring from the remote head
+		// leaked the base's own files as "outgoing" and blamed an innocent window.
+		{"resolved remote base is used", "refs/remotes/origin/main", "refs/remotes/origin/main"},
+		{"no resolvable remote base falls back to the bare base name", "", "main"},
 	}
 	for _, tc := range cases {
-		if got := outgoingFrom("main", tc.remoteSHA, tc.remoteIsAncestor, tc.resolvedBase); got != tc.want {
-			t.Errorf("%s: outgoingFrom(base=main, remote=%q, isAncestor=%v, resolved=%q) = %q, want %q",
-				tc.name, tc.remoteSHA, tc.remoteIsAncestor, tc.resolvedBase, got, tc.want)
+		if got := outgoingFrom("main", tc.resolvedBase); got != tc.want {
+			t.Errorf("%s: outgoingFrom(base=main, resolved=%q) = %q, want %q",
+				tc.name, tc.resolvedBase, got, tc.want)
 		}
+	}
+}
+
+// #136: a branch's outgoing set is its contribution OVER THE BASE — never the
+// base's own files — regardless of how the branch was refreshed. A
+// `git merge origin/main` refresh must not blame files that landed on main via
+// another window's already-merged PR. Encodes the issue's invariant across all
+// three history shapes (behind / rebased / merged) in one table so a future
+// refactor cannot fix one and regress another.
+func TestOutgoingPaths_HistoryShapeInvariant(t *testing.T) {
+	origin := t.TempDir()
+	runGitH(t, origin, "init", "-q", "--bare", "-b", "main")
+
+	repo := t.TempDir()
+	runGitH(t, repo, "clone", "-q", origin, ".")
+	runGitH(t, repo, "config", "user.email", "t@t.test")
+	runGitH(t, repo, "config", "user.name", "t")
+	writeFileH(t, repo, "base.txt", "base\n")
+	runGitH(t, repo, "add", "base.txt")
+	runGitH(t, repo, "commit", "-qm", "base")
+	runGitH(t, repo, "push", "-q", "origin", "main")
+
+	// Feature branch whose ONLY real change vs base is feat.txt.
+	runGitH(t, repo, "switch", "-qc", "feat")
+	writeFileH(t, repo, "feat.txt", "feat\n")
+	runGitH(t, repo, "add", "feat.txt")
+	runGitH(t, repo, "commit", "-qm", "feat work")
+	featBase := gitOutH(t, repo, "rev-parse", "HEAD") // feat tip before any refresh
+
+	// Another window's PR lands 5 innocent files on main.
+	runGitH(t, repo, "switch", "-q", "main")
+	for _, f := range []string{"other1.txt", "other2.txt", "other3.txt", "other4.txt", "other5.txt"} {
+		writeFileH(t, repo, f, "landed on main via another window's merged PR\n")
+		runGitH(t, repo, "add", f)
+	}
+	runGitH(t, repo, "commit", "-qm", "another window's merged PR")
+	runGitH(t, repo, "push", "-q", "origin", "main")
+	runGitH(t, repo, "switch", "-q", "feat")
+	runGitH(t, repo, "fetch", "-q", "origin")
+
+	t.Chdir(repo) // outgoingPaths resolves origin/main via git in cwd
+
+	shapes := []struct {
+		name    string
+		prepare func()
+	}{
+		{"behind base, not refreshed", func() {
+			runGitH(t, repo, "reset", "-q", "--hard", featBase)
+		}},
+		{"rebased onto origin/main (#106)", func() {
+			runGitH(t, repo, "reset", "-q", "--hard", featBase)
+			runGitH(t, repo, "rebase", "-q", "origin/main")
+		}},
+		{"git merge origin/main refresh (#136)", func() {
+			runGitH(t, repo, "reset", "-q", "--hard", featBase)
+			runGitH(t, repo, "merge", "-q", "--no-edit", "origin/main")
+		}},
+	}
+	for _, s := range shapes {
+		t.Run(s.name, func(t *testing.T) {
+			s.prepare()
+			head := gitOutH(t, repo, "rev-parse", "HEAD")
+			got := outgoingPaths(repo, "main", head)
+			if !reflect.DeepEqual(got, []string{"feat.txt"}) {
+				t.Errorf("outgoing set = %v, want [feat.txt]; the base's own files (other1..5) must never appear", got)
+			}
+		})
+	}
+}
+
+func runGitH(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+func gitOutH(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func writeFileH(t *testing.T, dir, rel, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, rel), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
 
