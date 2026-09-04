@@ -216,7 +216,10 @@ func TestOutgoingPaths_HistoryShapeInvariant(t *testing.T) {
 		}},
 		{"git merge origin/main refresh (#136)", func() {
 			runGitH(t, repo, "reset", "-q", "--hard", featBase)
-			runGitH(t, repo, "merge", "-q", "--no-edit", "origin/main")
+			// -c merge.ff=false: force the merge COMMIT (the #136 shape) and stay
+			// robust to a global merge.ff=only, which would otherwise refuse this
+			// divergent merge.
+			runGitH(t, repo, "-c", "merge.ff=false", "merge", "-q", "--no-edit", "origin/main")
 		}},
 	}
 	for _, s := range shapes {
