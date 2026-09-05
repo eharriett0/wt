@@ -59,15 +59,17 @@ type StaleCheckout struct {
 	Severity   string `json:"severity"`    // "warn"
 }
 
-// UpstreamCheck flags a worktree whose branch tracks the BASE ref — a bare
-// `git push` there lands straight on the base (the deploy branch in a
-// merge_is_deploy repo) with no PR/CI/review — or has no upstream at all (#76).
+// UpstreamCheck flags a worktree whose branch tracks the BASE ref — under
+// push.default=upstream/tracking a bare `git push` there aims at the base branch
+// (though the wt pre-push guard still blocks it), while under simple it refuses
+// on the name mismatch — or has no upstream at all (#76, #138).
 type UpstreamCheck struct {
-	Path     string `json:"path"`
-	Branch   string `json:"branch"`
-	Upstream string `json:"upstream,omitempty"` // e.g. "origin/main"; "" when none
-	Issue    string `json:"issue"`              // "tracks_base" | "no_upstream"
-	Severity string `json:"severity"`           // "fail" | "warn" | "info"
+	Path        string `json:"path"`
+	Branch      string `json:"branch"`
+	Upstream    string `json:"upstream,omitempty"`     // e.g. "origin/main"; "" when none
+	Issue       string `json:"issue"`                  // "tracks_base" | "no_upstream"
+	Severity    string `json:"severity"`               // "warn" | "info"
+	PushDefault string `json:"push_default,omitempty"` // effective push.default; "" = simple (#138)
 }
 
 // DocCheck is one structured_doc's compiled-regex status.
@@ -143,19 +145,18 @@ func build(c *config.Config) *Report {
 	rep.Upstream = upstreamChecks(c)
 	rep.StaleCheckouts = staleCheckouts(c)
 	rep.HooksInstalled = hooksInstalled(c)
-	// A worktree tracking the base branch in a merge_is_deploy repo is a hard
-	// finding — a bare `git push` there ships to prod. That fails doctor.
-	for _, u := range rep.Upstream {
-		if u.Severity == "fail" {
-			rep.Healthy = false
-		}
-	}
+	// A base-tracking worktree branch is NOT a hard failure (#138): under git's
+	// default push.default=simple a bare push refuses on the name mismatch, and
+	// the wt pre-push guard blocks a base push regardless — so it's a warn/info,
+	// never a ✗ that fails doctor.
 	return rep
 }
 
-// upstreamChecks flags every worktree whose branch tracks the base ref (a bare
-// `git push` lands on the base — prod, in a merge_is_deploy repo) or has no
-// upstream at all. The base branch itself legitimately tracks base, so it's
+// upstreamChecks flags every worktree whose branch tracks the base ref (under
+// push.default=upstream/tracking a bare `git push` there aims at the base, and
+// `git pull` merges the base into the branch) or has no upstream at all. Reads
+// push.default per-worktree so the severity reflects the config actually in
+// effect (#138). The base branch itself legitimately tracks base, so it's
 // skipped. `wt new` sets upstreams correctly; the broken ones are ad-hoc
 // branches created outside wt (#76).
 func upstreamChecks(c *config.Config) []UpstreamCheck {
@@ -169,12 +170,14 @@ func upstreamChecks(c *config.Config) []UpstreamCheck {
 			continue // detached, or the base branch itself
 		}
 		merge, _ := gitx.RunDir(r.Path, "config", "--get", "branch."+r.Branch+".merge")
-		issue, sev := classifyUpstream(merge, c.Base, c.MergeIsDeploy)
+		pushDefault, _ := gitx.RunDir(r.Path, "config", "--get", "push.default")
+		issue, sev := classifyUpstream(merge, c.Base, pushDefault)
 		if issue == "" {
 			continue // tracks its own remote branch — fine
 		}
 		uc := UpstreamCheck{Path: r.Path, Branch: r.Branch, Issue: issue, Severity: sev}
 		if issue == "tracks_base" {
+			uc.PushDefault = pushDefault
 			remote, _ := gitx.RunDir(r.Path, "config", "--get", "branch."+r.Branch+".remote")
 			uc.Upstream = c.Base
 			if remote != "" {
@@ -256,20 +259,42 @@ func dirtyFileCount(path string) int {
 
 // classifyUpstream decides a worktree branch's upstream finding from its git
 // merge ref (branch.<b>.merge, e.g. "refs/heads/main" or "" for no upstream),
-// the base branch, and whether merge_is_deploy is set. Returns ("","") when the
+// the base branch, and the effective push.default. Returns ("","") when the
 // branch is fine (tracks its own remote branch). Pure — the testable core of the
 // #76 check.
-func classifyUpstream(mergeRef, base string, mergeIsDeploy bool) (issue, severity string) {
+//
+// Severity for a base-tracking branch turns on push.default, NOT merge_is_deploy
+// (#138): a bare `git push` only follows the UPSTREAM ref (→ the base branch)
+// under push.default=upstream/tracking. Under simple — git's default since 2.0 —
+// it targets the SAME-NAMED remote branch, so a base-tracking feature branch
+// REFUSES on the name mismatch rather than silently shipping to the base. And
+// the wt pre-push guard blocks a base push regardless. So the old hard ✗ ("a
+// bare push lands DIRECTLY on the deploy branch") over-claimed on every repo
+// running git's default config: warn only when push.default actually aims at the
+// upstream, else report the real, smaller consequence (info).
+func classifyUpstream(mergeRef, base, pushDefault string) (issue, severity string) {
 	if strings.TrimSpace(mergeRef) == "" {
 		return "no_upstream", "info"
 	}
 	if strings.TrimPrefix(mergeRef, "refs/heads/") != base {
 		return "", "" // tracks its own branch — fine
 	}
-	if mergeIsDeploy {
-		return "tracks_base", "fail" // a bare push here ships to prod
+	if pushDefaultFollowsUpstream(pushDefault) {
+		return "tracks_base", "warn" // a bare push aims at the base (guard still blocks it)
 	}
-	return "tracks_base", "warn"
+	return "tracks_base", "info" // simple refuses on the name mismatch; real cost is pull/status
+}
+
+// pushDefaultFollowsUpstream reports whether push.default makes a bare `git push`
+// follow the branch's UPSTREAM ref rather than its same-named remote branch. Only
+// "upstream" and its deprecated alias "tracking" do; "simple" (unset default
+// since git 2.0), "current", "matching", "nothing" all key off the branch name.
+func pushDefaultFollowsUpstream(v string) bool {
+	switch strings.TrimSpace(v) {
+	case "upstream", "tracking":
+		return true
+	}
+	return false
 }
 
 // hooksInstalled reports whether the wt pre-push base-branch guard is present in
@@ -480,20 +505,38 @@ func render(rep *Report) {
 		}
 	}
 
-	// Worktree upstream sanity (#76): a branch tracking the base ref turns a
-	// reflexive `git push` into a direct push to the base/deploy branch.
+	// Worktree upstream sanity (#76, #138): a base-tracking branch only aims a
+	// bare `git push` at the base under push.default=upstream/tracking — and the
+	// wt pre-push guard blocks that regardless; under simple it refuses on the
+	// name mismatch. State the consequence that's actually true for the config.
 	if len(rep.Upstream) == 0 {
 		ui.OK("worktree upstreams — no branch tracks the base branch")
 	}
 	for _, u := range rep.Upstream {
 		fix := ui.Cyan(fmt.Sprintf("git -C %s branch --unset-upstream", u.Path))
-		switch u.Severity {
-		case "fail":
-			ui.Err("worktree branch %q tracks the base (upstream %s) — a bare `git push` here lands DIRECTLY on the deploy branch (merge_is_deploy: no PR/CI/review). Fix: %s", u.Branch, u.Upstream, fix)
-		case "warn":
-			ui.Warn("worktree branch %q tracks the base (upstream %s) — a bare `git push` here goes to the base branch, not a PR. Fix: %s", u.Branch, u.Upstream, fix)
-		case "info":
+		switch {
+		case u.Issue == "no_upstream":
 			ui.Info("worktree branch %q has no upstream — a `git push` there prompts rather than landing anywhere", u.Branch)
+		case u.Severity == "warn": // tracks_base under push.default=upstream/tracking
+			// The pre-push guard is the real backstop — but only when installed.
+			// In the one genuinely-dangerous config (push.default=upstream AND no
+			// guard) a bare push actually reaches the base, so don't claim it's
+			// blocked (#138 review).
+			guard := "the wt pre-push guard blocks it when installed"
+			if rep.HooksInstalled != nil {
+				if *rep.HooksInstalled {
+					guard = "the wt pre-push guard blocks it"
+				} else {
+					guard = "the wt pre-push guard is NOT installed here (see the hooks check below), so nothing stops it — run `wt install-hooks`"
+				}
+			}
+			ui.Warn("worktree branch %q tracks the base (upstream %s) and push.default=%s, so a bare `git push` aims at the base branch — %s; unset the base upstream: %s", u.Branch, u.Upstream, u.PushDefault, guard, fix)
+		default: // tracks_base under push.default=simple (or current/matching/nothing)
+			pd := u.PushDefault
+			if pd == "" {
+				pd = "simple"
+			}
+			ui.Info("worktree branch %q tracks the base (upstream %s) — `git pull` here merges the base INTO your branch and `git status` reports ahead/behind against it; a bare `git push` does not reach the base under push.default=%s. Fix: %s", u.Branch, u.Upstream, pd, fix)
 		}
 	}
 
