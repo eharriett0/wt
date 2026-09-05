@@ -214,3 +214,78 @@ func TestAnyDeployPath(t *testing.T) {
 		})
 	}
 }
+
+// #140: -h/--help must route to usage and a leading-'-' positional must be
+// rejected, so no command silently treats "--help" (or a typo'd flag) as a
+// value (a branch, id, path). These pure helpers back guardHelp/guardPositionalArg
+// used by every subcommand.
+
+func TestIsHelpFlag(t *testing.T) {
+	for _, s := range []string{"-h", "--help", "-help"} {
+		if !isHelpFlag(s) {
+			t.Errorf("isHelpFlag(%q) = false, want true", s)
+		}
+	}
+	for _, s := range []string{"", "-", "help", "--h", "-hh", "branch", "--force"} {
+		if isHelpFlag(s) {
+			t.Errorf("isHelpFlag(%q) = true, want false", s)
+		}
+	}
+}
+
+func TestWantsHelp(t *testing.T) {
+	for _, args := range [][]string{{"--help"}, {"-h"}, {"x", "--help"}, {"x", "-h", "y"}} {
+		if !wantsHelp(args) {
+			t.Errorf("wantsHelp(%v) = false, want true", args)
+		}
+	}
+	for _, args := range [][]string{{}, {"x"}, {"x", "y"}, {"--force", "42"}} {
+		if wantsHelp(args) {
+			t.Errorf("wantsHelp(%v) = true, want false", args)
+		}
+	}
+	// A --help AFTER a "--" passthrough separator is meant for the forwarded
+	// command (e.g. gh), not wt — must NOT be read as a wt help request.
+	if wantsHelp([]string{"5", "--", "--help"}) {
+		t.Error(`wantsHelp(["5","--","--help"]) = true, want false (--help is passthrough)`)
+	}
+}
+
+func TestLooksLikeFlag(t *testing.T) {
+	for _, s := range []string{"-x", "--help", "--force", "-h"} {
+		if !looksLikeFlag(s) {
+			t.Errorf("looksLikeFlag(%q) = false, want true", s)
+		}
+	}
+	for _, s := range []string{"", "-", "--", "branch", "feat/x", "42", "#7"} {
+		if looksLikeFlag(s) {
+			t.Errorf("looksLikeFlag(%q) = true, want false", s)
+		}
+	}
+}
+
+func TestGuardHelp(t *testing.T) {
+	if code, done := guardHelp([]string{"--help"}, "usage: wt x"); !done || code != 0 {
+		t.Errorf("guardHelp(--help) = (%d,%v), want (0,true)", code, done)
+	}
+	if code, done := guardHelp([]string{"real"}, "usage: wt x"); done || code != 0 {
+		t.Errorf("guardHelp(real) = (%d,%v), want (0,false)", code, done)
+	}
+}
+
+func TestGuardPositionalArg(t *testing.T) {
+	// -h/--help → usage, exit 0
+	if code, done := guardPositionalArg([]string{"--help"}, "usage: wt new <branch>"); !done || code != 0 {
+		t.Errorf("guard(--help) = (%d,%v), want (0,true)", code, done)
+	}
+	// a leading-'-' arg is a mistyped/omitted flag → reject, exit 64 (the #140 core)
+	if code, done := guardPositionalArg([]string{"-x"}, "usage: wt new <branch>"); !done || code != 64 {
+		t.Errorf("guard(-x) = (%d,%v), want (64,true)", code, done)
+	}
+	// a real value or empty → not handled, command proceeds
+	for _, args := range [][]string{{"mybranch"}, {}} {
+		if code, done := guardPositionalArg(args, "usage: wt new <branch>"); done || code != 0 {
+			t.Errorf("guard(%v) = (%d,%v), want (0,false)", args, code, done)
+		}
+	}
+}

@@ -153,6 +153,9 @@ func withConfig(fn func(*config.Config) int) int {
 }
 
 func cmdNew(args []string) int {
+	if code, done := guardPositionalArg(args, "usage: wt new <branch>"); done {
+		return code
+	}
 	if len(args) < 1 || args[0] == "" {
 		ui.Err("usage: wt new <branch>")
 		return 64
@@ -217,7 +220,64 @@ func parseInterspersed(fs *flag.FlagSet, args []string) (positionals, passthroug
 	return positionals, passthrough, nil
 }
 
+// isHelpFlag reports whether s is a help request.
+func isHelpFlag(s string) bool { return s == "-h" || s == "--help" || s == "-help" }
+
+// wantsHelp reports whether any arg BEFORE a "--" passthrough separator is a help
+// request. Stopping at "--" keeps `wt merge-pr 5 -- --help` (a --help meant for
+// the forwarded gh command) from being read as a request for wt's own usage.
+func wantsHelp(args []string) bool {
+	for _, a := range args {
+		if a == "--" {
+			return false
+		}
+		if isHelpFlag(a) {
+			return true
+		}
+	}
+	return false
+}
+
+// looksLikeFlag reports whether a positional arg is really a flag — it starts
+// with '-' and isn't the "--" separator. Branch names, issue/PR numbers,
+// coordination ids and paths never start with '-', so a FLAGLESS command that
+// reads such an arg as its value silently acts on a mistyped or help flag (#140).
+func looksLikeFlag(s string) bool { return len(s) > 1 && s[0] == '-' && s != "--" }
+
+// guardHelp routes a -h/--help request to the command's own usage line (exit 0),
+// uniformly across the CLI (#140). Used by EVERY subcommand so `wt <cmd> --help`
+// always prints that command's usage and succeeds, instead of some printing the
+// flag package's terser auto-usage (exit 64) and others silently treating
+// "--help" as a value. Returns (0, true) when it printed usage.
+func guardHelp(args []string, usage string) (int, bool) {
+	if wantsHelp(args) {
+		fmt.Println(usage)
+		return 0, true
+	}
+	return 0, false
+}
+
+// guardPositionalArg is guardHelp plus a reject of a leading-'-' first arg — a
+// mistyped or omitted flag — for a command that takes NO flags, so it never
+// treats "--foo" as a value (a branch, id or path); that silent value-treatment
+// was the #140 bug. Returns (code, true) when it handled the input. FLAGLESS
+// commands only: a flagged command's own parser tells a valid flag (--force)
+// from a typo, so it must not blanket-reject a leading '-'.
+func guardPositionalArg(args []string, usage string) (int, bool) {
+	if code, done := guardHelp(args, usage); done {
+		return code, true
+	}
+	if len(args) > 0 && looksLikeFlag(args[0]) {
+		ui.Err("%q looks like a flag, not a value — %s", args[0], usage)
+		return 64, true
+	}
+	return 0, false
+}
+
 func cmdClaim(args []string) int {
+	if code, done := guardHelp(args, "usage: wt claim <issue> [--force] [--no-pr] [--epic <id>]"); done {
+		return code
+	}
 	fs := flag.NewFlagSet("claim", flag.ContinueOnError)
 	force := fs.Bool("force", false, "claim even if the issue is already assigned")
 	noPR := fs.Bool("no-pr", false, "skip opening a draft PR")
@@ -242,6 +302,9 @@ func cmdClaim(args []string) int {
 }
 
 func cmdAdopt(args []string) int {
+	if code, done := guardHelp(args, "usage: wt adopt <branch|pr#> [--epic <id>]"); done {
+		return code
+	}
 	fs := flag.NewFlagSet("adopt", flag.ContinueOnError)
 	epic := fs.String("epic", "", "tag this adoption with a cross-repo epic id (wt status --epic)")
 	pos, _, err := parseInterspersed(fs, args)
@@ -263,6 +326,9 @@ func cmdAdopt(args []string) int {
 }
 
 func cmdRelease(args []string) int {
+	if code, done := guardHelp(args, "usage: wt release <issue> [--clean]"); done {
+		return code
+	}
 	fs := flag.NewFlagSet("release", flag.ContinueOnError)
 	clean := fs.Bool("clean", false, "also remove the worktree if the branch is abandoned (clean, no live PR, WIP-only)")
 	pos, _, err := parseInterspersed(fs, args)
@@ -283,6 +349,9 @@ func cmdRelease(args []string) int {
 }
 
 func cmdMergePR(args []string) int {
+	if code, done := guardHelp(args, "usage: wt merge-pr <pr> [--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok] [--no-close-check] [-- extra gh args]"); done {
+		return code
+	}
 	fs := flag.NewFlagSet("merge-pr", flag.ContinueOnError)
 	dryRun := fs.Bool("dry-run", false, "print the guard verdict without merging")
 	bypass := fs.Bool("bypass", false, "merge despite a block verdict (rare)")
@@ -921,6 +990,11 @@ func unknownCheckPaths(paths []string, ws []collide.Window) []string {
 }
 
 func cmdCheck(args []string) int {
+	const checkUsage = "usage: wt check [--include-stale] [--show-diff] [--json] [--blocking] [--allow-missing] <path> [path...]"
+	// route -h/--help to usage instead of parseCheckArgs' unknown-flag reject (#140)
+	if code, done := guardHelp(args, checkUsage); done {
+		return code
+	}
 	// paths are positional and flags may appear anywhere (a plain flag.Parse
 	// would stop at the first positional), so we scan manually.
 	paths, includeStale, showDiff, asJSON, blocking, allowMissing, maxAge, unknownFlag := parseCheckArgs(args)
@@ -929,7 +1003,7 @@ func cmdCheck(args []string) int {
 		return 64
 	}
 	if len(paths) == 0 {
-		ui.Err("usage: wt check [--include-stale] [--show-diff] [--json] [--blocking] [--allow-missing] <path> [path...]")
+		ui.Err(checkUsage)
 		return 64
 	}
 	return withConfig(func(c *config.Config) int {
@@ -1003,6 +1077,9 @@ func cmdDoctor(args []string) int {
 // JUST the absolute path to stdout (so `cd $(wt where 42)` works); non-zero +
 // stderr when not found (#46).
 func cmdWhere(args []string) int {
+	if code, done := guardPositionalArg(args, "usage: wt where <issue|branch>"); done {
+		return code
+	}
 	if len(args) < 1 || strings.TrimSpace(args[0]) == "" {
 		ui.Err("usage: wt where <issue|branch>")
 		return 64
