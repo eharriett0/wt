@@ -713,7 +713,7 @@ func ChangedRanges(dir, base, file string) []LineRange {
 	// dropping them keeps the base-frame comparability (#29/#108) AND real
 	// deletions (a delete/modify IS contested), fixing only the false positive.
 	if g := baseInsertedRanges(dir, base, file); len(g) > 0 {
-		r = subtractOverlapping(r, g)
+		r = subtractRanges(r, g)
 	}
 	return r
 }
@@ -734,13 +734,20 @@ func baseInsertedRanges(dir, base, file string) []LineRange {
 			continue
 		}
 		mb, err := RunDir(dir, "merge-base", ref, "HEAD")
-		if err != nil || strings.TrimSpace(mb) == "" {
+		if err != nil || mb == "" {
 			return nil
 		}
-		if strings.TrimSpace(mb) == strings.TrimSpace(sha) {
+		if mb == sha {
 			return nil // branch is up to date with base — nothing gained since
 		}
-		out, err := runRaw(dir, "diff", "-U0", strings.TrimSpace(mb), ref, "--", file)
+		// Only subtract when the file EXISTED at the merge-base. If it didn't,
+		// base "inserting" the whole file isn't phantom-the-branch-lacks — the
+		// branch may have independently ADDED its own file (a real add/add
+		// conflict), and subtracting would suppress it (#142 review).
+		if _, err := RunDir(dir, "cat-file", "-e", mb+":"+file); err != nil {
+			return nil
+		}
+		out, err := runRaw(dir, "diff", "-U0", mb, ref, "--", file)
 		if err != nil {
 			return nil
 		}
@@ -763,28 +770,39 @@ func parseInsertedRangesNew(diff string) []LineRange {
 		if m[2] != "" {
 			count, _ = strconv.Atoi(m[2])
 		}
-		if count == 0 {
-			continue
-		}
 		out = append(out, LineRange{start, start + count - 1})
 	}
 	return out
 }
 
-// subtractOverlapping returns the spans of r that overlap NO span in g. (#142)
-func subtractOverlapping(r, g []LineRange) []LineRange {
+// subtractRanges removes the g spans from the r spans by true INTERVAL
+// subtraction — an r span that straddles a g span is SPLIT, not dropped whole.
+// `git diff -U0` folds a phantom base-block deletion together with a real branch
+// edit into ONE hunk when the edit is directly adjacent to the block (no
+// unchanged line between), so dropping the whole span would discard the real
+// edit — a false negative in the exact shared-manifest scenario (#142 review).
+// Splitting keeps the real edit and removes only the phantom part.
+func subtractRanges(r, g []LineRange) []LineRange {
 	var out []LineRange
 	for _, rr := range r {
-		overlaps := false
+		segs := []LineRange{rr}
 		for _, gg := range g {
-			if rr.Overlaps(gg) {
-				overlaps = true
-				break
+			var next []LineRange
+			for _, s := range segs {
+				if !s.Overlaps(gg) {
+					next = append(next, s)
+					continue
+				}
+				if s.Start < gg.Start {
+					next = append(next, LineRange{s.Start, gg.Start - 1})
+				}
+				if s.End > gg.End {
+					next = append(next, LineRange{gg.End + 1, s.End})
+				}
 			}
+			segs = next
 		}
-		if !overlaps {
-			out = append(out, rr)
-		}
+		out = append(out, segs...)
 	}
 	return out
 }
