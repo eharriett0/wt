@@ -69,7 +69,11 @@ func Main(args []string) int {
 	}
 	cmd, rest := args[0], args[1:]
 
-	checkForUpdate(cmd)
+	// Skip the "newer wt available" nudge on a help request (top-level OR
+	// subcommand, e.g. `wt claim --help`) so `--help` output stays clean (#140).
+	if !wantsHelp(rest) {
+		checkForUpdate(cmd)
+	}
 
 	switch cmd {
 	case "help", "-h", "--help":
@@ -260,14 +264,17 @@ func guardHelp(args []string, usage string) (int, bool) {
 // guardPositionalArg is guardHelp plus a reject of a leading-'-' first arg — a
 // mistyped or omitted flag — for a command that takes NO flags, so it never
 // treats "--foo" as a value (a branch, id or path); that silent value-treatment
-// was the #140 bug. Returns (code, true) when it handled the input. FLAGLESS
-// commands only: a flagged command's own parser tells a valid flag (--force)
-// from a typo, so it must not blanket-reject a leading '-'.
+// was the #140 bug. A bare "--" is rejected too: a flagless command has no
+// passthrough, so it's never a valid value (and `wt new -- --help` would
+// otherwise reach git with branch "--" — the same opaque error #140 kills).
+// Returns (code, true) when it handled the input. FLAGLESS commands only: a
+// flagged command's own parser tells a valid flag (--force) from a typo, so it
+// must not blanket-reject a leading '-'.
 func guardPositionalArg(args []string, usage string) (int, bool) {
 	if code, done := guardHelp(args, usage); done {
 		return code, true
 	}
-	if len(args) > 0 && looksLikeFlag(args[0]) {
+	if len(args) > 0 && (looksLikeFlag(args[0]) || args[0] == "--") {
 		ui.Err("%q looks like a flag, not a value — %s", args[0], usage)
 		return 64, true
 	}

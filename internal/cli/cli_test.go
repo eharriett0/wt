@@ -278,14 +278,39 @@ func TestGuardPositionalArg(t *testing.T) {
 	if code, done := guardPositionalArg([]string{"--help"}, "usage: wt new <branch>"); !done || code != 0 {
 		t.Errorf("guard(--help) = (%d,%v), want (0,true)", code, done)
 	}
-	// a leading-'-' arg is a mistyped/omitted flag → reject, exit 64 (the #140 core)
-	if code, done := guardPositionalArg([]string{"-x"}, "usage: wt new <branch>"); !done || code != 64 {
-		t.Errorf("guard(-x) = (%d,%v), want (64,true)", code, done)
+	// a leading-'-' arg (or a bare "--") is a mistyped/omitted flag → reject,
+	// exit 64 (the #140 core; "--" would otherwise reach git as branch "--")
+	for _, bad := range []string{"-x", "--", "--nope"} {
+		if code, done := guardPositionalArg([]string{bad}, "usage: wt new <branch>"); !done || code != 64 {
+			t.Errorf("guard(%q) = (%d,%v), want (64,true)", bad, code, done)
+		}
 	}
 	// a real value or empty → not handled, command proceeds
 	for _, args := range [][]string{{"mybranch"}, {}} {
 		if code, done := guardPositionalArg(args, "usage: wt new <branch>"); done || code != 0 {
 			t.Errorf("guard(%v) = (%d,%v), want (0,false)", args, code, done)
+		}
+	}
+}
+
+// #140 wiring: prove the guard is actually WIRED into the commands that used to
+// treat --help as a value — not just that the helper works. The --help and -x
+// paths return BEFORE any config/git I/O, so Main can be driven cheaply. Guards
+// against a future refactor silently dropping a guard call and regressing #140.
+func TestHelpGuardWiring(t *testing.T) {
+	t.Setenv("WT_NO_UPDATE_CHECK", "1") // no network / stamp-file nudge in the test
+	for _, cmd := range []string{"new", "where", "all-clear"} {
+		if code := Main([]string{cmd, "--help"}); code != 0 {
+			t.Errorf("wt %s --help exit = %d, want 0 (usage, not an error/value)", cmd, code)
+		}
+		if code := Main([]string{cmd, "-x"}); code != 64 {
+			t.Errorf("wt %s -x exit = %d, want 64 (reject the typo'd flag, not act on it)", cmd, code)
+		}
+	}
+	// A flagged command's --help also routes to usage (exit 0), before its parser.
+	for _, cmd := range []string{"claim", "adopt", "merge-pr", "check"} {
+		if code := Main([]string{cmd, "--help"}); code != 0 {
+			t.Errorf("wt %s --help exit = %d, want 0", cmd, code)
 		}
 	}
 }
