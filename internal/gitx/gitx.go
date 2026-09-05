@@ -703,7 +703,108 @@ func parseHunkRangesWith(diff string, re *regexp.Regexp) []LineRange {
 // where cross-window base comparison is meaningless anyway), degrade to the
 // NEW-side uncommitted hunks so a single window still self-reports.
 func ChangedRanges(dir, base, file string) []LineRange {
-	return changedRangesWith(dir, base, file, parseHunkRangesOld)
+	r := changedRangesWith(dir, base, file, parseHunkRangesOld)
+	// #142: subtract content the branch merely LACKS — the base's PURE insertions
+	// since this branch's merge-base. In the base-frame `base..worktree` diff a
+	// stale branch's absence of base-gained content reads as phantom DELETION
+	// hunks, so an unrelated edit inside that region (by another window) would
+	// falsely grade as an overlap. Those insertions sit at base-frame positions
+	// the branch never had, so they can't coincide with the branch's own edits —
+	// dropping them keeps the base-frame comparability (#29/#108) AND real
+	// deletions (a delete/modify IS contested), fixing only the false positive.
+	if g := baseInsertedRanges(dir, base, file); len(g) > 0 {
+		r = subtractRanges(r, g)
+	}
+	return r
+}
+
+// insertHunkRe matches a -U0 PURE-insertion hunk (old count 0), capturing the
+// NEW-side start + optional count — the lines the new side gained with no
+// old-side counterpart. A modify (`-a,M` with M>0) does NOT match. (#142)
+var insertHunkRe = regexp.MustCompile(`^@@ -\d+,0 \+(\d+)(?:,(\d+))? @@`)
+
+// baseInsertedRanges returns the base-frame line ranges the base has PURELY
+// INSERTED since the branch at dir diverged (merge-base(base, HEAD)..base) — the
+// content a stale branch lacks. Empty when the branch is up to date with base
+// (merge-base == base) or the base ref can't be resolved. (#142)
+func baseInsertedRanges(dir, base, file string) []LineRange {
+	for _, ref := range []string{"origin/" + base, base} {
+		sha, err := RunDir(dir, "rev-parse", "--verify", "--quiet", ref+"^{commit}")
+		if err != nil {
+			continue
+		}
+		mb, err := RunDir(dir, "merge-base", ref, "HEAD")
+		if err != nil || mb == "" {
+			return nil
+		}
+		if mb == sha {
+			return nil // branch is up to date with base — nothing gained since
+		}
+		// Only subtract when the file EXISTED at the merge-base. If it didn't,
+		// base "inserting" the whole file isn't phantom-the-branch-lacks — the
+		// branch may have independently ADDED its own file (a real add/add
+		// conflict), and subtracting would suppress it (#142 review).
+		if _, err := RunDir(dir, "cat-file", "-e", mb+":"+file); err != nil {
+			return nil
+		}
+		out, err := runRaw(dir, "diff", "-U0", mb, ref, "--", file)
+		if err != nil {
+			return nil
+		}
+		return parseInsertedRangesNew(out)
+	}
+	return nil
+}
+
+// parseInsertedRangesNew emits the NEW-side ranges of PURE-insertion hunks from a
+// -U0 diff (see insertHunkRe). (#142)
+func parseInsertedRangesNew(diff string) []LineRange {
+	var out []LineRange
+	for _, ln := range strings.Split(diff, "\n") {
+		m := insertHunkRe.FindStringSubmatch(ln)
+		if m == nil {
+			continue
+		}
+		start, _ := strconv.Atoi(m[1])
+		count := 1
+		if m[2] != "" {
+			count, _ = strconv.Atoi(m[2])
+		}
+		out = append(out, LineRange{start, start + count - 1})
+	}
+	return out
+}
+
+// subtractRanges removes the g spans from the r spans by true INTERVAL
+// subtraction — an r span that straddles a g span is SPLIT, not dropped whole.
+// `git diff -U0` folds a phantom base-block deletion together with a real branch
+// edit into ONE hunk when the edit is directly adjacent to the block (no
+// unchanged line between), so dropping the whole span would discard the real
+// edit — a false negative in the exact shared-manifest scenario (#142 review).
+// Splitting keeps the real edit and removes only the phantom part.
+func subtractRanges(r, g []LineRange) []LineRange {
+	var out []LineRange
+	for _, rr := range r {
+		segs := []LineRange{rr}
+		for _, gg := range g {
+			var next []LineRange
+			for _, s := range segs {
+				if !s.Overlaps(gg) {
+					next = append(next, s)
+					continue
+				}
+				if s.Start < gg.Start {
+					next = append(next, LineRange{s.Start, gg.Start - 1})
+				}
+				if s.End > gg.End {
+					next = append(next, LineRange{gg.End + 1, s.End})
+				}
+			}
+			segs = next
+		}
+		out = append(out, segs...)
+	}
+	return out
 }
 
 // ChangedRangesNew is ChangedRanges but NEW-frame (current/`+` side). Use it to
