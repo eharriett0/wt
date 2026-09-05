@@ -152,9 +152,11 @@ func build(c *config.Config) *Report {
 	return rep
 }
 
-// upstreamChecks flags every worktree whose branch tracks the base ref (a bare
-// `git push` lands on the base — prod, in a merge_is_deploy repo) or has no
-// upstream at all. The base branch itself legitimately tracks base, so it's
+// upstreamChecks flags every worktree whose branch tracks the base ref (under
+// push.default=upstream/tracking a bare `git push` there aims at the base, and
+// `git pull` merges the base into the branch) or has no upstream at all. Reads
+// push.default per-worktree so the severity reflects the config actually in
+// effect (#138). The base branch itself legitimately tracks base, so it's
 // skipped. `wt new` sets upstreams correctly; the broken ones are ad-hoc
 // branches created outside wt (#76).
 func upstreamChecks(c *config.Config) []UpstreamCheck {
@@ -516,7 +518,19 @@ func render(rep *Report) {
 		case u.Issue == "no_upstream":
 			ui.Info("worktree branch %q has no upstream — a `git push` there prompts rather than landing anywhere", u.Branch)
 		case u.Severity == "warn": // tracks_base under push.default=upstream/tracking
-			ui.Warn("worktree branch %q tracks the base (upstream %s) and push.default=%s, so a bare `git push` aims at the base branch — the wt pre-push guard blocks it, but set a same-named upstream: %s", u.Branch, u.Upstream, u.PushDefault, fix)
+			// The pre-push guard is the real backstop — but only when installed.
+			// In the one genuinely-dangerous config (push.default=upstream AND no
+			// guard) a bare push actually reaches the base, so don't claim it's
+			// blocked (#138 review).
+			guard := "the wt pre-push guard blocks it when installed"
+			if rep.HooksInstalled != nil {
+				if *rep.HooksInstalled {
+					guard = "the wt pre-push guard blocks it"
+				} else {
+					guard = "the wt pre-push guard is NOT installed here (see the hooks check below), so nothing stops it — run `wt install-hooks`"
+				}
+			}
+			ui.Warn("worktree branch %q tracks the base (upstream %s) and push.default=%s, so a bare `git push` aims at the base branch — %s; unset the base upstream: %s", u.Branch, u.Upstream, u.PushDefault, guard, fix)
 		default: // tracks_base under push.default=simple (or current/matching/nothing)
 			pd := u.PushDefault
 			if pd == "" {
