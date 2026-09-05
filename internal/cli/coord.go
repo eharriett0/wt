@@ -112,6 +112,9 @@ func remoteRecords(issue int) []coord.Record {
 }
 
 func cmdAnnounce(args []string) int {
+	if code, done := guardHelp(args, `usage: wt announce "<message>" [--file <path>] [--issue N] [--hold "op,..."]   (or --clear <id>)`); done {
+		return code
+	}
 	fs := flag.NewFlagSet("announce", flag.ContinueOnError)
 	issue := fs.Int("issue", 0, "mirror this announcement as a comment on GitHub issue #N")
 	hold := fs.String("hold", "", "comma-separated ops other windows should avoid until all-clear (e.g. \"merge-main,flux-reconcile\")")
@@ -200,6 +203,9 @@ func cmdInbox(args []string) int {
 }
 
 func cmdAck(args []string) int {
+	if code, done := guardHelp(args, `usage: wt ack <id> [--state "<current-state>"] [--file <path>]`); done {
+		return code
+	}
 	fs := flag.NewFlagSet("ack", flag.ContinueOnError)
 	state := fs.String("state", "", "one-line report of what THIS window is currently touching")
 	file := fs.String("file", "", "read --state from a file (or - for stdin) instead of the flag — opaque to the shell (#75)")
@@ -248,6 +254,9 @@ func cmdAck(args []string) int {
 }
 
 func cmdAllClear(args []string) int {
+	if code, done := guardPositionalArg(args, "usage: wt all-clear <id>"); done {
+		return code
+	}
 	if len(args) < 1 {
 		ui.Err("usage: wt all-clear <id>")
 		return 64

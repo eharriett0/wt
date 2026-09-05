@@ -214,3 +214,103 @@ func TestAnyDeployPath(t *testing.T) {
 		})
 	}
 }
+
+// #140: -h/--help must route to usage and a leading-'-' positional must be
+// rejected, so no command silently treats "--help" (or a typo'd flag) as a
+// value (a branch, id, path). These pure helpers back guardHelp/guardPositionalArg
+// used by every subcommand.
+
+func TestIsHelpFlag(t *testing.T) {
+	for _, s := range []string{"-h", "--help", "-help"} {
+		if !isHelpFlag(s) {
+			t.Errorf("isHelpFlag(%q) = false, want true", s)
+		}
+	}
+	for _, s := range []string{"", "-", "help", "--h", "-hh", "branch", "--force"} {
+		if isHelpFlag(s) {
+			t.Errorf("isHelpFlag(%q) = true, want false", s)
+		}
+	}
+}
+
+func TestWantsHelp(t *testing.T) {
+	for _, args := range [][]string{{"--help"}, {"-h"}, {"x", "--help"}, {"x", "-h", "y"}} {
+		if !wantsHelp(args) {
+			t.Errorf("wantsHelp(%v) = false, want true", args)
+		}
+	}
+	for _, args := range [][]string{{}, {"x"}, {"x", "y"}, {"--force", "42"}} {
+		if wantsHelp(args) {
+			t.Errorf("wantsHelp(%v) = true, want false", args)
+		}
+	}
+	// A --help AFTER a "--" passthrough separator is meant for the forwarded
+	// command (e.g. gh), not wt — must NOT be read as a wt help request.
+	if wantsHelp([]string{"5", "--", "--help"}) {
+		t.Error(`wantsHelp(["5","--","--help"]) = true, want false (--help is passthrough)`)
+	}
+}
+
+func TestLooksLikeFlag(t *testing.T) {
+	for _, s := range []string{"-x", "--help", "--force", "-h"} {
+		if !looksLikeFlag(s) {
+			t.Errorf("looksLikeFlag(%q) = false, want true", s)
+		}
+	}
+	for _, s := range []string{"", "-", "--", "branch", "feat/x", "42", "#7"} {
+		if looksLikeFlag(s) {
+			t.Errorf("looksLikeFlag(%q) = true, want false", s)
+		}
+	}
+}
+
+func TestGuardHelp(t *testing.T) {
+	if code, done := guardHelp([]string{"--help"}, "usage: wt x"); !done || code != 0 {
+		t.Errorf("guardHelp(--help) = (%d,%v), want (0,true)", code, done)
+	}
+	if code, done := guardHelp([]string{"real"}, "usage: wt x"); done || code != 0 {
+		t.Errorf("guardHelp(real) = (%d,%v), want (0,false)", code, done)
+	}
+}
+
+func TestGuardPositionalArg(t *testing.T) {
+	// -h/--help → usage, exit 0
+	if code, done := guardPositionalArg([]string{"--help"}, "usage: wt new <branch>"); !done || code != 0 {
+		t.Errorf("guard(--help) = (%d,%v), want (0,true)", code, done)
+	}
+	// a leading-'-' arg (or a bare "--") is a mistyped/omitted flag → reject,
+	// exit 64 (the #140 core; "--" would otherwise reach git as branch "--")
+	for _, bad := range []string{"-x", "--", "--nope"} {
+		if code, done := guardPositionalArg([]string{bad}, "usage: wt new <branch>"); !done || code != 64 {
+			t.Errorf("guard(%q) = (%d,%v), want (64,true)", bad, code, done)
+		}
+	}
+	// a real value or empty → not handled, command proceeds
+	for _, args := range [][]string{{"mybranch"}, {}} {
+		if code, done := guardPositionalArg(args, "usage: wt new <branch>"); done || code != 0 {
+			t.Errorf("guard(%v) = (%d,%v), want (0,false)", args, code, done)
+		}
+	}
+}
+
+// #140 wiring: prove the guard is actually WIRED into the commands that used to
+// treat --help as a value — not just that the helper works. The --help and -x
+// paths return BEFORE any config/git I/O, so Main can be driven cheaply. Guards
+// against a future refactor silently dropping a guard call and regressing #140.
+func TestHelpGuardWiring(t *testing.T) {
+	t.Setenv("WT_NO_UPDATE_CHECK", "1") // no network / stamp-file nudge in the test
+	for _, cmd := range []string{"new", "where", "all-clear"} {
+		if code := Main([]string{cmd, "--help"}); code != 0 {
+			t.Errorf("wt %s --help exit = %d, want 0 (usage, not an error/value)", cmd, code)
+		}
+		if code := Main([]string{cmd, "-x"}); code != 64 {
+			t.Errorf("wt %s -x exit = %d, want 64 (reject the typo'd flag, not act on it)", cmd, code)
+		}
+	}
+	// A flagged command's --help also routes to usage (exit 0), before its parser.
+	for _, cmd := range []string{"claim", "adopt", "merge-pr", "check"} {
+		if code := Main([]string{cmd, "--help"}); code != 0 {
+			t.Errorf("wt %s --help exit = %d, want 0", cmd, code)
+		}
+	}
+}

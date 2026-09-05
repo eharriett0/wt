@@ -69,6 +69,9 @@ func scanFileMaxBlock(file string, re *regexp.Regexp) (int, error) {
 
 // cmdBlockID implements `wt block-id <file> [--pattern P] [--format]`.
 func cmdBlockID(args []string) int {
+	if code, done := guardHelp(args, `usage: wt block-id <file> [--pattern "NEWEST-{n}"] [--format] [--written N]`); done {
+		return code
+	}
 	fs := flag.NewFlagSet("block-id", flag.ContinueOnError)
 	pattern := fs.String("pattern", defaultBlockPattern,
 		"append-log id pattern; {n} is the numeric placeholder")

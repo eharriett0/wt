@@ -24,6 +24,9 @@ import (
 const defaultSectionDelimiter = `^#{1,6}\s`
 
 func cmdAppend(args []string) int {
+	if code, done := guardHelp(args, `usage: wt append <doc> --section "<heading>" "<text>"   (or --file <path>)`); done {
+		return code
+	}
 	fs := flag.NewFlagSet("append", flag.ContinueOnError)
 	sec := fs.String("section", "", "heading of the section to append under (exact or contains match)")
 	pattern := fs.String("pattern", "", "section-delimiter regexp (default: the doc's structured_doc config, else markdown headings)")
