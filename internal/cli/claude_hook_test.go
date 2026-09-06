@@ -180,7 +180,11 @@ func TestMergeClaudeHook_FreshAndIdempotent(t *testing.T) {
 		t.Fatalf("fresh: changed=%v err=%v", changed, err)
 	}
 	s := string(out)
-	for _, want := range []string{claudeHookCommand, "Edit|Write|MultiEdit", claudeContextCommand, "UserPromptSubmit"} {
+	for _, want := range []string{
+		claudeHookCommand, "Edit|Write|MultiEdit",
+		claudeContextCommand, "UserPromptSubmit",
+		todoWriteCommand, "PostToolUse", "TodoWrite", // #144: the todos mirror
+	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("fresh output missing %q:\n%s", want, s)
 		}
@@ -245,6 +249,43 @@ func TestMergeClaudeHook_AddsContextToPreToolUseOnly(t *testing.T) {
 	}
 }
 
+// #144 upgrade path: a user whose settings.json has the two PRE-#144 hooks
+// (PreToolUse claude-edit + UserPromptSubmit claude-context) re-runs
+// install-claude-hook. It must ADD only the PostToolUse/TodoWrite mirror — not
+// duplicate the other two — and report changed, so `wt todos` stops being
+// permanently empty for everyone who installed before #144.
+func TestMergeClaudeHook_AddsTodoWriteToOlderInstall(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/settings.json"
+	existing := `{"hooks":{` +
+		`"PreToolUse":[{"matcher":"Edit|Write|MultiEdit","hooks":[{"type":"command","command":"wt _hook claude-edit"}]}],` +
+		`"UserPromptSubmit":[{"hooks":[{"type":"command","command":"wt _hook claude-context"}]}]}}`
+	if err := os.WriteFile(path, []byte(existing), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, changed, err := mergeClaudeHook(path)
+	if err != nil || !changed {
+		t.Fatalf("older install should gain the TodoWrite hook: changed=%v err=%v", changed, err)
+	}
+	s := string(out)
+	if !strings.Contains(s, "PostToolUse") || !strings.Contains(s, "TodoWrite") || !strings.Contains(s, todoWriteCommand) {
+		t.Errorf("did not add the PostToolUse/TodoWrite mirror:\n%s", s)
+	}
+	if n := strings.Count(s, claudeHookCommand); n != 1 {
+		t.Errorf("PreToolUse claude-edit must stay single, got %d:\n%s", n, s)
+	}
+	if n := strings.Count(s, claudeContextCommand); n != 1 {
+		t.Errorf("UserPromptSubmit claude-context must stay single, got %d:\n%s", n, s)
+	}
+	// now all three present → second run is a no-op
+	if err := os.WriteFile(path, out, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, changed, err := mergeClaudeHook(path); err != nil || changed {
+		t.Errorf("all three present → no-op: changed=%v err=%v", changed, err)
+	}
+}
+
 func TestMergeClaudeHook_RefusesGarbage(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/settings.json"
@@ -253,5 +294,84 @@ func TestMergeClaudeHook_RefusesGarbage(t *testing.T) {
 	}
 	if _, _, err := mergeClaudeHook(path); err == nil {
 		t.Error("expected refuse on unparseable JSON")
+	}
+}
+
+// #144 defect 1: todoWriteHookInstalled reads .claude/settings.json so `wt todos`
+// can distinguish an empty store's two causes (hook absent vs. installed-but-
+// never-fired) instead of asserting "hook not installed" as fact.
+func TestTodoWriteHookInstalled(t *testing.T) {
+	writeSettings := func(t *testing.T, root, body string) {
+		t.Helper()
+		if err := os.MkdirAll(root+"/.claude", 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(root+"/.claude/settings.json", []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	writeLocal := func(t *testing.T, root, body string) {
+		t.Helper()
+		if err := os.MkdirAll(root+"/.claude", 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(root+"/.claude/settings.local.json", []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// the exact shape mergeClaudeHook writes → detected
+	root := t.TempDir()
+	writeSettings(t, root, `{"hooks":{"PostToolUse":[{"matcher":"TodoWrite","hooks":[{"type":"command","command":"wt _hook todo-write"}]}]}}`)
+	if !todoWriteHookInstalled(root) {
+		t.Error("wired todo-write hook not detected")
+	}
+
+	// #144-review F1: a path-qualified command is still the same hook → detected
+	root = t.TempDir()
+	writeSettings(t, root, `{"hooks":{"PostToolUse":[{"matcher":"TodoWrite","hooks":[{"type":"command","command":"/usr/local/bin/wt _hook todo-write"}]}]}}`)
+	if !todoWriteHookInstalled(root) {
+		t.Error("path-qualified todo-write command not detected")
+	}
+
+	// #144-review F5: hook wired only in settings.local.json (Claude Code merges it) → detected
+	root = t.TempDir()
+	writeLocal(t, root, `{"hooks":{"PostToolUse":[{"matcher":"TodoWrite","hooks":[{"type":"command","command":"wt _hook todo-write"}]}]}}`)
+	if !todoWriteHookInstalled(root) {
+		t.Error("todo-write hook in settings.local.json not detected")
+	}
+
+	// other wt hooks present but NOT todo-write → false (the misleading case #144 is about)
+	root = t.TempDir()
+	writeSettings(t, root, `{"hooks":{"PreToolUse":[{"matcher":"Edit|Write|MultiEdit","hooks":[{"type":"command","command":"wt _hook claude-edit"}]}]}}`)
+	if todoWriteHookInstalled(root) {
+		t.Error("false positive: reported installed when only claude-edit is wired")
+	}
+
+	// fail-open to false: no settings file, and unparseable settings
+	if todoWriteHookInstalled(t.TempDir()) {
+		t.Error("absent settings.json must read as not-installed")
+	}
+	root = t.TempDir()
+	writeSettings(t, root, `{ not json`)
+	if todoWriteHookInstalled(root) {
+		t.Error("garbage settings.json must read as not-installed (fail-open)")
+	}
+
+	// end-to-end: what install-claude-hook --write actually produces IS detected
+	root = t.TempDir()
+	merged, _, err := mergeClaudeHook(root + "/.claude/settings.json")
+	if err != nil {
+		t.Fatalf("mergeClaudeHook: %v", err)
+	}
+	if err := os.MkdirAll(root+"/.claude", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(root+"/.claude/settings.json", merged, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !todoWriteHookInstalled(root) {
+		t.Error("hook written by mergeClaudeHook must be detected by todoWriteHookInstalled")
 	}
 }

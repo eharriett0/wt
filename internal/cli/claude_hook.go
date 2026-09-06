@@ -274,9 +274,10 @@ func claudeEditRanges(raw []byte, content string) ([]gitx.LineRange, bool) {
 	return ranges, true
 }
 
-// claudeHookSnippet is the .claude/settings.json entry that wires both hooks:
-// PreToolUse (per-edit collision check) + UserPromptSubmit (per-turn multi-window
-// awareness — overlaps + un-acked coordination holds/announcements).
+// claudeHookSnippet is the .claude/settings.json entry that wires all three hooks:
+// PreToolUse (per-edit collision check) + PostToolUse/TodoWrite (mirror each
+// window's TODO list so `wt todos` can show it) + UserPromptSubmit (per-turn
+// multi-window awareness — overlaps + un-acked coordination holds/announcements).
 const claudeHookSnippet = `{
   "hooks": {
     "PreToolUse": [
@@ -284,6 +285,14 @@ const claudeHookSnippet = `{
         "matcher": "Edit|Write|MultiEdit",
         "hooks": [
           { "type": "command", "command": "wt _hook claude-edit" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "TodoWrite",
+        "hooks": [
+          { "type": "command", "command": "wt _hook todo-write" }
         ]
       }
     ],
@@ -303,6 +312,12 @@ const claudeHookCommand = "wt _hook claude-edit"
 // awareness snapshot (shares hookAgentContext with codex-context).
 const claudeContextCommand = "wt _hook claude-context"
 
+// todoWriteCommand is the PostToolUse/TodoWrite hook that mirrors each window's
+// Claude Code TODO list into the wt todo store (the data source for `wt todos`).
+// Nothing wired it before #144, so `wt todos` was permanently empty even though
+// the recording hook (`wt _hook todo-write`) already existed.
+const todoWriteCommand = "wt _hook todo-write"
+
 // cmdInstallClaudeHook prints (or, with --write, merges) the PreToolUse hook
 // entry into the project's .claude/settings.json (#95).
 func cmdInstallClaudeHook(args []string) int {
@@ -315,10 +330,12 @@ func cmdInstallClaudeHook(args []string) int {
 	if !write {
 		ui.Info("add this to .claude/settings.json (project) so Claude Code gets multi-window collision awareness:")
 		ui.Info("  • PreToolUse — collision-check every agent edit (#95)")
+		ui.Info("  • PostToolUse — mirror each window's TodoWrite list so `wt todos` shows what every window is on")
 		ui.Info("  • UserPromptSubmit — per-turn snapshot of file overlaps + coordination holds/announcements")
 		fmt.Println(claudeHookSnippet)
-		ui.Info("or run `wt install-claude-hook --write` to merge both automatically")
+		ui.Info("or run `wt install-claude-hook --write` to merge all three automatically")
 		ui.Info("advisory by default; WT_CLAUDE_HOOK_BLOCK=1 makes a HIGH collision a hard deny; WT_SKIP_COLLISION=1 bypasses")
+		ui.Info("tip: set WT_MAX_AGE (e.g. 5d) to keep the per-turn hook from flagging stale/abandoned worktrees as HIGH")
 		return 0
 	}
 	return withConfig(func(c *config.Config) int {
@@ -329,7 +346,7 @@ func cmdInstallClaudeHook(args []string) int {
 			return 1
 		}
 		if !changed {
-			ui.OK("Claude Code hooks (PreToolUse + UserPromptSubmit) already wired in %s", path)
+			ui.OK("Claude Code hooks (PreToolUse + PostToolUse + UserPromptSubmit) already wired in %s", path)
 			return 0
 		}
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -340,16 +357,18 @@ func cmdInstallClaudeHook(args []string) int {
 			ui.Err("install-claude-hook: %v", err)
 			return 1
 		}
-		ui.OK("wired the Claude collision hooks (PreToolUse + UserPromptSubmit) into %s", path)
+		ui.OK("wired the Claude hooks (PreToolUse + PostToolUse + UserPromptSubmit) into %s", path)
 		ui.Info("advisory by default; WT_CLAUDE_HOOK_BLOCK=1 makes a HIGH collision a hard deny")
+		ui.Info("`wt todos` will populate once the agent uses the TodoWrite tool in a window")
 		return 0
 	})
 }
 
-// mergeClaudeHook reads .claude/settings.json (a fresh {} if absent), ensures a
-// PreToolUse Edit|Write|MultiEdit entry running our command is present WITHOUT
-// clobbering any existing hooks, and returns the pretty-printed result + whether
-// it changed. An unparseable file is a refuse (err) — never overwrite blind.
+// mergeClaudeHook reads .claude/settings.json (a fresh {} if absent), ensures the
+// PreToolUse (Edit|Write|MultiEdit), PostToolUse (TodoWrite) and UserPromptSubmit
+// entries running our commands are present WITHOUT clobbering any existing hooks,
+// and returns the pretty-printed result + whether it changed. An unparseable file
+// is a refuse (err) — never overwrite blind.
 func mergeClaudeHook(path string) (out []byte, changed bool, err error) {
 	root := map[string]any{}
 	if b, rerr := os.ReadFile(path); rerr == nil {
@@ -363,7 +382,8 @@ func mergeClaudeHook(path string) (out []byte, changed bool, err error) {
 	}
 	c1 := ensureHookEntry(hooks, "PreToolUse", "Edit|Write|MultiEdit", claudeHookCommand)
 	c2 := ensureHookEntry(hooks, "UserPromptSubmit", "", claudeContextCommand)
-	if !c1 && !c2 {
+	c3 := ensureHookEntry(hooks, "PostToolUse", "TodoWrite", todoWriteCommand)
+	if !c1 && !c2 && !c3 {
 		return nil, false, nil
 	}
 	root["hooks"] = hooks

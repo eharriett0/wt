@@ -17,6 +17,7 @@ func printHelp() {
 	fmt.Println(b(y("  ✦ COLLISION AWARENESS")) + d("  — the core: who's touching what, right now"))
 	fmt.Printf("    %s       %s\n", c("wt status [--json]"), "all windows + which files each is touching + graded overlaps  "+d("[--blocking] [--max-age D]"))
 	fmt.Printf("    %s             %s\n", c("wt todos"), "what every window is working on (mirrors each window's TODO list)")
+	fmt.Println("    " + d("fed by the ") + c("install-claude-hook") + d(" TodoWrite mirror — empty until that hook is wired AND the agent uses TodoWrite."))
 	fmt.Printf("    %s   %s\n", c("wt check <paths…>"), "before you edit: is anyone in these files? "+d("[--show-diff] [--json] [--blocking] [--max-age D]"))
 	fmt.Printf("    %s      %s\n", c("wt where <issue|branch>"), "print that window's worktree path — "+d("cd $(wt where 42)"))
 	fmt.Println("    " + d("HUNK-LEVEL: overlapping line ranges = ") + y("HIGH") + d(" (exit 3); same file but"))
@@ -74,7 +75,7 @@ func printHelp() {
 
 	fmt.Println(b("  ✦ SETUP"))
 	fmt.Printf("    %s        %s\n", c("wt install-hooks"), "install pre-push (base-branch guard) + pre-commit (collision notice)")
-	fmt.Printf("    %s %s\n", c("wt install-claude-hook"), "wire Claude Code hooks (per-edit collision-check + per-turn overlaps + coordination)  "+d("[--write]"))
+	fmt.Printf("    %s %s\n", c("wt install-claude-hook"), "wire Claude Code hooks (per-edit collision-check + TodoWrite mirror for `wt todos` + per-turn overlaps/coordination)  "+d("[--write]"))
 	fmt.Printf("    %s  %s\n", c("wt install-codex-hook"), "wire Codex hooks (per-turn + per-edit apply_patch) for multi-window collision awareness  "+d("[--write]"))
 	fmt.Printf("    %s                 %s\n", c("wt mcp"), "stdio MCP server exposing read-only tools (wt_status/check/todos/where) to any MCP client")
 	fmt.Printf("    %s              %s\n", c("wt doctor"), "check git/gh + all resolved config + structured-doc regex + coord-log health + preflight  "+d("[--json]"))
