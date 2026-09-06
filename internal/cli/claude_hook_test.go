@@ -311,11 +311,35 @@ func TestTodoWriteHookInstalled(t *testing.T) {
 		}
 	}
 
+	writeLocal := func(t *testing.T, root, body string) {
+		t.Helper()
+		if err := os.MkdirAll(root+"/.claude", 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(root+"/.claude/settings.local.json", []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	// the exact shape mergeClaudeHook writes → detected
 	root := t.TempDir()
 	writeSettings(t, root, `{"hooks":{"PostToolUse":[{"matcher":"TodoWrite","hooks":[{"type":"command","command":"wt _hook todo-write"}]}]}}`)
 	if !todoWriteHookInstalled(root) {
 		t.Error("wired todo-write hook not detected")
+	}
+
+	// #144-review F1: a path-qualified command is still the same hook → detected
+	root = t.TempDir()
+	writeSettings(t, root, `{"hooks":{"PostToolUse":[{"matcher":"TodoWrite","hooks":[{"type":"command","command":"/usr/local/bin/wt _hook todo-write"}]}]}}`)
+	if !todoWriteHookInstalled(root) {
+		t.Error("path-qualified todo-write command not detected")
+	}
+
+	// #144-review F5: hook wired only in settings.local.json (Claude Code merges it) → detected
+	root = t.TempDir()
+	writeLocal(t, root, `{"hooks":{"PostToolUse":[{"matcher":"TodoWrite","hooks":[{"type":"command","command":"wt _hook todo-write"}]}]}}`)
+	if !todoWriteHookInstalled(root) {
+		t.Error("todo-write hook in settings.local.json not detected")
 	}
 
 	// other wt hooks present but NOT todo-write → false (the misleading case #144 is about)

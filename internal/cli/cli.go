@@ -1202,15 +1202,28 @@ func hookTodoWrite(r io.Reader) int {
 }
 
 // todoWriteHookInstalled reports whether the Claude Code PostToolUse/TodoWrite
-// hook that feeds `wt todos` is wired in the project's .claude/settings.json
-// (the same file `install-claude-hook --write` merges into). It lets cmdTodos
-// distinguish an empty store's two causes — (a) the hook is not installed vs.
-// (b) it IS installed but no window has recorded a todo yet — instead of
-// asserting (a) as fact (#144). Fail-open to false: an unreadable/absent/
-// unparseable settings file ⇒ treat as not-installed, so the message stays the
+// hook that feeds `wt todos` is wired for the repo at root. It checks BOTH the
+// project settings.json and the (usually gitignored) settings.local.json that
+// Claude Code merges — the same files install-claude-hook --write targets — so a
+// hook kept in the local-overrides file isn't misreported as absent (#144). It
+// lets cmdTodos distinguish an empty store's two causes — (a) the hook is not
+// installed vs. (b) it IS installed but no window has recorded a todo yet —
+// instead of asserting (a) as fact. Fail-open to false: unreadable/absent/
+// unparseable settings ⇒ treat as not-installed, so the message stays the
 // actionable "wire the hook" one rather than a misleading "it's installed".
 func todoWriteHookInstalled(root string) bool {
-	b, err := os.ReadFile(filepath.Join(root, ".claude", "settings.json"))
+	for _, name := range []string{"settings.json", "settings.local.json"} {
+		if settingsWiresTodoWrite(filepath.Join(root, ".claude", name)) {
+			return true
+		}
+	}
+	return false
+}
+
+// settingsWiresTodoWrite reports whether a single Claude Code settings file wires
+// the todo-write hook. Fail-open to false on any read/parse error.
+func settingsWiresTodoWrite(path string) bool {
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return false
 	}
@@ -1224,12 +1237,13 @@ func todoWriteHookInstalled(root string) bool {
 	if err := json.Unmarshal(b, &doc); err != nil {
 		return false
 	}
-	// The command is unique to this hook, so a match under any event is
-	// unambiguous evidence it's wired (robust to a hand-placed entry).
+	// The `_hook todo-write` subcommand is unique to this hook, so a command
+	// carrying it under any event is unambiguous evidence it's wired — matched as
+	// a substring so a path-qualified `/usr/local/bin/wt _hook todo-write` counts.
 	for _, groups := range doc.Hooks {
 		for _, g := range groups {
 			for _, h := range g.Hooks {
-				if strings.TrimSpace(h.Command) == todoWriteCommand {
+				if strings.Contains(h.Command, "_hook todo-write") {
 					return true
 				}
 			}
@@ -1282,10 +1296,12 @@ func cmdTodos(args []string) int {
 				idle++
 				if *all {
 					fmt.Println(ui.Bold(w.Label()) + "  " + ui.Cyan(w.Branch))
-					if hookInstalled {
+					// Probe THIS window's own worktree: settings.json may be
+					// gitignored and present in one checkout but not another.
+					if todoWriteHookInstalled(w.Worktree) {
 						fmt.Println("   " + ui.Dim("(no TODO list recorded yet — the agent may not have used the TodoWrite tool)"))
 					} else {
-						fmt.Println("   " + ui.Dim("(no todos recorded — TodoWrite hook not installed; run `wt install-claude-hook --write`)"))
+						fmt.Println("   " + ui.Dim("(no todos recorded — TodoWrite hook not installed here; run `wt install-claude-hook --write`)"))
 					}
 					fmt.Println()
 				}
