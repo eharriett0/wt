@@ -1201,6 +1201,43 @@ func hookTodoWrite(r io.Reader) int {
 	return 0
 }
 
+// todoWriteHookInstalled reports whether the Claude Code PostToolUse/TodoWrite
+// hook that feeds `wt todos` is wired in the project's .claude/settings.json
+// (the same file `install-claude-hook --write` merges into). It lets cmdTodos
+// distinguish an empty store's two causes — (a) the hook is not installed vs.
+// (b) it IS installed but no window has recorded a todo yet — instead of
+// asserting (a) as fact (#144). Fail-open to false: an unreadable/absent/
+// unparseable settings file ⇒ treat as not-installed, so the message stays the
+// actionable "wire the hook" one rather than a misleading "it's installed".
+func todoWriteHookInstalled(root string) bool {
+	b, err := os.ReadFile(filepath.Join(root, ".claude", "settings.json"))
+	if err != nil {
+		return false
+	}
+	var doc struct {
+		Hooks map[string][]struct {
+			Hooks []struct {
+				Command string `json:"command"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(b, &doc); err != nil {
+		return false
+	}
+	// The command is unique to this hook, so a match under any event is
+	// unambiguous evidence it's wired (robust to a hand-placed entry).
+	for _, groups := range doc.Hooks {
+		for _, g := range groups {
+			for _, h := range g.Hooks {
+				if strings.TrimSpace(h.Command) == todoWriteCommand {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // cmdTodos shows what every window is currently working on, by joining each
 // live worktree (collide.Scan) with its mirrored Claude Code TODO list.
 func cmdTodos(args []string) int {
@@ -1235,6 +1272,8 @@ func cmdTodos(args []string) int {
 			return 0
 		}
 
+		hookInstalled := todoWriteHookInstalled(c.Root)
+
 		ui.Banner("wt todos — " + filepath.Base(c.Root) + " (" + fmt.Sprintf("%d window(s)", len(ws)) + ")")
 		recorded, idle := 0, 0
 		for _, w := range ws {
@@ -1243,7 +1282,11 @@ func cmdTodos(args []string) int {
 				idle++
 				if *all {
 					fmt.Println(ui.Bold(w.Label()) + "  " + ui.Cyan(w.Branch))
-					fmt.Println("   " + ui.Dim("(no todos recorded — hook not installed, or no TODO list yet)"))
+					if hookInstalled {
+						fmt.Println("   " + ui.Dim("(no TODO list recorded yet — the agent may not have used the TodoWrite tool)"))
+					} else {
+						fmt.Println("   " + ui.Dim("(no todos recorded — TodoWrite hook not installed; run `wt install-claude-hook --write`)"))
+					}
 					fmt.Println()
 				}
 				continue
@@ -1280,7 +1323,11 @@ func cmdTodos(args []string) int {
 			}
 		}
 		if recorded == 0 {
-			ui.Info("no todos recorded yet — install the Claude Code PostToolUse hook (`wt help`) so each window mirrors its TODO list.")
+			if hookInstalled {
+				ui.Info("no todos recorded yet — the TodoWrite hook (PostToolUse/TodoWrite) is installed but no window has recorded a todo; the agent session may not have the TodoWrite tool enabled.")
+			} else {
+				ui.Info("no todos recorded yet — wire the Claude Code TodoWrite hook with `wt install-claude-hook --write` so each window mirrors its TODO list.")
+			}
 		} else if idle > 0 && !*all {
 			ui.Info("+%d window(s) with no recorded TODO list (hidden) — `wt todos --all` to show them", idle)
 		}
