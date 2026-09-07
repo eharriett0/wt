@@ -117,6 +117,39 @@ func TestCoordContextMessage_NewestFirstAndAgeOut(t *testing.T) {
 	}
 }
 
+// #147 review (HIGH): `wt ack --all` must NEVER bulk-ack a HOLD — acking a hold
+// removes it from coord.Inbox and thus from the merge-main interlock, so a fresh
+// hold buried past the cap would be silently waived. bulkAckTargets keeps holds
+// out of the bulk-ack set and counts them as left-standing.
+func TestBulkAckTargets_ExcludesHolds(t *testing.T) {
+	box := []coord.Record{
+		{ID: "n1", Message: "note one"},
+		{ID: "h1", Hold: []string{"merge-main"}},
+		{ID: "n2", Message: "note two"},
+		{ID: "h2", Hold: []string{"rebase", "deploy"}},
+	}
+	notes, holdsLeft := bulkAckTargets(box)
+	if holdsLeft != 2 {
+		t.Errorf("holdsLeft = %d, want 2", holdsLeft)
+	}
+	if len(notes) != 2 || notes[0].ID != "n1" || notes[1].ID != "n2" {
+		t.Fatalf("notes = %+v, want the two plain announcements [n1 n2]", notes)
+	}
+	for _, n := range notes {
+		if len(n.Hold) > 0 {
+			t.Errorf("bulk-ack set must never contain a hold: %+v", n)
+		}
+	}
+	// all-holds inbox → nothing to bulk-ack, both held
+	if notes, holds := bulkAckTargets([]coord.Record{{ID: "h", Hold: []string{"x"}}}); len(notes) != 0 || holds != 1 {
+		t.Errorf("all-holds: notes=%v holds=%d, want [] and 1", notes, holds)
+	}
+	// empty inbox
+	if notes, holds := bulkAckTargets(nil); len(notes) != 0 || holds != 0 {
+		t.Errorf("empty: notes=%v holds=%d", notes, holds)
+	}
+}
+
 func TestParseCodexCwd(t *testing.T) {
 	if cwd, ok := parseCodexCwd([]byte(`{"cwd":"/repo","session_id":"x","prompt":"hi"}`)); !ok || cwd != "/repo" {
 		t.Errorf("valid: (%q,%v)", cwd, ok)

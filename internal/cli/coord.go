@@ -262,23 +262,52 @@ func cmdAck(args []string) int {
 	})
 }
 
-// ackAll acks every un-acked announcement in this window's inbox in one step —
-// the recovery path for a saturated coordination backlog (#147), where clearing
-// by hand would mean one `wt ack <id>` per stale record. Local-only: bulk-clearing
-// stale local noise must not spray N GitHub-mirror API calls (an all-clear on a
-// specific hold is still the way to release it cross-machine).
+// bulkAckTargets splits an inbox into the plain announcements `wt ack --all`
+// should clear and the count of HOLDs it must LEAVE STANDING. A hold is a
+// merge-main interlock: acking it removes it from coord.Inbox (which excludes
+// acked ids), so PendingHolds and the merge-pr gate stop seeing it. Silently
+// waiving a fresh hold the user never saw — the exact case ack --all exists for,
+// a hold buried past the 12-line cap — would defeat the very interlock wt exists
+// to protect (#147 review). Holds are cleared only by a deliberate `wt ack <id>`
+// or `wt all-clear <id>`. Pure.
+func bulkAckTargets(box []coord.Record) (notes []coord.Record, holdsLeft int) {
+	for _, a := range box {
+		if len(a.Hold) > 0 {
+			holdsLeft++
+			continue
+		}
+		notes = append(notes, a)
+	}
+	return notes, holdsLeft
+}
+
+// ackAll acks every un-acked PLAIN announcement in this window's inbox in one
+// step — the recovery path for a saturated coordination backlog (#147), where
+// clearing by hand would mean one `wt ack <id>` per stale record. HOLDs are left
+// standing (see bulkAckTargets). Local-only: bulk-clearing stale local noise must
+// not spray N GitHub-mirror API calls (an all-clear on a specific hold is still
+// the way to release it cross-machine).
 func ackAll(c *config.Config) int {
 	path, window := coordCtx(c)
 	local, _ := coord.Load(path)
 	recs := coord.MergeByID(local, remoteRecords(c.CoordIssue))
-	box := coord.Inbox(recs, window)
-	if len(box) == 0 {
-		ui.OK("inbox already clear — nothing to ack")
+	notes, holdsLeft := bulkAckTargets(coord.Inbox(recs, window))
+
+	heldNote := ""
+	if holdsLeft > 0 {
+		heldNote = fmt.Sprintf(" — %d hold(s) left standing (ack or all-clear each deliberately; `wt inbox`)", holdsLeft)
+	}
+	if len(notes) == 0 {
+		if holdsLeft > 0 {
+			ui.OK("no plain announcements to ack%s", heldNote)
+		} else {
+			ui.OK("inbox already clear — nothing to ack")
+		}
 		return 0
 	}
 	base := time.Now()
 	repo := mainRepoName(c)
-	for i, a := range box {
+	for i, a := range notes {
 		// Distinct, monotonically increasing IDs so MergeByID (in every reader's
 		// path) can never collapse two acks that target DIFFERENT announcements —
 		// NewID is UnixNano-base36, and a tight loop can outrun the clock.
@@ -296,7 +325,7 @@ func ackAll(c *config.Config) int {
 			return 1
 		}
 	}
-	ui.OK("acked %d announcement(s) — inbox clear", len(box))
+	ui.OK("acked %d announcement(s)%s", len(notes), heldNote)
 	return 0
 }
 
