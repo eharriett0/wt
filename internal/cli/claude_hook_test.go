@@ -301,6 +301,12 @@ func TestMergeClaudeHook_RefusesGarbage(t *testing.T) {
 // can distinguish an empty store's two causes (hook absent vs. installed-but-
 // never-fired) instead of asserting "hook not installed" as fact.
 func TestTodoWriteHookInstalled(t *testing.T) {
+	// Isolate from the real ~/.claude: point the user-level probe at a controlled
+	// dir (empty until the last case writes to it) so results depend only on what
+	// the test writes, not on this machine's actual config.
+	userCfg := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", userCfg)
+
 	writeSettings := func(t *testing.T, root, body string) {
 		t.Helper()
 		if err := os.MkdirAll(root+"/.claude", 0o755); err != nil {
@@ -373,5 +379,25 @@ func TestTodoWriteHookInstalled(t *testing.T) {
 	}
 	if !todoWriteHookInstalled(root) {
 		t.Error("hook written by mergeClaudeHook must be detected by todoWriteHookInstalled")
+	}
+
+	// #146: hook wired ONLY at the user level (CLAUDE_CONFIG_DIR / ~/.claude) is
+	// detected from a project root that lacks it — a machine-wide install counts,
+	// instead of being misreported as absent and prompting a duplicate.
+	if err := os.WriteFile(userCfg+"/settings.json", []byte(`{"hooks":{"PostToolUse":[{"matcher":"TodoWrite","hooks":[{"type":"command","command":"wt _hook todo-write"}]}]}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !todoWriteHookInstalled(t.TempDir()) {
+		t.Error("user-level (CLAUDE_CONFIG_DIR) todo-write hook not detected for a project without it")
+	}
+	// user-level settings.local.json also counts
+	if err := os.Remove(userCfg + "/settings.json"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(userCfg+"/settings.local.json", []byte(`{"hooks":{"PostToolUse":[{"matcher":"TodoWrite","hooks":[{"type":"command","command":"wt _hook todo-write"}]}]}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !todoWriteHookInstalled(t.TempDir()) {
+		t.Error("user-level settings.local.json todo-write hook not detected")
 	}
 }
