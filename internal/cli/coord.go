@@ -429,10 +429,17 @@ func cmdPruneCoord(args []string) int {
 			ui.Err("prune failed: %v", err)
 			return 1
 		}
+		// #152: block reservations live in per-file ledgers now — GC those too, or
+		// they'd grow append-only forever (the per-repo PruneLog never sees them).
+		if home, herr := os.UserHomeDir(); herr == nil && home != "" {
+			if bd, berr := coord.PruneBlockLedgers(home, time.Now(), dur); berr == nil {
+				dropped += bd
+			}
+		}
 		if dropped == 0 {
 			ui.OK("coordination log already tidy — nothing to prune")
 		} else {
-			ui.OK("pruned %d resolved/expired record(s) from the coordination log", dropped)
+			ui.OK("pruned %d resolved/expired record(s) from the coordination log + block ledgers", dropped)
 		}
 		return 0
 	})

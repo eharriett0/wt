@@ -6,6 +6,28 @@ import (
 	"testing"
 )
 
+// #152 review: the ledger key must be symlink-resolved so a per-repo symlink into
+// a shared doc keys the SAME ledger as its real path (else the cross-repo fix fails).
+func TestCanonicalFilePath(t *testing.T) {
+	real := t.TempDir()
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	// existing file reached via the symlink and via the real path → same canonical
+	f := filepath.Join(real, "resume.md")
+	if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if via, direct := canonicalFilePath(filepath.Join(link, "resume.md")), canonicalFilePath(f); via != direct {
+		t.Errorf("symlink and real path must canonicalize equal:\n  via link: %q\n  direct:   %q", via, direct)
+	}
+	// a NOT-yet-existing file (first reserve) under the symlinked dir also matches
+	if via, direct := canonicalFilePath(filepath.Join(link, "new.md")), canonicalFilePath(filepath.Join(real, "new.md")); via != direct {
+		t.Errorf("not-yet-existing file must canonicalize equal:\n  via link: %q\n  direct:   %q", via, direct)
+	}
+}
+
 // #152: fileHasBlock is the "is this block actually written" check --written uses
 // so it can't clear a reservation for a block that isn't in the file.
 func TestFileHasBlock(t *testing.T) {

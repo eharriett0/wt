@@ -370,6 +370,12 @@ func PruneRecords(recs []Record, now time.Time, blockMaxAge time.Duration) (kept
 // -> PruneRecords -> rewrite the file with only the survivors. Returns how many
 // records were dropped. A missing/empty log is a no-op.
 func PruneLog(path string, now time.Time, blockMaxAge time.Duration) (dropped int, err error) {
+	// MkdirAll the parent (like Append): O_CREATE makes the file but not the dir,
+	// and a block-only repo may never have created ~/.wt/coordination/ (its block
+	// records live in the per-file ledgers now, #152) — pruning must not error there.
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return 0, err
+	}
 	lf, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return 0, err
@@ -609,6 +615,32 @@ func BlockLedgerPath(home, absFile string) string {
 	sum := sha256.Sum256([]byte(absFile))
 	name := slug(filepath.Base(absFile)) + "-" + hex.EncodeToString(sum[:])[:12] + ".jsonl"
 	return filepath.Join(BlocksDir(home), name)
+}
+
+// PruneBlockLedgers GCs every per-file block ledger under home (#152 review): the
+// same age-based drop PruneLog applies to the per-repo log, applied to each ledger,
+// so relocating block records to ledgers didn't strand them beyond the #33/#35 GC
+// (each written or aged-out reservation is dropped). Returns total records dropped.
+// Missing dir → (0, nil); a per-ledger error stops and returns what was dropped.
+func PruneBlockLedgers(home string, now time.Time, blockMaxAge time.Duration) (dropped int, err error) {
+	entries, rerr := os.ReadDir(BlocksDir(home))
+	if rerr != nil {
+		if os.IsNotExist(rerr) {
+			return 0, nil
+		}
+		return 0, rerr
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		d, perr := PruneLog(filepath.Join(BlocksDir(home), e.Name()), now, blockMaxAge)
+		if perr != nil {
+			return dropped, perr
+		}
+		dropped += d
+	}
+	return dropped, nil
 }
 
 // LoadBlockLedgers reads every per-file block ledger this machine has coordinated

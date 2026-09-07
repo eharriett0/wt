@@ -92,6 +92,39 @@ func fileHasBlock(file string, re *regexp.Regexp, n int) (bool, error) {
 	return false, sc.Err()
 }
 
+// canonicalFilePath resolves file to a STABLE absolute identity for keying the
+// per-file block ledger (#152 review): symlinks are resolved so a per-repo symlink
+// into a shared doc — the canonical way to share ONE append-log across repos —
+// maps to the SAME ledger as the doc's real path. Without this, two windows would
+// key different ledgers off the different symlink paths and re-collide. The
+// append-log may not exist yet on the first reserve, so EvalSymlinks the deepest
+// EXISTING ancestor and re-join the not-yet-existing tail (the house style used by
+// repoRelativePath / collide / worktree). Falls back to a lexical Abs on error.
+// Caveat: on case-insensitive volumes, paths differing only in case still key
+// different ledgers — reference the file by one consistent path across windows.
+func canonicalFilePath(file string) string {
+	abs, err := filepath.Abs(file)
+	if err != nil || abs == "" {
+		return file
+	}
+	unresolved := ""
+	cur := abs
+	for {
+		if resolved, rerr := filepath.EvalSymlinks(cur); rerr == nil {
+			if unresolved == "" {
+				return resolved
+			}
+			return filepath.Join(resolved, unresolved)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return abs // reached root with nothing resolvable (shouldn't happen)
+		}
+		unresolved = filepath.Join(filepath.Base(cur), unresolved)
+		cur = parent
+	}
+}
+
 // cmdBlockID implements `wt block-id <file> [--pattern P] [--format]`.
 func cmdBlockID(args []string) int {
 	if code, done := guardHelp(args, `usage: wt block-id <file> [--pattern "NEWEST-{n}"] [--format] [--written N]`); done {
@@ -118,14 +151,11 @@ func cmdBlockID(args []string) int {
 		ui.Err("%v", err)
 		return 64
 	}
-	// Canonical key: absolute path. The resume memory doc lives at ONE shared
-	// location, so every window (in any worktree) abspaths to the same key and
-	// coordinates on the same N-space via the shared per-repo log. Fall back to
-	// the given path if Abs fails (never blocks the allocation).
-	absFile := file
-	if a, aerr := filepath.Abs(file); aerr == nil {
-		absFile = a
-	}
+	// Canonical key: symlink-resolved absolute path (#152). The shared append-log
+	// lives at ONE real location; every window (any repo, any worktree, reached via
+	// a symlink or not) must resolve it to the SAME key so they coordinate on one
+	// per-file ledger. See canonicalFilePath.
+	absFile := canonicalFilePath(file)
 	return withConfig(func(c *config.Config) int {
 		path, window := coordCtx(c)
 		// block-id coordinates on the shared FILE, not the repo: use a per-file
@@ -215,7 +245,7 @@ func blockReservationBanner(c *config.Config) {
 	if len(res) == 0 {
 		return
 	}
-	ui.Banner(fmt.Sprintf("%d recent block-id reservation(s) from another window — a prepend may be imminent", len(res)))
+	ui.Banner(fmt.Sprintf("%d recent block-id reservation(s) from another window (any repo — reservations are per shared file) — a prepend may be imminent", len(res)))
 	for _, r := range res {
 		fmt.Fprintf(os.Stderr, "  %s reserved block %s on %s  %s\n",
 			ui.Cyan(r.Window), ui.Bold(strconv.Itoa(r.Block)),

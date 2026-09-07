@@ -27,6 +27,38 @@ func TestBlockLedgerPath(t *testing.T) {
 	}
 }
 
+// #152 review: block records moved to per-file ledgers, so prune-coord must GC the
+// ledgers too — else they grow append-only forever (the #33/#35 GC regression).
+func TestPruneBlockLedgers(t *testing.T) {
+	home := t.TempDir()
+	f := "/a/x.md"
+	p := BlockLedgerPath(home, f)
+	old := time.Now().Add(-48 * time.Hour)
+	fresh := time.Now()
+	for _, r := range []Record{
+		{ID: NewID(old), TS: old.UTC().Format(time.RFC3339), Window: "w", Kind: KindBlockReserve, File: f, Block: 1},     // aged out
+		{ID: NewID(fresh), TS: fresh.UTC().Format(time.RFC3339), Window: "w", Kind: KindBlockReserve, File: f, Block: 2}, // fresh
+	} {
+		if err := Append(p, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dropped, err := PruneBlockLedgers(home, time.Now(), 24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dropped != 1 {
+		t.Errorf("dropped = %d, want 1 (the 48h-old reservation)", dropped)
+	}
+	if recs := LoadBlockLedgers(home); len(recs) != 1 || recs[0].Block != 2 {
+		t.Errorf("survivors = %+v, want only fresh block 2", recs)
+	}
+	// missing dir → (0, nil)
+	if d, err := PruneBlockLedgers(filepath.Join(t.TempDir(), "nope"), time.Now(), 24*time.Hour); d != 0 || err != nil {
+		t.Errorf("missing dir: d=%d err=%v", d, err)
+	}
+}
+
 func TestLoadBlockLedgers(t *testing.T) {
 	home := t.TempDir()
 	for i, f := range []string{"/a/x.md", "/b/y.md"} {
