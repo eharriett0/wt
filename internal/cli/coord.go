@@ -175,6 +175,11 @@ func cmdInbox(args []string) int {
 			recs = coord.MergeByID(recs, remoteRecords(iss))
 		}
 		box := coord.Inbox(recs, window)
+		// newest-first: a fresh announcement is always at the top, never buried
+		// under a deep backlog of old un-acked records (#147).
+		for i, j := 0, len(box)-1; i < j; i, j = i+1, j-1 {
+			box[i], box[j] = box[j], box[i]
+		}
 		if *asJSON {
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
@@ -203,18 +208,22 @@ func cmdInbox(args []string) int {
 }
 
 func cmdAck(args []string) int {
-	if code, done := guardHelp(args, `usage: wt ack <id> [--state "<current-state>"] [--file <path>]`); done {
+	if code, done := guardHelp(args, `usage: wt ack <id> [--state "<current-state>"] [--file <path>]  |  wt ack --all`); done {
 		return code
 	}
 	fs := flag.NewFlagSet("ack", flag.ContinueOnError)
 	state := fs.String("state", "", "one-line report of what THIS window is currently touching")
 	file := fs.String("file", "", "read --state from a file (or - for stdin) instead of the flag — opaque to the shell (#75)")
+	all := fs.Bool("all", false, "ack EVERY un-acked announcement from other windows in one step — clears a saturated backlog (#147)")
 	pos, _, err := parseInterspersed(fs, args)
 	if err != nil {
 		return 64
 	}
+	if *all {
+		return withConfig(ackAll)
+	}
 	if len(pos) < 1 {
-		ui.Err("usage: wt ack <id> [--state \"<current-state>\"] [--file <path>]")
+		ui.Err("usage: wt ack <id> [--state \"<current-state>\"] [--file <path>]  (or `wt ack --all` to clear the whole backlog)")
 		return 64
 	}
 	id := pos[0]
@@ -251,6 +260,44 @@ func cmdAck(args []string) int {
 		mirror(iss, r, fmt.Sprintf("✅ **wt ack** of `%s` — window `%s`%s", id, window, stateLine(r.State)))
 		return 0
 	})
+}
+
+// ackAll acks every un-acked announcement in this window's inbox in one step —
+// the recovery path for a saturated coordination backlog (#147), where clearing
+// by hand would mean one `wt ack <id>` per stale record. Local-only: bulk-clearing
+// stale local noise must not spray N GitHub-mirror API calls (an all-clear on a
+// specific hold is still the way to release it cross-machine).
+func ackAll(c *config.Config) int {
+	path, window := coordCtx(c)
+	local, _ := coord.Load(path)
+	recs := coord.MergeByID(local, remoteRecords(c.CoordIssue))
+	box := coord.Inbox(recs, window)
+	if len(box) == 0 {
+		ui.OK("inbox already clear — nothing to ack")
+		return 0
+	}
+	base := time.Now()
+	repo := mainRepoName(c)
+	for i, a := range box {
+		// Distinct, monotonically increasing IDs so MergeByID (in every reader's
+		// path) can never collapse two acks that target DIFFERENT announcements —
+		// NewID is UnixNano-base36, and a tight loop can outrun the clock.
+		t := base.Add(time.Duration(i))
+		r := coord.Record{
+			ID:     coord.NewID(t),
+			TS:     t.UTC().Format(time.RFC3339),
+			Window: window,
+			Repo:   repo,
+			Kind:   coord.KindAck,
+			AckOf:  a.ID,
+		}
+		if err := coord.Append(path, r); err != nil {
+			ui.Err("could not write coordination log after %d ack(s): %v", i, err)
+			return 1
+		}
+	}
+	ui.OK("acked %d announcement(s) — inbox clear", len(box))
+	return 0
 }
 
 func cmdAllClear(args []string) int {

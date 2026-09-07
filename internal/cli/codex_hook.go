@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/eharriett0/wt/internal/collide"
 	"github.com/eharriett0/wt/internal/config"
@@ -152,7 +153,7 @@ func hookAgentContext(r io.Reader) int {
 	// Fail-open: a coord read error just omits this block (never breaks the turn).
 	if logPath, self := coordCtx(c); logPath != "" {
 		if recs, rerr := coord.Load(logPath); rerr == nil {
-			if msg, has := coordContextMessage(coord.Inbox(recs, self)); has {
+			if msg, has := coordContextMessage(coord.Inbox(recs, self), c.MaxAge, time.Now()); has {
 				parts = append(parts, msg)
 			}
 		}
@@ -166,11 +167,25 @@ func hookAgentContext(r io.Reader) int {
 // coordContextMessage renders the un-acked coordination signals from OTHER
 // windows for the per-turn context: active HOLDS (an op another window asked you
 // to avoid until all-clear) + plain announcements. inbox is already self-excluded
-// and un-acked (coord.Inbox). Holds come first (they survive the cap); the full
-// record id is shown so `wt ack <id>` copy-pastes. Pure; has=false when empty.
-func coordContextMessage(inbox []coord.Record) (msg string, has bool) {
+// and un-acked (coord.Inbox), arriving OLDEST-first (log order).
+//
+// NEWEST-first delivery (#147): a fresh announcement must always be visible even
+// when a window's backlog is deep. Oldest-first + a 12-line cap meant that once a
+// window's un-acked count passed the cap, every NEW announcement sorted past the
+// visible window forever. We reverse to newest-first so the cap drops the OLDEST,
+// not the newest. Holds still come first (they survive the cap) and, within each
+// group, newest-first. Stale plain announcements are also aged out of DELIVERY
+// when maxAge>0 (they remain in `wt inbox`) so a roll that finished weeks ago
+// can't keep poisoning every turn's context; holds are never aged out (an
+// un-cleared hold is a standing safety request). Pure; has=false when empty.
+func coordContextMessage(inbox []coord.Record, maxAge time.Duration, now time.Time) (msg string, has bool) {
+	// reverse to newest-first (inbox is oldest-first log order)
+	ordered := make([]coord.Record, len(inbox))
+	for i, r := range inbox {
+		ordered[len(inbox)-1-i] = r
+	}
 	var holds, notes []string
-	for _, r := range inbox {
+	for _, r := range ordered {
 		who := r.Window
 		if who == "" {
 			who = "another window"
@@ -181,9 +196,12 @@ func coordContextMessage(inbox []coord.Record) (msg string, has bool) {
 		}
 		if len(r.Hold) > 0 {
 			holds = append(holds, fmt.Sprintf("  ⚠ HOLD %s [%s]%s (wt ack %s)", who, strings.Join(r.Hold, ","), suffix, r.ID))
-		} else {
-			notes = append(notes, fmt.Sprintf("  %s%s (wt ack %s)", who, suffix, r.ID))
+			continue
 		}
+		if maxAge > 0 && coord.Age(r, now) > maxAge {
+			continue // stale plain announcement — drop from delivery (still in `wt inbox`)
+		}
+		notes = append(notes, fmt.Sprintf("  %s%s (wt ack %s)", who, suffix, r.ID))
 	}
 	if len(holds) == 0 && len(notes) == 0 {
 		return "", false
@@ -192,11 +210,12 @@ func coordContextMessage(inbox []coord.Record) (msg string, has bool) {
 	lines = append(lines, notes...)
 	if len(lines) > codexMaxOverlapLines {
 		extra := len(lines) - codexMaxOverlapLines
-		lines = append(lines[:codexMaxOverlapLines:codexMaxOverlapLines], fmt.Sprintf("  …and %d more", extra))
+		lines = append(lines[:codexMaxOverlapLines:codexMaxOverlapLines],
+			fmt.Sprintf("  …and %d older not shown (newest %d shown; `wt inbox` for all, `wt ack --all` to clear)", extra, codexMaxOverlapLines))
 	}
 	msg = "wt coordination — un-acked signals from other windows (respect any HOLD before that op):\n" +
 		strings.Join(lines, "\n") +
-		"\nSee `wt inbox` for detail; `wt ack <id>` to acknowledge. (Set WT_SKIP_COLLISION=1 to silence.)"
+		"\nSee `wt inbox` for detail; `wt ack <id>` to acknowledge (`wt ack --all` clears the backlog). (Set WT_SKIP_COLLISION=1 to silence.)"
 	return msg, true
 }
 
