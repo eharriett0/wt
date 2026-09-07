@@ -1202,22 +1202,45 @@ func hookTodoWrite(r io.Reader) int {
 }
 
 // todoWriteHookInstalled reports whether the Claude Code PostToolUse/TodoWrite
-// hook that feeds `wt todos` is wired for the repo at root. It checks BOTH the
-// project settings.json and the (usually gitignored) settings.local.json that
-// Claude Code merges — the same files install-claude-hook --write targets — so a
-// hook kept in the local-overrides file isn't misreported as absent (#144). It
-// lets cmdTodos distinguish an empty store's two causes — (a) the hook is not
-// installed vs. (b) it IS installed but no window has recorded a todo yet —
-// instead of asserting (a) as fact. Fail-open to false: unreadable/absent/
+// hook that feeds `wt todos` is wired for the repo at root, across EVERY location
+// Claude Code merges settings from: the user-level config dir ($CLAUDE_CONFIG_DIR
+// or ~/.claude) AND the project's .claude — each as settings.json +
+// settings.local.json. A machine-wide hook wired once at the user level (the
+// natural place for a hook you want in every repo) therefore counts, instead of
+// being misreported as absent and prompting a duplicate project-level install
+// (#146). It lets cmdTodos distinguish an empty store's two causes — (a) the hook
+// is not installed vs. (b) it IS installed but no window has recorded a todo yet —
+// instead of asserting (a) as fact (#144). Fail-open to false: unreadable/absent/
 // unparseable settings ⇒ treat as not-installed, so the message stays the
 // actionable "wire the hook" one rather than a misleading "it's installed".
 func todoWriteHookInstalled(root string) bool {
-	for _, name := range []string{"settings.json", "settings.local.json"} {
-		if settingsWiresTodoWrite(filepath.Join(root, ".claude", name)) {
-			return true
+	dirs := []string{filepath.Join(root, ".claude")}
+	if ucd := claudeUserConfigDir(); ucd != "" {
+		dirs = append(dirs, ucd)
+	}
+	for _, dir := range dirs {
+		for _, name := range []string{"settings.json", "settings.local.json"} {
+			if settingsWiresTodoWrite(filepath.Join(dir, name)) {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+// claudeUserConfigDir returns Claude Code's user-level config directory —
+// $CLAUDE_CONFIG_DIR when set (a relocated config dir), else ~/.claude. This is
+// where a hook you want in every repo on the machine is wired. "" when neither is
+// resolvable (home dir unknown), which the caller treats as "no user-level file".
+func claudeUserConfigDir() string {
+	if d := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")); d != "" {
+		return d
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".claude")
 }
 
 // settingsWiresTodoWrite reports whether a single Claude Code settings file wires
