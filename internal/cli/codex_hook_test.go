@@ -98,6 +98,31 @@ func TestCoordContextMessage_ShortNotesAllShown(t *testing.T) {
 	if !strings.Contains(msg, "HOLD w0") {
 		t.Errorf("the hold must be present (holds first): %q", msg)
 	}
+	// #150 review F2: the size is shown even when nothing dropped (cost always visible)
+	if !strings.Contains(msg, "shown, ~") || !strings.Contains(msg, "KB)") {
+		t.Errorf("cost (N shown, ~X KB) must be visible even in the no-drop case: %q", msg)
+	}
+}
+
+// #150 review F3: holds are always delivered (safety) and are NOT budget-gated —
+// even a set of holds large enough to exceed the byte budget is fully shown.
+func TestCoordContextMessage_HoldsAlwaysDelivered(t *testing.T) {
+	var inbox []coord.Record
+	for i := 0; i < 30; i++ { // 30 holds × ~330B truncated > 8KB budget
+		inbox = append(inbox, coord.Record{
+			ID: fmt.Sprintf("h%02d", i), Window: fmt.Sprintf("w%02d", i),
+			Hold: []string{"merge-main"}, Message: fmt.Sprintf("HOLDMARK%02d ", i) + strings.Repeat("z", 500),
+		})
+	}
+	msg, has := coordContextMessage(inbox, 0, time.Now())
+	if !has {
+		t.Fatal("expected a message")
+	}
+	for i := 0; i < 30; i++ {
+		if !strings.Contains(msg, fmt.Sprintf("HOLDMARK%02d", i)) {
+			t.Errorf("hold %d dropped — holds must always be delivered regardless of budget", i)
+		}
+	}
 }
 
 func TestTruncateMessage(t *testing.T) {

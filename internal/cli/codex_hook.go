@@ -172,10 +172,13 @@ func hookAgentContext(r io.Reader) int {
 // stays in `wt inbox`.
 const coordMaxEntryChars = 300
 
-// coordMaxInjectBytes is a hard ceiling on the whole coordination injection (#150)
-// so the per-turn cost is bounded regardless of how many announcements or how
-// verbose. Entries are added NEWEST-first and the budget drops the OLDEST — never
-// the newest (that would recreate #147).
+// coordMaxInjectBytes bounds the coordination injection (#150) so the per-turn
+// cost is capped regardless of how many announcements or how verbose. It covers
+// the entry lines PLUS the fixed header/footer framing (seeded into the running
+// total below); the single trailing summary line (~110B) is the only unbudgeted
+// part. Entries are added NEWEST-first and the budget drops the OLDEST notes —
+// never the newest (that would recreate #147). Holds are always delivered
+// (safety) and are not budget-gated.
 const coordMaxInjectBytes = 8192
 
 // truncateMessage caps an announcement's free-text to coordMaxEntryChars runes,
@@ -239,13 +242,18 @@ func coordContextMessage(inbox []coord.Record, maxAge time.Duration, now time.Ti
 		return "", false
 	}
 
+	// header/footer are fixed framing; seed the running total with them so the byte
+	// budget bounds the WHOLE injection, not just the entry lines (#150 review).
+	const header = "wt coordination — un-acked signals from other windows (respect any HOLD before that op):"
+	const footer = "See `wt inbox` for detail; `wt ack <id>` to acknowledge (`wt ack --all` clears the backlog). (Set WT_SKIP_COLLISION=1 to silence.)"
+
 	// Assemble under the byte budget, newest-first. Holds are always included;
 	// notes fill the remaining budget (the newest note is always kept even if it
 	// alone would exceed — dropping the newest would recreate #147). Dropped =
 	// oldest notes.
-	shown := append([]string{}, holds...)
-	used := 0
-	for _, l := range shown {
+	body := append([]string{}, holds...)
+	used := len(header) + len(footer) + 2 // + the two newlines joining header/body/footer
+	for _, l := range holds {
 		used += len(l) + 1
 	}
 	kept := 0
@@ -253,17 +261,20 @@ func coordContextMessage(inbox []coord.Record, maxAge time.Duration, now time.Ti
 		if kept > 0 && used+len(l)+1 > coordMaxInjectBytes {
 			break
 		}
-		shown = append(shown, l)
+		body = append(body, l)
 		used += len(l) + 1
 		kept++
 	}
+	// The summary ALWAYS names count + size so the per-turn cost is visible (#150
+	// review), with the dropped-count clause when the budget dropped older notes.
+	shownCount := len(holds) + kept
 	if dropped := len(notes) - kept; dropped > 0 {
-		shown = append(shown, fmt.Sprintf("  …and %d older not shown (%d shown, ~%.1f KB; `wt inbox` for all, `wt ack --all` to clear)",
-			dropped, len(holds)+kept, float64(used)/1024))
+		body = append(body, fmt.Sprintf("  …and %d older not shown (%d shown, ~%.1f KB; `wt inbox` for all, `wt ack --all` to clear)",
+			dropped, shownCount, float64(used)/1024))
+	} else {
+		body = append(body, fmt.Sprintf("  (%d shown, ~%.1f KB)", shownCount, float64(used)/1024))
 	}
-	msg = "wt coordination — un-acked signals from other windows (respect any HOLD before that op):\n" +
-		strings.Join(shown, "\n") +
-		"\nSee `wt inbox` for detail; `wt ack <id>` to acknowledge (`wt ack --all` clears the backlog). (Set WT_SKIP_COLLISION=1 to silence.)"
+	msg = header + "\n" + strings.Join(body, "\n") + "\n" + footer
 	return msg, true
 }
 
