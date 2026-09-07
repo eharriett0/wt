@@ -164,58 +164,117 @@ func hookAgentContext(r io.Reader) int {
 	return 0
 }
 
+// coordMaxEntryChars caps a single announcement's free-text in the per-turn hook
+// (#150). Newest-first (#147) surfaces the verbose CURRENT announcements, which
+// un-truncated ballooned the injection ~5x (9KB → 44KB) — charged to every
+// window's context budget every turn. The first ~300 chars (roughly the first
+// sentence) almost always decide whether the reader needs the rest; the full text
+// stays in `wt inbox`.
+const coordMaxEntryChars = 300
+
+// coordMaxInjectBytes bounds the coordination injection (#150) so the per-turn
+// cost is capped regardless of how many announcements or how verbose. It covers
+// the entry lines PLUS the fixed header/footer framing (seeded into the running
+// total below); the single trailing summary line (~110B) is the only unbudgeted
+// part. Entries are added NEWEST-first and the budget drops the OLDEST notes —
+// never the newest (that would recreate #147). Holds are always delivered
+// (safety) and are not budget-gated.
+const coordMaxInjectBytes = 8192
+
+// truncateMessage caps an announcement's free-text to coordMaxEntryChars runes,
+// appending a marker pointing at `wt inbox` for the full text (#150). Pure.
+func truncateMessage(m string) string {
+	m = strings.TrimSpace(m)
+	r := []rune(m)
+	if len(r) <= coordMaxEntryChars {
+		return m
+	}
+	return strings.TrimSpace(string(r[:coordMaxEntryChars])) + "… (truncated — `wt inbox` for full)"
+}
+
 // coordContextMessage renders the un-acked coordination signals from OTHER
 // windows for the per-turn context: active HOLDS (an op another window asked you
 // to avoid until all-clear) + plain announcements. inbox is already self-excluded
 // and un-acked (coord.Inbox), arriving OLDEST-first (log order).
 //
 // NEWEST-first delivery (#147): a fresh announcement must always be visible even
-// when a window's backlog is deep. Oldest-first + a 12-line cap meant that once a
-// window's un-acked count passed the cap, every NEW announcement sorted past the
-// visible window forever. We reverse to newest-first so the cap drops the OLDEST,
-// not the newest. Holds still come first (they survive the cap) and, within each
-// group, newest-first. Stale plain announcements are also aged out of DELIVERY
-// when maxAge>0 (they remain in `wt inbox`) so a roll that finished weeks ago
-// can't keep poisoning every turn's context; holds are never aged out (an
-// un-cleared hold is a standing safety request). Pure; has=false when empty.
+// when a window's backlog is deep. Holds come first (always delivered, never aged
+// out — an un-cleared hold is a standing safety request); plain announcements are
+// aged out of delivery when maxAge>0 (they remain in `wt inbox`).
+//
+// Bounded cost (#150): each entry's free-text is truncated (coordMaxEntryChars)
+// and the whole injection is held under a byte budget (coordMaxInjectBytes),
+// filled newest-first so the OLDEST notes drop, never the newest. Holds are always
+// included; notes fill the remaining budget. The summary line names the count and
+// the size so the cost is visible. Pure; has=false when empty.
 func coordContextMessage(inbox []coord.Record, maxAge time.Duration, now time.Time) (msg string, has bool) {
 	// reverse to newest-first (inbox is oldest-first log order)
 	ordered := make([]coord.Record, len(inbox))
 	for i, r := range inbox {
 		ordered[len(inbox)-1-i] = r
 	}
-	var holds, notes []string
-	for _, r := range ordered {
+	render := func(r coord.Record) string {
 		who := r.Window
 		if who == "" {
 			who = "another window"
 		}
 		suffix := ""
-		if m := strings.TrimSpace(r.Message); m != "" {
+		if m := truncateMessage(r.Message); m != "" {
 			suffix = " — " + m
 		}
 		if len(r.Hold) > 0 {
-			holds = append(holds, fmt.Sprintf("  ⚠ HOLD %s [%s]%s (wt ack %s)", who, strings.Join(r.Hold, ","), suffix, r.ID))
+			return fmt.Sprintf("  ⚠ HOLD %s [%s]%s (wt ack %s)", who, strings.Join(r.Hold, ","), suffix, r.ID)
+		}
+		return fmt.Sprintf("  %s%s (wt ack %s)", who, suffix, r.ID)
+	}
+	var holds, notes []string
+	for _, r := range ordered {
+		if len(r.Hold) > 0 {
+			holds = append(holds, render(r))
 			continue
 		}
 		if maxAge > 0 && coord.Age(r, now) > maxAge {
 			continue // stale plain announcement — drop from delivery (still in `wt inbox`)
 		}
-		notes = append(notes, fmt.Sprintf("  %s%s (wt ack %s)", who, suffix, r.ID))
+		notes = append(notes, render(r))
 	}
 	if len(holds) == 0 && len(notes) == 0 {
 		return "", false
 	}
-	lines := append([]string{}, holds...)
-	lines = append(lines, notes...)
-	if len(lines) > codexMaxOverlapLines {
-		extra := len(lines) - codexMaxOverlapLines
-		lines = append(lines[:codexMaxOverlapLines:codexMaxOverlapLines],
-			fmt.Sprintf("  …and %d older not shown (newest %d shown; `wt inbox` for all, `wt ack --all` to clear)", extra, codexMaxOverlapLines))
+
+	// header/footer are fixed framing; seed the running total with them so the byte
+	// budget bounds the WHOLE injection, not just the entry lines (#150 review).
+	const header = "wt coordination — un-acked signals from other windows (respect any HOLD before that op):"
+	const footer = "See `wt inbox` for detail; `wt ack <id>` to acknowledge (`wt ack --all` clears the backlog). (Set WT_SKIP_COLLISION=1 to silence.)"
+
+	// Assemble under the byte budget, newest-first. Holds are always included;
+	// notes fill the remaining budget (the newest note is always kept even if it
+	// alone would exceed — dropping the newest would recreate #147). Dropped =
+	// oldest notes.
+	body := append([]string{}, holds...)
+	used := len(header) + len(footer) + 2 // + the two newlines joining header/body/footer
+	for _, l := range holds {
+		used += len(l) + 1
 	}
-	msg = "wt coordination — un-acked signals from other windows (respect any HOLD before that op):\n" +
-		strings.Join(lines, "\n") +
-		"\nSee `wt inbox` for detail; `wt ack <id>` to acknowledge (`wt ack --all` clears the backlog). (Set WT_SKIP_COLLISION=1 to silence.)"
+	kept := 0
+	for _, l := range notes {
+		if kept > 0 && used+len(l)+1 > coordMaxInjectBytes {
+			break
+		}
+		body = append(body, l)
+		used += len(l) + 1
+		kept++
+	}
+	// The summary ALWAYS names count + size so the per-turn cost is visible (#150
+	// review), with the dropped-count clause when the budget dropped older notes.
+	shownCount := len(holds) + kept
+	if dropped := len(notes) - kept; dropped > 0 {
+		body = append(body, fmt.Sprintf("  …and %d older not shown (%d shown, ~%.1f KB; `wt inbox` for all, `wt ack --all` to clear)",
+			dropped, shownCount, float64(used)/1024))
+	} else {
+		body = append(body, fmt.Sprintf("  (%d shown, ~%.1f KB)", shownCount, float64(used)/1024))
+	}
+	msg = header + "\n" + strings.Join(body, "\n") + "\n" + footer
 	return msg, true
 }
 
