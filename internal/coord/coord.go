@@ -14,6 +14,8 @@ package coord
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -591,4 +593,40 @@ func ReserveBlock(path string, r Record, file string, fileMax func() (int, error
 		return Record{}, err
 	}
 	return r, nil
+}
+
+// BlocksDir is where per-file block-id ledgers live under ~/.wt.
+func BlocksDir(home string) string { return filepath.Join(home, ".wt", "blocks") }
+
+// BlockLedgerPath is the per-FILE block-reservation ledger for absFile (#152).
+// block-id coordinates on the shared append-log, NOT the repo: two windows in
+// DIFFERENT repos editing the same file must share ONE reservation namespace and
+// ONE lock, or they hand out the same id (the per-repo coord log can't — each repo
+// has its own, so cross-repo reservations are invisible to each other). Keyed by a
+// hash of the absolute path so any window, in any repo, resolves the same ledger.
+// The readable basename prefix is for humans debugging ~/.wt/blocks.
+func BlockLedgerPath(home, absFile string) string {
+	sum := sha256.Sum256([]byte(absFile))
+	name := slug(filepath.Base(absFile)) + "-" + hex.EncodeToString(sum[:])[:12] + ".jsonl"
+	return filepath.Join(BlocksDir(home), name)
+}
+
+// LoadBlockLedgers reads every per-file block ledger this machine has coordinated
+// on, so the wt-status banner + `wt holds` surface block reservations regardless of
+// which repo made them. Missing dir / unreadable ledger → skipped (best-effort).
+func LoadBlockLedgers(home string) []Record {
+	entries, err := os.ReadDir(BlocksDir(home))
+	if err != nil {
+		return nil
+	}
+	var recs []Record
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		if rs, err := Load(filepath.Join(BlocksDir(home), e.Name())); err == nil {
+			recs = append(recs, rs...)
+		}
+	}
+	return recs
 }

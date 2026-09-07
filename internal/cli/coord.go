@@ -455,7 +455,12 @@ func cmdHolds(args []string) int {
 			return 1
 		}
 		own := coord.OwnOpenAnnouncements(recs, window)
-		reserves := coord.OwnBlockReservations(recs, window)
+		// #152: block reservations live in per-file ledgers (cross-repo shared), not
+		// the per-repo announce/ack log.
+		var reserves []coord.Record
+		if home, herr := os.UserHomeDir(); herr == nil && home != "" {
+			reserves = coord.OwnBlockReservations(coord.LoadBlockLedgers(home), window)
+		}
 		if len(own) == 0 && len(reserves) == 0 {
 			ui.OK("no outstanding holds/announcements or block reservations for this window (%s)", window)
 			return 0

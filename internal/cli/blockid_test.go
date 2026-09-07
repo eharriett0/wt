@@ -6,6 +6,33 @@ import (
 	"testing"
 )
 
+// #152: fileHasBlock is the "is this block actually written" check --written uses
+// so it can't clear a reservation for a block that isn't in the file.
+func TestFileHasBlock(t *testing.T) {
+	re, err := blockPatternRe("NEWEST-{n}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	f := filepath.Join(dir, "resume.md")
+	if err := os.WriteFile(f, []byte("## NEWEST-5 foo\nbody\n## NEWEST-7 bar\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for n, want := range map[int]bool{5: true, 7: true, 6: false, 99: false} {
+		got, err := fileHasBlock(f, re, n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Errorf("fileHasBlock(%d) = %v, want %v", n, got, want)
+		}
+	}
+	// missing file → false, no error (a fresh append-log)
+	if got, err := fileHasBlock(filepath.Join(dir, "nope.md"), re, 5); err != nil || got {
+		t.Errorf("missing file: got=%v err=%v, want false/nil", got, err)
+	}
+}
+
 func TestBlockPatternRe(t *testing.T) {
 	re, err := blockPatternRe("NEWEST-{n}")
 	if err != nil {
