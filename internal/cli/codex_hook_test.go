@@ -5,13 +5,14 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/eharriett0/wt/internal/coord"
 )
 
 func TestCoordContextMessage(t *testing.T) {
 	// empty inbox → nothing to say
-	if _, has := coordContextMessage(nil); has {
+	if _, has := coordContextMessage(nil, 0, time.Now()); has {
 		t.Error("empty inbox → no message")
 	}
 
@@ -20,7 +21,7 @@ func TestCoordContextMessage(t *testing.T) {
 		{ID: "id-note", Window: "feat/y", Message: "fyi: renamed pkg"},
 		{ID: "id-bare", Window: "feat/z"}, // no message
 	}
-	msg, has := coordContextMessage(inbox)
+	msg, has := coordContextMessage(inbox, 0, time.Now())
 	if !has {
 		t.Fatal("expected a message")
 	}
@@ -53,15 +54,99 @@ func TestCoordContextMessage_Caps(t *testing.T) {
 	for i := 0; i < codexMaxOverlapLines+5; i++ {
 		inbox = append(inbox, coord.Record{ID: fmt.Sprintf("n%d", i), Window: fmt.Sprintf("w%d", i+1), Message: "note"})
 	}
-	msg, has := coordContextMessage(inbox)
+	msg, has := coordContextMessage(inbox, 0, time.Now())
 	if !has {
 		t.Fatal("expected a message")
 	}
-	if !strings.Contains(msg, "…and 6 more") {
-		t.Errorf("expected the cap summary line: %q", msg)
+	if !strings.Contains(msg, "…and 6 older not shown") {
+		t.Errorf("expected the cap summary line naming what's hidden: %q", msg)
 	}
 	if !strings.Contains(msg, "HOLD w0") {
 		t.Errorf("the hold must survive the cap (holds first): %q", msg)
+	}
+}
+
+// #147: the whole bug is ordering. Delivery must be NEWEST-first (so a fresh
+// announcement is never buried under a deep backlog) and stale plain notes must
+// age out of delivery, while holds are always delivered regardless of age.
+func TestCoordContextMessage_NewestFirstAndAgeOut(t *testing.T) {
+	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	note := func(id string, agoHours int) coord.Record {
+		return coord.Record{
+			ID: id, Window: "w-" + id, Message: "note " + id,
+			TS: now.Add(-time.Duration(agoHours) * time.Hour).UTC().Format(time.RFC3339),
+		}
+	}
+	// oldest-first inbox (log order): old, mid, new
+	inbox := []coord.Record{note("old", 72), note("mid", 5), note("new", 1)}
+
+	// no age-out (maxAge 0): all shown, NEWEST first
+	msg, has := coordContextMessage(inbox, 0, now)
+	if !has {
+		t.Fatal("expected a message")
+	}
+	iNew, iMid, iOld := strings.Index(msg, "ack new"), strings.Index(msg, "ack mid"), strings.Index(msg, "ack old")
+	if !(iNew >= 0 && iNew < iMid && iMid < iOld) {
+		t.Errorf("expected newest-first (new < mid < old), got new=%d mid=%d old=%d:\n%s", iNew, iMid, iOld, msg)
+	}
+
+	// age-out at 24h: the 72h-old note drops from delivery; fresher ones remain
+	msg2, has2 := coordContextMessage(inbox, 24*time.Hour, now)
+	if !has2 {
+		t.Fatal("expected a message")
+	}
+	if strings.Contains(msg2, "ack old") {
+		t.Errorf("stale (72h) note should be aged out of delivery:\n%s", msg2)
+	}
+	if !strings.Contains(msg2, "ack new") || !strings.Contains(msg2, "ack mid") {
+		t.Errorf("fresh notes should remain:\n%s", msg2)
+	}
+
+	// age-out that removes every note → silent (nothing to inject)
+	if _, has := coordContextMessage(inbox, 30*time.Minute, now); has {
+		t.Error("all notes older than 30m → nothing to deliver")
+	}
+
+	// a hold is NEVER aged out — an un-cleared hold is a standing safety request
+	oldHold := coord.Record{
+		ID: "h", Window: "wh", Hold: []string{"merge-main"},
+		TS: now.Add(-100 * time.Hour).UTC().Format(time.RFC3339),
+	}
+	if hmsg, has := coordContextMessage([]coord.Record{oldHold}, time.Hour, now); !has || !strings.Contains(hmsg, "HOLD wh") {
+		t.Errorf("an un-cleared hold must always be delivered regardless of age: has=%v msg=%q", has, hmsg)
+	}
+}
+
+// #147 review (HIGH): `wt ack --all` must NEVER bulk-ack a HOLD — acking a hold
+// removes it from coord.Inbox and thus from the merge-main interlock, so a fresh
+// hold buried past the cap would be silently waived. bulkAckTargets keeps holds
+// out of the bulk-ack set and counts them as left-standing.
+func TestBulkAckTargets_ExcludesHolds(t *testing.T) {
+	box := []coord.Record{
+		{ID: "n1", Message: "note one"},
+		{ID: "h1", Hold: []string{"merge-main"}},
+		{ID: "n2", Message: "note two"},
+		{ID: "h2", Hold: []string{"rebase", "deploy"}},
+	}
+	notes, holdsLeft := bulkAckTargets(box)
+	if holdsLeft != 2 {
+		t.Errorf("holdsLeft = %d, want 2", holdsLeft)
+	}
+	if len(notes) != 2 || notes[0].ID != "n1" || notes[1].ID != "n2" {
+		t.Fatalf("notes = %+v, want the two plain announcements [n1 n2]", notes)
+	}
+	for _, n := range notes {
+		if len(n.Hold) > 0 {
+			t.Errorf("bulk-ack set must never contain a hold: %+v", n)
+		}
+	}
+	// all-holds inbox → nothing to bulk-ack, both held
+	if notes, holds := bulkAckTargets([]coord.Record{{ID: "h", Hold: []string{"x"}}}); len(notes) != 0 || holds != 1 {
+		t.Errorf("all-holds: notes=%v holds=%d, want [] and 1", notes, holds)
+	}
+	// empty inbox
+	if notes, holds := bulkAckTargets(nil); len(notes) != 0 || holds != 0 {
+		t.Errorf("empty: notes=%v holds=%d", notes, holds)
 	}
 }
 
@@ -101,8 +186,8 @@ func TestCodexContextMessage(t *testing.T) {
 	}
 
 	ov := []StatusOverlap{
-		{File: "foo.go", Windows: []string{"#1", "feat/x"}, Severity: "HIGH"},   // #1 participates → "also"
-		{File: "bar.go", Windows: []string{"feat/y", "#1"}, Severity: "low"},    // #1 participates → "also"
+		{File: "foo.go", Windows: []string{"#1", "feat/x"}, Severity: "HIGH"},    // #1 participates → "also"
+		{File: "bar.go", Windows: []string{"feat/y", "#1"}, Severity: "low"},     // #1 participates → "also"
 		{File: "baz.go", Windows: []string{"feat/y", "feat/z"}, Severity: "low"}, // #1 NOT a participant → no "also"
 	}
 	msg, has := codexContextMessage(ov, "#1")

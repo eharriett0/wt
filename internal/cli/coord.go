@@ -175,6 +175,11 @@ func cmdInbox(args []string) int {
 			recs = coord.MergeByID(recs, remoteRecords(iss))
 		}
 		box := coord.Inbox(recs, window)
+		// newest-first: a fresh announcement is always at the top, never buried
+		// under a deep backlog of old un-acked records (#147).
+		for i, j := 0, len(box)-1; i < j; i, j = i+1, j-1 {
+			box[i], box[j] = box[j], box[i]
+		}
 		if *asJSON {
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
@@ -203,18 +208,22 @@ func cmdInbox(args []string) int {
 }
 
 func cmdAck(args []string) int {
-	if code, done := guardHelp(args, `usage: wt ack <id> [--state "<current-state>"] [--file <path>]`); done {
+	if code, done := guardHelp(args, `usage: wt ack <id> [--state "<current-state>"] [--file <path>]  |  wt ack --all`); done {
 		return code
 	}
 	fs := flag.NewFlagSet("ack", flag.ContinueOnError)
 	state := fs.String("state", "", "one-line report of what THIS window is currently touching")
 	file := fs.String("file", "", "read --state from a file (or - for stdin) instead of the flag — opaque to the shell (#75)")
+	all := fs.Bool("all", false, "ack EVERY un-acked announcement from other windows in one step — clears a saturated backlog (#147)")
 	pos, _, err := parseInterspersed(fs, args)
 	if err != nil {
 		return 64
 	}
+	if *all {
+		return withConfig(ackAll)
+	}
 	if len(pos) < 1 {
-		ui.Err("usage: wt ack <id> [--state \"<current-state>\"] [--file <path>]")
+		ui.Err("usage: wt ack <id> [--state \"<current-state>\"] [--file <path>]  (or `wt ack --all` to clear the whole backlog)")
 		return 64
 	}
 	id := pos[0]
@@ -251,6 +260,73 @@ func cmdAck(args []string) int {
 		mirror(iss, r, fmt.Sprintf("✅ **wt ack** of `%s` — window `%s`%s", id, window, stateLine(r.State)))
 		return 0
 	})
+}
+
+// bulkAckTargets splits an inbox into the plain announcements `wt ack --all`
+// should clear and the count of HOLDs it must LEAVE STANDING. A hold is a
+// merge-main interlock: acking it removes it from coord.Inbox (which excludes
+// acked ids), so PendingHolds and the merge-pr gate stop seeing it. Silently
+// waiving a fresh hold the user never saw — the exact case ack --all exists for,
+// a hold buried past the 12-line cap — would defeat the very interlock wt exists
+// to protect (#147 review). Holds are cleared only by a deliberate `wt ack <id>`
+// or `wt all-clear <id>`. Pure.
+func bulkAckTargets(box []coord.Record) (notes []coord.Record, holdsLeft int) {
+	for _, a := range box {
+		if len(a.Hold) > 0 {
+			holdsLeft++
+			continue
+		}
+		notes = append(notes, a)
+	}
+	return notes, holdsLeft
+}
+
+// ackAll acks every un-acked PLAIN announcement in this window's inbox in one
+// step — the recovery path for a saturated coordination backlog (#147), where
+// clearing by hand would mean one `wt ack <id>` per stale record. HOLDs are left
+// standing (see bulkAckTargets). Local-only: bulk-clearing stale local noise must
+// not spray N GitHub-mirror API calls (an all-clear on a specific hold is still
+// the way to release it cross-machine).
+func ackAll(c *config.Config) int {
+	path, window := coordCtx(c)
+	local, _ := coord.Load(path)
+	recs := coord.MergeByID(local, remoteRecords(c.CoordIssue))
+	notes, holdsLeft := bulkAckTargets(coord.Inbox(recs, window))
+
+	heldNote := ""
+	if holdsLeft > 0 {
+		heldNote = fmt.Sprintf(" — %d hold(s) left standing (ack or all-clear each deliberately; `wt inbox`)", holdsLeft)
+	}
+	if len(notes) == 0 {
+		if holdsLeft > 0 {
+			ui.OK("no plain announcements to ack%s", heldNote)
+		} else {
+			ui.OK("inbox already clear — nothing to ack")
+		}
+		return 0
+	}
+	base := time.Now()
+	repo := mainRepoName(c)
+	for i, a := range notes {
+		// Distinct, monotonically increasing IDs so MergeByID (in every reader's
+		// path) can never collapse two acks that target DIFFERENT announcements —
+		// NewID is UnixNano-base36, and a tight loop can outrun the clock.
+		t := base.Add(time.Duration(i))
+		r := coord.Record{
+			ID:     coord.NewID(t),
+			TS:     t.UTC().Format(time.RFC3339),
+			Window: window,
+			Repo:   repo,
+			Kind:   coord.KindAck,
+			AckOf:  a.ID,
+		}
+		if err := coord.Append(path, r); err != nil {
+			ui.Err("could not write coordination log after %d ack(s): %v", i, err)
+			return 1
+		}
+	}
+	ui.OK("acked %d announcement(s)%s", len(notes), heldNote)
+	return 0
 }
 
 func cmdAllClear(args []string) int {
