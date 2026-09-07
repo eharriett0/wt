@@ -67,6 +67,64 @@ func scanFileMaxBlock(file string, re *regexp.Regexp) (int, error) {
 	return max, sc.Err()
 }
 
+// fileHasBlock reports whether file contains a block whose id == n per the
+// pattern — the "is this block actually written" check `--written` needs so it
+// can't clear a reservation for a block that isn't there (#152). Missing file →
+// false; a real read error propagates.
+func fileHasBlock(file string, re *regexp.Regexp, n int) (bool, error) {
+	f, err := os.Open(file)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		for _, m := range re.FindAllStringSubmatch(sc.Text(), -1) {
+			if v, err := strconv.Atoi(m[1]); err == nil && v == n {
+				return true, nil
+			}
+		}
+	}
+	return false, sc.Err()
+}
+
+// canonicalFilePath resolves file to a STABLE absolute identity for keying the
+// per-file block ledger (#152 review): symlinks are resolved so a per-repo symlink
+// into a shared doc — the canonical way to share ONE append-log across repos —
+// maps to the SAME ledger as the doc's real path. Without this, two windows would
+// key different ledgers off the different symlink paths and re-collide. The
+// append-log may not exist yet on the first reserve, so EvalSymlinks the deepest
+// EXISTING ancestor and re-join the not-yet-existing tail (the house style used by
+// repoRelativePath / collide / worktree). Falls back to a lexical Abs on error.
+// Caveat: on case-insensitive volumes, paths differing only in case still key
+// different ledgers — reference the file by one consistent path across windows.
+func canonicalFilePath(file string) string {
+	abs, err := filepath.Abs(file)
+	if err != nil || abs == "" {
+		return file
+	}
+	unresolved := ""
+	cur := abs
+	for {
+		if resolved, rerr := filepath.EvalSymlinks(cur); rerr == nil {
+			if unresolved == "" {
+				return resolved
+			}
+			return filepath.Join(resolved, unresolved)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return abs // reached root with nothing resolvable (shouldn't happen)
+		}
+		unresolved = filepath.Join(filepath.Base(cur), unresolved)
+		cur = parent
+	}
+}
+
 // cmdBlockID implements `wt block-id <file> [--pattern P] [--format]`.
 func cmdBlockID(args []string) int {
 	if code, done := guardHelp(args, `usage: wt block-id <file> [--pattern "NEWEST-{n}"] [--format] [--written N]`); done {
@@ -93,28 +151,47 @@ func cmdBlockID(args []string) int {
 		ui.Err("%v", err)
 		return 64
 	}
-	// Canonical key: absolute path. The resume memory doc lives at ONE shared
-	// location, so every window (in any worktree) abspaths to the same key and
-	// coordinates on the same N-space via the shared per-repo log. Fall back to
-	// the given path if Abs fails (never blocks the allocation).
-	absFile := file
-	if a, aerr := filepath.Abs(file); aerr == nil {
-		absFile = a
-	}
+	// Canonical key: symlink-resolved absolute path (#152). The shared append-log
+	// lives at ONE real location; every window (any repo, any worktree, reached via
+	// a symlink or not) must resolve it to the SAME key so they coordinate on one
+	// per-file ledger. See canonicalFilePath.
+	absFile := canonicalFilePath(file)
 	return withConfig(func(c *config.Config) int {
 		path, window := coordCtx(c)
+		// block-id coordinates on the shared FILE, not the repo: use a per-file
+		// ledger so windows in ANY repo editing this append-log share one lock +
+		// reservation namespace (#152). Fall back to the per-repo log only if HOME
+		// is unresolvable (degrades to the old, per-repo-only behavior).
+		ledger := path
+		if home, herr := os.UserHomeDir(); herr == nil && home != "" {
+			ledger = coord.BlockLedgerPath(home, absFile)
+		}
 
 		// --written N: terminal signal that reservation N was actually prepended
-		// (#35). Clears the "imminent prepend" banner + `wt holds` entry now, and
-		// lets prune-coord GC the reservation. Best-effort — never allocates.
+		// (#35). REFUSE unless (a) the file really contains a block N AND (b) a
+		// reservation for N belongs to THIS window — otherwise the bookkeeping would
+		// record a completion that never happened, or that is another window's (#152).
 		if *written >= 0 {
-			recs, _ := coord.Load(path)
-			m := newRecord(c, window, coord.KindBlockWritten)
-			m.File, m.Block = absFile, *written
-			if res, ok := coord.FindOwnReservation(recs, window, absFile, *written); ok {
-				m.AckOf = res.ID
+			inFile, ferr := fileHasBlock(absFile, re, *written)
+			if ferr != nil {
+				ui.Err("could not read %s: %v", filepath.Base(absFile), ferr)
+				return 1
 			}
-			if err := coord.Append(path, m); err != nil {
+			if !inFile {
+				ui.Err("block %d is not in %s — write your `%s` block before marking it written (nothing recorded)",
+					*written, filepath.Base(absFile), strings.Replace(*pattern, "{n}", strconv.Itoa(*written), 1))
+				return 1
+			}
+			recs, _ := coord.Load(ledger)
+			res, ok := coord.FindOwnReservation(recs, window, absFile, *written)
+			if !ok {
+				ui.Err("no reservation for block %d belongs to this window (%s) — it may be another window's block; `wt block-id %s` to reserve your own (nothing recorded)",
+					*written, window, file)
+				return 1
+			}
+			m := newRecord(c, window, coord.KindBlockWritten)
+			m.File, m.Block, m.AckOf = absFile, *written, res.ID
+			if err := coord.Append(ledger, m); err != nil {
 				ui.Err("could not record block-written: %v", err)
 				return 1
 			}
@@ -123,21 +200,26 @@ func cmdBlockID(args []string) int {
 		}
 
 		r := newRecord(c, window, coord.KindBlockReserve)
-		out, rerr := coord.ReserveBlock(path, r, absFile, func() (int, error) {
+		out, rerr := coord.ReserveBlock(ledger, r, absFile, func() (int, error) {
 			return scanFileMaxBlock(absFile, re)
 		})
 		if rerr != nil {
 			ui.Err("could not reserve block id: %v", rerr)
 			return 1
 		}
+		// The id (bare number, or --format token) is the ONLY thing on stdout — the
+		// whole point of block-id is `N=$(wt block-id file)`. The human hint goes to
+		// STDERR so it never pollutes the captured value (#152). (ui.Info/ui.OK print
+		// to stdout, so they'd corrupt the number — use a stderr write here.)
 		if *format {
 			fmt.Println(strings.Replace(*pattern, "{n}", strconv.Itoa(out.Block), 1))
 		} else {
 			fmt.Println(out.Block)
 		}
-		ui.Info("reserved block %d for %s (window %s) — write your %s block now, then `wt block-id %s --written %d`",
+		fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf(
+			"reserved block %d for %s (window %s) — write your %s block now, then `wt block-id %s --written %d`",
 			out.Block, filepath.Base(absFile), window,
-			strings.Replace(*pattern, "{n}", strconv.Itoa(out.Block), 1), file, out.Block)
+			strings.Replace(*pattern, "{n}", strconv.Itoa(out.Block), 1), file, out.Block)))
 		return 0
 	})
 }
@@ -150,17 +232,20 @@ func blockReservationBanner(c *config.Config) {
 	if c == nil {
 		return
 	}
-	path, window := coordCtx(c)
-	recs, err := coord.Load(path)
-	if err != nil {
+	_, window := coordCtx(c)
+	home, herr := os.UserHomeDir()
+	if herr != nil || home == "" {
 		return
 	}
+	// #152: block reservations live in per-file ledgers now, so aggregate across
+	// them — this also surfaces a reservation made from ANOTHER repo on a shared file.
+	recs := coord.LoadBlockLedgers(home)
 	now := time.Now()
 	res := coord.RecentBlockReservations(recs, window, now, blockReservationMaxAge)
 	if len(res) == 0 {
 		return
 	}
-	ui.Banner(fmt.Sprintf("%d recent block-id reservation(s) from another window — a prepend may be imminent", len(res)))
+	ui.Banner(fmt.Sprintf("%d recent block-id reservation(s) from another window (any repo — reservations are per shared file) — a prepend may be imminent", len(res)))
 	for _, r := range res {
 		fmt.Fprintf(os.Stderr, "  %s reserved block %s on %s  %s\n",
 			ui.Cyan(r.Window), ui.Bold(strconv.Itoa(r.Block)),

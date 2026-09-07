@@ -14,6 +14,8 @@ package coord
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -368,6 +370,12 @@ func PruneRecords(recs []Record, now time.Time, blockMaxAge time.Duration) (kept
 // -> PruneRecords -> rewrite the file with only the survivors. Returns how many
 // records were dropped. A missing/empty log is a no-op.
 func PruneLog(path string, now time.Time, blockMaxAge time.Duration) (dropped int, err error) {
+	// MkdirAll the parent (like Append): O_CREATE makes the file but not the dir,
+	// and a block-only repo may never have created ~/.wt/coordination/ (its block
+	// records live in the per-file ledgers now, #152) — pruning must not error there.
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return 0, err
+	}
 	lf, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return 0, err
@@ -591,4 +599,66 @@ func ReserveBlock(path string, r Record, file string, fileMax func() (int, error
 		return Record{}, err
 	}
 	return r, nil
+}
+
+// BlocksDir is where per-file block-id ledgers live under ~/.wt.
+func BlocksDir(home string) string { return filepath.Join(home, ".wt", "blocks") }
+
+// BlockLedgerPath is the per-FILE block-reservation ledger for absFile (#152).
+// block-id coordinates on the shared append-log, NOT the repo: two windows in
+// DIFFERENT repos editing the same file must share ONE reservation namespace and
+// ONE lock, or they hand out the same id (the per-repo coord log can't — each repo
+// has its own, so cross-repo reservations are invisible to each other). Keyed by a
+// hash of the absolute path so any window, in any repo, resolves the same ledger.
+// The readable basename prefix is for humans debugging ~/.wt/blocks.
+func BlockLedgerPath(home, absFile string) string {
+	sum := sha256.Sum256([]byte(absFile))
+	name := slug(filepath.Base(absFile)) + "-" + hex.EncodeToString(sum[:])[:12] + ".jsonl"
+	return filepath.Join(BlocksDir(home), name)
+}
+
+// PruneBlockLedgers GCs every per-file block ledger under home (#152 review): the
+// same age-based drop PruneLog applies to the per-repo log, applied to each ledger,
+// so relocating block records to ledgers didn't strand them beyond the #33/#35 GC
+// (each written or aged-out reservation is dropped). Returns total records dropped.
+// Missing dir → (0, nil); a per-ledger error stops and returns what was dropped.
+func PruneBlockLedgers(home string, now time.Time, blockMaxAge time.Duration) (dropped int, err error) {
+	entries, rerr := os.ReadDir(BlocksDir(home))
+	if rerr != nil {
+		if os.IsNotExist(rerr) {
+			return 0, nil
+		}
+		return 0, rerr
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		d, perr := PruneLog(filepath.Join(BlocksDir(home), e.Name()), now, blockMaxAge)
+		if perr != nil {
+			return dropped, perr
+		}
+		dropped += d
+	}
+	return dropped, nil
+}
+
+// LoadBlockLedgers reads every per-file block ledger this machine has coordinated
+// on, so the wt-status banner + `wt holds` surface block reservations regardless of
+// which repo made them. Missing dir / unreadable ledger → skipped (best-effort).
+func LoadBlockLedgers(home string) []Record {
+	entries, err := os.ReadDir(BlocksDir(home))
+	if err != nil {
+		return nil
+	}
+	var recs []Record
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		if rs, err := Load(filepath.Join(BlocksDir(home), e.Name())); err == nil {
+			recs = append(recs, rs...)
+		}
+	}
+	return recs
 }

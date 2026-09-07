@@ -366,8 +366,18 @@ func coordHealth(c *config.Config) *CoordHealth {
 	home, _ := os.UserHomeDir()
 	path := coord.LogPath(home, repoName(c))
 	h := &CoordHealth{Path: path}
+	branch, _ := gitx.CurrentBranch()
+	self := coord.WindowID(os.Getenv("WT_WINDOW"), c.Root, branch)
+	// Block reservations live in per-file ledgers (independent of THIS repo's coord
+	// log), so count them regardless of whether the per-repo log exists yet — else a
+	// block-only repo reports 0 while `wt holds` shows the reservation (#152).
+	if home, herr := os.UserHomeDir(); herr == nil && home != "" {
+		ledger := coord.LoadBlockLedgers(home)
+		h.OwnBlockReserves = len(coord.OwnBlockReservations(ledger, self))
+		_, h.Prunable = coord.PruneRecords(ledger, time.Now(), pruneBlockMaxAge)
+	}
 	if _, err := os.Stat(path); err != nil {
-		return h // Exists=false — a fresh repo, healthy
+		return h // per-repo coord log not created yet — ledger reserves already counted
 	}
 	h.Exists = true
 	recs, err := coord.Load(path)
@@ -377,11 +387,10 @@ func coordHealth(c *config.Config) *CoordHealth {
 	}
 	h.Readable = true
 	h.Records = len(recs)
-	branch, _ := gitx.CurrentBranch()
-	self := coord.WindowID(os.Getenv("WT_WINDOW"), c.Root, branch)
 	h.OwnOpen = len(coord.OwnOpenAnnouncements(recs, self))
-	h.OwnBlockReserves = len(coord.OwnBlockReservations(recs, self))
-	_, h.Prunable = coord.PruneRecords(recs, time.Now(), pruneBlockMaxAge)
+	if _, p := coord.PruneRecords(recs, time.Now(), pruneBlockMaxAge); p > 0 {
+		h.Prunable += p
+	}
 	return h
 }
 
@@ -472,7 +481,12 @@ func render(rep *Report) {
 	if h := rep.Coord; h != nil {
 		switch {
 		case !h.Exists:
-			ui.Info("%-18s %s %s", "coord log", h.Path, ui.Dim("(none yet)"))
+			if h.OwnBlockReserves > 0 {
+				ui.Info("%-18s %s %s", "coord log", h.Path,
+					ui.Dim(fmt.Sprintf("(no announcements yet — YOU have %d block reservation(s), see `wt holds`)", h.OwnBlockReserves)))
+			} else {
+				ui.Info("%-18s %s %s", "coord log", h.Path, ui.Dim("(none yet)"))
+			}
 		case h.Err != "":
 			ui.Err("coord log — UNREADABLE %s: %s", h.Path, h.Err)
 		default:

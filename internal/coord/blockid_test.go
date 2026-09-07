@@ -3,10 +3,79 @@ package coord
 import (
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+// #152: block coordination is keyed by the shared FILE, not the repo, so two
+// windows in different repos editing the same append-log share ONE ledger.
+func TestBlockLedgerPath(t *testing.T) {
+	home := "/home/u"
+	p1 := BlockLedgerPath(home, "/shared/resume.md")
+	p2 := BlockLedgerPath(home, "/shared/resume.md")
+	p3 := BlockLedgerPath(home, "/other/resume.md")
+	if p1 != p2 {
+		t.Errorf("same abs path must map to the same ledger: %q vs %q", p1, p2)
+	}
+	if p1 == p3 {
+		t.Errorf("different abs paths must map to different ledgers: both %q", p1)
+	}
+	if !strings.HasPrefix(p1, filepath.Join(home, ".wt", "blocks")) || !strings.HasSuffix(p1, ".jsonl") {
+		t.Errorf("ledger path shape off: %q", p1)
+	}
+}
+
+// #152 review: block records moved to per-file ledgers, so prune-coord must GC the
+// ledgers too — else they grow append-only forever (the #33/#35 GC regression).
+func TestPruneBlockLedgers(t *testing.T) {
+	home := t.TempDir()
+	f := "/a/x.md"
+	p := BlockLedgerPath(home, f)
+	old := time.Now().Add(-48 * time.Hour)
+	fresh := time.Now()
+	for _, r := range []Record{
+		{ID: NewID(old), TS: old.UTC().Format(time.RFC3339), Window: "w", Kind: KindBlockReserve, File: f, Block: 1},     // aged out
+		{ID: NewID(fresh), TS: fresh.UTC().Format(time.RFC3339), Window: "w", Kind: KindBlockReserve, File: f, Block: 2}, // fresh
+	} {
+		if err := Append(p, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dropped, err := PruneBlockLedgers(home, time.Now(), 24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dropped != 1 {
+		t.Errorf("dropped = %d, want 1 (the 48h-old reservation)", dropped)
+	}
+	if recs := LoadBlockLedgers(home); len(recs) != 1 || recs[0].Block != 2 {
+		t.Errorf("survivors = %+v, want only fresh block 2", recs)
+	}
+	// missing dir → (0, nil)
+	if d, err := PruneBlockLedgers(filepath.Join(t.TempDir(), "nope"), time.Now(), 24*time.Hour); d != 0 || err != nil {
+		t.Errorf("missing dir: d=%d err=%v", d, err)
+	}
+}
+
+func TestLoadBlockLedgers(t *testing.T) {
+	home := t.TempDir()
+	for i, f := range []string{"/a/x.md", "/b/y.md"} {
+		ts := time.Unix(int64(i+1), 0)
+		r := Record{ID: NewID(ts), TS: ts.UTC().Format(time.RFC3339), Window: "w", Kind: KindBlockReserve, File: f, Block: i + 1}
+		if err := Append(BlockLedgerPath(home, f), r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if recs := LoadBlockLedgers(home); len(recs) != 2 {
+		t.Fatalf("LoadBlockLedgers = %d records, want 2 (one per ledger)", len(recs))
+	}
+	// missing blocks dir → nil, no panic
+	if got := LoadBlockLedgers(filepath.Join(t.TempDir(), "nope")); got != nil {
+		t.Errorf("missing blocks dir should yield nil, got %v", got)
+	}
+}
 
 func TestNextBlock(t *testing.T) {
 	now := time.Now()
