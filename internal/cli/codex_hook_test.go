@@ -47,22 +47,73 @@ func TestCoordContextMessage(t *testing.T) {
 	}
 }
 
-func TestCoordContextMessage_Caps(t *testing.T) {
+// #150: the whole injection is bounded by a BYTE budget (per-entry truncation +
+// coordMaxInjectBytes), filled newest-first so the OLDEST notes drop — never the
+// newest. Short notes all fit; verbose ones are truncated and the tail is dropped.
+func TestCoordContextMessage_ByteBudget(t *testing.T) {
+	// many notes, oldest-first n00..n29, each with a long free-text (a unique MARK
+	// at the front stays within the per-entry truncation window).
 	var inbox []coord.Record
-	// one hold first, then many notes → the hold must survive the cap
+	for i := 0; i < 30; i++ {
+		inbox = append(inbox, coord.Record{
+			ID: fmt.Sprintf("n%02d", i), Window: fmt.Sprintf("w%02d", i),
+			Message: fmt.Sprintf("MARK%02d ", i) + strings.Repeat("y", 500),
+		})
+	}
+	msg, has := coordContextMessage(inbox, 0, time.Now())
+	if !has {
+		t.Fatal("expected a message")
+	}
+	if len(msg) > coordMaxInjectBytes+1024 { // + header/footer/summary overhead
+		t.Errorf("injection %d bytes exceeds the budget %d:\n%s", len(msg), coordMaxInjectBytes, msg[:200])
+	}
+	if !strings.Contains(msg, "truncated — `wt inbox` for full") {
+		t.Errorf("verbose entries must be per-entry truncated: %q", msg[:300])
+	}
+	if !strings.Contains(msg, "MARK29") {
+		t.Errorf("the NEWEST note must always be kept: %q", msg[:300])
+	}
+	if strings.Contains(msg, "MARK00") {
+		t.Errorf("the OLDEST notes must drop under the budget, not the newest:\n%s", msg)
+	}
+	if !strings.Contains(msg, "older not shown") {
+		t.Errorf("summary line naming dropped count + size expected: %q", msg)
+	}
+}
+
+// short notes all fit under the byte budget — no truncation, no drop.
+func TestCoordContextMessage_ShortNotesAllShown(t *testing.T) {
+	var inbox []coord.Record
 	inbox = append(inbox, coord.Record{ID: "keep", Window: "w0", Hold: []string{"merge-main"}})
-	for i := 0; i < codexMaxOverlapLines+5; i++ {
+	for i := 0; i < 20; i++ {
 		inbox = append(inbox, coord.Record{ID: fmt.Sprintf("n%d", i), Window: fmt.Sprintf("w%d", i+1), Message: "note"})
 	}
 	msg, has := coordContextMessage(inbox, 0, time.Now())
 	if !has {
 		t.Fatal("expected a message")
 	}
-	if !strings.Contains(msg, "…and 6 older not shown") {
-		t.Errorf("expected the cap summary line naming what's hidden: %q", msg)
+	if strings.Contains(msg, "older not shown") {
+		t.Errorf("21 short entries fit under the byte budget — nothing should be dropped:\n%s", msg)
 	}
 	if !strings.Contains(msg, "HOLD w0") {
-		t.Errorf("the hold must survive the cap (holds first): %q", msg)
+		t.Errorf("the hold must be present (holds first): %q", msg)
+	}
+}
+
+func TestTruncateMessage(t *testing.T) {
+	if got := truncateMessage("  short note  "); got != "short note" {
+		t.Errorf("short message should be trimmed and unchanged, got %q", got)
+	}
+	long := strings.Repeat("z", coordMaxEntryChars+50)
+	got := truncateMessage(long)
+	if !strings.HasSuffix(got, "… (truncated — `wt inbox` for full)") {
+		t.Errorf("long message should carry the truncation marker: %q", got)
+	}
+	if len([]rune(got)) >= len([]rune(long)) {
+		t.Errorf("truncated message should be shorter than the original")
+	}
+	if got := truncateMessage(""); got != "" {
+		t.Errorf("empty stays empty, got %q", got)
 	}
 }
 

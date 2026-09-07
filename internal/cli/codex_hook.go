@@ -164,57 +164,105 @@ func hookAgentContext(r io.Reader) int {
 	return 0
 }
 
+// coordMaxEntryChars caps a single announcement's free-text in the per-turn hook
+// (#150). Newest-first (#147) surfaces the verbose CURRENT announcements, which
+// un-truncated ballooned the injection ~5x (9KB → 44KB) — charged to every
+// window's context budget every turn. The first ~300 chars (roughly the first
+// sentence) almost always decide whether the reader needs the rest; the full text
+// stays in `wt inbox`.
+const coordMaxEntryChars = 300
+
+// coordMaxInjectBytes is a hard ceiling on the whole coordination injection (#150)
+// so the per-turn cost is bounded regardless of how many announcements or how
+// verbose. Entries are added NEWEST-first and the budget drops the OLDEST — never
+// the newest (that would recreate #147).
+const coordMaxInjectBytes = 8192
+
+// truncateMessage caps an announcement's free-text to coordMaxEntryChars runes,
+// appending a marker pointing at `wt inbox` for the full text (#150). Pure.
+func truncateMessage(m string) string {
+	m = strings.TrimSpace(m)
+	r := []rune(m)
+	if len(r) <= coordMaxEntryChars {
+		return m
+	}
+	return strings.TrimSpace(string(r[:coordMaxEntryChars])) + "… (truncated — `wt inbox` for full)"
+}
+
 // coordContextMessage renders the un-acked coordination signals from OTHER
 // windows for the per-turn context: active HOLDS (an op another window asked you
 // to avoid until all-clear) + plain announcements. inbox is already self-excluded
 // and un-acked (coord.Inbox), arriving OLDEST-first (log order).
 //
 // NEWEST-first delivery (#147): a fresh announcement must always be visible even
-// when a window's backlog is deep. Oldest-first + a 12-line cap meant that once a
-// window's un-acked count passed the cap, every NEW announcement sorted past the
-// visible window forever. We reverse to newest-first so the cap drops the OLDEST,
-// not the newest. Holds still come first (they survive the cap) and, within each
-// group, newest-first. Stale plain announcements are also aged out of DELIVERY
-// when maxAge>0 (they remain in `wt inbox`) so a roll that finished weeks ago
-// can't keep poisoning every turn's context; holds are never aged out (an
-// un-cleared hold is a standing safety request). Pure; has=false when empty.
+// when a window's backlog is deep. Holds come first (always delivered, never aged
+// out — an un-cleared hold is a standing safety request); plain announcements are
+// aged out of delivery when maxAge>0 (they remain in `wt inbox`).
+//
+// Bounded cost (#150): each entry's free-text is truncated (coordMaxEntryChars)
+// and the whole injection is held under a byte budget (coordMaxInjectBytes),
+// filled newest-first so the OLDEST notes drop, never the newest. Holds are always
+// included; notes fill the remaining budget. The summary line names the count and
+// the size so the cost is visible. Pure; has=false when empty.
 func coordContextMessage(inbox []coord.Record, maxAge time.Duration, now time.Time) (msg string, has bool) {
 	// reverse to newest-first (inbox is oldest-first log order)
 	ordered := make([]coord.Record, len(inbox))
 	for i, r := range inbox {
 		ordered[len(inbox)-1-i] = r
 	}
-	var holds, notes []string
-	for _, r := range ordered {
+	render := func(r coord.Record) string {
 		who := r.Window
 		if who == "" {
 			who = "another window"
 		}
 		suffix := ""
-		if m := strings.TrimSpace(r.Message); m != "" {
+		if m := truncateMessage(r.Message); m != "" {
 			suffix = " — " + m
 		}
 		if len(r.Hold) > 0 {
-			holds = append(holds, fmt.Sprintf("  ⚠ HOLD %s [%s]%s (wt ack %s)", who, strings.Join(r.Hold, ","), suffix, r.ID))
+			return fmt.Sprintf("  ⚠ HOLD %s [%s]%s (wt ack %s)", who, strings.Join(r.Hold, ","), suffix, r.ID)
+		}
+		return fmt.Sprintf("  %s%s (wt ack %s)", who, suffix, r.ID)
+	}
+	var holds, notes []string
+	for _, r := range ordered {
+		if len(r.Hold) > 0 {
+			holds = append(holds, render(r))
 			continue
 		}
 		if maxAge > 0 && coord.Age(r, now) > maxAge {
 			continue // stale plain announcement — drop from delivery (still in `wt inbox`)
 		}
-		notes = append(notes, fmt.Sprintf("  %s%s (wt ack %s)", who, suffix, r.ID))
+		notes = append(notes, render(r))
 	}
 	if len(holds) == 0 && len(notes) == 0 {
 		return "", false
 	}
-	lines := append([]string{}, holds...)
-	lines = append(lines, notes...)
-	if len(lines) > codexMaxOverlapLines {
-		extra := len(lines) - codexMaxOverlapLines
-		lines = append(lines[:codexMaxOverlapLines:codexMaxOverlapLines],
-			fmt.Sprintf("  …and %d older not shown (newest %d shown; `wt inbox` for all, `wt ack --all` to clear)", extra, codexMaxOverlapLines))
+
+	// Assemble under the byte budget, newest-first. Holds are always included;
+	// notes fill the remaining budget (the newest note is always kept even if it
+	// alone would exceed — dropping the newest would recreate #147). Dropped =
+	// oldest notes.
+	shown := append([]string{}, holds...)
+	used := 0
+	for _, l := range shown {
+		used += len(l) + 1
+	}
+	kept := 0
+	for _, l := range notes {
+		if kept > 0 && used+len(l)+1 > coordMaxInjectBytes {
+			break
+		}
+		shown = append(shown, l)
+		used += len(l) + 1
+		kept++
+	}
+	if dropped := len(notes) - kept; dropped > 0 {
+		shown = append(shown, fmt.Sprintf("  …and %d older not shown (%d shown, ~%.1f KB; `wt inbox` for all, `wt ack --all` to clear)",
+			dropped, len(holds)+kept, float64(used)/1024))
 	}
 	msg = "wt coordination — un-acked signals from other windows (respect any HOLD before that op):\n" +
-		strings.Join(lines, "\n") +
+		strings.Join(shown, "\n") +
 		"\nSee `wt inbox` for detail; `wt ack <id>` to acknowledge (`wt ack --all` clears the backlog). (Set WT_SKIP_COLLISION=1 to silence.)"
 	return msg, true
 }
