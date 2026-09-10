@@ -1,6 +1,27 @@
 package claim
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/eharriett0/wt/internal/config"
+)
+
+// #156: the identity recorded in the active-work file must be the STABLE
+// worktree-based coord.WindowID (matching wt doctor), not a per-shell hostname-PID.
+func TestWindowID_StableAndMatchesContract(t *testing.T) {
+	c := &config.Config{Root: "/home/u/worktree-x"}
+	// WT_WINDOW wins — an explicit, restart-stable label
+	t.Setenv("WT_WINDOW", "term-7")
+	if got := windowID(c); got != "term-7" {
+		t.Errorf("windowID with WT_WINDOW = %q, want term-7", got)
+	}
+	// unset → the worktree toplevel PATH (stable across shell restarts; what
+	// coord.WindowID / wt doctor produce), never a hostname-PID
+	t.Setenv("WT_WINDOW", "")
+	if got := windowID(c); got != "/home/u/worktree-x" {
+		t.Errorf("windowID = %q, want the stable worktree path /home/u/worktree-x", got)
+	}
+}
 
 func TestSlugFromTitle(t *testing.T) {
 	cases := map[string]string{

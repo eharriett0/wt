@@ -13,6 +13,7 @@ import (
 
 	"github.com/eharriett0/wt/internal/activework"
 	"github.com/eharriett0/wt/internal/config"
+	"github.com/eharriett0/wt/internal/coord"
 	"github.com/eharriett0/wt/internal/ghx"
 	"github.com/eharriett0/wt/internal/gitx"
 	"github.com/eharriett0/wt/internal/ui"
@@ -45,7 +46,7 @@ func Claim(c *config.Config, issue string, force, openPR bool, epic string) erro
 	// placeholder commit / draft PR / duplicate section. No --force needed.
 	if user, _ := ghx.CurrentUser(); assignedTo(assignees, user) && isDir(wtPath) && hasSection(c, issue) {
 		content := activework.Read(c.ActiveWork)
-		e := activework.Entry{Issue: issue, Title: title, Branch: branch, Worktree: wtPath, Window: windowID(), Epic: epic, When: time.Now()}
+		e := activework.Entry{Issue: issue, Title: title, Branch: branch, Worktree: wtPath, Window: windowID(c), Epic: epic, When: time.Now()}
 		if err := activework.Write(c.ActiveWork, activework.UpsertSection(content, e)); err != nil {
 			ui.Warn("active-work refresh failed (continuing): %v", err)
 		}
@@ -126,7 +127,7 @@ func Claim(c *config.Config, issue string, force, openPR bool, epic string) erro
 
 	entry := activework.Entry{
 		Issue: issue, Title: title, Branch: branch, Worktree: wtDir,
-		PRURL: prURL, Window: windowID(), Epic: epic, When: time.Now(),
+		PRURL: prURL, Window: windowID(c), Epic: epic, When: time.Now(),
 	}
 	if err := activework.Write(c.ActiveWork, activework.AppendSection(activework.Read(c.ActiveWork), entry)); err != nil {
 		ui.Warn("active-work update failed (continuing): %v", err)
@@ -196,7 +197,7 @@ func Adopt(c *config.Config, target, epic string) error {
 
 	entry := activework.Entry{
 		Issue: ident, Title: title, Branch: branch, Worktree: wtDir,
-		PRURL: prURL, Window: windowID(), Epic: epic, When: time.Now(),
+		PRURL: prURL, Window: windowID(c), Epic: epic, When: time.Now(),
 	}
 	if err := activework.Write(c.ActiveWork, activework.UpsertSection(activework.Read(c.ActiveWork), entry)); err != nil {
 		ui.Warn("active-work update failed (continuing): %v", err)
@@ -380,13 +381,15 @@ func truncate(s string, n int) string {
 	return s[:n]
 }
 
-func windowID() string {
-	if v := os.Getenv("WT_WINDOW"); v != "" {
-		return v
-	}
-	if v := os.Getenv("TERM_SESSION_ID"); v != "" {
-		return v
-	}
-	host, _ := os.Hostname()
-	return fmt.Sprintf("%s-%d", host, os.Getpid())
+// windowID is the STABLE identity recorded in the active-work file — the SAME
+// value `wt doctor` prints and that coordCtx uses (#156). It must match, or a
+// window that restarts its shell can't recognise its own claims: the old
+// hostname-PID identity changed every shell, so a restarted window saw its OWN
+// prior claims as another window's, and its old identity lingered as a claim
+// nothing could ever update or release. coord.WindowID keys on WT_WINDOW → the
+// worktree toplevel PATH (stable across shell restarts AND branch switches) →
+// branch, so the recorded identity survives a restart.
+func windowID(c *config.Config) string {
+	branch, _ := gitx.CurrentBranch()
+	return coord.WindowID(os.Getenv("WT_WINDOW"), c.Root, branch)
 }
