@@ -152,21 +152,46 @@ type Conflict struct {
 
 // CheckPaths reports, for each requested path, which OTHER windows (not
 // currentWorktree) are already touching it. Pure. paths are matched against
-// each window's touched set both exactly and by suffix, so callers can pass
-// repo-relative paths or basenames.
+// each window's touched set exactly, by suffix, by basename, and — for a
+// DIRECTORY — by expanding to every touched file beneath it (#154).
+//
+// A directory expands to one Conflict PER FILE rather than one for the
+// directory, so each file keeps its own hunk grading downstream. Those entries
+// carry the matched file in Path as well, because a report that printed the
+// requested directory three times would not tell you which files to look at.
+// Entries are deduped by (window, file): passing both a directory and a file
+// under it is a natural thing to do and must not double-report.
 func CheckPaths(ws []Window, currentWorktree string, paths []string) []Conflict {
 	var out []Conflict
 	for _, w := range ws {
 		if sameWorktree(w.Worktree, currentWorktree) {
 			continue
 		}
+		seen := map[string]struct{}{}
 		for _, p := range paths {
 			p = strings.TrimSpace(p)
 			if p == "" {
 				continue
 			}
 			if matched, ok := matchTouched(p, w.Touched); ok {
-				out = append(out, Conflict{Path: p, Window: w.Label(), MatchedFile: matched})
+				if _, dup := seen[matched]; !dup {
+					seen[matched] = struct{}{}
+					out = append(out, Conflict{Path: p, Window: w.Label(), MatchedFile: matched})
+				}
+				continue
+			}
+			// #154: no file matched, so try p as a directory. `wt check <dir>`
+			// used to match NOTHING and print "clear — no other window is
+			// touching <dir>", silently and regardless of commit state: a
+			// positive claim about a whole subtree made after matching nothing
+			// in it. A directory is the cheapest way to ask the question, so it
+			// is what gets used when someone is being careful.
+			for _, f := range matchTouchedDir(p, w.Touched) {
+				if _, dup := seen[f]; dup {
+					continue
+				}
+				seen[f] = struct{}{}
+				out = append(out, Conflict{Path: f, Window: w.Label(), MatchedFile: f})
 			}
 		}
 	}
@@ -194,6 +219,12 @@ func PathTouchedByAny(p string, ws []Window) bool {
 		if _, ok := matchTouched(p, w.Touched); ok {
 			return true
 		}
+		// #154: a DIRECTORY that exists only on another window's branch is a real
+		// path, not a typo. Widening here can only remove a false "no such path",
+		// which is the safe direction for this guard.
+		if len(matchTouchedDir(p, w.Touched)) > 0 {
+			return true
+		}
 	}
 	return false
 }
@@ -213,6 +244,35 @@ func matchTouched(p string, touched []string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// matchTouchedDir treats p as a DIRECTORY and returns every touched file beneath
+// it, sorted (#154). It mirrors matchTouched's two tiers one level up: p as a
+// repo-relative directory prefix, and p as a directory SUFFIX, so `wt check
+// configs/kiali/` and `wt check kiali` both reach `envs/.../configs/kiali/x.yaml`
+// the same way `wt check foo.go` already reaches `internal/foo.go`.
+//
+// ⚠ Both tiers match on a SEGMENT BOUNDARY — the "/" in p+"/" is load-bearing.
+// A bare prefix test would make `envs/app` match `envs/application/x.yaml`, i.e.
+// invent a collision in a sibling directory, and a false HIGH on a safety tool
+// is how people learn to pass --bypass.
+//
+// A trailing slash is accepted and stripped: it is how anyone types a directory,
+// and `wt check envs/app/` reporting differently from `wt check envs/app` would
+// be its own small trap.
+func matchTouchedDir(p string, touched []string) []string {
+	p = strings.Trim(strings.TrimSpace(p), "/")
+	if p == "" {
+		return nil // "/" or "" is the whole repo — not a question worth answering
+	}
+	var out []string
+	for _, f := range touched {
+		if strings.HasPrefix(f, p+"/") || strings.Contains(f, "/"+p+"/") {
+			out = append(out, f)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // IsSharedDoc reports whether path is one of the configured append-heavy shared
