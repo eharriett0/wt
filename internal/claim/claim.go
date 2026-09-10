@@ -6,6 +6,7 @@ package claim
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -101,7 +102,7 @@ func Claim(c *config.Config, issue string, force, yes, openPR bool, epic string)
 	// touched. Surface the title (a wrong number is obvious from it) and, on an
 	// interactive terminal, confirm before assigning. --yes / --force skip it; an
 	// agent/pipe (non-TTY) proceeds with the title shown either way.
-	if !force && !yes && !confirmNewClaim(issue, title, stdinIsTTY()) {
+	if !force && !yes && !confirmNewClaim(issue, title, promptInteractive(), os.Stdin) {
 		return fmt.Errorf("claim cancelled (re-run with --yes to skip the prompt)")
 	}
 
@@ -397,13 +398,13 @@ func truncate(s string, n int) string {
 // terminal, asks before proceeding. Non-interactive (agent/pipe) proceeds: the
 // title is surfaced either way and blocking would break the scripted `wt claim`
 // flow. --yes / --force skip this entirely (checked by the caller).
-func confirmNewClaim(issue, title string, interactive bool) bool {
+func confirmNewClaim(issue, title string, interactive bool, in io.Reader) bool {
 	ui.Info("about to claim #%s — %q", issue, title)
 	if !interactive {
 		return true // agent/pipe — proceed with the title shown, never hang on a prompt
 	}
 	fmt.Fprintf(os.Stderr, "%s claim #%s? [y/N] ", ui.Yellow("→"), issue)
-	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	line, _ := bufio.NewReader(in).ReadString('\n')
 	switch strings.ToLower(strings.TrimSpace(line)) {
 	case "y", "yes":
 		return true
@@ -411,11 +412,21 @@ func confirmNewClaim(issue, title string, interactive bool) bool {
 	return false
 }
 
-// stdinIsTTY reports whether stdin is an interactive terminal, so confirmNewClaim
-// only prompts a human — an agent/pipe (the documented scripted `wt claim` flow)
-// has a non-TTY stdin and proceeds without ever blocking on a prompt.
-func stdinIsTTY() bool {
-	fi, err := os.Stdin.Stat()
+// promptInteractive reports whether to ASK a human before claiming. It requires
+// BOTH stdin and stderr to be a terminal — the prompt is written to stderr, so a
+// piped stderr means nobody is watching to answer — which keeps the scripted /
+// agent `wt claim` flow (and a pty-wrapping harness that only makes stdin a TTY)
+// from ever blocking on a prompt (#157 + review). WT_YES is an env escape hatch
+// for an unattended run that can't pass --yes (e.g. a wrapper).
+func promptInteractive() bool {
+	if os.Getenv("WT_YES") != "" {
+		return false
+	}
+	return isTTY(os.Stdin) && isTTY(os.Stderr)
+}
+
+func isTTY(f *os.File) bool {
+	fi, err := f.Stat()
 	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }
 

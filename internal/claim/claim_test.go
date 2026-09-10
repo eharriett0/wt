@@ -1,16 +1,30 @@
 package claim
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/eharriett0/wt/internal/config"
 )
 
-// #157: confirmNewClaim never blocks a non-interactive (agent/pipe) claim — in
-// `go test` stdin is not a TTY, so it proceeds while still surfacing the title.
-func TestConfirmNewClaim_NonInteractiveProceeds(t *testing.T) {
-	if !confirmNewClaim("42", "some issue title", false) {
+// #157 (+review): non-interactive ALWAYS proceeds (agents never hang); the
+// interactive y/N branch — the actual wrong-number catch — only y/yes proceeds.
+func TestConfirmNewClaim(t *testing.T) {
+	// non-interactive: proceeds regardless of what stdin would say
+	if !confirmNewClaim("42", "some issue title", false, strings.NewReader("n\n")) {
 		t.Error("non-interactive confirmNewClaim must proceed (true), never block a scripted claim")
+	}
+	// interactive: only y/yes (any case) proceed; everything else aborts
+	for _, tc := range []struct {
+		in   string
+		want bool
+	}{
+		{"y\n", true}, {"yes\n", true}, {"Y\n", true}, {"  yes  \n", true},
+		{"n\n", false}, {"no\n", false}, {"\n", false}, {"", false}, {"nope\n", false},
+	} {
+		if got := confirmNewClaim("42", "t", true, strings.NewReader(tc.in)); got != tc.want {
+			t.Errorf("confirmNewClaim(interactive, %q) = %v, want %v", tc.in, got, tc.want)
+		}
 	}
 }
 
