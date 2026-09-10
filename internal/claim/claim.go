@@ -4,7 +4,9 @@
 package claim
 
 import (
+	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/eharriett0/wt/internal/activework"
 	"github.com/eharriett0/wt/internal/config"
+	"github.com/eharriett0/wt/internal/coord"
 	"github.com/eharriett0/wt/internal/ghx"
 	"github.com/eharriett0/wt/internal/gitx"
 	"github.com/eharriett0/wt/internal/ui"
@@ -22,8 +25,9 @@ import (
 var issueRe = regexp.MustCompile(`^[0-9]+$`)
 
 // Claim adopts issue for the current window. epic (optional) tags the claim for
-// cross-repo grouping (wt status --epic).
-func Claim(c *config.Config, issue string, force, openPR bool, epic string) error {
+// cross-repo grouping (wt status --epic). yes skips the pre-claim confirmation
+// (#157); force additionally overrides the already-assigned guard.
+func Claim(c *config.Config, issue string, force, yes, openPR bool, epic string) error {
 	if !issueRe.MatchString(issue) {
 		return fmt.Errorf("issue must be a positive integer, got %q", issue)
 	}
@@ -45,7 +49,7 @@ func Claim(c *config.Config, issue string, force, openPR bool, epic string) erro
 	// placeholder commit / draft PR / duplicate section. No --force needed.
 	if user, _ := ghx.CurrentUser(); assignedTo(assignees, user) && isDir(wtPath) && hasSection(c, issue) {
 		content := activework.Read(c.ActiveWork)
-		e := activework.Entry{Issue: issue, Title: title, Branch: branch, Worktree: wtPath, Window: windowID(), Epic: epic, When: time.Now()}
+		e := activework.Entry{Issue: issue, Title: title, Branch: branch, Worktree: wtPath, Window: windowID(c), Epic: epic, When: time.Now()}
 		if err := activework.Write(c.ActiveWork, activework.UpsertSection(content, e)); err != nil {
 			ui.Warn("active-work refresh failed (continuing): %v", err)
 		}
@@ -93,6 +97,15 @@ func Claim(c *config.Config, issue string, force, openPR bool, epic string) erro
 		}
 	}
 
+	// #157: nothing above catches claiming the WRONG (unassigned) issue number —
+	// the assign + dup-PR guards only fire on issues someone/something already
+	// touched. Surface the title (a wrong number is obvious from it) and, on an
+	// interactive terminal, confirm before assigning. --yes / --force skip it; an
+	// agent/pipe (non-TTY) proceeds with the title shown either way.
+	if !force && !yes && !confirmNewClaim(issue, title, promptInteractive(), os.Stdin) {
+		return fmt.Errorf("claim cancelled (re-run with --yes to skip the prompt)")
+	}
+
 	if err := ghx.IssueAddAssigneeMe(issue); err != nil {
 		return fmt.Errorf("assign issue: %w", err)
 	}
@@ -126,7 +139,7 @@ func Claim(c *config.Config, issue string, force, openPR bool, epic string) erro
 
 	entry := activework.Entry{
 		Issue: issue, Title: title, Branch: branch, Worktree: wtDir,
-		PRURL: prURL, Window: windowID(), Epic: epic, When: time.Now(),
+		PRURL: prURL, Window: windowID(c), Epic: epic, When: time.Now(),
 	}
 	if err := activework.Write(c.ActiveWork, activework.AppendSection(activework.Read(c.ActiveWork), entry)); err != nil {
 		ui.Warn("active-work update failed (continuing): %v", err)
@@ -196,7 +209,7 @@ func Adopt(c *config.Config, target, epic string) error {
 
 	entry := activework.Entry{
 		Issue: ident, Title: title, Branch: branch, Worktree: wtDir,
-		PRURL: prURL, Window: windowID(), Epic: epic, When: time.Now(),
+		PRURL: prURL, Window: windowID(c), Epic: epic, When: time.Now(),
 	}
 	if err := activework.Write(c.ActiveWork, activework.UpsertSection(activework.Read(c.ActiveWork), entry)); err != nil {
 		ui.Warn("active-work update failed (continuing): %v", err)
@@ -380,13 +393,52 @@ func truncate(s string, n int) string {
 	return s[:n]
 }
 
-func windowID() string {
-	if v := os.Getenv("WT_WINDOW"); v != "" {
-		return v
+// confirmNewClaim shows what's about to be claimed — a wrong issue NUMBER is
+// obvious the moment its title is on screen (#157) — and, on an interactive
+// terminal, asks before proceeding. Non-interactive (agent/pipe) proceeds: the
+// title is surfaced either way and blocking would break the scripted `wt claim`
+// flow. --yes / --force skip this entirely (checked by the caller).
+func confirmNewClaim(issue, title string, interactive bool, in io.Reader) bool {
+	ui.Info("about to claim #%s — %q", issue, title)
+	if !interactive {
+		return true // agent/pipe — proceed with the title shown, never hang on a prompt
 	}
-	if v := os.Getenv("TERM_SESSION_ID"); v != "" {
-		return v
+	fmt.Fprintf(os.Stderr, "%s claim #%s? [y/N] ", ui.Yellow("→"), issue)
+	line, _ := bufio.NewReader(in).ReadString('\n')
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return true
 	}
-	host, _ := os.Hostname()
-	return fmt.Sprintf("%s-%d", host, os.Getpid())
+	return false
+}
+
+// promptInteractive reports whether to ASK a human before claiming. It requires
+// BOTH stdin and stderr to be a terminal — the prompt is written to stderr, so a
+// piped stderr means nobody is watching to answer — which keeps the scripted /
+// agent `wt claim` flow (and a pty-wrapping harness that only makes stdin a TTY)
+// from ever blocking on a prompt (#157 + review). WT_YES is an env escape hatch
+// for an unattended run that can't pass --yes (e.g. a wrapper).
+func promptInteractive() bool {
+	if os.Getenv("WT_YES") != "" {
+		return false
+	}
+	return isTTY(os.Stdin) && isTTY(os.Stderr)
+}
+
+func isTTY(f *os.File) bool {
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+// windowID is the STABLE identity recorded in the active-work file — the SAME
+// value `wt doctor` prints and that coordCtx uses (#156). It must match, or a
+// window that restarts its shell can't recognise its own claims: the old
+// hostname-PID identity changed every shell, so a restarted window saw its OWN
+// prior claims as another window's, and its old identity lingered as a claim
+// nothing could ever update or release. coord.WindowID keys on WT_WINDOW → the
+// worktree toplevel PATH (stable across shell restarts AND branch switches) →
+// branch, so the recorded identity survives a restart.
+func windowID(c *config.Config) string {
+	branch, _ := gitx.CurrentBranch()
+	return coord.WindowID(os.Getenv("WT_WINDOW"), c.Root, branch)
 }

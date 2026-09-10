@@ -34,7 +34,7 @@ func printHelp() {
 	fmt.Println()
 
 	fmt.Println(b(g("  ✦ CLAIM A UNIT OF WORK")) + d("  — assign issue + worktree + draft PR + record"))
-	fmt.Printf("    %s   %s\n", c("wt claim <issue>"), "claim a GitHub issue for this window  "+d("[--force] [--no-pr] [--epic <id>]"))
+	fmt.Printf("    %s   %s\n", c("wt claim <issue>"), "claim a GitHub issue for this window  "+d("[--force] [--yes] [--no-pr] [--epic <id>]"))
 	fmt.Printf("    %s %s\n", c("wt adopt <branch|pr>"), "worktree on an EXISTING branch/PR (don't fork a new one) + record  "+d("[--epic <id>]"))
 	fmt.Printf("    %s %s\n", c("wt release <issue>"), "drop the claim  "+d("[--clean = also remove an abandoned worktree]"))
 	fmt.Println("    " + d("claim refuses (won't duplicate) when an OPEN PR already references the issue —"))

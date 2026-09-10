@@ -282,11 +282,13 @@ func guardPositionalArg(args []string, usage string) (int, bool) {
 }
 
 func cmdClaim(args []string) int {
-	if code, done := guardHelp(args, "usage: wt claim <issue> [--force] [--no-pr] [--epic <id>]"); done {
+	if code, done := guardHelp(args, "usage: wt claim <issue> [--force] [--yes] [--no-pr] [--epic <id>]"); done {
 		return code
 	}
 	fs := flag.NewFlagSet("claim", flag.ContinueOnError)
 	force := fs.Bool("force", false, "claim even if the issue is already assigned")
+	yes := fs.Bool("yes", false, "skip the pre-claim confirmation (show-title prompt) — for scripted claims (#157)")
+	fs.BoolVar(yes, "y", false, "alias for --yes")
 	noPR := fs.Bool("no-pr", false, "skip opening a draft PR")
 	epic := fs.String("epic", "", "tag this claim with a cross-repo epic id (wt status --epic)")
 	pos, _, err := parseInterspersed(fs, args)
@@ -294,13 +296,13 @@ func cmdClaim(args []string) int {
 		return 64
 	}
 	if len(pos) < 1 {
-		ui.Err("usage: wt claim <issue> [--force] [--no-pr] [--epic <id>]")
+		ui.Err("usage: wt claim <issue> [--force] [--yes] [--no-pr] [--epic <id>]")
 		return 64
 	}
 	return withConfig(func(c *config.Config) int {
 		peerHoldBanner(c)
 		openPR := c.ClaimOpenPR && !*noPR
-		if err := claim.Claim(c, pos[0], *force, openPR, *epic); err != nil {
+		if err := claim.Claim(c, pos[0], *force, *yes, openPR, *epic); err != nil {
 			ui.Err("%v", err)
 			return 1
 		}

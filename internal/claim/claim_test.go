@@ -1,6 +1,49 @@
 package claim
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"github.com/eharriett0/wt/internal/config"
+)
+
+// #157 (+review): non-interactive ALWAYS proceeds (agents never hang); the
+// interactive y/N branch — the actual wrong-number catch — only y/yes proceeds.
+func TestConfirmNewClaim(t *testing.T) {
+	// non-interactive: proceeds regardless of what stdin would say
+	if !confirmNewClaim("42", "some issue title", false, strings.NewReader("n\n")) {
+		t.Error("non-interactive confirmNewClaim must proceed (true), never block a scripted claim")
+	}
+	// interactive: only y/yes (any case) proceed; everything else aborts
+	for _, tc := range []struct {
+		in   string
+		want bool
+	}{
+		{"y\n", true}, {"yes\n", true}, {"Y\n", true}, {"  yes  \n", true},
+		{"n\n", false}, {"no\n", false}, {"\n", false}, {"", false}, {"nope\n", false},
+	} {
+		if got := confirmNewClaim("42", "t", true, strings.NewReader(tc.in)); got != tc.want {
+			t.Errorf("confirmNewClaim(interactive, %q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// #156: the identity recorded in the active-work file must be the STABLE
+// worktree-based coord.WindowID (matching wt doctor), not a per-shell hostname-PID.
+func TestWindowID_StableAndMatchesContract(t *testing.T) {
+	c := &config.Config{Root: "/home/u/worktree-x"}
+	// WT_WINDOW wins — an explicit, restart-stable label
+	t.Setenv("WT_WINDOW", "term-7")
+	if got := windowID(c); got != "term-7" {
+		t.Errorf("windowID with WT_WINDOW = %q, want term-7", got)
+	}
+	// unset → the worktree toplevel PATH (stable across shell restarts; what
+	// coord.WindowID / wt doctor produce), never a hostname-PID
+	t.Setenv("WT_WINDOW", "")
+	if got := windowID(c); got != "/home/u/worktree-x" {
+		t.Errorf("windowID = %q, want the stable worktree path /home/u/worktree-x", got)
+	}
+}
 
 func TestSlugFromTitle(t *testing.T) {
 	cases := map[string]string{
