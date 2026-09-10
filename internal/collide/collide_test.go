@@ -78,6 +78,124 @@ func TestCheckPaths_BasenameMatch(t *testing.T) {
 	}
 }
 
+// ---- #154: a DIRECTORY argument used to match nothing and report "clear" ----
+//
+// The bug was reported to me as "wt check cannot see uncommitted work". It could;
+// the control that isolated the real cause was re-running the SAME check with the
+// other window's work COMMITTED, which still reported clear. Commit state was
+// never the variable — the requested path being a directory was. These tests are
+// written at the matching layer, where that distinction lives, so they cannot be
+// satisfied by anything about staged vs committed.
+
+func TestCheckPaths_DirectoryExpandsToFilesBeneathIt(t *testing.T) {
+	ws := []Window{
+		{Issue: "1", Worktree: "/w/1", Touched: []string{
+			"envs/app/netpol.yaml", "envs/app/kustomization.yaml", "docs/x.md",
+		}},
+		{Issue: "2", Worktree: "/w/2", Touched: nil},
+	}
+	got := CheckPaths(ws, "/w/2", []string{"envs/app/"})
+	want := []Conflict{
+		{Path: "envs/app/kustomization.yaml", Window: "#1", MatchedFile: "envs/app/kustomization.yaml"},
+		{Path: "envs/app/netpol.yaml", Window: "#1", MatchedFile: "envs/app/netpol.yaml"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("directory must expand to the files beneath it =\n%#v\nwant\n%#v", got, want)
+	}
+}
+
+func TestCheckPaths_DirectoryWithoutTrailingSlash(t *testing.T) {
+	// How anyone actually types it. Reporting differently from the slashed form
+	// would be its own small trap.
+	ws := []Window{
+		{Issue: "1", Worktree: "/w/1", Touched: []string{"envs/app/netpol.yaml"}},
+		{Issue: "2", Worktree: "/w/2", Touched: nil},
+	}
+	if got := CheckPaths(ws, "/w/2", []string{"envs/app"}); len(got) != 1 {
+		t.Errorf("unslashed directory should match, got %v", got)
+	}
+}
+
+func TestCheckPaths_DirectoryMatchesOnSegmentBoundaryOnly(t *testing.T) {
+	// THE FALSE-POSITIVE CONTROL. A bare prefix test would make "envs/app" match
+	// "envs/application/x.yaml" — a collision invented in a sibling directory. A
+	// false HIGH on a safety tool is how people learn to pass --bypass.
+	ws := []Window{
+		{Issue: "1", Worktree: "/w/1", Touched: []string{"envs/application/x.yaml", "envs/app-2/y.yaml"}},
+		{Issue: "2", Worktree: "/w/2", Touched: nil},
+	}
+	if got := CheckPaths(ws, "/w/2", []string{"envs/app"}); len(got) != 0 {
+		t.Errorf("sibling directories must not match, got %v", got)
+	}
+}
+
+func TestCheckPaths_DirectorySuffixMatch(t *testing.T) {
+	// Mirrors the existing basename tier one level up: `wt check kiali` should
+	// reach a nested configs/kiali/ the way `wt check foo.go` reaches
+	// internal/foo.go.
+	ws := []Window{
+		{Issue: "1", Worktree: "/w/1", Touched: []string{"envs/landru/configs/kiali/netpol.yaml"}},
+		{Issue: "2", Worktree: "/w/2", Touched: nil},
+	}
+	if got := CheckPaths(ws, "/w/2", []string{"kiali"}); len(got) != 1 {
+		t.Errorf("directory suffix should match a nested dir, got %v", got)
+	}
+}
+
+func TestCheckPaths_DirectoryAndFileUnderItDoNotDoubleReport(t *testing.T) {
+	ws := []Window{
+		{Issue: "1", Worktree: "/w/1", Touched: []string{"envs/app/netpol.yaml"}},
+		{Issue: "2", Worktree: "/w/2", Touched: nil},
+	}
+	got := CheckPaths(ws, "/w/2", []string{"envs/app/", "envs/app/netpol.yaml"})
+	if len(got) != 1 {
+		t.Errorf("dir + file under it must dedupe to one entry, got %v", got)
+	}
+}
+
+func TestCheckPaths_DirectoryStillExcludesOwnWorktree(t *testing.T) {
+	ws := []Window{{Issue: "1", Worktree: "/w/1", Touched: []string{"envs/app/netpol.yaml"}}}
+	if got := CheckPaths(ws, "/w/1", []string{"envs/app/"}); len(got) != 0 {
+		t.Errorf("own worktree must stay excluded for a directory, got %v", got)
+	}
+}
+
+func TestCheckPaths_ExactFileMatchIsUnchangedByDirectorySupport(t *testing.T) {
+	// Regression guard: the directory tier runs only when no file matched, so an
+	// exact/basename request must keep reporting the requested path in Path.
+	ws := []Window{
+		{Issue: "1", Worktree: "/w/1", Touched: []string{"internal/foo.go"}},
+		{Issue: "2", Worktree: "/w/2", Touched: nil},
+	}
+	got := CheckPaths(ws, "/w/2", []string{"foo.go"})
+	want := []Conflict{{Path: "foo.go", Window: "#1", MatchedFile: "internal/foo.go"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("file matching changed =\n%#v\nwant\n%#v", got, want)
+	}
+}
+
+func TestMatchTouchedDir_RootIsNotAQuestion(t *testing.T) {
+	// "/" or "" would expand to the entire repo and report every file in it.
+	touched := []string{"a/b.go", "c/d.go"}
+	for _, p := range []string{"", "/", "   "} {
+		if got := matchTouchedDir(p, touched); len(got) != 0 {
+			t.Errorf("matchTouchedDir(%q) = %v, want none", p, got)
+		}
+	}
+}
+
+func TestPathTouchedByAny_KnowsADirectory(t *testing.T) {
+	// #93's typo guard must not call a directory that exists only on another
+	// window's branch a nonexistent path.
+	ws := []Window{{Issue: "1", Worktree: "/w/1", Touched: []string{"envs/app/netpol.yaml"}}}
+	if !PathTouchedByAny("envs/app/", ws) {
+		t.Error("a touched directory must count as a real path")
+	}
+	if PathTouchedByAny("envs/nope/", ws) {
+		t.Error("an untouched directory must not")
+	}
+}
+
 func TestCheckPaths_ExcludesOwnWorktree(t *testing.T) {
 	ws := []Window{{Issue: "1", Worktree: "/w/1", Touched: []string{"a.go"}}}
 	if got := CheckPaths(ws, "/w/1", []string{"a.go"}); len(got) != 0 {
