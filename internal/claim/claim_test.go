@@ -6,6 +6,14 @@ import (
 	"github.com/eharriett0/wt/internal/config"
 )
 
+// #157: confirmNewClaim never blocks a non-interactive (agent/pipe) claim — in
+// `go test` stdin is not a TTY, so it proceeds while still surfacing the title.
+func TestConfirmNewClaim_NonInteractiveProceeds(t *testing.T) {
+	if !confirmNewClaim("42", "some issue title", false) {
+		t.Error("non-interactive confirmNewClaim must proceed (true), never block a scripted claim")
+	}
+}
+
 // #156: the identity recorded in the active-work file must be the STABLE
 // worktree-based coord.WindowID (matching wt doctor), not a per-shell hostname-PID.
 func TestWindowID_StableAndMatchesContract(t *testing.T) {

@@ -4,6 +4,7 @@
 package claim
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,8 +24,9 @@ import (
 var issueRe = regexp.MustCompile(`^[0-9]+$`)
 
 // Claim adopts issue for the current window. epic (optional) tags the claim for
-// cross-repo grouping (wt status --epic).
-func Claim(c *config.Config, issue string, force, openPR bool, epic string) error {
+// cross-repo grouping (wt status --epic). yes skips the pre-claim confirmation
+// (#157); force additionally overrides the already-assigned guard.
+func Claim(c *config.Config, issue string, force, yes, openPR bool, epic string) error {
 	if !issueRe.MatchString(issue) {
 		return fmt.Errorf("issue must be a positive integer, got %q", issue)
 	}
@@ -92,6 +94,15 @@ func Claim(c *config.Config, issue string, force, openPR bool, epic string) erro
 			ui.Step("or open another:   wt claim %s --force", issue)
 			return fmt.Errorf("open PR #%d already references #%s (adopt it, or --force)", p.Number, issue)
 		}
+	}
+
+	// #157: nothing above catches claiming the WRONG (unassigned) issue number —
+	// the assign + dup-PR guards only fire on issues someone/something already
+	// touched. Surface the title (a wrong number is obvious from it) and, on an
+	// interactive terminal, confirm before assigning. --yes / --force skip it; an
+	// agent/pipe (non-TTY) proceeds with the title shown either way.
+	if !force && !yes && !confirmNewClaim(issue, title, stdinIsTTY()) {
+		return fmt.Errorf("claim cancelled (re-run with --yes to skip the prompt)")
 	}
 
 	if err := ghx.IssueAddAssigneeMe(issue); err != nil {
@@ -379,6 +390,33 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+// confirmNewClaim shows what's about to be claimed — a wrong issue NUMBER is
+// obvious the moment its title is on screen (#157) — and, on an interactive
+// terminal, asks before proceeding. Non-interactive (agent/pipe) proceeds: the
+// title is surfaced either way and blocking would break the scripted `wt claim`
+// flow. --yes / --force skip this entirely (checked by the caller).
+func confirmNewClaim(issue, title string, interactive bool) bool {
+	ui.Info("about to claim #%s — %q", issue, title)
+	if !interactive {
+		return true // agent/pipe — proceed with the title shown, never hang on a prompt
+	}
+	fmt.Fprintf(os.Stderr, "%s claim #%s? [y/N] ", ui.Yellow("→"), issue)
+	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return true
+	}
+	return false
+}
+
+// stdinIsTTY reports whether stdin is an interactive terminal, so confirmNewClaim
+// only prompts a human — an agent/pipe (the documented scripted `wt claim` flow)
+// has a non-TTY stdin and proceeds without ever blocking on a prompt.
+func stdinIsTTY() bool {
+	fi, err := os.Stdin.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }
 
 // windowID is the STABLE identity recorded in the active-work file — the SAME
