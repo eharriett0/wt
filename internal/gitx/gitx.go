@@ -957,6 +957,16 @@ func PushSetUpstream(dir, branch string) error {
 	return err
 }
 
+// DeleteRemoteBranch deletes branch on origin, from dir. `release --clean` uses it
+// to drop the abandoned placeholder branch that claim pushed, so re-claiming the
+// same issue pushes a fresh branch cleanly instead of hitting a non-fast-forward
+// rejection (#159). Errors (e.g. the remote ref is already gone) are the caller's
+// to treat as best-effort.
+func DeleteRemoteBranch(dir, branch string) error {
+	_, err := RunDir(dir, "push", "origin", "--delete", branch)
+	return err
+}
+
 // Abs resolves a possibly-relative path against the repo root.
 func Abs(p string) string {
 	if filepath.IsAbs(p) {
