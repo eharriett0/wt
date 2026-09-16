@@ -59,6 +59,53 @@ func TestPruneBlockLedgers(t *testing.T) {
 	}
 }
 
+// #160: abandoning a reservation you decided NOT to write clears it from holds +
+// the banner AND frees its id immediately (unlike written, whose id stays taken).
+func TestBlockAbandoned(t *testing.T) {
+	now := time.Now()
+	fresh := now.Add(-time.Minute).Format(time.RFC3339)
+	f := "resume.md"
+	// file's real max is 3; self reserves the next id, 4.
+	recs := []Record{{Kind: KindBlockReserve, Window: "self", File: f, Block: 4, TS: fresh}}
+
+	// before abandon: 4 is taken → next is 5; holds + banner (other window) show it
+	if got := NextBlock(recs, f, 3, now, 30*time.Minute); got != 5 {
+		t.Fatalf("before abandon: NextBlock = %d, want 5 (4 reserved)", got)
+	}
+	if got := OwnBlockReservations(recs, "self"); len(got) != 1 {
+		t.Fatalf("before abandon: holds shows %d, want 1", len(got))
+	}
+	if got := RecentBlockReservations(recs, "other", now, 30*time.Minute); len(got) != 1 {
+		t.Fatalf("before abandon: banner shows %d, want 1", len(got))
+	}
+
+	// abandon 4
+	recs = append(recs, Record{Kind: KindBlockAbandoned, Window: "self", File: f, Block: 4, TS: fresh})
+
+	// id 4 is FREED immediately (not waiting out the ttl) — next falls back to
+	// fileMax+1 = 4 instead of staying burned at 5. This is the #160 point vs #35.
+	if got := NextBlock(recs, f, 3, now, 30*time.Minute); got != 4 {
+		t.Errorf("after abandon: NextBlock = %d, want 4 (id freed, no longer burned)", got)
+	}
+	if got := OwnBlockReservations(recs, "self"); len(got) != 0 {
+		t.Errorf("after abandon: holds shows %d, want 0", len(got))
+	}
+	if got := RecentBlockReservations(recs, "other", now, 30*time.Minute); len(got) != 0 {
+		t.Errorf("after abandon: banner shows %d, want 0", len(got))
+	}
+
+	// prune-coord GCs the abandoned reservation + its marker
+	kept, dropped := PruneRecords(recs, now, 24*time.Hour)
+	if dropped != 2 {
+		t.Errorf("prune dropped %d, want 2 (reservation + abandon marker)", dropped)
+	}
+	for _, r := range kept {
+		if r.Kind == KindBlockReserve || r.Kind == KindBlockAbandoned {
+			t.Errorf("prune left a block record: %+v", r)
+		}
+	}
+}
+
 func TestLoadBlockLedgers(t *testing.T) {
 	home := t.TempDir()
 	for i, f := range []string{"/a/x.md", "/b/y.md"} {

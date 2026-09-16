@@ -44,6 +44,14 @@ const (
 	// permanently burning it. File/Block identify the pair; AckOf links back to
 	// the reservation record's ID (best-effort provenance).
 	KindBlockWritten = "block-written"
+	// KindBlockAbandoned is the OTHER terminal signal for a reservation (#160,
+	// follow-up to #35): the window reserved N but decided NOT to write it (e.g. a
+	// bad scan handed out a stale id, so it wrote a different number instead).
+	// Like block-written it clears the banner + `wt holds` entry and lets
+	// prune-coord GC the pair — but UNLIKE block-written it FREES the id for reuse
+	// (the id is not in the file), so NextBlock stops counting it immediately
+	// rather than waiting out DefaultBlockReserveTTL.
+	KindBlockAbandoned = "block-abandoned"
 )
 
 // DefaultBlockReserveTTL bounds how long an UN-written block reservation is
@@ -343,8 +351,9 @@ func ActiveHolds(recs []Record, self, op string) []Record {
 // operator all-clears those, they're not silently GC'd), its acks, and any
 // other record are kept. Pure. dropped = len(recs) - len(kept).
 func PruneRecords(recs []Record, now time.Time, blockMaxAge time.Duration) (kept []Record, dropped int) {
-	cl := cleared(recs)              // announce ids that have an all-clear
-	consumed := consumedBlocks(recs) // (file,block) pairs with a block-written marker (#35)
+	cl := cleared(recs)                // announce ids that have an all-clear
+	consumed := consumedBlocks(recs)   // (file,block) pairs with a block-written marker (#35)
+	abandoned := abandonedBlocks(recs) // ... with a block-abandoned marker (#160)
 	for _, r := range recs {
 		drop := false
 		switch r.Kind {
@@ -353,10 +362,11 @@ func PruneRecords(recs []Record, now time.Time, blockMaxAge time.Duration) (kept
 		case KindAck, KindAllClear:
 			drop = cl[r.AckOf]
 		case KindBlockReserve:
-			// A written reservation is a completed handshake — drop it (and its
-			// marker below) regardless of age; else drop only when aged out.
-			drop = consumed[r.File][r.Block] || (blockMaxAge > 0 && Age(r, now) > blockMaxAge)
-		case KindBlockWritten:
+			// A written (#35) or abandoned (#160) reservation is a completed
+			// handshake — drop it (and its marker below) regardless of age; else
+			// drop only when aged out.
+			drop = consumed[r.File][r.Block] || abandoned[r.File][r.Block] || (blockMaxAge > 0 && Age(r, now) > blockMaxAge)
+		case KindBlockWritten, KindBlockAbandoned:
 			drop = true // the marker is only needed while its reservation lives
 		}
 		if !drop {
@@ -450,10 +460,12 @@ func OwnOpenAnnouncements(recs []Record, self string) []Record {
 // — the ids you hold (and may not have written yet), for `wt holds` (#34).
 func OwnBlockReservations(recs []Record, self string) []Record {
 	consumed := consumedBlocks(recs)
+	abandoned := abandonedBlocks(recs)
 	var out []Record
 	for _, r := range recs {
-		if r.Kind == KindBlockReserve && r.Window == self && !consumed[r.File][r.Block] {
-			out = append(out, r) // #35: hide reservations you've already written
+		if r.Kind == KindBlockReserve && r.Window == self &&
+			!consumed[r.File][r.Block] && !abandoned[r.File][r.Block] {
+			out = append(out, r) // hide reservations you've written (#35) or abandoned (#160)
 		}
 	}
 	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
@@ -483,10 +495,14 @@ func Age(r Record, now time.Time) time.Duration {
 // predates it (existing NEWEST-55 in the doc → next is 56, not 1). Pure.
 func NextBlock(recs []Record, file string, fileMax int, now time.Time, ttl time.Duration) int {
 	consumed := consumedBlocks(recs)
+	abandoned := abandonedBlocks(recs)
 	max := fileMax
 	for _, r := range recs {
 		if r.Kind != KindBlockReserve || r.File != file || r.Block <= max {
 			continue
+		}
+		if abandoned[r.File][r.Block] {
+			continue // #160: explicitly abandoned → free the id NOW (not in the file)
 		}
 		// Count a reservation only if it's still live (younger than ttl) or has
 		// been written (a written id is also ≤ fileMax, so this is belt-and-braces).
@@ -504,9 +520,23 @@ func NextBlock(recs []Record, file string, fileMax int, now time.Time, ttl time.
 // block-written terminal record (#35). A written pair is resolved: it no longer
 // signals an imminent prepend and can be pruned. Pure.
 func consumedBlocks(recs []Record) map[string]map[int]bool {
+	return blockMarkers(recs, KindBlockWritten)
+}
+
+// abandonedBlocks indexes (file → block → true) for every reservation with a
+// block-abandoned terminal record (#160). Like consumed, it's resolved (out of
+// the banner + holds + prunable); unlike consumed, its id is FREE (NextBlock skips
+// it) since nothing was written. Pure.
+func abandonedBlocks(recs []Record) map[string]map[int]bool {
+	return blockMarkers(recs, KindBlockAbandoned)
+}
+
+// blockMarkers indexes (file → block → true) for every record of the given
+// terminal kind. Pure.
+func blockMarkers(recs []Record, kind string) map[string]map[int]bool {
 	out := map[string]map[int]bool{}
 	for _, r := range recs {
-		if r.Kind != KindBlockWritten || r.File == "" {
+		if r.Kind != kind || r.File == "" {
 			continue
 		}
 		if out[r.File] == nil {
@@ -537,13 +567,14 @@ func FindOwnReservation(recs []Record, self, file string, block int) (Record, bo
 // know your own). Newest first. Pure.
 func RecentBlockReservations(recs []Record, self string, now time.Time, maxAge time.Duration) []Record {
 	consumed := consumedBlocks(recs)
+	abandoned := abandonedBlocks(recs)
 	var out []Record
 	for _, r := range recs {
 		if r.Kind != KindBlockReserve || r.Window == self {
 			continue
 		}
-		if consumed[r.File][r.Block] { // #35: written → prepend already happened
-			continue
+		if consumed[r.File][r.Block] || abandoned[r.File][r.Block] {
+			continue // written (#35) or abandoned (#160) → no longer imminent
 		}
 		if Age(r, now) <= maxAge {
 			out = append(out, r)
