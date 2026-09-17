@@ -967,6 +967,21 @@ func DeleteRemoteBranch(dir, branch string) error {
 	return err
 }
 
+// RemoteBranchTip returns the sha origin/branch points at (via ls-remote), or ""
+// when the remote branch doesn't exist. `release --clean` compares it to the local
+// placeholder tip before deleting, so a remote that diverged with real commits is
+// never force-deleted (#159 review).
+func RemoteBranchTip(dir, branch string) (string, error) {
+	out, err := RunDir(dir, "ls-remote", "origin", "refs/heads/"+branch)
+	if err != nil {
+		return "", err
+	}
+	if out = strings.TrimSpace(out); out == "" {
+		return "", nil
+	}
+	return strings.Fields(out)[0], nil // "<sha>\trefs/heads/<branch>"
+}
+
 // Abs resolves a possibly-relative path against the repo root.
 func Abs(p string) string {
 	if filepath.IsAbs(p) {

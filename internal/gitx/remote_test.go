@@ -52,3 +52,28 @@ func TestDeleteRemoteBranch(t *testing.T) {
 		t.Error("deleting an absent remote branch should error (caller treats best-effort)")
 	}
 }
+
+// #159 review: release --clean compares the remote tip to the local placeholder
+// before deleting, so a diverged remote is never force-deleted. RemoteBranchTip
+// is that lookup.
+func TestRemoteBranchTip(t *testing.T) {
+	remote := t.TempDir()
+	runGit(t, remote, "init", "-q", "--bare", "-b", "main")
+	repo := gitRepo(t)
+	runGit(t, repo, "remote", "add", "origin", remote)
+	runGit(t, repo, "push", "-q", "-u", "origin", "main")
+	runGit(t, repo, "switch", "-qc", "feat-x")
+	runGit(t, repo, "commit", "--allow-empty", "-qm", "x")
+	if err := PushSetUpstream(repo, "feat-x"); err != nil {
+		t.Fatal(err)
+	}
+	// present → the remote tip equals the local ref
+	localTip, _ := RunDir(repo, "rev-parse", "refs/heads/feat-x")
+	if tip, err := RemoteBranchTip(repo, "feat-x"); err != nil || tip != localTip {
+		t.Errorf("RemoteBranchTip(feat-x) = (%q, %v), want %q", tip, err, localTip)
+	}
+	// absent → "" with no error (caller treats as "nothing to delete")
+	if tip, err := RemoteBranchTip(repo, "nope"); err != nil || tip != "" {
+		t.Errorf("RemoteBranchTip(nope) = (%q, %v), want empty/nil", tip, err)
+	}
+}
