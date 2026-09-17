@@ -66,7 +66,7 @@ func TestBlockAbandoned(t *testing.T) {
 	fresh := now.Add(-time.Minute).Format(time.RFC3339)
 	f := "resume.md"
 	// file's real max is 3; self reserves the next id, 4.
-	recs := []Record{{Kind: KindBlockReserve, Window: "self", File: f, Block: 4, TS: fresh}}
+	recs := []Record{{ID: "res4", Kind: KindBlockReserve, Window: "self", File: f, Block: 4, TS: fresh}}
 
 	// before abandon: 4 is taken → next is 5; holds + banner (other window) show it
 	if got := NextBlock(recs, f, 3, now, 30*time.Minute); got != 5 {
@@ -79,8 +79,8 @@ func TestBlockAbandoned(t *testing.T) {
 		t.Fatalf("before abandon: banner shows %d, want 1", len(got))
 	}
 
-	// abandon 4
-	recs = append(recs, Record{Kind: KindBlockAbandoned, Window: "self", File: f, Block: 4, TS: fresh})
+	// abandon 4 (the abandon marker links back to the reservation's record ID)
+	recs = append(recs, Record{Kind: KindBlockAbandoned, Window: "self", File: f, Block: 4, AckOf: "res4", TS: fresh})
 
 	// id 4 is FREED immediately (not waiting out the ttl) — next falls back to
 	// fileMax+1 = 4 instead of staying burned at 5. This is the #160 point vs #35.
@@ -103,6 +103,36 @@ func TestBlockAbandoned(t *testing.T) {
 		if r.Kind == KindBlockReserve || r.Kind == KindBlockAbandoned {
 			t.Errorf("prune left a block record: %+v", r)
 		}
+	}
+}
+
+// #160 review (HIGH): --abandon FREES the id, so a LATER reservation of the same
+// number must NOT inherit the old abandonment. Abandonment is keyed by the
+// reservation's record ID, not (file, block) — otherwise two windows collide on
+// the freed id and the new reservation is hidden from holds/banner + wrongly pruned.
+func TestBlockAbandoned_ReuseNotMasked(t *testing.T) {
+	now := time.Now()
+	fresh := now.Add(-time.Minute).Format(time.RFC3339)
+	f := "r.md"
+	// A reserves 4 (fileMax 3) then abandons it → id 4 freed
+	recs := []Record{
+		{ID: "resA", Kind: KindBlockReserve, Window: "A", File: f, Block: 4, TS: fresh},
+		{Kind: KindBlockAbandoned, Window: "A", File: f, Block: 4, AckOf: "resA", TS: fresh},
+	}
+	// B reserves the freed id 4 — a DIFFERENT record, still live
+	recs = append(recs, Record{ID: "resB", Kind: KindBlockReserve, Window: "B", File: f, Block: 4, TS: fresh})
+
+	if got := NextBlock(recs, f, 3, now, 30*time.Minute); got != 5 {
+		t.Errorf("NextBlock = %d, want 5 — B's LIVE reservation of the freed id must not be masked by A's abandon (collision)", got)
+	}
+	if got := OwnBlockReservations(recs, "B"); len(got) != 1 {
+		t.Errorf("B's holds shows %d, want 1 — the reused id is B's live reservation", len(got))
+	}
+	if got := RecentBlockReservations(recs, "other", now, 30*time.Minute); len(got) != 1 {
+		t.Errorf("banner shows %d, want 1 — B's imminent reservation must still surface", len(got))
+	}
+	if got := OwnBlockReservations(recs, "A"); len(got) != 0 {
+		t.Errorf("A's holds shows %d, want 0 — A abandoned its own reservation", len(got))
 	}
 }
 

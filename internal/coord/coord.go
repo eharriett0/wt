@@ -351,9 +351,9 @@ func ActiveHolds(recs []Record, self, op string) []Record {
 // operator all-clears those, they're not silently GC'd), its acks, and any
 // other record are kept. Pure. dropped = len(recs) - len(kept).
 func PruneRecords(recs []Record, now time.Time, blockMaxAge time.Duration) (kept []Record, dropped int) {
-	cl := cleared(recs)                // announce ids that have an all-clear
-	consumed := consumedBlocks(recs)   // (file,block) pairs with a block-written marker (#35)
-	abandoned := abandonedBlocks(recs) // ... with a block-abandoned marker (#160)
+	cl := cleared(recs)                        // announce ids that have an all-clear
+	consumed := consumedBlocks(recs)           // (file,block) with a block-written marker (#35)
+	abandoned := abandonedReservationIDs(recs) // reservation ids with a block-abandoned marker (#160)
 	for _, r := range recs {
 		drop := false
 		switch r.Kind {
@@ -365,7 +365,7 @@ func PruneRecords(recs []Record, now time.Time, blockMaxAge time.Duration) (kept
 			// A written (#35) or abandoned (#160) reservation is a completed
 			// handshake — drop it (and its marker below) regardless of age; else
 			// drop only when aged out.
-			drop = consumed[r.File][r.Block] || abandoned[r.File][r.Block] || (blockMaxAge > 0 && Age(r, now) > blockMaxAge)
+			drop = consumed[r.File][r.Block] || abandoned[r.ID] || (blockMaxAge > 0 && Age(r, now) > blockMaxAge)
 		case KindBlockWritten, KindBlockAbandoned:
 			drop = true // the marker is only needed while its reservation lives
 		}
@@ -460,11 +460,11 @@ func OwnOpenAnnouncements(recs []Record, self string) []Record {
 // — the ids you hold (and may not have written yet), for `wt holds` (#34).
 func OwnBlockReservations(recs []Record, self string) []Record {
 	consumed := consumedBlocks(recs)
-	abandoned := abandonedBlocks(recs)
+	abandoned := abandonedReservationIDs(recs)
 	var out []Record
 	for _, r := range recs {
 		if r.Kind == KindBlockReserve && r.Window == self &&
-			!consumed[r.File][r.Block] && !abandoned[r.File][r.Block] {
+			!consumed[r.File][r.Block] && !abandoned[r.ID] {
 			out = append(out, r) // hide reservations you've written (#35) or abandoned (#160)
 		}
 	}
@@ -495,14 +495,14 @@ func Age(r Record, now time.Time) time.Duration {
 // predates it (existing NEWEST-55 in the doc → next is 56, not 1). Pure.
 func NextBlock(recs []Record, file string, fileMax int, now time.Time, ttl time.Duration) int {
 	consumed := consumedBlocks(recs)
-	abandoned := abandonedBlocks(recs)
+	abandoned := abandonedReservationIDs(recs)
 	max := fileMax
 	for _, r := range recs {
 		if r.Kind != KindBlockReserve || r.File != file || r.Block <= max {
 			continue
 		}
-		if abandoned[r.File][r.Block] {
-			continue // #160: explicitly abandoned → free the id NOW (not in the file)
+		if abandoned[r.ID] {
+			continue // #160: THIS reservation was abandoned → free its id NOW (per-record)
 		}
 		// Count a reservation only if it's still live (younger than ttl) or has
 		// been written (a written id is also ≤ fileMax, so this is belt-and-braces).
@@ -523,12 +523,20 @@ func consumedBlocks(recs []Record) map[string]map[int]bool {
 	return blockMarkers(recs, KindBlockWritten)
 }
 
-// abandonedBlocks indexes (file → block → true) for every reservation with a
-// block-abandoned terminal record (#160). Like consumed, it's resolved (out of
-// the banner + holds + prunable); unlike consumed, its id is FREE (NextBlock skips
-// it) since nothing was written. Pure.
-func abandonedBlocks(recs []Record) map[string]map[int]bool {
-	return blockMarkers(recs, KindBlockAbandoned)
+// abandonedReservationIDs is the set of RESERVATION record IDs that have a
+// block-abandoned marker (#160). Keyed by the reservation's record ID (the abandon
+// record's AckOf) — NOT (file, block) like consumed — because --abandon FREES the
+// id for reuse: a LATER reservation of the same number is a DIFFERENT record and
+// must stay live, not be silently masked by the old abandonment (which would
+// re-introduce the exact same-id collision block-id exists to prevent). Pure.
+func abandonedReservationIDs(recs []Record) map[string]bool {
+	out := map[string]bool{}
+	for _, r := range recs {
+		if r.Kind == KindBlockAbandoned && r.AckOf != "" {
+			out[r.AckOf] = true
+		}
+	}
+	return out
 }
 
 // blockMarkers indexes (file → block → true) for every record of the given
@@ -567,13 +575,13 @@ func FindOwnReservation(recs []Record, self, file string, block int) (Record, bo
 // know your own). Newest first. Pure.
 func RecentBlockReservations(recs []Record, self string, now time.Time, maxAge time.Duration) []Record {
 	consumed := consumedBlocks(recs)
-	abandoned := abandonedBlocks(recs)
+	abandoned := abandonedReservationIDs(recs)
 	var out []Record
 	for _, r := range recs {
 		if r.Kind != KindBlockReserve || r.Window == self {
 			continue
 		}
-		if consumed[r.File][r.Block] || abandoned[r.File][r.Block] {
+		if consumed[r.File][r.Block] || abandoned[r.ID] {
 			continue // written (#35) or abandoned (#160) → no longer imminent
 		}
 		if Age(r, now) <= maxAge {

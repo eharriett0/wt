@@ -153,6 +153,13 @@ func cmdBlockID(args []string) int {
 		ui.Err("%v", err)
 		return 64
 	}
+	// #160 review: the two terminal signals are mutually exclusive — --written needs
+	// the block IN the file, --abandon needs it ABSENT — so passing both is
+	// contradictory. Reject it rather than silently running one.
+	if *written >= 0 && *abandon >= 0 {
+		ui.Err("--written and --abandon are mutually exclusive (a block is either written or abandoned, not both)")
+		return 64
+	}
 	// Canonical key: symlink-resolved absolute path (#152). The shared append-log
 	// lives at ONE real location; every window (any repo, any worktree, reached via
 	// a symlink or not) must resolve it to the SAME key so they coordinate on one
