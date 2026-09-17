@@ -122,6 +122,11 @@ func Claim(c *config.Config, issue string, force, yes, openPR bool, epic string)
 		return fmt.Errorf("placeholder commit: %w", err)
 	}
 	if err := gitx.PushSetUpstream(wtDir, branch); err != nil {
+		// #159: nothing durable is recorded yet (active-work is appended only AFTER
+		// the push), so a failed push would strand a partial claim — issue assigned +
+		// worktree/branch created — which then blocks a retry with "already assigned".
+		// Roll back to a clean slate so re-running `wt claim` works.
+		rollbackFailedClaim(c, issue, wtDir, branch)
 		return fmt.Errorf("push branch: %w", err)
 	}
 
@@ -276,6 +281,26 @@ func Release(c *config.Config, issue string, clean bool) error {
 	return nil
 }
 
+// rollbackFailedClaim undoes a claim that failed before anything durable was
+// recorded (#159): remove the just-created worktree + local branch and unassign
+// the issue, so a retry starts clean instead of tripping the already-assigned
+// guard. NON-force remove (#159 review): a freshly-created worktree holds only our
+// committed placeholder so it's clean and removes cleanly, but if worktree.New
+// short-circuited to a PRE-EXISTING worktree with uncommitted work, the clean guard
+// refuses rather than discarding it. Best-effort: each step reports but never masks
+// the push error.
+func rollbackFailedClaim(c *config.Config, issue, wtDir, branch string) {
+	ui.Info("rolling back partial claim of #%s (push failed) …", issue)
+	if err := worktree.Remove(c, wtDir, branch, false); err != nil {
+		ui.Warn("rollback: couldn't remove worktree %s: %v", wtDir, err)
+	}
+	if user, err := ghx.CurrentUser(); err == nil && user != "" {
+		if err := ghx.IssueRemoveAssignee(issue, user); err == nil {
+			ui.Info("rollback: unassigned #%s", issue)
+		}
+	}
+}
+
 // cleanAbandonedWorktree removes the released claim's worktree iff it's under
 // the worktree root, clean, and abandoned (no live PR, WIP-only commits). Any
 // non-abandoned/dirty case is reported, never forced.
@@ -314,8 +339,29 @@ func cleanAbandonedWorktree(c *config.Config, e activework.Entry) {
 		}
 		return
 	}
+	// Capture the local placeholder tip BEFORE removing the branch — the remote we
+	// delete must be the SAME placeholder we just proved abandoned (#159 review).
+	localTip, _ := gitx.RunDir(c.Root, "rev-parse", "refs/heads/"+e.Branch)
 	if err := worktree.Remove(c, e.Worktree, e.Branch, false); err != nil {
 		ui.Warn("--clean: couldn't remove worktree: %v", err)
+	}
+	// #159: claim also PUSHED this branch, so removing only the worktree + local
+	// branch leaves the remote placeholder behind — re-claiming the same issue then
+	// pushes a fresh placeholder from base and is rejected non-fast-forward. Delete
+	// the remote too, but ONLY when it matches the local placeholder we proved
+	// abandoned: a remote that diverged with real commits (an out-of-band push, no
+	// PR) must never be force-deleted. Best-effort — the remote may already be gone.
+	switch remoteTip, rerr := gitx.RemoteBranchTip(c.Root, e.Branch); {
+	case rerr != nil || remoteTip == "":
+		// no remote branch (already gone) — nothing to do
+	case localTip != "" && remoteTip == localTip:
+		if err := gitx.DeleteRemoteBranch(c.Root, e.Branch); err != nil {
+			ui.Info("--clean: remote origin/%s not deleted: %v", e.Branch, err)
+		} else {
+			ui.OK("--clean: deleted remote branch origin/%s", e.Branch)
+		}
+	default:
+		ui.Info("--clean: remote origin/%s differs from the local placeholder — left in place (delete by hand if truly abandoned)", e.Branch)
 	}
 }
 

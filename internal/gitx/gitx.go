@@ -957,6 +957,31 @@ func PushSetUpstream(dir, branch string) error {
 	return err
 }
 
+// DeleteRemoteBranch deletes branch on origin, from dir. `release --clean` uses it
+// to drop the abandoned placeholder branch that claim pushed, so re-claiming the
+// same issue pushes a fresh branch cleanly instead of hitting a non-fast-forward
+// rejection (#159). Errors (e.g. the remote ref is already gone) are the caller's
+// to treat as best-effort.
+func DeleteRemoteBranch(dir, branch string) error {
+	_, err := RunDir(dir, "push", "origin", "--delete", branch)
+	return err
+}
+
+// RemoteBranchTip returns the sha origin/branch points at (via ls-remote), or ""
+// when the remote branch doesn't exist. `release --clean` compares it to the local
+// placeholder tip before deleting, so a remote that diverged with real commits is
+// never force-deleted (#159 review).
+func RemoteBranchTip(dir, branch string) (string, error) {
+	out, err := RunDir(dir, "ls-remote", "origin", "refs/heads/"+branch)
+	if err != nil {
+		return "", err
+	}
+	if out = strings.TrimSpace(out); out == "" {
+		return "", nil
+	}
+	return strings.Fields(out)[0], nil // "<sha>\trefs/heads/<branch>"
+}
+
 // Abs resolves a possibly-relative path against the repo root.
 func Abs(p string) string {
 	if filepath.IsAbs(p) {
