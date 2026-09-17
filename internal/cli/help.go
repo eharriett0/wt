@@ -60,7 +60,7 @@ func printHelp() {
 	fmt.Printf("    %s     %s\n", c("wt all-clear <id>"), "release your hold  "+d("(also: wt announce --clear <id>)"))
 	fmt.Printf("    %s               %s\n", c("wt holds"), "YOUR outstanding announcements/holds + block reservations (with all-clear lines)")
 	fmt.Printf("    %s          %s\n", c("wt prune-coord"), "GC the coordination log (drop resolved handshakes + aged block reservations)")
-	fmt.Printf("    %s  %s\n", c("wt block-id <file>"), "reserve the next append-log id so two windows never grab the same NEWEST-N  "+d("[--pattern \"NEWEST-{n}\"] [--format] [--written N]"))
+	fmt.Printf("    %s  %s\n", c("wt block-id <file>"), "reserve the next append-log id so two windows never grab the same NEWEST-N  "+d("[--pattern \"NEWEST-{n}\"] [--format] [--written N | --abandon N]"))
 	fmt.Printf("    %s  %s\n", c("wt append <doc> --section H \"txt\""), "locked append under a section — parallel gotcha-adds can't clobber  "+d("[--file <path>]"))
 	fmt.Println("    " + d("Prose with backticks / $ / ! ? Pass ") + c("--file <path>") + d(" (or ") + c("--file -") + d(" for stdin) — a shell-quoted"))
 	fmt.Println("    " + d("argument expands those BEFORE wt sees it, silently deleting a `...` span (#75)."))

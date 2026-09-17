@@ -127,28 +127,37 @@ func canonicalFilePath(file string) string {
 
 // cmdBlockID implements `wt block-id <file> [--pattern P] [--format]`.
 func cmdBlockID(args []string) int {
-	if code, done := guardHelp(args, `usage: wt block-id <file> [--pattern "NEWEST-{n}"] [--format] [--written N]`); done {
+	if code, done := guardHelp(args, `usage: wt block-id <file> [--pattern "NEWEST-{n}"] [--format] [--written N | --abandon N]`); done {
 		return code
 	}
 	fs := flag.NewFlagSet("block-id", flag.ContinueOnError)
 	pattern := fs.String("pattern", defaultBlockPattern,
-		"append-log id pattern; {n} is the numeric placeholder")
+		"append-log id pattern ({n} = numeric id); MATCH a decorated heading (e.g. \"## ⚠ {n}:\") or the default scan under-reports the max and reserves a stale id (#160)")
 	format := fs.Bool("format", false,
 		"print the full formatted token (e.g. NEWEST-56) instead of the bare number")
 	written := fs.Int("written", -1,
 		"mark block N as WRITTEN (prepended) — clears the reservation instead of allocating a new id")
+	abandon := fs.Int("abandon", -1,
+		"abandon block N — a number you reserved but decided NOT to write: clears it from `wt holds`/the banner and frees the id (#160)")
 	pos, _, err := parseInterspersed(fs, args)
 	if err != nil {
 		return 64
 	}
 	file := strings.TrimSpace(strings.Join(pos, " "))
 	if file == "" {
-		ui.Err(`usage: wt block-id <file> [--pattern "NEWEST-{n}"] [--format] [--written N]`)
+		ui.Err(`usage: wt block-id <file> [--pattern "NEWEST-{n}"] [--format] [--written N | --abandon N]`)
 		return 64
 	}
 	re, err := blockPatternRe(*pattern)
 	if err != nil {
 		ui.Err("%v", err)
+		return 64
+	}
+	// #160 review: the two terminal signals are mutually exclusive — --written needs
+	// the block IN the file, --abandon needs it ABSENT — so passing both is
+	// contradictory. Reject it rather than silently running one.
+	if *written >= 0 && *abandon >= 0 {
+		ui.Err("--written and --abandon are mutually exclusive (a block is either written or abandoned, not both)")
 		return 64
 	}
 	// Canonical key: symlink-resolved absolute path (#152). The shared append-log
@@ -196,6 +205,29 @@ func cmdBlockID(args []string) int {
 				return 1
 			}
 			ui.OK("marked block %d written on %s — reservation cleared", *written, filepath.Base(absFile))
+			return 0
+		}
+
+		// --abandon N: terminal signal that reservation N will NOT be written (#160).
+		// The symmetric exit to --written for a number you reserved but decided not to
+		// use (e.g. a bad scan handed out a stale id). REFUSE unless a reservation for
+		// N belongs to THIS window — but do NOT require the block to be in the file
+		// (the whole point is it isn't). Clears holds/banner and frees the id.
+		if *abandon >= 0 {
+			recs, _ := coord.Load(ledger)
+			res, ok := coord.FindOwnReservation(recs, window, absFile, *abandon)
+			if !ok {
+				ui.Err("no reservation for block %d belongs to this window (%s) — nothing to abandon (`wt holds` lists yours)",
+					*abandon, window)
+				return 1
+			}
+			m := newRecord(c, window, coord.KindBlockAbandoned)
+			m.File, m.Block, m.AckOf = absFile, *abandon, res.ID
+			if err := coord.Append(ledger, m); err != nil {
+				ui.Err("could not record block-abandoned: %v", err)
+				return 1
+			}
+			ui.OK("abandoned block %d on %s — reservation cleared, id freed for reuse", *abandon, filepath.Base(absFile))
 			return 0
 		}
 
