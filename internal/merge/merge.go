@@ -214,6 +214,74 @@ type ClosingRef struct {
 	Number int    // issue number
 	Repo   string // "" = same-repo (#N or same-repo URL); "owner/repo" = cross-repo
 	Raw    string // the matched span, for display
+
+	// Suspect names why this close looks UNINTENDED, or "" for an ordinary one
+	// (#164). GitHub matches `<keyword> #N` and reads none of the surrounding
+	// words, so a sentence written to say a PR does NOT close an issue closes
+	// it. That phrasing is never a deliberate close, which is what makes it
+	// safe to gate on where gating on every close would not be (#104).
+	Suspect string
+	// Context is the sentence the match sits in, so the warning can show the
+	// phrasing rather than a bare number — a number alone reads as the ordinary
+	// case, which is how these get merged past.
+	Context string
+}
+
+// Suspect reasons.
+const (
+	SuspectNegated   = "negated"   // "does NOT close #N"
+	SuspectQualified = "qualified" // "Closes #N partially"
+)
+
+// negationRe matches, in the text BEFORE a close keyword and within the same
+// sentence, a word that makes the close non-literal. Deliberately conservative:
+// a false positive here blocks a legitimate merge and pushes people toward the
+// override, which is the failure #104 exists to prevent. Hypothetical modals
+// ("would have closed #N as a false alarm") are included because they describe
+// something that did not happen and are never an intended close.
+var negationRe = regexp.MustCompile(
+	`(?i)\b(?:not|never|neither|nor|without)\b|n't\b|\bno longer\b|` +
+		`\brather than\b|\binstead of\b|\b(?:would|could|might)(?:'ve| have)\b`)
+
+// qualifierRe matches a hedge IMMEDIATELY after the reference. "Closes #N
+// partially" closes #N completely — the qualifier is prose and the parser never
+// sees it.
+var qualifierRe = regexp.MustCompile(`(?i)^\W{0,3}\b(?:partially|partly|in part)\b`)
+
+// sentenceAround returns the span of the sentence containing text[start:end],
+// bounded by line breaks and by sentence terminators. Pure. Markdown headings
+// carry no terminator, so the line break is the load-bearing bound.
+func sentenceAround(text string, start, end int) (int, int) {
+	lo := strings.LastIndexByte(text[:start], '\n') + 1
+	hi := strings.IndexByte(text[end:], '\n')
+	if hi < 0 {
+		hi = len(text)
+	} else {
+		hi += end
+	}
+	if i := strings.LastIndexAny(text[lo:start], ".!?"); i >= 0 {
+		lo += i + 1
+	}
+	if i := strings.IndexAny(text[end:hi], ".!?"); i >= 0 {
+		hi = end + i + 1
+	}
+	return lo, hi
+}
+
+// classifySuspect decides whether a close keyword matched at text[start:end]
+// reads as unintended, and returns the reason plus the sentence it sits in.
+// Pure.
+func classifySuspect(text string, start, end int) (reason, context string) {
+	lo, hi := sentenceAround(text, start, end)
+	switch {
+	case negationRe.MatchString(text[lo:start]):
+		reason = SuspectNegated
+	case qualifierRe.MatchString(text[end:hi]):
+		reason = SuspectQualified
+	default:
+		return "", ""
+	}
+	return reason, strings.TrimSpace(text[lo:hi])
 }
 
 // closingRefRe matches a GitHub closing keyword immediately followed by an issue
@@ -234,15 +302,21 @@ var closingRefRe = regexp.MustCompile(
 func ClosingRefs(text string) []ClosingRef {
 	var out []ClosingRef
 	seen := map[string]bool{}
-	for _, m := range closingRefRe.FindAllStringSubmatch(text, -1) {
+	for _, idx := range closingRefRe.FindAllStringSubmatchIndex(text, -1) {
+		group := func(i int) string {
+			if idx[2*i] < 0 {
+				return ""
+			}
+			return text[idx[2*i]:idx[2*i+1]]
+		}
 		var repo, num string
 		switch {
-		case m[1] != "": // #N (same repo)
-			num = m[1]
-		case m[2] != "" && m[3] != "": // owner/repo#N
-			repo, num = m[2], m[3]
-		case m[4] != "" && m[5] != "": // full issue URL
-			repo, num = m[4], m[5]
+		case group(1) != "": // #N (same repo)
+			num = group(1)
+		case group(2) != "" && group(3) != "": // owner/repo#N
+			repo, num = group(2), group(3)
+		case group(4) != "" && group(5) != "": // full issue URL
+			repo, num = group(4), group(5)
 		}
 		n, err := strconv.Atoi(num)
 		if err != nil {
@@ -253,7 +327,32 @@ func ClosingRefs(text string) []ClosingRef {
 			continue
 		}
 		seen[key] = true
-		out = append(out, ClosingRef{Number: n, Repo: repo, Raw: strings.TrimSpace(m[0])})
+		reason, context := classifySuspect(text, idx[0], idx[1])
+		out = append(out, ClosingRef{
+			Number:  n,
+			Repo:    repo,
+			Raw:     strings.TrimSpace(text[idx[0]:idx[1]]),
+			Suspect: reason,
+			Context: context,
+		})
+	}
+	return out
+}
+
+// SuspectClosings returns the refs whose phrasing says the close is not meant —
+// a negation before the keyword or a qualifier after the number (#164). Pure.
+//
+// ⚠ Deliberately NOT deduplicated against ClosingRefs' ordering: a text that
+// says "Closes #5" once and "does not close #5" later keeps the FIRST match, so
+// an ordinary close is not retroactively made suspect by later prose about it.
+// That direction matters — the alternative flags the postmortem describing the
+// trap, which is how the advice "don't quote it" kept failing.
+func SuspectClosings(text string) []ClosingRef {
+	var out []ClosingRef
+	for _, r := range ClosingRefs(text) {
+		if r.Suspect != "" {
+			out = append(out, r)
+		}
 	}
 	return out
 }

@@ -2,6 +2,7 @@ package merge
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -179,5 +180,99 @@ func TestExtraClosings(t *testing.T) {
 	// all closings already in graph → no extras.
 	if got := ExtraClosings("Closes #5", []int{5}); got != nil {
 		t.Fatalf("ExtraClosings = %v, want nil", got)
+	}
+}
+
+func TestSuspectClosings(t *testing.T) {
+	cases := []struct {
+		name string
+		text string
+		want string // "" = must NOT be flagged
+	}{
+		// --- MUST FIRE. Every one of these is a real phrasing that closed a
+		// live issue; the sentence existed to prevent the close in most of them.
+		{"plain negation", "This does NOT close #1027.", SuspectNegated},
+		{"lowercase negation", "this does not close #77", SuspectNegated},
+		{"contraction", "it doesn't close #5", SuspectNegated},
+		{"negation in a heading", "## Scope, and why this does NOT close #2083", SuspectNegated},
+		{"never", "this will never close #9", SuspectNegated},
+		{"without", "landed without closing #12, resolves #12 is wrong", SuspectNegated},
+		{"rather than", "Refs #3 rather than closing it, so do not fix #3", SuspectNegated},
+		{"hypothetical would have", "a whole-document compare would have closed #1583 as a false alarm", SuspectNegated},
+		{"hypothetical might have", "that might have resolved #44, but it did not", SuspectNegated},
+		{"qualifier partially", "Closes #599 partially (IAM precondition only)", SuspectQualified},
+		{"qualifier partly", "Fixes #12 partly", SuspectQualified},
+		{"qualifier in part", "Resolves #12 in part", SuspectQualified},
+		{"cross-repo negated", "does not close owner/repo#5", SuspectNegated},
+
+		// --- MUST NOT FIRE. A false positive blocks a legitimate merge and
+		// makes the override routine, which is the #104 failure.
+		{"ordinary close", "Closes #1633", ""},
+		{"ordinary close with body", "Adds the guard.\n\nCloses #5", ""},
+		{"negation in a PRIOR sentence", "This is not a revert. Closes #5", ""},
+		{"negation on a PRIOR line", "This does not revert anything\nCloses #5", ""},
+		{"negation AFTER the ref", "Closes #5, not #6 as previously stated", ""},
+		{"qualifier not adjacent", "Closes #5 and the work is partially done elsewhere", ""},
+		{"bare ref with negation", "this does not affect #5", ""},
+		{"'note' must not match 'not'", "note: closes #5", ""},
+		{"'cannot' must not match", "cannot be reverted once it closes #5", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := SuspectClosings(tc.text)
+			if tc.want == "" {
+				if len(got) != 0 {
+					t.Fatalf("SuspectClosings(%q) = %+v, want none", tc.text, got)
+				}
+				return
+			}
+			if len(got) != 1 {
+				t.Fatalf("SuspectClosings(%q) = %+v, want exactly 1", tc.text, got)
+			}
+			if got[0].Suspect != tc.want {
+				t.Errorf("Suspect = %q, want %q", got[0].Suspect, tc.want)
+			}
+			if got[0].Context == "" {
+				t.Error("Context is empty — the warning must be able to show the phrasing, " +
+					"because a bare issue number reads as the ordinary case")
+			}
+		})
+	}
+}
+
+// An ordinary close must not be made suspect by LATER prose describing the trap.
+// Quoting the phrase in a postmortem is how the earlier advice kept failing, so
+// the first match wins and the dedup keeps it.
+func TestSuspectClosings_ordinaryCloseNotPoisonedByLaterProse(t *testing.T) {
+	text := "Closes #5\n\nEarlier I wrote that it does not close #5, which was wrong."
+	if got := SuspectClosings(text); len(got) != 0 {
+		t.Fatalf("SuspectClosings = %+v, want none (first match is the ordinary close)", got)
+	}
+	if refs := ClosingRefs(text); len(refs) != 1 || refs[0].Suspect != "" {
+		t.Fatalf("ClosingRefs = %+v, want one non-suspect ref", refs)
+	}
+}
+
+// The classifier must not change WHICH issues close — that set is GitHub's and
+// this change only annotates it.
+func TestSuspectClosings_doesNotChangeTheCloseSet(t *testing.T) {
+	text := "This does NOT close #1027. Closes #5 partially. Fixes #9"
+	var nums []int
+	for _, r := range ClosingRefs(text) {
+		nums = append(nums, r.Number)
+	}
+	if len(nums) != 3 || nums[0] != 1027 || nums[1] != 5 || nums[2] != 9 {
+		t.Fatalf("ClosingRefs numbers = %v, want [1027 5 9] — all three still close", nums)
+	}
+}
+
+func TestSentenceAround(t *testing.T) {
+	// The bound is the line break as well as the terminator, because a markdown
+	// heading carries no terminator at all.
+	text := "alpha. beta #1 gamma\ndelta"
+	start := strings.Index(text, "#1")
+	lo, hi := sentenceAround(text, start, start+2)
+	if got := text[lo:hi]; strings.TrimSpace(got) != "beta #1 gamma" {
+		t.Fatalf("sentenceAround = %q, want %q", got, "beta #1 gamma")
 	}
 }
