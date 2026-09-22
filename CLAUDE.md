@@ -174,6 +174,28 @@ The formula supports `head "…", branch: "main"` for `--HEAD` builds.
   — use `gh api repos/OWNER/REPO/pulls/N -X PATCH -F body=@file`.
 - `gh issue create` has **no `--json`** — capture the printed URL, parse the
   number.
+- **A backtick code span DOES suppress GitHub's linked-issue parser — measured, #164.**
+  One PR, one already-closed issue, body varied and `closingIssuesReferences` sampled:
+
+  | body | reading |
+  |---|---|
+  | keyword inside `` `…` `` | `[]` at T+0, 60, 120, 180s |
+  | same keyword, bare | `[160]` **immediately** at T+0 |
+
+  So quoting the phrase in a postmortem is safe, and `wt`'s own lint deliberately
+  **over-reports** there (`test_a_code_span_is_still_matched` pins that): flagging a
+  keyword GitHub would ignore is noise, missing one it would honour is a closed issue.
+  ⚠ **Only the PR-BODY surface was measured.** A commit message is not markdown and
+  may not honour code spans at all, so do NOT rely on backticks there.
+- ⚠ **On an OPEN PR the field tracks the body immediately, in both directions.** Measured
+  on the same PR: adding a bare keyword registered at T+0, and removing it cleared at T+0.
+  So there is no general "closingIssuesReferences lags" rule.
+  ⚠⚠ **The one observed lag was on a MERGED PR**, where stripping the keyword left the
+  field still returning the issue across two consecutive reads before it cleared. That is
+  the reading that produced the false claim "a merged PR's closing link is frozen and
+  cannot be cleared". It is not frozen; it was read too early, twice.
+  ⇒ Treat a post-merge read as the only one needing a pause, and never conclude "frozen"
+  from two quick samples of the same artifact.
 - `closingIssuesReferences` is **GraphQL-only** (not a `gh pr view --json` field)
   — query via `gh api graphql … resource(url:){… on PullRequest{…}}`. It reads
   the PR body only, NOT the squash commit body (the `merge-pr` close-lint scans
