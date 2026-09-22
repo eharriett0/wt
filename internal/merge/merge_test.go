@@ -153,6 +153,13 @@ func TestClosingRefs(t *testing.T) {
 		{"single-segment repo#N does NOT close", "Closes wt#5", nil},
 		{"full issue URL closes", "resolves https://github.com/o/r/issues/9", []want{{9, "o/r"}}},
 		{"dedup by repo#num", "Closes #7 ... closes #7", []want{{7, ""}}},
+		// ⚠ A BACKTICK CODE SPAN DOES NOT SUPPRESS THIS MATCHER (#164). Pinned as
+		// current behaviour rather than as a preference: whether it SHOULD suppress
+		// depends on whether GitHub's own parser honours code spans, which is the
+		// open question on that issue. Until that is settled by measurement, the
+		// lint deliberately over-reports here — flagging a keyword GitHub would
+		// ignore is noise, missing one it would honour is a closed issue.
+		{"a code span is still matched", "see `Closes #8` in the postmortem", []want{{8, ""}}},
 		{"'postfix #9' — no keyword boundary match", "postfix #9", nil},
 	}
 	for _, tc := range cases {
