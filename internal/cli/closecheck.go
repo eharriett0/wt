@@ -20,10 +20,20 @@ import (
 
 // closePlan is the pre-merge close analysis, threaded to the post-merge verify.
 type closePlan struct {
-	refs   []merge.ClosingRef // every closing ref in PR body + commit messages
-	extra  []int              // same-repo closings NOT in closingIssuesReferences (trap 2)
-	watch  []int              // same-repo issue numbers to re-check after the merge
-	before map[int]string     // issue → state snapshot before the merge
+	refs    []merge.ClosingRef // every closing ref in PR body + commit messages
+	extra   []int              // same-repo closings NOT in closingIssuesReferences (trap 2)
+	suspect []merge.ClosingRef // closes whose phrasing says they are not meant (#164)
+	watch   []int              // same-repo issue numbers to re-check after the merge
+	before  map[int]string     // issue → state snapshot before the merge
+}
+
+// refLabel renders a ClosingRef the way GitHub addresses it, so the warning can
+// be copied straight into a search.
+func refLabel(r merge.ClosingRef) string {
+	if r.Repo != "" {
+		return fmt.Sprintf("%s#%d", r.Repo, r.Number)
+	}
+	return fmt.Sprintf("#%d", r.Number)
 }
 
 // analyzeClosings gathers what the squash will close (PR body + full commit
@@ -52,10 +62,11 @@ func analyzeClosings(pr string) closePlan {
 	}
 	sort.Ints(watch)
 	return closePlan{
-		refs:   merge.ClosingRefs(text),
-		extra:  merge.ExtraClosings(text, graph),
-		watch:  watch,
-		before: before,
+		refs:    merge.ClosingRefs(text),
+		extra:   merge.ExtraClosings(text, graph),
+		suspect: merge.SuspectClosings(text),
+		watch:   watch,
+		before:  before,
 	}
 }
 
@@ -81,13 +92,22 @@ func renderClosePlan(p closePlan) bool {
 		}
 		fmt.Printf("    %s  %s  %s\n", ui.Bold("#"+strconv.Itoa(r.Number)), ui.Yellow("["+st+"]"), ui.Dim(title))
 	}
+	gate := false
 	if len(p.extra) > 0 {
 		ui.Warn("the squash COMMIT body will close %s — NOT in the PR's own closing references. "+
 			"GitHub's closingIssuesReferences is blind to the commit body, so this would close silently (#77 trap 2).",
 			joinNums(p.extra))
-		return true
+		gate = true
 	}
-	return false
+	// A close keyword written inside a negation or a qualifier is never a
+	// deliberate close, and it fires whether or not the ref is in the PR's own
+	// closing references — so it is checked independently of trap 2 (#164).
+	for _, r := range p.suspect {
+		ui.Warn("%s reads as a close that is NOT meant (%s), and GitHub ignores the surrounding words:\n    %s",
+			ui.Bold(refLabel(r)), r.Suspect, ui.Dim(r.Context))
+		gate = true
+	}
+	return gate
 }
 
 // verifyClosings re-checks the watched issues after the merge and reports any
