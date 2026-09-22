@@ -435,12 +435,21 @@ func cmdMergePR(args []string) int {
 	// what auto-closes. Print the resolved close set; refuse only when the squash
 	// closes something the PR's own closing references don't (trap 2), unless
 	// --close-ok. Best-effort — a gh failure yields an empty plan (never blocks).
+	// ⚠ This runs on --dry-run TOO (#164). It used to be skipped there, which
+	// made the one command you would reach for to preview a merge the one that
+	// could not tell you what the merge closes — you had to perform the merge to
+	// find out. The analysis is read-only, so previewing costs nothing, and a
+	// dry-run reports what it WOULD refuse instead of refusing.
 	var plan closePlan
-	if !*dryRun && !*noCloseCheck {
+	if !*noCloseCheck {
 		plan = analyzeClosings(pr)
 		if gate := renderClosePlan(plan); gate && !*closeOK {
-			ui.Err("refusing to merge — the squash would close issues the PR doesn't declare (see above). Verify, then pass --close-ok to proceed.")
-			return 1
+			if *dryRun {
+				ui.Warn("--dry-run: a real merge would REFUSE here. Verify the close set, then pass --close-ok.")
+			} else {
+				ui.Err("refusing to merge — the squash would close issues the PR doesn't declare, or close one whose phrasing says it is not meant (see above). Verify, then pass --close-ok to proceed.")
+				return 1
+			}
 		}
 	}
 	ghArgs = merge.WithAdmin(*admin, ghArgs)
