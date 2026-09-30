@@ -180,11 +180,16 @@ func cmdClean(args []string) int {
 	fs.BoolVar(apply, "yes", false, "alias for -y")
 	staleIndex := fs.Bool("stale-index", false, "ALSO report merged-PR worktrees holding a leftover uncommitted index that a plain clean silently leaves (prints the manual remove command; never auto-discards) (#88)")
 	allRoots := fs.Bool("all-roots", false, "ALSO evaluate worktrees outside worktree_root (e.g. a legacy worktree root) — the collision engine scans them and they can block a push that a default clean never clears (#101)")
-	if err := fs.Parse(args); err != nil {
+	// #169: `wt clean [-y] <name>...` limits the run to the named worktrees (a
+	// directory basename, a branch, or a path), so one session can remove its own
+	// without touching the others the list shows. Every shipped-ness guard still
+	// applies to a named worktree; naming one never forces it.
+	names, _, err := parseInterspersed(fs, args)
+	if err != nil {
 		return 64
 	}
 	return withConfig(func(c *config.Config) int {
-		if err := worktree.Clean(c, *apply, *staleIndex, *allRoots); err != nil {
+		if err := worktree.Clean(c, *apply, *staleIndex, *allRoots, names); err != nil {
 			ui.Err("%v", err)
 			return 1
 		}
@@ -405,8 +410,15 @@ func cmdMergePR(args []string) int {
 			return 1
 		}
 	}
-	if c.MergeIsDeploy && !*dryRun && deployGateApplies(c, pr) {
-		if code := deployGate(pr, *confirmDeploy); code != 0 {
+	// ⚠ The gate is EVALUATED on --dry-run too (#170), for the reason the close-set
+	// preview below gives (#164): deployGateApplies and the draft read are
+	// read-only, and a dry run that stayed silent here printed `verdict=ok` for a
+	// PR the real merge then stopped at. A dry run never prompts.
+	if c.MergeIsDeploy && deployGateApplies(c, pr) {
+		if *dryRun {
+			draft, derr := ghx.PRIsDraft(pr)
+			ui.Warn("%s", deployDryRunNote(pr, draft && derr == nil, *confirmDeploy))
+		} else if code := deployGate(pr, *confirmDeploy); code != 0 {
 			return code
 		}
 	}
@@ -631,6 +643,21 @@ func matchesAny(globs []string, name string) bool {
 		}
 	}
 	return false
+}
+
+// deployDryRunNote is what `merge-pr --dry-run` says about the merge==deploy gate
+// once deployGateApplies has said it fires (#170). It follows deployGate's own
+// order: a draft is refused before anything else, then --confirm-deploy decides
+// whether the real merge would stop for the typed ack. Pure.
+func deployDryRunNote(pr string, draft, confirmed bool) string {
+	switch {
+	case draft:
+		return "--dry-run: a real merge would REFUSE here: PR #" + pr + " is a DRAFT in a merge==deploy repo. Mark it ready first."
+	case confirmed:
+		return "--dry-run: merging PR #" + pr + " AUTO-APPLIES to prod (merge_is_deploy); --confirm-deploy is set, so a real merge would proceed."
+	default:
+		return "--dry-run: a real merge stops at the deploy gate: merging PR #" + pr + " AUTO-APPLIES to prod (merge_is_deploy). Pass --confirm-deploy, or type deploy at a terminal."
+	}
 }
 
 func deployGate(pr string, confirmed bool) int {

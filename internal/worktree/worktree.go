@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -290,7 +291,81 @@ func ReapableBranch(branch, base string) bool {
 	return branch != "" && branch != "HEAD" && branch != base
 }
 
-func Clean(c *config.Config, apply, staleIndex, allRoots bool) error {
+// MatchedName returns the first of names that picks out the worktree at wtPath
+// on branch, or "" (#169). A name matches the worktree's directory basename, its
+// branch, or its path (`resolved` holds each name's real path, "" when it is not
+// one). Matching only SELECTS: a named worktree still goes through every
+// shipped-ness guard, so naming an unshipped one removes nothing. Pure.
+func MatchedName(names, resolved []string, wtPath, branch string) string {
+	for i, n := range names {
+		if n == "" {
+			continue
+		}
+		if n == filepath.Base(wtPath) || (branch != "" && n == branch) ||
+			(i < len(resolved) && resolved[i] != "" && resolved[i] == wtPath) {
+			return n
+		}
+	}
+	return ""
+}
+
+// CheckNames refuses a name list that clean cannot act on exactly (#169), before
+// anything is evaluated or removed. hits maps each name to the worktrees it picks
+// out ON ITS OWN. Two ways a list is refused:
+//   - a name that picks out nothing: almost always a typo, and "nothing to clean"
+//     would read as "that worktree is not shipped";
+//   - a name that picks out more than one worktree: a directory name in one and a
+//     branch name in another (dir feat-d on feat/d, branch feat-d elsewhere).
+//
+// Either way nothing is cleaned, so a mistyped or ambiguous `-y` list never removes
+// "the rest" of what it named. The review round found both. Pure.
+func CheckNames(names []string, hits map[string][]string) error {
+	var missing, ambiguous []string
+	seen := map[string]bool{}
+	for _, n := range names {
+		if n == "" || seen[n] {
+			continue
+		}
+		seen[n] = true
+		switch len(hits[n]) {
+		case 0:
+			missing = append(missing, n)
+		case 1:
+		default:
+			ambiguous = append(ambiguous, fmt.Sprintf("%s (%s)", n, strings.Join(hits[n], ", ")))
+		}
+	}
+	var msgs []string
+	if len(missing) > 0 {
+		msgs = append(msgs, "no worktree matches "+strings.Join(missing, ", ")+" (a name is a worktree directory, a branch, or a path)")
+	}
+	if len(ambiguous) > 0 {
+		msgs = append(msgs, "more than one worktree matches "+strings.Join(ambiguous, "; ")+", so name it by its path")
+	}
+	if len(msgs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s; nothing was cleaned", strings.Join(msgs, "; "))
+}
+
+// RerunHint is the line a listing-only clean ends with, or "" when it listed
+// nothing as shipped. listed holds, for a named run, the names that picked out a
+// shipped worktree. The old unconditional hint told the reader to "remove the
+// shipped ones listed above" after listing none, and for a name that matched
+// nothing it echoed the name back as a command that exits 1 (#169). Pure.
+func RerunHint(named bool, listed []string) string {
+	if len(listed) == 0 {
+		return ""
+	}
+	if named {
+		return fmt.Sprintf("re-run with `wt clean -y %s` to remove the shipped ones listed above", strings.Join(listed, " "))
+	}
+	return "re-run with `wt clean -y` to remove the shipped worktrees listed above"
+}
+
+// Clean lists (or, with apply, removes) the shipped secondary worktrees. names,
+// when non-empty, limits the run to the worktrees they pick out (#169).
+func Clean(c *config.Config, apply, staleIndex, allRoots bool, names []string) error {
 	ui.Step("fetching origin/%s", c.Base)
 	_ = gitx.Fetch("origin", c.Base)
 	_ = gitx.WorktreePrune() // #42: drop stale metadata for manually-deleted dirs
@@ -301,13 +376,44 @@ func Clean(c *config.Config, apply, staleIndex, allRoots bool) error {
 	}
 	if len(paths) <= 1 {
 		ui.Info("no secondary worktrees to clean")
-		return nil
+		return CheckNames(names, nil)
+	}
+	// A name that is a path is compared by its real path, the form git reports.
+	resolved := make([]string, len(names))
+	for i, n := range names {
+		if strings.ContainsRune(n, filepath.Separator) {
+			resolved[i] = realPath(n)
+		}
+	}
+	// #169: resolve every name before acting on any (see CheckNames).
+	if len(names) > 0 {
+		hits := map[string][]string{}
+		for _, wt := range paths[1:] {
+			b, _ := gitx.CurrentBranchIn(wt)
+			for i, n := range names {
+				if MatchedName(names[i:i+1], resolved[i:i+1], realPath(wt), b) != "" && !slices.Contains(hits[n], wt) {
+					hits[n] = append(hits[n], wt)
+				}
+			}
+		}
+		if err := CheckNames(names, hits); err != nil {
+			return err
+		}
 	}
 
 	now := time.Now()
 	removed := 0
+	var listed []string // what a listing-only run showed as shipped, for RerunHint
 	skippedOutOfRoot := 0
 	for _, wt := range paths[1:] { // skip primary (index 0)
+		name := ""
+		if len(names) > 0 {
+			b, _ := gitx.CurrentBranchIn(wt)
+			name = MatchedName(names, resolved, realPath(wt), b)
+			if name == "" {
+				continue // not named: say nothing about it
+			}
+		}
 		if !ManagedByClean(wt, c.WorktreeRoot, allRoots) {
 			skippedOutOfRoot++
 			// Say what to DO about it (#101): the old wording ("never offered for
@@ -342,7 +448,10 @@ func Clean(c *config.Config, apply, staleIndex, allRoots bool) error {
 		cherryFailed := cerr != nil
 		// One PR-state read (#88) shared with collide/status/check via ghx —
 		// merged ⇒ shipped (#37 squash). Feeds both the normal reap and --stale-index.
-		prNum, prState, prOK := ghx.PRForBranch(br)
+		// #168: when no PR has this branch's name, the branch's tip commit is looked
+		// up instead, so work pushed under another name and squash-merged there is
+		// recognised as shipped. A dirty worktree is still never removed.
+		prNum, prState, viaTip, prOK := ghx.PRForBranchOrTip(br, gitx.ResolveRemoteBase(c.Base))
 		prMerged := prOK && prState == "MERGED"
 
 		// #88 --stale-index: REPORT (never auto-remove) a MERGED-PR worktree that
@@ -351,7 +460,13 @@ func Clean(c *config.Config, apply, staleIndex, allRoots bool) error {
 		// work shipped, and the dirty index could be fresh post-merge work (the #88
 		// review). Surface it + the manual command; the operator inspects + decides.
 		if StaleIndexReportable(prState, prOK, !gitx.IsClean(wt), staleIndex, withinGrace) {
-			ui.Warn("%s — PR #%s merged, but this worktree has a leftover uncommitted index (%d dirty file(s)) so plain clean leaves it. INSPECT it, then if it's stale leftovers (not fresh work) remove it by hand:", br, prNum, dirtyCount(wt))
+			if viaTip {
+				// #168: a follow-up branch started at the PR's head looks the same,
+				// so "leftover" is a guess here, not the likely reading.
+				ui.Warn("%s — PR #%s merged (found by the branch's tip commit), but this worktree has uncommitted changes (%d dirty file(s)) that may be a follow-up rather than leftovers, so plain clean leaves it. INSPECT it, then if it's stale leftovers (not fresh work) remove it by hand:", br, prNum, dirtyCount(wt))
+			} else {
+				ui.Warn("%s — PR #%s merged, but this worktree has a leftover uncommitted index (%d dirty file(s)) so plain clean leaves it. INSPECT it, then if it's stale leftovers (not fresh work) remove it by hand:", br, prNum, dirtyCount(wt))
+			}
 			fmt.Printf("  git -C %s status              # confirm what's uncommitted FIRST\n", wt)
 			fmt.Printf("  git worktree remove --force %s && git branch -D %s\n", wt, br)
 			continue
@@ -373,10 +488,14 @@ func Clean(c *config.Config, apply, staleIndex, allRoots bool) error {
 		reason := fmt.Sprintf("patch-equivalent on %s", c.Base)
 		if prMerged {
 			reason = "PR merged"
+			if viaTip {
+				reason = fmt.Sprintf("PR #%s merged, found by the branch's tip commit", prNum)
+			}
 		}
 		if !apply {
 			ui.OK("%s — shipped (%s), safe to remove", br, reason)
 			fmt.Printf("  git worktree remove %s && git branch -D %s\n", wt, br)
+			listed = append(listed, name)
 			continue
 		}
 		// apply: remove it (never force — refuse to discard uncommitted work).
@@ -394,8 +513,8 @@ func Clean(c *config.Config, apply, staleIndex, allRoots bool) error {
 		} else {
 			ui.OK("removed %d shipped worktree(s)", removed)
 		}
-	} else if removed == 0 {
-		ui.Info("re-run with `wt clean -y` to remove the shipped worktrees listed above")
+	} else if hint := RerunHint(len(names) > 0, listed); hint != "" {
+		ui.Info("%s", hint)
 	}
 	if skippedOutOfRoot > 0 {
 		// The whole point of #101: these still collide, so "clean says nothing to

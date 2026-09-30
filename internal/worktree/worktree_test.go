@@ -193,3 +193,90 @@ func TestRemoveStillRefusesOutOfRoot(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
+
+// TestMatchedName pins `wt clean <name>` selection (#169): a name picks a worktree
+// by its directory basename, its branch, or its (real) path, and nothing else.
+func TestMatchedName(t *testing.T) {
+	wt := "/r/wts/feat-42-login"
+	cases := []struct {
+		name     string
+		names    []string
+		resolved []string
+		branch   string
+		want     string
+	}{
+		{"by directory", []string{"feat-42-login"}, nil, "feat-42-login", "feat-42-login"},
+		{"by branch when it differs from the directory", []string{"fix-x"}, nil, "fix-x", "fix-x"},
+		{"by path", []string{"../wts/feat-42-login"}, []string{"/r/wts/feat-42-login"}, "b", "../wts/feat-42-login"},
+		{"a branch name with a slash still matches as a branch", []string{"bot/image-x"}, []string{"/cwd/bot/image-x"}, "bot/image-x", "bot/image-x"},
+		{"a prefix is not a match", []string{"feat-42"}, nil, "feat-42-login", ""},
+		{"another worktree's name", []string{"feat-43-login"}, nil, "feat-43-login-other", ""},
+		{"empty names match nothing", []string{""}, nil, "", ""},
+		{"first matching name is returned", []string{"nope", "feat-42-login"}, nil, "b", "feat-42-login"},
+	}
+	for _, c := range cases {
+		if got := MatchedName(c.names, c.resolved, wt, c.branch); got != c.want {
+			t.Errorf("%s: MatchedName = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestCheckNames pins the name contract (#169): every name must pick out exactly
+// one worktree, or the run stops with nothing cleaned. A typo (`wt clean -y
+// feat-4` for feat-42) fails loudly instead of reading as "not shipped", and an
+// ambiguous name, or a list with one bad name, never removes the rest.
+func TestCheckNames(t *testing.T) {
+	one := map[string][]string{"a": {"/w/a"}, "b": {"/w/b"}}
+	if err := CheckNames([]string{"a", "b", "a", ""}, one); err != nil {
+		t.Errorf("each name picks out one worktree (a repeat is not ambiguity) → %v, want nil", err)
+	}
+	if err := CheckNames(nil, nil); err != nil {
+		t.Errorf("no names → %v, want nil", err)
+	}
+	cases := []struct {
+		names []string
+		hits  map[string][]string
+		want  []string // substrings the error must carry
+	}{
+		{[]string{"a", "c", "e"}, one, []string{"no worktree matches c, e", "nothing was cleaned"}},
+		{[]string{"c", "c"}, one, []string{"no worktree matches c (a name"}}, // named once, not "c, c"
+		{[]string{"x"}, nil, []string{"no worktree matches x"}},
+		{[]string{"a", "d"}, map[string][]string{"a": {"/w/a"}, "d": {"/w/d", "/w/x"}},
+			[]string{"more than one worktree matches d (/w/d, /w/x)", "by its path", "nothing was cleaned"}},
+		{[]string{"c", "d"}, map[string][]string{"d": {"/w/d", "/w/x"}},
+			[]string{"no worktree matches c", "more than one worktree matches d"}},
+	}
+	for _, tc := range cases {
+		err := CheckNames(tc.names, tc.hits)
+		if err == nil {
+			t.Errorf("CheckNames(%q) = nil, want an error", tc.names)
+			continue
+		}
+		for _, w := range tc.want {
+			if !strings.Contains(err.Error(), w) {
+				t.Errorf("CheckNames(%q) = %q, want it to contain %q", tc.names, err, w)
+			}
+		}
+	}
+}
+
+// #169: the hint is printed only after something was listed as shipped, and a
+// named run echoes only the names that picked one out. The scratch-repo smoke
+// found `wt clean nosuch` suggesting `wt clean -y nosuch`, a command that exits 1.
+func TestRerunHint(t *testing.T) {
+	cases := []struct {
+		named  bool
+		listed []string
+		want   string
+	}{
+		{false, nil, ""},
+		{true, nil, ""},
+		{false, []string{""}, "re-run with `wt clean -y` to remove the shipped worktrees listed above"},
+		{true, []string{"a", "feat/d"}, "re-run with `wt clean -y a feat/d` to remove the shipped ones listed above"},
+	}
+	for _, tc := range cases {
+		if got := RerunHint(tc.named, tc.listed); got != tc.want {
+			t.Errorf("RerunHint(%v, %q) = %q, want %q", tc.named, tc.listed, got, tc.want)
+		}
+	}
+}

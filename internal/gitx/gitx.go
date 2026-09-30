@@ -967,6 +967,37 @@ func DeleteRemoteBranch(dir, branch string) error {
 	return err
 }
 
+// BranchTip returns the full sha refs/heads/<branch> points at, or "" when it does
+// not resolve (no such branch, detached HEAD). Branches are shared by every
+// worktree, so this reads from the current repo. Used by the #168 tip lookup.
+func BranchTip(branch string) string {
+	if branch == "" || branch == "HEAD" {
+		return ""
+	}
+	out, err := Run("rev-parse", "--verify", "--quiet", "refs/heads/"+branch+"^{commit}")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+// IsAncestor reports whether commit a is reachable from ref b (`git merge-base
+// --is-ancestor`). Exit 0 is true and exit 1 is false; any other outcome (a bad or
+// missing ref) is an error, so a caller cannot read "could not tell" as "no".
+func IsAncestor(a, b string) (bool, error) {
+	if a == "" || b == "" {
+		return false, fmt.Errorf("is-ancestor needs two refs, got %q and %q", a, b)
+	}
+	_, err := Run("merge-base", "--is-ancestor", a, b)
+	if err == nil {
+		return true, nil
+	}
+	if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, err
+}
+
 // RemoteBranchTip returns the sha origin/branch points at (via ls-remote), or ""
 // when the remote branch doesn't exist. `release --clean` compares it to the local
 // placeholder tip before deleting, so a remote that diverged with real commits is

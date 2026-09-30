@@ -653,6 +653,12 @@ func (wl WindowLiveness) Label() string {
 	if wl.Dirty && (wl.Level == LiveStale || wl.Level == LiveClosedPR) {
 		base += " · leftover uncommitted edits"
 	}
+	// #168: a dirty worktree whose commits merged under another branch name stays
+	// HIGH (ClassifyFacts' tip exception). Name the PR so the reader can see the
+	// edits are the only live part, and commit or discard them to clear it.
+	if wl.Level == LiveDirty && wl.MergedPR != "" {
+		base += " · its commits merged in #" + wl.MergedPR
+	}
 	// #87: a dirty base checkout that's fallen behind origin/base stays HIGH (its
 	// uncommitted edits could be live work — never hidden), but the drift is
 	// noted so a reader can dismiss likely rot fast. Past the threshold, say so.
@@ -700,6 +706,7 @@ type LiveFacts struct {
 	PRChecked bool // whether PR status was actually resolvable (gh present+authed)
 	Dirty     bool
 	Merged    bool          // a MERGED PR exists for the branch — squash-merged/shipped (#73)
+	ViaTip    bool          // that MERGED PR was found by the branch's tip commit, not its name (#168)
 	ClosedPR  bool          // the branch's most-recent PR was CLOSED unmerged — abandoned/superseded (#79)
 	Unshipped int           // git cherry "+" count; <0 means it could not be computed
 	Age       time.Duration // time since last commit (0 = unknown)
@@ -719,6 +726,13 @@ type LiveFacts struct {
 // Neither can create NEW contention on base, so both suppress regardless of the
 // index. Only when NO PR resolved does a dirty worktree mean live editing.
 //
+// #168 exception: a MERGED PR found only by the branch's TIP commit (ViaTip) does
+// NOT outrank a dirty worktree. Found by name, the branch IS the merged PR's head,
+// so a dirty index is leftover cruft. Found by tip, the branch only points into a
+// merged PR, which is equally true of a follow-up branch started at that PR's
+// head, whose uncommitted edits are new work. wt cannot tell the two apart, so the
+// edits stay visible (HIGH, as before #168); a clean tree still suppresses.
+//
 // maxAge (>0) enables dormancy on an unmerged, no-PR, clean branch idle past the
 // threshold (LiveDormant, suppressed). Dormancy also requires PRChecked: if PR
 // status couldn't be resolved (gh offline/unauthed) we must NOT downgrade an
@@ -727,7 +741,7 @@ func ClassifyFacts(f LiveFacts, maxAge time.Duration) Liveness {
 	switch {
 	case f.HasOpenPR:
 		return LiveOpenPR
-	case f.Merged:
+	case f.Merged && !(f.ViaTip && f.Dirty):
 		// MERGED ⇒ shipped. Suppress even with Unshipped>0 (squash-merge breaks
 		// git-cherry patch-equivalence) and even with a leftover dirty index (#73,
 		// #79 comment 2). The dirtiness is carried into the label, not the level.
@@ -766,14 +780,17 @@ func Classify(w Window, base string, maxAge time.Duration, now time.Time) Window
 	// in a single call (#79) — replacing the separate open- + merged-lookups (#73).
 	// The most-recent PR's state decides: OPEN ⇒ contention, MERGED ⇒ shipped (#73),
 	// CLOSED ⇒ abandoned/superseded (#79). Absent ⇒ fall through to git signals.
+	// #168: with no PR under the branch's own name, the branch's tip commit is
+	// looked up, so work pushed under another name reads as its real PR (OPEN
+	// stays contention; MERGED only when the tip is in that PR's final commits).
 	if ghx.Present() && ghx.Authed() {
 		f.PRChecked = true
-		if n, state, ok := ghx.PRForBranch(w.Branch); ok {
+		if n, state, viaTip, ok := ghx.PRForBranchOrTip(w.Branch, gitx.ResolveRemoteBase(base)); ok {
 			switch state {
 			case "OPEN":
 				f.HasOpenPR, pr = true, n
 			case "MERGED":
-				f.Merged, mergedPR = true, n
+				f.Merged, f.ViaTip, mergedPR = true, viaTip, n
 			case "CLOSED":
 				f.ClosedPR, closedPR = true, n
 			}

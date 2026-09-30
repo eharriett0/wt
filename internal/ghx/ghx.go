@@ -259,15 +259,163 @@ func PRForBranch(branch string) (number, state string, ok bool) {
 		return "", "", false
 	}
 	out, err := run("pr", "list", "--head", branch, "--state", "all",
-		"--json", "number,state", "--jq", `.[0] | "\(.number) \(.state)"`)
+		"--json", "number,state", "--jq", `.[0] // empty | "\(.number) \(.state)"`)
 	if err != nil {
 		return "", "", false
 	}
-	fields := strings.Fields(strings.TrimSpace(out))
-	if len(fields) != 2 {
+	return parsePRForBranch(out)
+}
+
+// parsePRForBranch reads PRForBranch's `<number> <state>` line. Only a numeric
+// number and a known state count as a PR. Pure.
+//
+// ⚠ Before #168 the query was `.[0] | …`, which prints "null null" for a branch
+// with NO PR, and that parsed as ok=true with state "null". Every caller then
+// matched no state, so "no PR" worked by accident, and the #168 tip fallback, the
+// first caller to ask "was there a PR at all?", never ran. Both halves are fixed:
+// the query prints nothing for no PR, and this refuses anything that is not a PR.
+func parsePRForBranch(out string) (number, state string, ok bool) {
+	f := strings.Fields(strings.TrimSpace(out))
+	if len(f) != 2 {
 		return "", "", false
 	}
-	return fields[0], fields[1], true
+	if _, err := strconv.Atoi(f[0]); err != nil {
+		return "", "", false
+	}
+	switch f[1] {
+	case "OPEN", "MERGED", "CLOSED":
+		return f[0], f[1], true
+	}
+	return "", "", false
+}
+
+// CommitPR is one pull request GitHub associates with a commit (#168).
+type CommitPR struct {
+	Number string
+	Open   bool
+	Merged bool
+	// HasTip: the commit is in the PR's FINAL commit list. Read only for a merged
+	// PR, where it is what makes "merged" mean "this work shipped".
+	HasTip bool
+}
+
+// parseCommitPRs reads PRForTip's `<number> <state> <merged>` lines. A line that
+// does not have that shape is skipped rather than guessed at. Pure.
+func parseCommitPRs(out string) []CommitPR {
+	var prs []CommitPR
+	for _, ln := range strings.Split(out, "\n") {
+		f := strings.Fields(ln)
+		if len(f) != 3 {
+			continue
+		}
+		if _, err := strconv.Atoi(f[0]); err != nil {
+			continue
+		}
+		prs = append(prs, CommitPR{Number: f[0], Open: f[1] == "open", Merged: f[2] == "true"})
+	}
+	return prs
+}
+
+// ChooseTipPR picks the PR that speaks for a branch whose tip commit belongs to
+// PRs under OTHER head names (#168). Pure.
+//   - An OPEN PR wins: the work is live under another name. It is surfaced as
+//     contention, never suppressed.
+//   - Otherwise the highest-numbered MERGED PR whose final commits contain the
+//     tip: that work shipped.
+//   - A merged PR that no longer contains the tip (force-pushed away before the
+//     merge) proves nothing, and a closed-unmerged one is not used either. Both
+//     fall through to git signals, exactly as before #168.
+func ChooseTipPR(prs []CommitPR) (number, state string, ok bool) {
+	pick := func(want func(CommitPR) bool) string {
+		best, bestN := -1, ""
+		for _, p := range prs {
+			if n, err := strconv.Atoi(p.Number); err == nil && want(p) && n > best {
+				best, bestN = n, p.Number
+			}
+		}
+		return bestN
+	}
+	if n := pick(func(p CommitPR) bool { return p.Open }); n != "" {
+		return n, "OPEN", true
+	}
+	if n := pick(func(p CommitPR) bool { return p.Merged && p.HasTip }); n != "" {
+		return n, "MERGED", true
+	}
+	return "", "", false
+}
+
+// TipLookupApplies decides whether to look a branch's PR up by its tip commit
+// (#168). Only when no PR has the branch's own name as its head, the tip
+// resolves, and the tip is known NOT to be on base. Pure.
+//
+// ⚠ The base condition is load-bearing. A branch with nothing ahead of base has
+// a tip that IS a base commit, and on a repo that merges by merge commit or
+// rebase every base commit belongs to some merged PR's final commits. Without
+// this, a fresh `wt new` worktree would read as shipped, and `wt clean` would
+// reap it: the #61 data-loss class. Unknown ancestry skips the lookup, which is
+// the behaviour before #168.
+func TipLookupApplies(prFound bool, tip string, onBase, ancestryKnown bool) bool {
+	return !prFound && tip != "" && ancestryKnown && !onBase
+}
+
+// PRForTip resolves the PR that a commit belongs to (#168), for a branch whose
+// commits were pushed under another name: `git push origin fix-x:bot/y` onto a
+// PR an automation had opened. No PR has head `fix-x`, so PRForBranch finds
+// nothing, and `git cherry` cannot see a squash. GitHub still lists the PR for
+// the commit after the squash merge. Returns ("OPEN"|"MERGED") per ChooseTipPR.
+// Best-effort: ("", "", false) on any gh error, including the 422 GitHub returns
+// for a commit it has never seen, which is the normal case for unpushed work.
+func PRForTip(sha string) (number, state string, ok bool) {
+	if sha == "" || !Present() || !Authed() {
+		return "", "", false
+	}
+	out, err := run("api", "repos/{owner}/{repo}/commits/"+sha+"/pulls",
+		"--jq", `.[] | "\(.number) \(.state) \(.merged_at != null)"`)
+	if err != nil {
+		return "", "", false
+	}
+	prs := parseCommitPRs(out)
+	for i := range prs {
+		if prs[i].Merged {
+			prs[i].HasTip = prContainsCommit(prs[i].Number, sha)
+		}
+	}
+	return ChooseTipPR(prs)
+}
+
+// prContainsCommit reports whether sha is in PR pr's final commit list. false on
+// any error, so an unreadable list never counts as proof of shipping.
+func prContainsCommit(pr, sha string) bool {
+	out, err := run("api", "--paginate", "repos/{owner}/{repo}/pulls/"+pr+"/commits",
+		"--jq", ".[].sha")
+	if err != nil {
+		return false
+	}
+	for _, ln := range strings.Split(out, "\n") {
+		if strings.TrimSpace(ln) == sha {
+			return true
+		}
+	}
+	return false
+}
+
+// PRForBranchOrTip is PRForBranch, falling back to the branch's tip commit when
+// no PR carries the branch's own name (#168). baseRef is the ref the tip is
+// tested against (gitx.ResolveRemoteBase). viaTip says the answer came from the
+// fallback, so callers can say so. Used where liveness and shipped-ness are
+// decided (collide.Classify, worktree.Clean); the fallback costs gh calls, and
+// those paths already run only for the few worktrees that matter.
+func PRForBranchOrTip(branch, baseRef string) (number, state string, viaTip, ok bool) {
+	if n, s, found := PRForBranch(branch); found {
+		return n, s, false, true
+	}
+	tip := gitx.BranchTip(branch)
+	onBase, err := gitx.IsAncestor(tip, baseRef)
+	if !TipLookupApplies(false, tip, onBase, err == nil) {
+		return "", "", false, false
+	}
+	n, s, found := PRForTip(tip)
+	return n, s, found, found
 }
 
 // PRHeadBranch returns the PR's head branch name (headRefName), for locating
