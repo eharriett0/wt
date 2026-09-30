@@ -3,6 +3,7 @@ package ghx
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestPRCreateArgs pins the `wt claim` draft-PR regression: PR creation must
@@ -84,6 +85,30 @@ func TestAuthStatusArgs(t *testing.T) {
 	ghe := strings.Join(authStatusArgs("ghe.example.com"), " ")
 	if !strings.Contains(ghe, "--hostname ghe.example.com") {
 		t.Errorf("enterprise host must scope to itself: got %q", ghe)
+	}
+}
+
+// #172: an AuthedFor answer is reused for authTTL, so one command runs gh once
+// per host instead of once per PR lookup (a bare check took about 6 s). The bound
+// is what lets a long-lived `wt mcp` notice a later `gh auth login`.
+func TestAuthFresh(t *testing.T) {
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name string
+		at   time.Time
+		want bool
+	}{
+		{"never asked", time.Time{}, false},
+		{"just asked", now, true},
+		{"within the bound", now.Add(-authTTL + time.Second), true},
+		{"at the bound", now.Add(-authTTL), false},
+		{"past the bound", now.Add(-2 * authTTL), false},
+		{"in the future (a clock step)", now.Add(time.Second), false},
+	}
+	for _, c := range cases {
+		if got := authFresh(c.at, now); got != c.want {
+			t.Errorf("%s: authFresh = %v, want %v", c.name, got, c.want)
+		}
 	}
 }
 

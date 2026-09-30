@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/eharriett0/wt/internal/gitx"
 )
@@ -75,9 +77,43 @@ func authStatusArgs(host string) []string {
 	return args
 }
 
-// AuthedFor reports whether gh has an authenticated account FOR host.
+// authTTL bounds how long an AuthedFor answer is reused (#172). One command asks
+// once per PR lookup (every worktree in `wt clean`, every colliding window in a
+// hook), and the answer does not change mid-command. The bound is for `wt mcp`,
+// which can outlive a `gh auth login`.
+const authTTL = time.Minute
+
+var (
+	authMu   sync.Mutex
+	authMemo = map[string]authAnswer{}
+)
+
+type authAnswer struct {
+	ok bool
+	at time.Time
+}
+
+// authFresh reports whether an answer taken at `at` may be reused at now: not in
+// the future (a clock step) and younger than authTTL. A zero `at` (never asked)
+// is centuries old, so it fails the second test. Pure.
+func authFresh(at, now time.Time) bool {
+	age := now.Sub(at)
+	return age >= 0 && age < authTTL
+}
+
+// AuthedFor reports whether gh has an authenticated account FOR host. The answer
+// is memoized per host for authTTL; the lock is held across the gh call so that
+// concurrent first callers (ClassifyWindows runs 8) share one check (#172).
 func AuthedFor(host string) bool {
-	return exec.Command("gh", authStatusArgs(host)...).Run() == nil
+	authMu.Lock()
+	defer authMu.Unlock()
+	now := time.Now()
+	if a, ok := authMemo[host]; ok && authFresh(a.at, now) {
+		return a.ok
+	}
+	ok := exec.Command("gh", authStatusArgs(host)...).Run() == nil
+	authMemo[host] = authAnswer{ok: ok, at: now}
+	return ok
 }
 
 // Authed reports whether gh is authenticated for the host THIS repo uses.
@@ -92,6 +128,10 @@ func AuthedFor(host string) bool {
 // Scoping also fixes the mirror-image false NEGATIVE: a repo hosted on an
 // enterprise instance used to pass because github.com happened to be authed,
 // while the host it actually needs was not.
+//
+// With no forge host (a local-path origin) the check stays bare, as #100 chose,
+// and a bare check validates every configured host: about 6 s with two (#172).
+// AuthedFor's memo is what keeps that to once per command.
 func Authed() bool { return AuthedFor(RepoHost()) }
 
 // CurrentUser returns the authenticated login.
