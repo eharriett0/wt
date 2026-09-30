@@ -342,11 +342,24 @@ func WorktreePrune() error {
 }
 
 // HasUpstream reports whether the checkout at dir has a configured upstream
-// (@{u}) — i.e. the branch has been pushed. A branch with no upstream was never
-// shared, so it can't be "merged" and must not be reaped by `wt clean` (#61).
+// (@{u}). ⚠ That is NOT "has been pushed": a branch cut from origin/<base> (every
+// `wt new` branch) gets origin/<base> as its upstream from birth, via git's
+// default branch.autoSetupMerge. Pair it with UpstreamMergeRef and
+// worktree.PushedUpstream to ask "was it pushed" (#175).
 func HasUpstream(dir string) bool {
 	_, err := RunDir(dir, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
 	return err == nil
+}
+
+// UpstreamMergeRef returns branch's configured merge ref (branch.<b>.merge, e.g.
+// "refs/heads/main" for a `wt new` branch, "refs/heads/<b>" once pushed with -u),
+// read in dir, or "" when unset or unreadable (#175).
+func UpstreamMergeRef(dir, branch string) string {
+	out, err := RunDir(dir, "config", "--get", "branch."+branch+".merge")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
 }
 
 // IsInsideWorktree reports whether dir is a live git worktree (its .git resolves

@@ -54,24 +54,40 @@ func IsAbandonedBranch(unshippedSubjects []string, prOpen, prMerged bool) bool {
 // ReapVerdict is the SAFE invariant for `wt clean` (#61): only ever remove a
 // worktree that is provably shipped, and never one that could hold live work.
 //   - within the grace window (just created)      → keep (race protection)
+//   - uncommitted changes (dirty)                  → keep (live work, #174)
 //   - a MERGED PR                                  → reap (pushed + merged)
-//   - no upstream (never pushed)                   → keep (new / unshared work)
+//   - never pushed (PushedUpstream)                → keep (new / unshared work)
 //   - pushed AND patch-equivalent on base (cherry) → reap
 //
 // The old ShippedVerdict classified a commitless worktree (cherry reports 0)
-// as shipped — reaping a brand-new `wt new` checkout. Requiring an upstream
-// closes that: `wt new` never pushes, so its worktree is never swept. Pure.
-func ReapVerdict(unshipped int, cherryFailed, prMerged, hasUpstream, withinGrace bool) bool {
-	if withinGrace {
+// as shipped — reaping a brand-new `wt new` checkout. Requiring a push closes
+// that: `wt new` never pushes, so its worktree is never swept. ⚠ "Has an
+// upstream" is NOT "pushed": `wt new` branches from origin/<base>, and git sets
+// that as the new branch's upstream, so until #175 this guard never fired and a
+// commitless checkout was swept once its grace window passed.
+//
+// dirty keeps the LISTING honest (#174): remove() already refused a dirty tree,
+// but the listing said "safe to remove" and printed a remove command for a
+// worktree whose only content was uncommitted work. Pure.
+func ReapVerdict(unshipped int, cherryFailed, prMerged, pushed, withinGrace, dirty bool) bool {
+	if withinGrace || dirty {
 		return false
 	}
 	if prMerged {
 		return true
 	}
-	if !hasUpstream {
+	if !pushed {
 		return false
 	}
 	return !cherryFailed && unshipped == 0
+}
+
+// PushedUpstream reports whether a branch's upstream shows it was pushed (#175).
+// An upstream that is the base itself (mergeRef = refs/heads/<base>) is where the
+// branch was cut from, which is what `wt new` produces, not where it was pushed.
+// No upstream, or one whose merge ref cannot be read, is not proof of a push. Pure.
+func PushedUpstream(hasUpstream bool, mergeRef, base string) bool {
+	return hasUpstream && mergeRef != "" && mergeRef != "refs/heads/"+base
 }
 
 // dirtyCount counts uncommitted changes in the worktree at wt (porcelain lines),
@@ -436,11 +452,14 @@ func Clean(c *config.Config, apply, staleIndex, allRoots bool, names []string) e
 			continue
 		}
 		// #61 safety: freshly-created worktrees are protected by a grace window so
-		// another window's clean can't reap them mid-work; a branch with no
-		// upstream was never pushed, so it holds new/unshared work, not stale work.
+		// another window's clean can't reap them mid-work; a branch that was never
+		// pushed holds new/unshared work, not stale work. "Never pushed" includes a
+		// `wt new` branch whose only upstream is the base it was cut from (#175),
+		// and a dirty tree is live work whatever its branch says (#174).
 		age, ageOK := worktreeAge(wt, now)
 		withinGrace := ageOK && age < cleanGraceWindow
-		hasUpstream := gitx.HasUpstream(wt)
+		pushed := PushedUpstream(gitx.HasUpstream(wt), gitx.UpstreamMergeRef(wt, br), c.Base)
+		dirty := !gitx.IsClean(wt) // fails closed: unreadable status counts as dirty
 		n, cerr := gitx.CountUnshipped("origin/"+c.Base, "refs/heads/"+br)
 		if cerr != nil {
 			n, cerr = gitx.CountUnshipped(c.Base, "refs/heads/"+br)
@@ -459,7 +478,7 @@ func Clean(c *config.Config, apply, staleIndex, allRoots bool, names []string) e
 		// (#79). wt won't force-discard it — a MERGED PR only proves the committed
 		// work shipped, and the dirty index could be fresh post-merge work (the #88
 		// review). Surface it + the manual command; the operator inspects + decides.
-		if StaleIndexReportable(prState, prOK, !gitx.IsClean(wt), staleIndex, withinGrace) {
+		if StaleIndexReportable(prState, prOK, dirty, staleIndex, withinGrace) {
 			if viaTip {
 				// #168: a follow-up branch started at the PR's head looks the same,
 				// so "leftover" is a guess here, not the likely reading.
@@ -472,12 +491,16 @@ func Clean(c *config.Config, apply, staleIndex, allRoots bool, names []string) e
 			continue
 		}
 
-		if !ReapVerdict(n, cherryFailed, prMerged, hasUpstream, withinGrace) {
+		if !ReapVerdict(n, cherryFailed, prMerged, pushed, withinGrace, dirty) {
 			switch {
 			case withinGrace:
 				ui.Info("%s — created %s ago, within grace window, leave alone", br, age.Round(time.Second))
-			case !hasUpstream:
-				ui.Info("%s — never pushed (no upstream), holds unshared work, leave alone", br)
+			case dirty && prMerged:
+				ui.Info("%s — PR #%s merged, but has uncommitted changes (%d file(s)), leave alone; `wt clean --stale-index` reports it with the manual remove", br, prNum, dirtyCount(wt))
+			case dirty:
+				ui.Info("%s — has uncommitted changes (%d file(s)), leave alone", br, dirtyCount(wt))
+			case !pushed:
+				ui.Info("%s — never pushed (no upstream of its own), leave alone", br)
 			case cherryFailed:
 				// can't tell (no cherry base) and no merged PR → leave alone silently
 			default:
