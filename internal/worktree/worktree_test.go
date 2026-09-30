@@ -53,27 +53,59 @@ func TestIsAbandonedBranch(t *testing.T) {
 
 func TestReapVerdict(t *testing.T) {
 	cases := []struct {
-		name                                       string
-		unshipped                                  int
-		cherryFailed, prMerged, hasUpstream, grace bool
-		want                                       bool
+		name                                         string
+		unshipped                                    int
+		cherryFailed, prMerged, pushed, grace, dirty bool
+		want                                         bool
 	}{
 		// The #61 data-loss cases — must all be KEEP (false):
-		{"fresh commitless wt new (no upstream)", 0, false, false, false, false, false},
-		{"within grace window", 0, false, false, true, true, false},
-		{"merged PR but still in grace", 0, false, true, true, true, false},
-		{"pushed, unshipped commits", 2, false, false, true, false, false},
-		{"no upstream even if cherry says 0", 0, false, false, false, false, false},
+		// (a fresh commitless `wt new` checkout is "not pushed" via PushedUpstream,
+		// #175: its upstream is the base it was cut from, which is not a push)
+		{"fresh commitless wt new (not pushed)", 0, false, false, false, false, false, false},
+		{"within grace window", 0, false, false, true, true, false, false},
+		{"merged PR but still in grace", 0, false, true, true, true, false, false},
+		{"pushed, unshipped commits", 2, false, false, true, false, false, false},
+		{"not pushed even if cherry says 0", 0, false, false, false, false, false, false},
+		// #174: a dirty tree is live work, so it is never listed or reaped, whatever
+		// its branch says. remove() refused it already; the listing did not.
+		{"dirty, pushed + patch-equivalent", 0, false, false, true, false, true, false},
+		{"dirty, merged PR past grace", 0, false, true, true, false, true, false},
+		{"dirty, never committed or pushed", 0, false, false, false, false, true, false},
 		// Legit reaps (true):
-		{"merged PR, past grace", 0, false, true, true, false, true},
-		{"pushed + patch-equivalent on base", 0, false, false, true, false, true},
-		// cherry failed, no merged PR, has upstream → can't prove shipped → keep
-		{"cherry failed, no PR", 0, true, false, true, false, false},
+		{"merged PR, past grace", 0, false, true, true, false, false, true},
+		{"merged PR reaps even if never pushed under its own name", 0, false, true, false, false, false, true},
+		{"pushed + patch-equivalent on base", 0, false, false, true, false, false, true},
+		// cherry failed, no merged PR, pushed → can't prove shipped → keep
+		{"cherry failed, no PR", 0, true, false, true, false, false, false},
 	}
 	for _, tc := range cases {
-		got := ReapVerdict(tc.unshipped, tc.cherryFailed, tc.prMerged, tc.hasUpstream, tc.grace)
+		got := ReapVerdict(tc.unshipped, tc.cherryFailed, tc.prMerged, tc.pushed, tc.grace, tc.dirty)
 		if got != tc.want {
 			t.Errorf("%s: ReapVerdict = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestPushedUpstream pins #175: an upstream is proof of a push only when it is
+// not the base itself. `wt new` branches from origin/<base> and git records that
+// as the upstream (branch.<b>.merge = refs/heads/<base>) before anything is pushed.
+func TestPushedUpstream(t *testing.T) {
+	cases := []struct {
+		name        string
+		hasUpstream bool
+		mergeRef    string
+		want        bool
+	}{
+		{"wt new: upstream is the base it was cut from", true, "refs/heads/main", false},
+		{"pushed with -u under its own name", true, "refs/heads/feat-42-login", true},
+		{"pushed with -u under another name", true, "refs/heads/bot/image-x", true},
+		{"no upstream at all", false, "", false},
+		{"upstream set but merge ref unreadable → not proof", true, "", false},
+		{"a base-like name that is not the base", true, "refs/heads/main-2", true},
+	}
+	for _, c := range cases {
+		if got := PushedUpstream(c.hasUpstream, c.mergeRef, "main"); got != c.want {
+			t.Errorf("%s: PushedUpstream(%v, %q, main) = %v, want %v", c.name, c.hasUpstream, c.mergeRef, got, c.want)
 		}
 	}
 }

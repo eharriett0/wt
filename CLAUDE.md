@@ -64,6 +64,16 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   on the BASE branch** (`ReapableBranch`): "patch-equivalent on base" is
   trivially true for the base itself, so every downstream verdict says shipped
   and the printed command becomes `git branch -D main` (#101).
+  ⚠ **An upstream is not a push (#175).** `wt new` branches from
+  `origin/<base>`, and git's default `branch.autoSetupMerge` records that as the
+  new branch's upstream, so `HasUpstream` is true from birth. The "never pushed"
+  guard read it as a push and never fired: a clean commitless checkout was swept
+  as soon as its grace window passed. `PushedUpstream` excludes an upstream
+  whose merge ref is the base itself. ⚠ **`dirty` is an input to `ReapVerdict`
+  (#174)**, so the LISTING agrees with `remove()`, which already refused a dirty
+  tree: the listing used to say "safe to remove" above a remove command for a
+  worktree whose only content was uncommitted work. `remove()` keeps its own
+  refusal as defense in depth.
 - **The tip-commit PR lookup is data-loss-relevant (#168).** When no PR has a
   branch's own name, `PRForBranchOrTip` asks GitHub which PRs contain the
   branch's TIP commit. MERGED counts only when the tip is in that PR's FINAL
