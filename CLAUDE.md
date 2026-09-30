@@ -47,7 +47,7 @@ docs live in [README.md](README.md); this file is for working *on* wt.
 - **`ClassifyFacts` precedence:** open PR > merged PR > closed PR > dirty >
   unmerged > merged-by-ancestry. PR state outranks a dirty index (a
   merged/closed branch with leftover staged cruft is stale, not a permanent
-  HIGH — #79).
+  HIGH — #79), except a MERGED PR found only by the tip commit (#168, below).
 - **The hook block predicate MUST equal `wt check`.** Advisory means advisory in
   both; disjoint hunks don't block in either. `pushCollisionBlocks` mirrors
   `buildCheckReport`'s hunk grading on purpose (#92). If you change the grading,
@@ -64,6 +64,31 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   on the BASE branch** (`ReapableBranch`): "patch-equivalent on base" is
   trivially true for the base itself, so every downstream verdict says shipped
   and the printed command becomes `git branch -D main` (#101).
+- **The tip-commit PR lookup is data-loss-relevant (#168).** When no PR has a
+  branch's own name, `PRForBranchOrTip` asks GitHub which PRs contain the
+  branch's TIP commit. MERGED counts only when the tip is in that PR's FINAL
+  commits (a force-pushed-away commit proves nothing), OPEN stays contention,
+  and closed-unmerged is ignored. ⚠ It runs only for a tip that is NOT on base
+  (`TipLookupApplies`): a tip already on base belongs to some merged PR on a
+  merge-commit or rebase repo, so a fresh `wt new` worktree would read as
+  shipped and `clean` would reap it (the #61 class). Unknown ancestry skips it.
+  ⚠ **A tip-found MERGED does NOT outrank a dirty worktree** (`LiveFacts.ViaTip`,
+  the one exception to #79's "PR state outranks dirty"). Found by name, the
+  branch IS the merged PR's head, so a dirty index is leftover cruft. Found by
+  tip, it only points into a merged PR, and so does a follow-up branch started
+  at that PR's head, whose uncommitted edits are new work. wt cannot tell them
+  apart, so the edits stay HIGH (as before #168) and the label names the PR.
+- **`wt clean <name>...` resolves every name before acting (#169).** A name
+  must pick out exactly ONE worktree (`CheckNames`): none is a typo, two is a
+  directory name that is also another worktree's branch. Either stops the run
+  with nothing cleaned, so a bad `-y` list never removes "the rest" of it.
+- **"No PR" must be an `ok=false`, never a parsed placeholder (#168).**
+  `PRForBranch`'s old `.[0] | …` query printed `null null` for a branch with
+  no PR, which parsed as a PR in state `null`. Every caller then matched no
+  state, so it worked by accident, until the first caller that asked "was there
+  a PR at all?" (the tip fallback) silently never ran. Only the e2e smoke found
+  it. `parsePRForBranch` now refuses anything that is not a number and a known
+  state; keep new gh queries to `// empty` for "none".
 - **Scope-widening re-opens what narrowness was hiding.** The base-branch footgun
   above was latent for as long as `clean` skipped everything outside
   `worktree_root` — an accident, not a guard. `--all-roots` (#101) armed it, and

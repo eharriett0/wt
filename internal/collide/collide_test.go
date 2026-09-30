@@ -231,6 +231,12 @@ func TestClassifyFacts(t *testing.T) {
 		// leftover dirty index. A merged/closed branch with staged cruft `wt clean`
 		// can't remove must NOT read HIGH — the dirtiness rides the label, not the level.
 		{"merged beats dirty (leftover index, not live work)", LiveFacts{Merged: true, Dirty: true, Unshipped: 3}, 0, LiveStale},
+		// #168: a MERGED PR found only by the branch's TIP commit. Clean ⇒ shipped,
+		// like a name match. Dirty ⇒ still live: a follow-up branch started at a
+		// merged PR's head looks identical, and its uncommitted edits are new work.
+		{"merged by tip, clean → stale", LiveFacts{Merged: true, ViaTip: true, Unshipped: 3, PRChecked: true}, 0, LiveStale},
+		{"merged by tip does NOT beat dirty", LiveFacts{Merged: true, ViaTip: true, Dirty: true, Unshipped: 3, PRChecked: true}, 0, LiveDirty},
+		{"merged by tip, dirty, never dormant", LiveFacts{Merged: true, ViaTip: true, Dirty: true, Unshipped: 3, Age: 30 * day, PRChecked: true}, day, LiveDirty},
 		{"open PR beats merged (shouldn't co-occur, but PR wins)", LiveFacts{Merged: true, HasOpenPR: true}, 0, LiveOpenPR},
 		// #79: CLOSED-unmerged PR ⇒ suppressed (LiveClosedPR), even with unshipped
 		// commits + a dirty index (the branch is kept on purpose). Open/merged win above.
@@ -315,6 +321,10 @@ func TestWindowLiveness_Label(t *testing.T) {
 		// below the threshold: note the drift but no "likely stale".
 		{"dirty base slightly behind", WindowLiveness{Level: LiveDirty, Dirty: true, BehindBase: 3},
 			"uncommitted edits · 3 behind base"},
+		// #168: dirty, with commits merged under another branch name (found by the
+		// tip). Still HIGH; the label names the PR so only the edits need a look.
+		{"dirty + commits merged by tip", WindowLiveness{Level: LiveDirty, Dirty: true, MergedPR: "1105"},
+			"uncommitted edits · its commits merged in #1105"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

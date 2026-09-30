@@ -3,6 +3,7 @@ package cli
 import (
 	"flag"
 	"io"
+	"strings"
 	"testing"
 )
 
@@ -311,6 +312,35 @@ func TestHelpGuardWiring(t *testing.T) {
 	for _, cmd := range []string{"claim", "adopt", "merge-pr", "check"} {
 		if code := Main([]string{cmd, "--help"}); code != 0 {
 			t.Errorf("wt %s --help exit = %d, want 0", cmd, code)
+		}
+	}
+}
+
+// TestDeployDryRunNote pins what `merge-pr --dry-run` says once the deploy gate
+// applies (#170). It must follow deployGate's own order, so a draft is reported as
+// a refusal even when --confirm-deploy is set, and it must never read as a pass.
+func TestDeployDryRunNote(t *testing.T) {
+	cases := []struct {
+		name             string
+		draft, confirmed bool
+		want             []string
+	}{
+		{"not confirmed → the real merge stops for the ack", false, false,
+			[]string{"a real merge stops at the deploy gate", "AUTO-APPLIES to prod", "--confirm-deploy"}},
+		{"confirmed → the real merge would proceed, and still says it deploys", false, true,
+			[]string{"AUTO-APPLIES to prod", "would proceed"}},
+		{"draft → refused, before --confirm-deploy is considered", true, true,
+			[]string{"would REFUSE", "DRAFT"}},
+	}
+	for _, c := range cases {
+		got := deployDryRunNote("2602", c.draft, c.confirmed)
+		if !strings.HasPrefix(got, "--dry-run: ") || !strings.Contains(got, "#2602") {
+			t.Errorf("%s: %q must say it is a dry run and name the PR", c.name, got)
+		}
+		for _, w := range c.want {
+			if !strings.Contains(got, w) {
+				t.Errorf("%s: %q is missing %q", c.name, got, w)
+			}
 		}
 	}
 }

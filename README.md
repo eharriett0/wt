@@ -103,6 +103,15 @@ diff), so it's suppressed too and labelled `PR #N closed`. PR state also
 staged cruft `wt clean` won't remove reads stale (with a `· leftover uncommitted
 edits` note), not a permanent HIGH.
 
+When no PR has the branch's own name, the branch's **tip commit** is looked up
+instead, so work pushed under another name (an automation's PR branch, say) reads
+as its real PR: `merged #N` when that commit is in a merged PR's final commits,
+`open PR #N` when an open PR holds it. One difference from a name match: a tip
+match does **not** outrank uncommitted edits. A follow-up branch started at a
+merged PR's head looks the same as the merged work, so a dirty worktree stays
+active, shown as `[uncommitted edits · its commits merged in #N]`. Commit or
+discard the edits to clear it.
+
 The last-commit age is always shown on unmerged/dormant windows. **Dormancy** is
 opt-in: set `max_age` (e.g. `4d`, `2w`, `36h`) and an unmerged-but-idle branch —
 one you'd otherwise have to confirm out-of-band was abandoned — is suppressed
@@ -137,7 +146,7 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 | `wt check <paths…>` | Is another window touching these paths? `[--show-diff] [--json] [--blocking] [--include-stale] [--allow-missing] [--max-age D]` (exit 3 = HIGH). `--blocking` prints only HIGH (a scriptable gate). Refuses a path that doesn't exist, isn't tracked, and no window is touching — a typo must never falsely report "clear" (`--allow-missing` opts into a deleted/other-branch/about-to-create path) |
 | `wt where <issue\|branch>` | Print that window's worktree path — `cd $(wt where 42)` |
 | `wt new <branch>` | Create a worktree on a new branch from the base branch |
-| `wt clean [-y]` | List worktrees whose branch already shipped (incl. squash-merged PRs); `-y` removes them. Never reaps a just-created worktree (grace window), a never-pushed branch (no upstream = unshared work), or a dirty one. `[--stale-index]` also **reports** (never auto-removes) a merged-PR worktree holding a leftover uncommitted index a plain clean can't touch, and prints the manual remove command. `[--all-roots]` additionally evaluates worktrees **outside** `worktree_root` — the collision engine scans those, so a legacy worktree root can hard-block pushes that a default clean never clears (all the data-loss guards still apply) |
+| `wt clean [-y] [<name>...]` | List worktrees whose branch already shipped (incl. squash-merged PRs); `-y` removes them. Name worktrees (a directory, a branch, or a path) to limit the run to those, so one session can remove its own without touching the others the list shows. Every name must pick out exactly one worktree: one that matches nothing (a typo) or more than one (a directory name that is also another worktree's branch; use the path) stops the run with nothing cleaned. A branch whose commits were pushed under **another** name (e.g. onto an automation's PR branch) is recognised by its tip commit: shipped when that commit is in a merged PR's final commits. Never reaps a just-created worktree (grace window), a never-pushed branch (no upstream = unshared work), or a dirty one. `[--stale-index]` also **reports** (never auto-removes) a merged-PR worktree holding a leftover uncommitted index a plain clean can't touch, and prints the manual remove command. `[--all-roots]` additionally evaluates worktrees **outside** `worktree_root` — the collision engine scans those, so a legacy worktree root can hard-block pushes that a default clean never clears (all the data-loss guards still apply) |
 | `wt claim <issue>` | Assign a GitHub issue, make a worktree, open a draft PR, record the claim `[--force] [--no-pr] [--epic <id>]`. **Refuses (won't duplicate) when an open PR already references the issue** — including a plain `Refs #N` (which GitHub never treats as a linked/closing reference, so it's invisible to `closingIssuesReferences`); it names that PR and points at `wt adopt`. `--force` opens another anyway |
 | `wt adopt <branch\|pr>` | Put a worktree on an **existing** branch (a colleague's or a previous session's PR branch) instead of forking a new one, and record it like `claim` — resolves a PR number to its head branch. This is the actionable half of `claim`'s refusal above, and the only command that lands a registered worktree on a branch you didn't just create `[--epic <id>]` |
 | `wt release <issue>` | Drop the claim. `[--clean]` also removes the worktree when the branch is abandoned (clean tree, no live PR, WIP-only commits) |
@@ -199,6 +208,11 @@ reconcile on push), that squash is far higher-stakes than normal. Set
 - prints a `⚠ merging … AUTO-APPLIES to prod` banner,
 - requires a deliberate confirm — a typed `deploy` at an interactive prompt, or
   `--confirm-deploy` for non-interactive/agent use (never a silent default).
+
+`wt merge-pr <pr> --dry-run` evaluates the same gate without prompting and says
+what a real merge would do: refuse a draft, stop for the confirm, or proceed
+because `--confirm-deploy` was passed. With `merge_is_deploy_paths` set, a PR
+that touches no deploy path says it would skip the gate.
 
 ## Cross-repo epics
 
