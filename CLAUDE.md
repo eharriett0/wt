@@ -199,6 +199,13 @@ The formula supports `head "…", branch: "main"` for `--HEAD` builds.
   — use `gh api repos/OWNER/REPO/pulls/N -X PATCH -F body=@file`.
 - `gh issue create` has **no `--json`** — capture the printed URL, parse the
   number.
+- **Ask gh about auth only through `ghx.AuthedFor`/`Authed`** (#172). The answer
+  is memoized per host for `authTTL` (a minute: one command asks once, and a
+  long-lived `wt mcp` still notices a `gh auth login`). In a repo with no forge
+  host (a local-path origin, which is what a scratch-repo smoke uses) the check
+  is a bare `gh auth status`, deliberately (#100), and that validates EVERY
+  configured host: about 6 s with two. Uncached, it ran once per PR lookup and
+  made a two-worktree `wt clean` take 18 s instead of 6.
 - **A backtick code span DOES suppress GitHub's linked-issue parser — measured, #164.**
   One PR, one already-closed issue, body varied and `closingIssuesReferences` sampled:
 
