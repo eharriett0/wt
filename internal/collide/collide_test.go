@@ -54,13 +54,17 @@ func TestOverlaps_DedupWithinWindow(t *testing.T) {
 	}
 }
 
+// fuzzy builds a MatchFuzzy query: a `wt check` argument that names no path in
+// the repo (QueryFor decides that in production).
+func fuzzy(p string) []Query { return []Query{{Path: p, Mode: MatchFuzzy}} }
+
 func TestCheckPaths(t *testing.T) {
 	ws := []Window{
 		{Issue: "1", Worktree: "/w/1", Touched: []string{"internal/foo.go", "main.go"}},
 		{Issue: "2", Worktree: "/w/2", Touched: []string{"internal/bar.go"}},
 	}
 	// From window 2, about to edit internal/foo.go + README.md.
-	got := CheckPaths(ws, "/w/2", []string{"internal/foo.go", "README.md"})
+	got := CheckPaths(ws, "/w/2", ExactQueries([]string{"internal/foo.go", "README.md"}))
 	want := []Conflict{{Path: "internal/foo.go", Window: "#1", MatchedFile: "internal/foo.go"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("CheckPaths =\n%#v\nwant\n%#v", got, want)
@@ -72,9 +76,177 @@ func TestCheckPaths_BasenameMatch(t *testing.T) {
 		{Issue: "1", Worktree: "/w/1", Touched: []string{"internal/foo.go"}},
 		{Issue: "2", Worktree: "/w/2", Touched: nil},
 	}
-	got := CheckPaths(ws, "/w/2", []string{"foo.go"})
+	got := CheckPaths(ws, "/w/2", fuzzy("foo.go"))
 	if len(got) != 1 || got[0].Window != "#1" {
-		t.Errorf("basename should match a touched path, got %v", got)
+		t.Errorf("a fuzzy basename query should match a touched path, got %v", got)
+	}
+}
+
+// ---- #181: a repo-root file collided with a same-named nested file ----------
+//
+// Branch A edits the root README.md; branch B edits only pkg/svc/README.md.
+// "README.md" is a suffix of "pkg/svc/README.md" — a root path has no "/" to
+// anchor on — so `wt check README.md` reported HIGH against B and the pre-push
+// hook blocked A's push, for a file B never touched. The suffix/basename tiers
+// are now fuzzy-only, and only a query that names no real path is fuzzy.
+
+func TestCheckPaths_ExactMatchTable(t *testing.T) {
+	cases := []struct {
+		name    string
+		touched []string // the OTHER window's touched set
+		q       Query
+		want    []string // matched files, sorted; nil = no collision
+	}{
+		{"root file vs nested namesake (THE #181 bug)",
+			[]string{"pkg/svc/README.md"}, Query{Path: "README.md"}, nil},
+		{"nested vs a different nested namesake",
+			[]string{"pkg/svc/README.md"}, Query{Path: "docs/adr/README.md"}, nil},
+		{"a path with a directory component is not a suffix search",
+			[]string{"pkg/svc/README.md"}, Query{Path: "svc/README.md"}, nil},
+		{"root Makefile vs nested Makefile",
+			[]string{"tools/Makefile"}, Query{Path: "Makefile"}, nil},
+		{"root directory vs a nested namesake directory",
+			[]string{"site/docs/x.md"}, Query{Path: "docs"}, nil},
+		{"positive control: the same root file",
+			[]string{"README.md", "pkg/svc/README.md"}, Query{Path: "README.md"}, []string{"README.md"}},
+		{"positive control: the same nested file",
+			[]string{"pkg/svc/README.md"}, Query{Path: "pkg/svc/README.md"}, []string{"pkg/svc/README.md"}},
+		{"positive control: a root directory still expands",
+			[]string{"docs/x.md", "site/docs/y.md"}, Query{Path: "docs/"}, []string{"docs/x.md"}},
+		{"fuzzy: a bare name for a nested file still matches",
+			[]string{"internal/foo.go"}, Query{Path: "foo.go", Mode: MatchFuzzy}, []string{"internal/foo.go"}},
+		{"fuzzy: a partial path still suffix-matches on a segment boundary",
+			[]string{"pkg/svc/README.md"}, Query{Path: "svc/README.md", Mode: MatchFuzzy}, []string{"pkg/svc/README.md"}},
+		{"fuzzy: a bare directory name still reaches a nested directory",
+			[]string{"site/docs/x.md"}, Query{Path: "docs", Mode: MatchFuzzy}, []string{"site/docs/x.md"}},
+		{"fuzzy: still on a segment boundary",
+			[]string{"pkg/svc/NOTREADME.md"}, Query{Path: "README.md", Mode: MatchFuzzy}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ws := []Window{
+				{Branch: "feat-b", Worktree: "/w/b", Touched: tc.touched},
+				{Branch: "feat-a", Worktree: "/w/a"},
+			}
+			var got []string
+			for _, cf := range CheckPaths(ws, "/w/a", []Query{tc.q}) {
+				got = append(got, cf.MatchedFile)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("CheckPaths(%+v) matched %v, want %v", tc.q, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCheckPaths_NamesTheFileThatActuallyCollides(t *testing.T) {
+	// The pre-push hook sends BOTH outgoing files. Fuzzy matching resolved
+	// README.md to pkg/svc/README.md first, then deduped the real entry away, so
+	// the block message blamed the root README.md and never named the file that
+	// actually collides.
+	ws := []Window{
+		{Branch: "feat-b", Worktree: "/w/b", Touched: []string{"pkg/svc/README.md"}},
+		{Branch: "feat-a", Worktree: "/w/a"},
+	}
+	got := CheckPaths(ws, "/w/a", ExactQueries([]string{"README.md", "pkg/svc/README.md"}))
+	want := []Conflict{{Path: "pkg/svc/README.md", Window: "feat-b", MatchedFile: "pkg/svc/README.md"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("CheckPaths =\n%#v\nwant\n%#v", got, want)
+	}
+}
+
+func TestQueryFor(t *testing.T) {
+	ws := []Window{
+		{Branch: "feat-b", Worktree: "/w/b", Touched: []string{
+			"pkg/svc/README.md", "internal/foo.go", "NEW.md", "envs/app/netpol.yaml",
+		}},
+	}
+	cases := []struct {
+		name   string
+		arg    string
+		rel    string // the arg read relative to the cwd; "" = names no location in the repo
+		onDisk bool
+		want   Query
+	}{
+		{"root file that exists, typed at the root",
+			"README.md", "README.md", true, Query{"README.md", MatchExact}},
+		{"same name typed in pkg/svc/ names pkg/svc/README.md",
+			"README.md", "pkg/svc/README.md", true, Query{"pkg/svc/README.md", MatchExact}},
+		{"subdirectory-relative path typed in pkg/",
+			"svc/README.md", "pkg/svc/README.md", true, Query{"pkg/svc/README.md", MatchExact}},
+		{"../ out of a subdirectory names the root file",
+			"../README.md", "README.md", true, Query{"README.md", MatchExact}},
+		{"a path deleted here but still tracked is real",
+			"gone.go", "gone.go", true, Query{"gone.go", MatchExact}},
+		{"a file that exists only on another branch, at that exact path",
+			"NEW.md", "NEW.md", false, Query{"NEW.md", MatchExact}},
+		{"a directory that exists only on another branch",
+			"envs/app/", "envs/app", false, Query{"envs/app", MatchExact}},
+		{"bare name that is no path here stays a fuzzy search",
+			"foo.go", "foo.go", false, Query{"foo.go", MatchFuzzy}},
+		{"a fuzzy search keeps the argument as typed, not the cwd-joined path",
+			"foo.go", "pkg/foo.go", false, Query{"foo.go", MatchFuzzy}},
+		{"partial path that names nothing here stays a fuzzy search (#154)",
+			"configs/kiali", "configs/kiali", false, Query{"configs/kiali", MatchFuzzy}},
+		{"a path that leaves the repo can't be exact",
+			"../../etc/hosts", "", true, Query{"../../etc/hosts", MatchFuzzy}},
+		{"surrounding whitespace is trimmed",
+			"  foo.go ", "", false, Query{"foo.go", MatchFuzzy}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := QueryFor(tc.arg, tc.rel, tc.onDisk, ws); got != tc.want {
+				t.Errorf("QueryFor(%q, %q, %v) = %+v, want %+v", tc.arg, tc.rel, tc.onDisk, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestQueryFor_IssueScenarioEndToEnd(t *testing.T) {
+	// #181 as reported, at the pure layer: A edits the root README.md, B (open
+	// PR) edits only pkg/svc/README.md.
+	ws := []Window{
+		{Branch: "feat-a", Worktree: "/w/a", Touched: []string{"README.md"}},
+		{Branch: "feat-b", Worktree: "/w/b", Touched: []string{"pkg/svc/README.md", "internal/foo.go"}},
+	}
+	check := func(arg, rel string, onDisk bool) int {
+		return len(CheckPaths(ws, "/w/a", []Query{QueryFor(arg, rel, onDisk, ws)}))
+	}
+	if n := check("README.md", "README.md", true); n != 0 {
+		t.Errorf("wt check README.md (root, exists) = %d collision(s), want 0", n)
+	}
+	if n := check("pkg/svc/README.md", "pkg/svc/README.md", true); n != 1 {
+		t.Errorf("control: wt check pkg/svc/README.md = %d, want 1", n)
+	}
+	if n := check("README.md", "pkg/svc/README.md", true); n != 1 {
+		t.Errorf("control: wt check README.md from pkg/svc/ = %d, want 1", n)
+	}
+	if n := check("foo.go", "foo.go", false); n != 1 {
+		t.Errorf("control: bare foo.go (no root foo.go) must stay fuzzy = %d, want 1", n)
+	}
+}
+
+func TestQueryFor_RealPathIsWhatTheHooksAsk(t *testing.T) {
+	// The hook block predicate MUST equal `wt check` (#92). The hooks match
+	// git's repo-relative paths exactly, so `wt check` must ask the same
+	// question for a path that exists, or the two disagree and one gets
+	// bypassed.
+	for _, rel := range []string{"README.md", "pkg/svc/README.md", "go.mod"} {
+		if got, hook := QueryFor(rel, rel, true, nil), ExactQueries([]string{rel})[0]; got != hook {
+			t.Errorf("wt check %s = %+v, hooks ask %+v", rel, got, hook)
+		}
+	}
+}
+
+func TestMatchMode_ZeroValueIsExact(t *testing.T) {
+	// A query whose mode was never decided must not be able to invent a
+	// collision: the zero value is the strict mode.
+	if (Query{}).Mode != MatchExact {
+		t.Fatal("the zero MatchMode must be MatchExact")
+	}
+	ws := []Window{{Worktree: "/w/b", Touched: []string{"pkg/svc/README.md"}}}
+	if got := CheckPaths(ws, "/w/a", []Query{{Path: "README.md"}}); len(got) != 0 {
+		t.Errorf("an undecided query matched by suffix: %v", got)
 	}
 }
 
@@ -94,7 +266,7 @@ func TestCheckPaths_DirectoryExpandsToFilesBeneathIt(t *testing.T) {
 		}},
 		{Issue: "2", Worktree: "/w/2", Touched: nil},
 	}
-	got := CheckPaths(ws, "/w/2", []string{"envs/app/"})
+	got := CheckPaths(ws, "/w/2", ExactQueries([]string{"envs/app/"}))
 	want := []Conflict{
 		{Path: "envs/app/kustomization.yaml", Window: "#1", MatchedFile: "envs/app/kustomization.yaml"},
 		{Path: "envs/app/netpol.yaml", Window: "#1", MatchedFile: "envs/app/netpol.yaml"},
@@ -111,7 +283,7 @@ func TestCheckPaths_DirectoryWithoutTrailingSlash(t *testing.T) {
 		{Issue: "1", Worktree: "/w/1", Touched: []string{"envs/app/netpol.yaml"}},
 		{Issue: "2", Worktree: "/w/2", Touched: nil},
 	}
-	if got := CheckPaths(ws, "/w/2", []string{"envs/app"}); len(got) != 1 {
+	if got := CheckPaths(ws, "/w/2", ExactQueries([]string{"envs/app"})); len(got) != 1 {
 		t.Errorf("unslashed directory should match, got %v", got)
 	}
 }
@@ -124,8 +296,10 @@ func TestCheckPaths_DirectoryMatchesOnSegmentBoundaryOnly(t *testing.T) {
 		{Issue: "1", Worktree: "/w/1", Touched: []string{"envs/application/x.yaml", "envs/app-2/y.yaml"}},
 		{Issue: "2", Worktree: "/w/2", Touched: nil},
 	}
-	if got := CheckPaths(ws, "/w/2", []string{"envs/app"}); len(got) != 0 {
-		t.Errorf("sibling directories must not match, got %v", got)
+	for _, mode := range []MatchMode{MatchExact, MatchFuzzy} {
+		if got := CheckPaths(ws, "/w/2", []Query{{Path: "envs/app", Mode: mode}}); len(got) != 0 {
+			t.Errorf("mode %d: sibling directories must not match, got %v", mode, got)
+		}
 	}
 }
 
@@ -137,8 +311,12 @@ func TestCheckPaths_DirectorySuffixMatch(t *testing.T) {
 		{Issue: "1", Worktree: "/w/1", Touched: []string{"envs/landru/configs/kiali/netpol.yaml"}},
 		{Issue: "2", Worktree: "/w/2", Touched: nil},
 	}
-	if got := CheckPaths(ws, "/w/2", []string{"kiali"}); len(got) != 1 {
+	if got := CheckPaths(ws, "/w/2", fuzzy("kiali")); len(got) != 1 {
 		t.Errorf("directory suffix should match a nested dir, got %v", got)
+	}
+	// #181: only for a fuzzy query. An exact "kiali" is a ROOT directory.
+	if got := CheckPaths(ws, "/w/2", ExactQueries([]string{"kiali"})); len(got) != 0 {
+		t.Errorf("an exact root directory must not reach a nested namesake, got %v", got)
 	}
 }
 
@@ -147,7 +325,7 @@ func TestCheckPaths_DirectoryAndFileUnderItDoNotDoubleReport(t *testing.T) {
 		{Issue: "1", Worktree: "/w/1", Touched: []string{"envs/app/netpol.yaml"}},
 		{Issue: "2", Worktree: "/w/2", Touched: nil},
 	}
-	got := CheckPaths(ws, "/w/2", []string{"envs/app/", "envs/app/netpol.yaml"})
+	got := CheckPaths(ws, "/w/2", ExactQueries([]string{"envs/app/", "envs/app/netpol.yaml"}))
 	if len(got) != 1 {
 		t.Errorf("dir + file under it must dedupe to one entry, got %v", got)
 	}
@@ -155,7 +333,7 @@ func TestCheckPaths_DirectoryAndFileUnderItDoNotDoubleReport(t *testing.T) {
 
 func TestCheckPaths_DirectoryStillExcludesOwnWorktree(t *testing.T) {
 	ws := []Window{{Issue: "1", Worktree: "/w/1", Touched: []string{"envs/app/netpol.yaml"}}}
-	if got := CheckPaths(ws, "/w/1", []string{"envs/app/"}); len(got) != 0 {
+	if got := CheckPaths(ws, "/w/1", ExactQueries([]string{"envs/app/"})); len(got) != 0 {
 		t.Errorf("own worktree must stay excluded for a directory, got %v", got)
 	}
 }
@@ -167,7 +345,7 @@ func TestCheckPaths_ExactFileMatchIsUnchangedByDirectorySupport(t *testing.T) {
 		{Issue: "1", Worktree: "/w/1", Touched: []string{"internal/foo.go"}},
 		{Issue: "2", Worktree: "/w/2", Touched: nil},
 	}
-	got := CheckPaths(ws, "/w/2", []string{"foo.go"})
+	got := CheckPaths(ws, "/w/2", fuzzy("foo.go"))
 	want := []Conflict{{Path: "foo.go", Window: "#1", MatchedFile: "internal/foo.go"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("file matching changed =\n%#v\nwant\n%#v", got, want)
@@ -178,8 +356,10 @@ func TestMatchTouchedDir_RootIsNotAQuestion(t *testing.T) {
 	// "/" or "" would expand to the entire repo and report every file in it.
 	touched := []string{"a/b.go", "c/d.go"}
 	for _, p := range []string{"", "/", "   "} {
-		if got := matchTouchedDir(p, touched); len(got) != 0 {
-			t.Errorf("matchTouchedDir(%q) = %v, want none", p, got)
+		for _, mode := range []MatchMode{MatchExact, MatchFuzzy} {
+			if got := matchTouchedDir(Query{Path: p, Mode: mode}, touched); len(got) != 0 {
+				t.Errorf("matchTouchedDir(%q, mode %d) = %v, want none", p, mode, got)
+			}
 		}
 	}
 }
@@ -188,17 +368,17 @@ func TestPathTouchedByAny_KnowsADirectory(t *testing.T) {
 	// #93's typo guard must not call a directory that exists only on another
 	// window's branch a nonexistent path.
 	ws := []Window{{Issue: "1", Worktree: "/w/1", Touched: []string{"envs/app/netpol.yaml"}}}
-	if !PathTouchedByAny("envs/app/", ws) {
+	if !PathTouchedByAny(Query{Path: "envs/app/"}, ws) {
 		t.Error("a touched directory must count as a real path")
 	}
-	if PathTouchedByAny("envs/nope/", ws) {
+	if PathTouchedByAny(Query{Path: "envs/nope/"}, ws) {
 		t.Error("an untouched directory must not")
 	}
 }
 
 func TestCheckPaths_ExcludesOwnWorktree(t *testing.T) {
 	ws := []Window{{Issue: "1", Worktree: "/w/1", Touched: []string{"a.go"}}}
-	if got := CheckPaths(ws, "/w/1", []string{"a.go"}); len(got) != 0 {
+	if got := CheckPaths(ws, "/w/1", ExactQueries([]string{"a.go"})); len(got) != 0 {
 		t.Errorf("own worktree must be excluded, got %v", got)
 	}
 }
@@ -550,15 +730,21 @@ func TestPathTouchedByAny(t *testing.T) {
 		{Worktree: "/w/1", Touched: []string{"internal/foo.go", "docs/x.md"}},
 		{Worktree: "/w/2", Touched: []string{"cmd/main.go"}},
 	}
-	// exact + suffix + basename all match a touched file (#93 real-path signal).
+	// exact + suffix + basename all match a touched file (#93 real-path signal)...
 	for _, p := range []string{"internal/foo.go", "foo.go", "docs/x.md", "cmd/main.go", "main.go"} {
-		if !PathTouchedByAny(p, ws) {
-			t.Errorf("PathTouchedByAny(%q) = false, want true", p)
+		if !PathTouchedByAny(Query{Path: p, Mode: MatchFuzzy}, ws) {
+			t.Errorf("PathTouchedByAny(fuzzy %q) = false, want true", p)
+		}
+	}
+	// ...but suffix and basename only for a fuzzy query (#181).
+	for p, want := range map[string]bool{"internal/foo.go": true, "cmd/main.go": true, "foo.go": false, "main.go": false} {
+		if got := PathTouchedByAny(Query{Path: p}, ws); got != want {
+			t.Errorf("PathTouchedByAny(exact %q) = %v, want %v", p, got, want)
 		}
 	}
 	// a typo / genuinely-untouched path matches nothing.
 	for _, p := range []string{"internal/fooo.go", "nope/typo.go", "", "  "} {
-		if PathTouchedByAny(p, ws) {
+		if PathTouchedByAny(Query{Path: p, Mode: MatchFuzzy}, ws) {
 			t.Errorf("PathTouchedByAny(%q) = true, want false", p)
 		}
 	}

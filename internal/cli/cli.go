@@ -1005,31 +1005,70 @@ func parseCheckArgs(args []string) (paths []string, includeStale, showDiff, asJS
 	return
 }
 
+// checkArg is one `wt check` argument with the facts that decide both how it is
+// matched (#181) and whether it is a typo (#93), gathered once so the two
+// decisions read the same facts.
+type checkArg struct {
+	arg     string        // as typed, trimmed
+	query   collide.Query // how it is matched against each window's touched files
+	exists  bool          // present in the working tree
+	tracked bool          // known to git (a deleted-but-tracked path counts)
+}
+
+// resolveCheckArgs gathers each argument's facts and lets collide.QueryFor
+// decide its match mode: exact at the repo-relative path it names when it names
+// a real one, fuzzy as typed when it doesn't (#181). Everything is read
+// cwd-relative (NOT root-relative): the operator types paths relative to where
+// they are, and IsTracked (git ls-files) is cwd-relative too, so all of them
+// agree from a subdir (#92 review). root is the repo's top level (for an
+// absolute argument). Shared by `wt check` and MCP wt_check so the two can't
+// diverge. I/O: stat, git ls-files, git rev-parse.
+func resolveCheckArgs(args []string, root string, ws []collide.Window) []checkArg {
+	prefix, _ := gitx.ShowPrefix()
+	var out []checkArg
+	for _, a := range args {
+		a = strings.TrimSpace(a)
+		if a == "" {
+			continue
+		}
+		ca := checkArg{arg: a}
+		_, err := os.Stat(a)
+		ca.exists = err == nil
+		ca.tracked = !ca.exists && gitx.IsTracked(a)
+		ca.query = collide.QueryFor(a, repoRelativePath(root, prefix, a), ca.exists || ca.tracked, ws)
+		out = append(out, ca)
+	}
+	return out
+}
+
+// checkQueries returns the resolved query of each argument, in order. Pure.
+func checkQueries(args []checkArg) []collide.Query {
+	qs := make([]collide.Query, 0, len(args))
+	for _, a := range args {
+		qs = append(qs, a.query)
+	}
+	return qs
+}
+
 // unknownCheckPaths returns the requested paths that are almost certainly typos
 // (#93): they look like a real path (contain '/' or whitespace) yet don't exist
-// in the working tree, aren't tracked by git, and aren't touched by any window.
-// A bare basename (no '/' or whitespace) is a legitimate fuzzy suffix query and
-// is never flagged.
-func unknownCheckPaths(paths []string, ws []collide.Window) []string {
+// in the working tree, aren't tracked by git, and match no window's touched
+// files under the mode they will actually be checked with (#181). A bare name
+// (no '/' or whitespace) is never flagged: when it names no path here it is a
+// legitimate fuzzy basename search. Pure.
+func unknownCheckPaths(args []checkArg, ws []collide.Window) []string {
 	var out []string
-	for _, p := range paths {
-		p = strings.TrimSpace(p)
-		if p == "" || !strings.ContainsAny(p, "/ \t") {
-			continue // bare single-token basename → fuzzy query, exempt
+	for _, a := range args {
+		if a.arg == "" || !strings.ContainsAny(a.arg, "/ \t") {
+			continue // bare single-token name → exact if it exists, else a fuzzy search; exempt
 		}
-		// cwd-relative (NOT root-relative): the operator types paths relative to
-		// where they are, and IsTracked (git ls-files) is also cwd-relative, so
-		// both agree from a subdir (#92 review).
-		if _, err := os.Stat(p); err == nil {
-			continue // exists in the working tree
+		if a.exists || a.tracked {
+			continue // exists in the working tree, or a deleted-but-tracked path (legit)
 		}
-		if gitx.IsTracked(p) {
-			continue // deleted-but-tracked path (legit)
-		}
-		if collide.PathTouchedByAny(p, ws) {
+		if collide.PathTouchedByAny(a.query, ws) {
 			continue // a window is genuinely touching it (collision / other-branch path)
 		}
-		out = append(out, p)
+		out = append(out, a.arg)
 	}
 	return out
 }
@@ -1062,18 +1101,22 @@ func cmdCheck(args []string) int {
 			return 1
 		}
 		root, _ := gitx.RepoRoot()
+		// #181: a path that names a real location (here, tracked, or touched at
+		// that exact path by a window) matches EXACTLY; only one that names
+		// nothing in the repo is a fuzzy basename/suffix search.
+		args := resolveCheckArgs(paths, root, ws)
 		// #93: refuse a path that doesn't exist in the working tree, isn't tracked
 		// by git, and isn't touched by any window — a typo (or a zsh non-word-split
 		// single arg) that would otherwise falsely report '✓ clear'. Bare basenames
 		// (no '/' or space) are fuzzy suffix queries and exempt; --allow-missing
 		// opts into checking a genuinely-gone path.
 		if !allowMissing {
-			if unknown := unknownCheckPaths(paths, ws); len(unknown) > 0 {
+			if unknown := unknownCheckPaths(args, ws); len(unknown) > 0 {
 				ui.Err("wt check: no such path(s) — refusing to report 'clear' for path(s) that don't exist, aren't tracked, and no window is touching: %s. (typo, or zsh didn't word-split a $var? checking a path you're about to CREATE, or one that's deleted/on another branch? re-run with --allow-missing.)", strings.Join(unknown, ", "))
 				return 64
 			}
 		}
-		entries := buildCheckReport(c, ws, root, paths, includeStale)
+		entries := buildCheckReport(c, ws, root, checkQueries(args), includeStale)
 		if asJSON {
 			return renderCheckJSON(entries, includeStale)
 		}

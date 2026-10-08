@@ -338,7 +338,7 @@ func pushCollisionBlocks(c *config.Config, ws []collide.Window, root string, pat
 	if len(paths) == 0 {
 		return false
 	}
-	conflicts := collide.CheckPaths(ws, root, paths)
+	conflicts := pathConflicts(ws, root, paths)
 	if len(conflicts) == 0 {
 		return false
 	}
@@ -366,6 +366,18 @@ func pushCollisionBlocks(c *config.Config, ws []collide.Window, root string, pat
 	fmt.Fprintln(os.Stderr, ui.Yellow("   Coordinate with that window before pushing (run `wt check` for details)."))
 	fmt.Fprintln(os.Stderr, ui.Dim("   Bypass (you've coordinated): WT_SKIP_COLLISION=1 git push"))
 	return true
+}
+
+// pathConflicts runs the collision engine over paths that came from git — the
+// pre-push outgoing files, the pre-commit staged files — which are real
+// repo-relative paths and so match EXACTLY (#181). Fuzzy suffix/basename
+// matching made the root README.md "collide" with another window's
+// pkg/svc/README.md and blocked the push; worse, the dedupe then hid which file
+// actually collided when both were outgoing. Exact is also what `wt check`
+// does with an existing path, which keeps the block predicate equal to it.
+// Pure.
+func pathConflicts(ws []collide.Window, root string, paths []string) []collide.Conflict {
+	return collide.CheckPaths(ws, root, collide.ExactQueries(paths))
 }
 
 // distinctPaths returns the unique file paths across the conflicts.
@@ -496,7 +508,7 @@ func HookPreCommit(c *config.Config) int {
 	root, _ := gitx.RepoRoot()
 
 	if len(stagedFiles) > 0 {
-		if conflicts := collide.CheckPaths(ws, root, stagedFiles); len(conflicts) > 0 {
+		if conflicts := pathConflicts(ws, root, stagedFiles); len(conflicts) > 0 {
 			// Suppress collisions against stale branches (merged / no open PR) —
 			// same liveness rule as `wt check`, so the hook doesn't cry wolf on
 			// every commit against long-dead branches that touched the same file.

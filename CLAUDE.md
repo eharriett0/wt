@@ -56,6 +56,19 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   `collide.SharedSectionsAcross` — the hooks used to stop at the blanket
   shared-doc advisory, so the one case `structured_doc` exists to catch (two
   windows in the same lane) blocked in `check` and sailed through pre-push.
+- **A real path matches EXACTLY; only a search term is fuzzy (#181).** Paths
+  from git or a hook payload (pre-push outgoing, pre-commit staged,
+  Claude/Codex edit targets) go through `collide.ExactQueries`. A `wt check` /
+  `wt_check` argument goes through `collide.QueryFor`: exact when it names a
+  real path (on disk or tracked relative to the cwd, or touched at that exact
+  path by a window), fuzzy (suffix / basename / dir-suffix) only when it names
+  nothing. A root file has no `/` to anchor a suffix on, so fuzzy-matching every
+  path made the root `README.md` collide with another branch's
+  `pkg/svc/README.md` and blocked the push. The zero `MatchMode` is exact, so a
+  query whose mode was never decided can't invent a collision. Relative paths
+  resolve against `git rev-parse --show-prefix` (not root); absolute ones via
+  `resolveExisting`, which handles `/var`→`/private/var` even for a file that
+  doesn't exist yet.
 - **`wt clean` is data-loss-critical.** `ReapVerdict` only reaps a *provably
   shipped* worktree (grace window, upstream, merged PR / cherry). Never
   force-remove a dirty worktree automatically — `--stale-index` is

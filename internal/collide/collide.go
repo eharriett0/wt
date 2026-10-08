@@ -146,14 +146,87 @@ type Conflict struct {
 	Path        string
 	Window      string // the other window's label
 	MatchedFile string // the other window's actual repo-relative touched file that
-	// matched Path (may differ from Path when Path was a basename/suffix) — used
-	// for hunk-range lookup so basename checks on nested files still grade.
+	// matched Path (may differ from Path when Path was a fuzzy basename/suffix
+	// query) — used for hunk-range lookup so basename checks on nested files
+	// still grade.
 }
 
-// CheckPaths reports, for each requested path, which OTHER windows (not
-// currentWorktree) are already touching it. Pure. paths are matched against
-// each window's touched set exactly, by suffix, by basename, and — for a
-// DIRECTORY — by expanding to every touched file beneath it (#154).
+// MatchMode is how a requested path is compared with a window's touched files.
+//
+// ⚠ #181: every path used to be matched by suffix and basename too, so a file
+// at the REPO ROOT collided with any same-named file in a subdirectory —
+// "README.md" is a suffix of "pkg/svc/README.md". `wt check README.md` reported
+// HIGH and the pre-push guard blocked the push for a file the other branch never
+// touched, which teaches bypassing the one check that prevents duplicate PRs.
+// The fuzzy tiers are a convenience for a name a human types without knowing
+// where it lives. A path that names a real location is a question about THAT
+// location, and is compared as one.
+type MatchMode int
+
+const (
+	// MatchExact compares repo-relative paths: equality for a file, a
+	// segment-anchored prefix for a directory. It is the zero value on purpose:
+	// a query whose mode was never decided can't invent a collision. Every path
+	// that comes from git or a hook payload is exact (pre-push outgoing files,
+	// pre-commit staged files, Claude/Codex edit targets), and so is a `wt check`
+	// argument that names a path in the repo (QueryFor).
+	MatchExact MatchMode = iota
+	// MatchFuzzy is for a `wt check` argument that names NO path in the repo: a
+	// search term. It adds a suffix/basename tier (`foo.go` reaches
+	// internal/foo.go) and a directory-suffix tier (`kiali` reaches
+	// envs/.../configs/kiali/), both on a segment boundary.
+	MatchFuzzy
+)
+
+// Query is one requested path and how to match it.
+type Query struct {
+	Path string
+	Mode MatchMode
+}
+
+// ExactQueries wraps repo-relative paths that came from git or a hook payload,
+// which name real locations and are never search terms (#181). Pure.
+func ExactQueries(paths []string) []Query {
+	qs := make([]Query, 0, len(paths))
+	for _, p := range paths {
+		qs = append(qs, Query{Path: p, Mode: MatchExact})
+	}
+	return qs
+}
+
+// QueryFor decides how a `wt check` argument is matched (#181). arg is the
+// argument as typed. rel is the repo-relative path it names when read relative
+// to the current directory, or "" when it names no location inside the repo (it
+// leaves the repo, or is the root itself). onDisk reports that it exists in this
+// working tree or is tracked by git.
+//
+// An argument that names a real location is compared EXACTLY at its
+// repo-relative path: present here, or touched at exactly that path by some
+// window (a file or directory that exists only on another branch is still a
+// real place). Anything else is a search term, matched fuzzily as typed, which
+// keeps `wt check foo.go` reaching internal/foo.go.
+//
+// The root README.md exists, so `wt check README.md` at the root asks about
+// THAT file; matching it fuzzily is what made it collide with
+// pkg/svc/README.md. From pkg/svc/ the same argument names pkg/svc/README.md,
+// and is no longer matched against the root README.md either: the mirror image
+// of the same bug. Pure.
+func QueryFor(arg, rel string, onDisk bool, ws []Window) Query {
+	arg = strings.TrimSpace(arg)
+	if rel != "" {
+		exact := Query{Path: rel, Mode: MatchExact}
+		if onDisk || PathTouchedByAny(exact, ws) {
+			return exact
+		}
+	}
+	return Query{Path: arg, Mode: MatchFuzzy}
+}
+
+// CheckPaths reports, for each query, which OTHER windows (not
+// currentWorktree) are already touching it. Pure. A query matches a window's
+// touched file by repo-relative equality, and — for a DIRECTORY — by expanding
+// to every touched file beneath it (#154). A MatchFuzzy query also matches by
+// suffix and basename (#181: only a query that names no real path is fuzzy).
 //
 // A directory expands to one Conflict PER FILE rather than one for the
 // directory, so each file keeps its own hunk grading downstream. Those entries
@@ -161,32 +234,32 @@ type Conflict struct {
 // requested directory three times would not tell you which files to look at.
 // Entries are deduped by (window, file): passing both a directory and a file
 // under it is a natural thing to do and must not double-report.
-func CheckPaths(ws []Window, currentWorktree string, paths []string) []Conflict {
+func CheckPaths(ws []Window, currentWorktree string, qs []Query) []Conflict {
 	var out []Conflict
 	for _, w := range ws {
 		if sameWorktree(w.Worktree, currentWorktree) {
 			continue
 		}
 		seen := map[string]struct{}{}
-		for _, p := range paths {
-			p = strings.TrimSpace(p)
-			if p == "" {
+		for _, q := range qs {
+			q.Path = strings.TrimSpace(q.Path)
+			if q.Path == "" {
 				continue
 			}
-			if matched, ok := matchTouched(p, w.Touched); ok {
+			if matched, ok := matchTouched(q, w.Touched); ok {
 				if _, dup := seen[matched]; !dup {
 					seen[matched] = struct{}{}
-					out = append(out, Conflict{Path: p, Window: w.Label(), MatchedFile: matched})
+					out = append(out, Conflict{Path: q.Path, Window: w.Label(), MatchedFile: matched})
 				}
 				continue
 			}
-			// #154: no file matched, so try p as a directory. `wt check <dir>`
-			// used to match NOTHING and print "clear — no other window is
+			// #154: no file matched, so try the path as a directory. `wt check
+			// <dir>` used to match NOTHING and print "clear — no other window is
 			// touching <dir>", silently and regardless of commit state: a
 			// positive claim about a whole subtree made after matching nothing
 			// in it. A directory is the cheapest way to ask the question, so it
 			// is what gets used when someone is being careful.
-			for _, f := range matchTouchedDir(p, w.Touched) {
+			for _, f := range matchTouchedDir(q, w.Touched) {
 				if _, dup := seen[f]; dup {
 					continue
 				}
@@ -204,53 +277,63 @@ func CheckPaths(ws []Window, currentWorktree string, paths []string) []Conflict 
 	return out
 }
 
-// PathTouchedByAny reports whether requested path p matches ANY window's touched
-// set (exact / suffix / basename) — including the current window. Used by
-// `wt check` to tell a real path (a live collision target, or a path that exists
-// only on another window's branch) from a typo, so it can refuse to report
-// 'clear' for a nonexistent path (#93) without false-refusing a path another
-// window is genuinely editing.
-func PathTouchedByAny(p string, ws []Window) bool {
-	p = strings.TrimSpace(p)
-	if p == "" {
+// PathTouchedByAny reports whether query q matches ANY window's touched set,
+// under q's own mode — including the current window. Used by `wt check` to tell
+// a real path (a live collision target, or a path that exists only on another
+// window's branch) from a typo, so it can refuse to report 'clear' for a
+// nonexistent path (#93) without false-refusing a path another window is
+// genuinely editing; and by QueryFor, to recognize such a path as real.
+func PathTouchedByAny(q Query, ws []Window) bool {
+	q.Path = strings.TrimSpace(q.Path)
+	if q.Path == "" {
 		return false
 	}
 	for _, w := range ws {
-		if _, ok := matchTouched(p, w.Touched); ok {
+		if _, ok := matchTouched(q, w.Touched); ok {
 			return true
 		}
 		// #154: a DIRECTORY that exists only on another window's branch is a real
 		// path, not a typo. Widening here can only remove a false "no such path",
 		// which is the safe direction for this guard.
-		if len(matchTouchedDir(p, w.Touched)) > 0 {
+		if len(matchTouchedDir(q, w.Touched)) > 0 {
 			return true
 		}
 	}
 	return false
 }
 
-// matchTouched reports whether requested path p matches any touched file — by
-// exact repo-relative path, path suffix, or basename — and returns the actual
-// matched touched file (repo-relative), preferring an exact match.
-func matchTouched(p string, touched []string) (string, bool) {
+// matchTouched reports whether query q matches any touched file — by exact
+// repo-relative path, and for a MatchFuzzy query also by path suffix or
+// basename — and returns the actual matched touched file (repo-relative),
+// preferring an exact match.
+//
+// ⚠ The suffix/basename tier is fuzzy-only (#181). For a repo-relative path it
+// is never a better answer than equality, only a wrong one: a root file has no
+// "/" to anchor on, so "README.md" matched "pkg/svc/README.md".
+func matchTouched(q Query, touched []string) (string, bool) {
 	for _, f := range touched {
-		if f == p {
+		if f == q.Path {
 			return f, true
 		}
 	}
+	if q.Mode != MatchFuzzy {
+		return "", false
+	}
 	for _, f := range touched {
-		if strings.HasSuffix(f, "/"+p) || filepath.Base(f) == p {
+		if strings.HasSuffix(f, "/"+q.Path) || filepath.Base(f) == q.Path {
 			return f, true
 		}
 	}
 	return "", false
 }
 
-// matchTouchedDir treats p as a DIRECTORY and returns every touched file beneath
-// it, sorted (#154). It mirrors matchTouched's two tiers one level up: p as a
-// repo-relative directory prefix, and p as a directory SUFFIX, so `wt check
-// configs/kiali/` and `wt check kiali` both reach `envs/.../configs/kiali/x.yaml`
-// the same way `wt check foo.go` already reaches `internal/foo.go`.
+// matchTouchedDir treats q's path as a DIRECTORY and returns every touched file
+// beneath it, sorted (#154). It mirrors matchTouched's two tiers one level up:
+// the path as a repo-relative directory prefix, and — for a MatchFuzzy query
+// only (#181) — as a directory SUFFIX, so `wt check kiali` reaches
+// `envs/.../configs/kiali/x.yaml` the same way `wt check foo.go` reaches
+// `internal/foo.go`. An exact `docs` is the root docs/ directory, and must not
+// reach `site/docs/x.md`.
 //
 // ⚠ Both tiers match on a SEGMENT BOUNDARY — the "/" in p+"/" is load-bearing.
 // A bare prefix test would make `envs/app` match `envs/application/x.yaml`, i.e.
@@ -260,14 +343,15 @@ func matchTouched(p string, touched []string) (string, bool) {
 // A trailing slash is accepted and stripped: it is how anyone types a directory,
 // and `wt check envs/app/` reporting differently from `wt check envs/app` would
 // be its own small trap.
-func matchTouchedDir(p string, touched []string) []string {
-	p = strings.Trim(strings.TrimSpace(p), "/")
+func matchTouchedDir(q Query, touched []string) []string {
+	p := strings.Trim(strings.TrimSpace(q.Path), "/")
 	if p == "" {
 		return nil // "/" or "" is the whole repo — not a question worth answering
 	}
+	fuzzy := q.Mode == MatchFuzzy
 	var out []string
 	for _, f := range touched {
-		if strings.HasPrefix(f, p+"/") || strings.Contains(f, "/"+p+"/") {
+		if strings.HasPrefix(f, p+"/") || (fuzzy && strings.Contains(f, "/"+p+"/")) {
 			out = append(out, f)
 		}
 	}

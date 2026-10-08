@@ -148,7 +148,7 @@ func mcpToolDescriptors() []map[string]any {
 			"description": "Before editing: is any other live window touching these paths? Returns per-path " +
 				"grading (HIGH overlapping hunks vs disjoint/advisory). Read-only.",
 			"inputSchema": obj(map[string]any{
-				"paths":           map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "repo-relative paths (or bare basenames) to check"},
+				"paths":           map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "repo-relative or absolute paths to check, matched exactly; a bare name that is no path in the repo (e.g. foo.go) matches any touched file with that basename"},
 				"include_stale":   map[string]any{"type": "boolean", "description": "include merged/dormant windows"},
 				"include_missing": map[string]any{"type": "boolean", "description": "check a path that doesn't exist yet (one you're about to create); otherwise a nonexistent path is refused, not reported clear"},
 			}, "paths"),
@@ -274,19 +274,23 @@ func mcpCheck(c *config.Config, paths []string, includeStale, allowMissing bool)
 	if err != nil {
 		return "scan failed: " + err.Error(), true
 	}
+	// #181: same exact-vs-fuzzy resolution as `wt check`, so an existing path
+	// (e.g. the root README.md) matches exactly and only a name that is no path in
+	// the repo is a fuzzy basename search.
+	root, _ := gitx.RepoRoot()
+	args := resolveCheckArgs(paths, root, ws)
 	// #93: refuse to report "clear" for a path that doesn't exist, isn't tracked,
 	// and no window touches — a typo must NOT read as a false all-clear (the exact
 	// failure this tool exists to prevent). Mirrors `wt check`'s guard so the MCP
 	// answer can't diverge from `wt check --json`.
 	if !allowMissing {
-		if unk := unknownCheckPaths(paths, ws); len(unk) > 0 {
+		if unk := unknownCheckPaths(args, ws); len(unk) > 0 {
 			return "no such path(s) — refusing to report 'clear' for path(s) that don't exist, " +
 				"aren't tracked, and no window is touching: " + strings.Join(unk, ", ") +
 				" (typo? or a path you're about to CREATE — re-call with include_missing:true).", true
 		}
 	}
-	root, _ := gitx.RepoRoot()
-	entries := buildCheckReport(c, ws, root, paths, includeStale)
+	entries := buildCheckReport(c, ws, root, checkQueries(args), includeStale)
 	return jsonText(buildCheckPayload(entries, includeStale)), false
 }
 

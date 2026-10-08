@@ -109,6 +109,14 @@ func Present() bool {
 // RepoRoot returns the top-level dir of the repo containing cwd.
 func RepoRoot() (string, error) { return Run("rev-parse", "--show-toplevel") }
 
+// ShowPrefix returns cwd's path relative to the top of its worktree, as git
+// sees it: "pkg/svc/" in a subdirectory, "" at the root. Used to read a path the
+// operator typed relative to where they are as a repo-relative one (#181).
+// Asking git avoids comparing os.Getwd, which can return the logical /var/…
+// path on macOS, with --show-toplevel, which is always the physical
+// /private/var/… one.
+func ShowPrefix() (string, error) { return Run("rev-parse", "--show-prefix") }
+
 // CommonDir returns the absolute $GIT_COMMON_DIR (shared across all worktrees).
 func CommonDir() (string, error) {
 	return Run("rev-parse", "--path-format=absolute", "--git-common-dir")

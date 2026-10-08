@@ -99,27 +99,58 @@ func claudeDecision(file string, high []CheckEntry, block, fileLevel bool) (stri
 	return string(j), true
 }
 
-// repoRelativePath converts an absolute file path to a clean repo-relative one,
-// resolving symlinks so a /var vs /private/var mismatch on macOS doesn't defeat
-// the prefix strip. A path already relative is cleaned as-is. Returns "" when
-// the file is outside root (nothing to collision-check).
-func repoRelativePath(root, file string) string {
-	if !filepath.IsAbs(file) {
-		return filepath.Clean(file)
+// repoRelativePath converts file to a clean, slash-separated repo-relative path.
+// Returns "" when it is outside root, or is root itself: nothing to
+// collision-check.
+//
+// A relative file is read relative to the CURRENT directory, whose
+// repo-relative prefix is prefix (`git rev-parse --show-prefix`, "" at the
+// root), not relative to root. Collision matching is exact (#181), so reading
+// `README.md` typed in pkg/svc/ as the root README.md would check the wrong
+// file; the old suffix match used to paper over that by accident.
+//
+// An absolute file is made relative to root with symlinks resolved on both
+// sides, so a /var vs /private/var mismatch on macOS doesn't defeat the prefix
+// strip. That includes a file that doesn't exist yet (a Write creating it, a
+// path that exists only on another branch): its deepest existing ancestor is
+// resolved instead (resolveExisting).
+func repoRelativePath(root, prefix, file string) string {
+	var rel string
+	if filepath.IsAbs(file) {
+		r, err := filepath.Rel(resolveExisting(root), resolveExisting(file))
+		if err != nil {
+			return ""
+		}
+		rel = r
+	} else {
+		rel = filepath.Clean(filepath.Join(filepath.FromSlash(prefix), file))
 	}
-	rr := root
-	if r, err := filepath.EvalSymlinks(root); err == nil {
-		rr = r
-	}
-	rf := file
-	if r, err := filepath.EvalSymlinks(file); err == nil {
-		rf = r
-	}
-	rel, err := filepath.Rel(rr, rf)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return ""
 	}
-	return rel
+	return filepath.ToSlash(rel)
+}
+
+// resolveExisting returns the absolute path p with symlinks resolved in its
+// deepest EXISTING ancestor and the rest re-appended. filepath.EvalSymlinks
+// fails outright for a path that doesn't exist, which left such a path on the
+// logical /var/… side of a comparison with git's physical /private/var/… root,
+// where it read as outside the repo and went unchecked. Falls back to the
+// cleaned p.
+func resolveExisting(p string) string {
+	p = filepath.Clean(p)
+	var rest []string
+	for cur := p; ; {
+		if r, err := filepath.EvalSymlinks(cur); err == nil {
+			return filepath.Join(append([]string{r}, rest...)...)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return p
+		}
+		rest = append([]string{filepath.Base(cur)}, rest...)
+		cur = parent
+	}
 }
 
 // hookClaudeEdit implements `wt _hook claude-edit`. Always exits 0 (the JSON
@@ -155,7 +186,11 @@ func hookClaudeEdit(r io.Reader) int {
 	if err != nil {
 		return 0
 	}
-	rel := repoRelativePath(root, file)
+	prefix := ""
+	if !filepath.IsAbs(file) { // Claude sends absolute paths; only a relative one needs the cwd
+		prefix, _ = gitx.ShowPrefix()
+	}
+	rel := repoRelativePath(root, prefix, file)
 	if rel == "" {
 		return 0
 	}
@@ -163,7 +198,10 @@ func hookClaudeEdit(r io.Reader) int {
 	if err != nil {
 		return 0
 	}
-	entries := buildCheckReport(c, ws, root, []string{rel}, false)
+	// #181: the edit target is a real repo-relative path, so it matches EXACTLY,
+	// as the pre-push guard does. A fuzzy match flagged an edit to the root
+	// README.md because another window edited pkg/svc/README.md.
+	entries := buildCheckReport(c, ws, root, collide.ExactQueries([]string{rel}), false)
 
 	// #108: the hook fires at PRE-edit time, so buildCheckReport's "current" side
 	// (this worktree's diff vs base) doesn't yet include the edit the agent is

@@ -113,10 +113,12 @@ func untrackedInOther(otherWorktree, path string) bool {
 }
 
 // buildCheckReport classifies + hunk-grades every conflict for the requested
-// paths. currentWorktree is the window running `check` (its own edits, if any,
-// drive overlap detection). includeStale keeps merged/dormant windows.
-func buildCheckReport(c *config.Config, ws []collide.Window, currentWorktree string, paths []string, includeStale bool) []CheckEntry {
-	conflicts := collide.CheckPaths(ws, currentWorktree, paths)
+// queries. currentWorktree is the window running `check` (its own edits, if any,
+// drive overlap detection). includeStale keeps merged/dormant windows. Each
+// query carries its match mode (#181): a hook's or an agent's real path is
+// exact; only a `wt check` argument that names no path in the repo is fuzzy.
+func buildCheckReport(c *config.Config, ws []collide.Window, currentWorktree string, qs []collide.Query, includeStale bool) []CheckEntry {
+	conflicts := collide.CheckPaths(ws, currentWorktree, qs)
 	live := collide.ClassifyWindows(ws, c.Base, collide.ConflictWindowSet(conflicts), c.MaxAge)
 	byLabel := windowByLabel(ws)
 
@@ -126,8 +128,8 @@ func buildCheckReport(c *config.Config, ws []collide.Window, currentWorktree str
 		e := CheckEntry{Path: cf.Path, Window: cf.Window, Liveness: wl.Label()}
 
 		// Use the resolved repo-relative file (cf.MatchedFile) for hunk / blob
-		// lookup — cf.Path may be a basename that git pathspec can't resolve for a
-		// nested file.
+		// lookup — cf.Path may be a fuzzy basename that git pathspec can't
+		// resolve for a nested file.
 		rangesPath := cf.MatchedFile
 		if rangesPath == "" {
 			rangesPath = cf.Path
