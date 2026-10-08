@@ -85,7 +85,7 @@ func TestInbox(t *testing.T) {
 		rec(KindAnnounce, "other", "a3", ""),        // from other, will be all-cleared → hidden
 		rec(KindAllClear, "other", "y", "a3"),
 	}
-	got := Inbox(recs, "dep-sweep")
+	got := Inbox(recs, Self{Window: "dep-sweep"})
 	if len(got) != 1 || got[0].ID != "a1" {
 		t.Fatalf("inbox should be [a1], got %+v", ids(got))
 	}
@@ -96,25 +96,25 @@ func TestActiveHoldsBlocksUntilAckedOrCleared(t *testing.T) {
 		{ID: "a1", Kind: KindAnnounce, Window: "roll-nodes", Hold: []string{"merge-main", "flux-reconcile"}},
 	}
 	// Un-acked hold covering merge-main → blocks.
-	if h := ActiveHolds(base, "dep-sweep", "merge-main"); len(h) != 1 {
+	if h := ActiveHolds(base, Self{Window: "dep-sweep"}, "merge-main"); len(h) != 1 {
 		t.Fatalf("expected 1 active hold, got %d", len(h))
 	}
 	// Op not covered → no block.
-	if h := ActiveHolds(base, "dep-sweep", "kubectl-mutate:loki"); len(h) != 0 {
+	if h := ActiveHolds(base, Self{Window: "dep-sweep"}, "kubectl-mutate:loki"); len(h) != 0 {
 		t.Fatalf("uncovered op should not block, got %d", len(h))
 	}
 	// After self acks → cleared for self.
 	acked := append(append([]Record{}, base...), Record{ID: "k", Kind: KindAck, Window: "dep-sweep", AckOf: "a1"})
-	if h := ActiveHolds(acked, "dep-sweep", "merge-main"); len(h) != 0 {
+	if h := ActiveHolds(acked, Self{Window: "dep-sweep"}, "merge-main"); len(h) != 0 {
 		t.Fatalf("acked hold should not block self, got %d", len(h))
 	}
 	// After all-clear → cleared for everyone.
 	clr := append(append([]Record{}, base...), Record{ID: "z", Kind: KindAllClear, Window: "roll-nodes", AckOf: "a1"})
-	if h := ActiveHolds(clr, "dep-sweep", "merge-main"); len(h) != 0 {
+	if h := ActiveHolds(clr, Self{Window: "dep-sweep"}, "merge-main"); len(h) != 0 {
 		t.Fatalf("all-cleared hold should not block, got %d", len(h))
 	}
 	// A window never blocks on its OWN hold.
-	if h := ActiveHolds(base, "roll-nodes", "merge-main"); len(h) != 0 {
+	if h := ActiveHolds(base, Self{Window: "roll-nodes"}, "merge-main"); len(h) != 0 {
 		t.Fatalf("self hold should not block self, got %d", len(h))
 	}
 }
@@ -127,7 +127,7 @@ func TestPendingHolds(t *testing.T) {
 		rec(KindAnnounce, "other", "a3", "", "flux-reconcile"),  // will be acked → excluded
 		rec(KindAck, "self", "k", "a3"),
 	}
-	got := PendingHolds(recs, "self")
+	got := PendingHolds(recs, Self{Window: "self"})
 	if len(got) != 1 || got[0].ID != "a1" {
 		t.Fatalf("PendingHolds should be [a1], got %+v", ids(got))
 	}
@@ -207,17 +207,17 @@ func TestSelfBlockFixedByStableIdentity(t *testing.T) {
 	recs := []Record{
 		{ID: "a1", Kind: KindAnnounce, Window: selfAtAnnounce, Hold: []string{"merge-main"}},
 	}
-	if h := ActiveHolds(recs, selfAtMerge, "merge-main"); len(h) != 0 {
+	if h := ActiveHolds(recs, Self{Window: selfAtMerge}, "merge-main"); len(h) != 0 {
 		t.Fatalf("coordinator self-blocked on its OWN hold: got %d", len(h))
 	}
 	other := WindowID("", "/x/me-worktrees/dep-sweep", "dep-sweep")
-	if h := ActiveHolds(recs, other, "merge-main"); len(h) != 1 {
+	if h := ActiveHolds(recs, Self{Window: other}, "merge-main"); len(h) != 1 {
 		t.Fatalf("a genuinely different window must still be blocked: got %d", len(h))
 	}
 	// WT_WINDOW override also yields a stable, self-exempting identity across dirs.
 	pinned := WindowID("roll-coordinator", "/anywhere/else", "any-branch")
 	recs2 := []Record{{ID: "a2", Kind: KindAnnounce, Window: WindowID("roll-coordinator", top, "roll"), Hold: []string{"merge-main"}}}
-	if h := ActiveHolds(recs2, pinned, "merge-main"); len(h) != 0 {
+	if h := ActiveHolds(recs2, Self{Window: pinned}, "merge-main"); len(h) != 0 {
 		t.Fatalf("WT_WINDOW-pinned coordinator self-blocked across dirs: got %d", len(h))
 	}
 }
@@ -236,7 +236,7 @@ func TestDistinctTreesSameBasenameDoNotCollapse(t *testing.T) {
 	}
 	// clone B must still be blocked by clone A's merge-main hold.
 	recs := []Record{{ID: "h", Kind: KindAnnounce, Window: a, Hold: []string{"merge-main"}}}
-	if h := ActiveHolds(recs, b, "merge-main"); len(h) != 1 {
+	if h := ActiveHolds(recs, Self{Window: b}, "merge-main"); len(h) != 1 {
 		t.Fatalf("clone B must be blocked by clone A's hold, got %d", len(h))
 	}
 	// main checkout vs a worktree that happens to share the leaf name: distinct.
@@ -254,7 +254,7 @@ func TestActiveHoldsAt(t *testing.T) {
 			TS: now.Add(-time.Duration(ageH) * time.Hour).Format(time.RFC3339)}
 	}
 	recs := []Record{mk("a", "winA", 1), mk("b", "winB", 48)} // a fresh, b 2 days old
-	fresh, stale := ActiveHoldsAt(recs, "self", "merge-main", now, 24*time.Hour)
+	fresh, stale := ActiveHoldsAt(recs, Self{Window: "self"}, "merge-main", now, 24*time.Hour)
 	if len(fresh) != 1 || fresh[0].ID != "a" {
 		t.Errorf("fresh = %+v, want [a]", fresh)
 	}
@@ -262,7 +262,7 @@ func TestActiveHoldsAt(t *testing.T) {
 		t.Errorf("stale = %+v, want [b]", stale)
 	}
 	// maxAge 0 disables expiry — everything fresh (pre-#32 behavior)
-	f0, s0 := ActiveHoldsAt(recs, "self", "merge-main", now, 0)
+	f0, s0 := ActiveHoldsAt(recs, Self{Window: "self"}, "merge-main", now, 0)
 	if len(f0) != 2 || len(s0) != 0 {
 		t.Errorf("maxAge=0: fresh=%d stale=%d, want 2/0", len(f0), len(s0))
 	}
@@ -276,7 +276,7 @@ func TestOwnOpenAnnouncements(t *testing.T) {
 		{ID: "x", Kind: KindAllClear, Window: "me", AckOf: "3"},   // clears 3
 		{ID: "4", Kind: KindBlockReserve, Window: "me", Block: 5}, // not an announcement
 	}
-	own := OwnOpenAnnouncements(recs, "me")
+	own := OwnOpenAnnouncements(recs, Self{Window: "me"})
 	if len(own) != 1 || own[0].ID != "1" {
 		t.Errorf("OwnOpenAnnouncements = %+v, want just id 1 (2=other, 3=cleared)", own)
 	}

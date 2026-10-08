@@ -71,6 +71,10 @@ func printHelp() {
 	fmt.Println("    " + d("log ~/.wt/coordination/<repo>.jsonl; ") + c("--issue") + d(" mirrors to a GitHub issue (cross-machine)."))
 	fmt.Println("    " + d("Window identity = the worktree (stable across branch switches); export ") + c("WT_WINDOW"))
 	fmt.Println("    " + d("to pin it across checkouts so a hold's creator is never blocked by its own hold (#18)."))
+	fmt.Println("    " + d("Inside one checkout each SESSION is its own party (the Claude Code or Codex session, or"))
+	fmt.Println("    " + d("export ") + c("WT_SESSION") + d("): two agents sharing a checkout see each other's announcements and"))
+	fmt.Println("    " + d("holds, and doctor/status warn that they share ONE working tree (#163). /clear starts a new"))
+	fmt.Println("    " + d("session: a hold placed before it gates you after it — ") + c("wt ack <id>") + d(" waives it for you only."))
 	fmt.Println()
 
 	fmt.Println(b("  ✦ SETUP"))

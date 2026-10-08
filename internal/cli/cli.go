@@ -760,6 +760,7 @@ func statusReport(c *config.Config, asJSON, blocking bool) int {
 	if !asJSON {
 		peerHoldBanner(c)
 		blockReservationBanner(c)
+		sharedCheckoutBanner(c) // #163: another session posting from THIS checkout
 	}
 	ws, err := collide.Scan(c)
 	if err != nil {
@@ -1184,7 +1185,7 @@ func runHook(args []string) int {
 	// repo from the stdin payload's cwd and always exit 0 (fail-open context), so
 	// they run without a pre-loaded config.
 	if args[0] == "codex-context" || args[0] == "claude-context" {
-		return hookAgentContext(os.Stdin)
+		return hookAgentContext(os.Stdin, args[0] == "codex-context")
 	}
 	// codex-edit is a Codex CLI PreToolUse hook on apply_patch (#117): it derives
 	// the repo from its stdin payload's cwd and always exits 0 (fail-open), so it

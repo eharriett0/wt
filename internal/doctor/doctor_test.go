@@ -1,6 +1,7 @@
 package doctor
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/eharriett0/wt/internal/collide"
@@ -79,6 +80,25 @@ func TestPushDefaultFollowsUpstream(t *testing.T) {
 	for _, v := range []string{"", "simple", "current", "matching", "nothing", "garbage"} {
 		if pushDefaultFollowsUpstream(v) {
 			t.Errorf("pushDefaultFollowsUpstream(%q) = true, want false (bare push keys off the branch name)", v)
+		}
+	}
+}
+
+// #163: doctor names this shell's session and where it came from — or, with no
+// token at all, says so and how to fix it (it can't be told apart from another
+// token-less session in the same checkout).
+func TestSessionLine(t *testing.T) {
+	if got := sessionLine("c1", "CLAUDE_CODE_SESSION_ID"); got != "c1 (from CLAUDE_CODE_SESSION_ID)" {
+		t.Errorf("sessionLine(token) = %q", got)
+	}
+	// The text row shortens a raw session id (doctor --json keeps it whole).
+	if got := sessionLine("24288609-c37a-43a9-8a82-80e93779324e", "CLAUDE_CODE_SESSION_ID"); got != "24288609… (from CLAUDE_CODE_SESSION_ID)" {
+		t.Errorf("sessionLine(uuid) = %q, want the short form", got)
+	}
+	got := sessionLine("", "")
+	for _, want := range []string{"none", "WT_SESSION", "CLAUDE_CODE_SESSION_ID", "terminal tab ids are deliberately not used", "can't be told apart"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("token-less sessionLine missing %q: %q", want, got)
 		}
 	}
 }

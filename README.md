@@ -154,7 +154,7 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 | `wt todos` | What every window is working on (mirrors each window's TODO list) |
 | **— cross-window coordination —** | |
 | `wt announce "<msg>"` | Tell other windows a change is starting `[--hold "merge-main,…"] [--issue N]` |
-| `wt inbox` | Un-acked announcements from other windows. `[--issue N]` also reads back the cross-machine mirror `[--json]` |
+| `wt inbox` | Un-acked announcements from other windows, and from another session working in this same checkout (labelled; see below). `[--issue N]` also reads back the cross-machine mirror `[--json]` |
 | `wt ack <id>` | Acknowledge one `[--state "what this window is touching"]` |
 | `wt all-clear <id>` | Release your hold |
 | `wt holds` | YOUR outstanding announcements/holds + block reservations, with copy-pasteable all-clear lines |
@@ -167,6 +167,25 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 | `wt doctor` | Check git/gh + all resolved config + structured-doc regex + coordination-log health + preflight, and flag worktrees that track the base branch, a stale far-behind base checkout, and whether the hooks are installed `[--json]` |
 | `wt version` | Print the version |
 | `wt help` | Colorful overview |
+
+**Window and session identity.** A *window* is a checkout: its worktree path,
+stable across branch switches (`WT_WINDOW` pins it across checkouts). Inside one
+checkout, each *session* is its own party: the Claude Code session
+(`CLAUDE_CODE_SESSION_ID`), the Codex session (`CODEX_SESSION_ID`), or the value
+of `WT_SESSION` (the same value in several shells makes them one session; a
+distinct value per agent splits agents that export no session id of their own).
+So two agents started in the same checkout see each other's announcements in
+`inbox`, `holds` lists only your own, `merge-pr` honours the other session's
+`merge-main` hold, and `doctor` / `status` warn that the two share ONE working
+tree (where only `wt new` separates their edits). Claude Code keeps its session
+id across `--resume` / `--continue`; `--fork-session`, `/clear` and a fresh
+session get a new one, so a hold you placed before a `/clear` gates you after it
+like another session's: `wt ack <id>` waives it for you only (`wt all-clear <id>`
+would release it for every window). Terminal tabs are not sessions: a person's
+tabs, and anything started in them, stay one party. A shell with no session id is
+never silently merged with one that has: it sees that session's announcements,
+and `inbox` hedges rather than reporting a confident "clear". Records written before
+sessions existed keep the old window-only behaviour.
 
 Structured shared docs (`structured_doc.<name>` in config) upgrade the blanket
 "shared doc — advisory" to **section-aware** grading: two windows editing the
@@ -283,8 +302,10 @@ wt install-claude-hook --write    # merges both in (never clobbers existing hook
   agent as context (`additionalContext`), so it *sees* the collision and can
   coordinate, without being halted.
 - **`WT_CLAUDE_HOOK_BLOCK=1`** turns a HIGH (per-edit) into a hard `deny`.
-- **Cheap** — a repo with ≤1 worktree is skipped instantly (solo repos pay
-  nothing). Bypass with `WT_SKIP_COLLISION=1`; fail-open on any error
+- **Cheap** — a repo with ≤1 worktree and no coordination log is skipped
+  instantly (solo repos pay nothing); with a log, the per-turn hook still
+  delivers another same-checkout session's announcements and every other
+  window's hold. Bypass with `WT_SKIP_COLLISION=1`; fail-open on any error
   (a coordination nicety must never disrupt the session).
 
 So when the agent in worktree A goes to edit the exact hunk of `foo.go` that

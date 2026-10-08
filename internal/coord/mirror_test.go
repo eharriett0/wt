@@ -22,7 +22,7 @@ func TestMirrorRoundTrip(t *testing.T) {
 func TestParseMirroredRecords_SkipsNonRecords(t *testing.T) {
 	bodies := []string{
 		"just a human comment, no block",
-		"```wt-record\n{bad json\n```",       // malformed → skipped
+		"```wt-record\n{bad json\n```",        // malformed → skipped
 		"```wt-record\n{\"kind\":\"x\"}\n```", // no ID → skipped
 		"prefix\n```wt-record\n{\"id\":\"z\",\"kind\":\"ack\",\"ack_of\":\"abc\"}\n```\nsuffix",
 	}
@@ -50,7 +50,7 @@ func TestMergeByID_RemoteAllClearClearsHold(t *testing.T) {
 	local := []Record{{ID: "h1", Kind: KindAnnounce, Window: "remoteWin", Hold: []string{"merge-main"}}}
 	remote := []Record{{ID: "c1", Kind: KindAllClear, AckOf: "h1", Window: "remoteWin"}}
 	merged := MergeByID(local, remote)
-	fresh, stale := ActiveHoldsAt(merged, "myWin", "merge-main", time.Time{}, 0)
+	fresh, stale := ActiveHoldsAt(merged, Self{Window: "myWin"}, "merge-main", time.Time{}, 0)
 	if len(fresh) != 0 || len(stale) != 0 {
 		t.Fatalf("remote all-clear should clear the hold: fresh=%d stale=%d", len(fresh), len(stale))
 	}

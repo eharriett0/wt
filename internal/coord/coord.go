@@ -17,9 +17,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -65,7 +67,7 @@ const DefaultBlockReserveTTL = 30 * time.Minute
 type Record struct {
 	ID      string   `json:"id"`
 	TS      string   `json:"ts"`     // RFC3339
-	Window  string   `json:"window"` // announcing/acking window (worktree branch)
+	Window  string   `json:"window"` // announcing/acking window (WindowID: the checkout)
 	Repo    string   `json:"repo"`   // repo slug
 	Kind    string   `json:"kind"`   // announce | ack | all-clear | block-reserve
 	Message string   `json:"message,omitempty"`
@@ -75,6 +77,143 @@ type Record struct {
 	State   string   `json:"state,omitempty"`  // one-line in-flight state (on ack)
 	File    string   `json:"file,omitempty"`   // block-reserve: the append-log doc
 	Block   int      `json:"block,omitempty"`  // block-reserve: the reserved block id (N)
+	// Session is the writer's per-session token (#163): SessionToken, or
+	// SessionNone when its environment carried none. Empty ONLY on a record
+	// written before sessions existed — the back-compat wildcard in Self.Owns.
+	Session string `json:"session,omitempty"`
+}
+
+// SessionNone is the session of a writer/reader whose environment carries no
+// session token (#163). It is deliberately NON-empty: "" is reserved for records
+// that predate sessions and stays a wildcard (exactly the old behaviour), while a
+// token-less session that knows about sessions is told apart from a tagged one —
+// a terminal with no session id and a Claude Code session sharing one checkout
+// are two parties, not one.
+const SessionNone = "none"
+
+// SessionEnvVars is the session-token precedence (#163), first non-empty wins:
+//
+//  1. WT_SESSION — explicit override; set the same value in several shells to
+//     make them ONE session, or a distinct one per agent to split them.
+//  2. CLAUDE_CODE_SESSION_ID — Claude Code exports it into every Bash-tool shell
+//     AND into its hook processes, set from the same session id the hook payload
+//     carries, so the CLI and the per-turn hook agree. `--resume`/`--continue`
+//     keep it, so a resumed agent still owns its holds. `--fork-session` AND
+//     `/clear` mint a new one (verified in the 2.1.292 binary: the conversation
+//     reset rewrites it), and so does starting a fresh session: that session has
+//     no memory of the old one's holds, so they gate it like another session's —
+//     the gate names /clear as the likely reason. Subagents share their parent's.
+//  3. CODEX_SESSION_ID — Codex exports it into every shell command it runs
+//     (openai/codex#37848, `inject_session_env`): the root thread's id, shared by
+//     its subagent threads. Codex hook processes do NOT get it (a hook runs with
+//     the Codex process's own environment), so the codex-context hook falls back
+//     to its payload's session_id, which Codex fills from the same
+//     Session::session_id() (cli.agentHookSession).
+//
+// Terminal ids (TERM_SESSION_ID from Terminal.app, ITERM_SESSION_ID from iTerm2)
+// are deliberately NOT used. They are inherited by everything started in the tab
+// — tmux/screen panes, an editor launched from it — so two agents there would
+// share one "session" with false confidence; and they split one human's tabs
+// into separate parties, so a hold announced in one tab would block its owner's
+// merge in another and a WT_WINDOW pinned across terminals would stop exempting
+// its own hold (#18). A shell with none of these variables is SessionNone.
+var SessionEnvVars = []string{"WT_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_SESSION_ID"}
+
+// SessionToken resolves this process's session token from getenv per
+// SessionEnvVars, returning it and the variable it came from. ("", "") when none
+// is set (callers record that as SessionNone). Pure given getenv.
+func SessionToken(getenv func(string) string) (token, source string) {
+	for _, k := range SessionEnvVars {
+		if v := strings.TrimSpace(getenv(k)); v != "" {
+			return v, k
+		}
+	}
+	return "", ""
+}
+
+// Self is a process's coordination identity: the checkout (WindowID — path
+// based and deliberately unchanged, #18/#156) plus the session within it (#163).
+// The zero Session matches every session (the pre-#163 behaviour); live callers
+// build Self with CurrentSelf, which always sets one.
+type Self struct {
+	Window  string
+	Session string
+}
+
+// CurrentSelf builds this process's identity: WindowID(WT_WINDOW, toplevel,
+// branch) + SessionToken, with SessionNone when no token is set. Pure given getenv.
+func CurrentSelf(getenv func(string) string, toplevel, branch string) Self {
+	s, _ := SessionToken(getenv)
+	if s == "" {
+		s = SessionNone
+	}
+	return Self{Window: WindowID(getenv("WT_WINDOW"), toplevel, branch), Session: s}
+}
+
+// Owns reports whether r was written by self: same window AND (same session, or
+// either side carries no session at all). It is the ONE ownership predicate —
+// inbox, acks, `wt holds` and the merge-pr hold gate's own-hold exemption all go
+// through it (#163). Two sessions sharing a checkout resolve to the same window,
+// and before sessions each treated the other's announcements as its own: inbox
+// said "clear", `wt holds` listed them as yours, and the gate exempted their
+// holds. Both sides carrying a session (a token, or SessionNone) that differ is
+// another party — never own. An empty Session only exists on pre-#163 records
+// (and on a zero Self), so the wildcard keeps them exactly as they were.
+//
+// A record read back from the GitHub mirror carries MirrorSession(token), never
+// the token, so self also owns a record whose session is the hash of its own
+// token. Without that, #18 broke across checkouts that share only the mirror
+// (two clones with different directory names keep separate local logs): a
+// session pinned with WT_WINDOW announced a hold in one clone and was blocked by
+// it in the other. Only a real token hashes; "" and SessionNone never do, so a
+// token-less shell can't claim a tagged session's mirrored record. Pure.
+func (s Self) Owns(r Record) bool {
+	if r.Window != s.Window {
+		return false
+	}
+	if r.Session == "" || s.Session == "" || r.Session == s.Session {
+		return true
+	}
+	return s.Session != SessionNone && r.Session == MirrorSession(s.Session)
+}
+
+// SharesCheckout reports whether r was written from self's checkout by ANOTHER
+// session — the party #163 was about, whose records carry self's own window id.
+// Derived from Owns, so labels ("same checkout, another session") can never
+// disagree with the ownership decision. Pure.
+func (s Self) SharesCheckout(r Record) bool {
+	return r.Window == s.Window && !s.Owns(r)
+}
+
+// ShortSession renders a session token for humans: SessionNone as "no session
+// token", a short token (a WT_SESSION label) as is, a long one (a UUID) cut to
+// its first 8 runes, and a mirrored hash (MirrorSession) as its first 8 hex
+// digits marked "(mirrored)" — the "sha256:" prefix alone told every remote
+// session apart from none of the others. Pure.
+func ShortSession(s string) string {
+	switch s {
+	case "":
+		return "session unknown"
+	case SessionNone:
+		return "no session token"
+	}
+	return "session " + ShortToken(s)
+}
+
+// ShortToken is ShortSession's token part alone, for a field already labelled
+// "session" (wt doctor): a mirrored hash as its first 8 hex digits + "(mirrored)",
+// a long token cut to 8 runes + "…", a short one as is. Pure.
+func ShortToken(s string) string {
+	if hexPart, ok := strings.CutPrefix(s, mirrorSessionPrefix); ok {
+		if r := []rune(hexPart); len(r) > 8 {
+			hexPart = string(r[:8])
+		}
+		return hexPart + " (mirrored)"
+	}
+	if r := []rune(s); len(r) > 12 {
+		return string(r[:8]) + "…"
+	}
+	return s
 }
 
 // LogPath returns the coordination log path for repo under home's ~/.wt.
@@ -110,8 +249,28 @@ var mirrorBlockRe = regexp.MustCompile("(?s)```" + mirrorFence + "\\s*\\n(.*?)\\
 // MirrorJSONBlock renders r as a fenced JSON block to append to a mirrored
 // comment, so a machine reading the issue back can reconstruct the exact record.
 func MirrorJSONBlock(r Record) string {
+	r.Session = MirrorSession(r.Session)
 	b, _ := json.Marshal(r)
 	return "```" + mirrorFence + "\n" + string(b) + "\n```"
+}
+
+// mirrorSessionPrefix marks a session as MirrorSession's hash of a token.
+const mirrorSessionPrefix = "sha256:"
+
+// MirrorSession is the session a mirrored record carries (#163): a stable hash
+// of the token, never the token itself. The raw value is a local agent session
+// id (Claude Code names its transcripts after it) and a mirror issue may be
+// public; a hash still lets another machine tell sessions apart. Only the
+// session whose token hashes to it owns a mirrored record (Self.Owns), so a
+// session still owns its own records when it reads them back from the mirror
+// (#18), and no other session can. "" (pre-#163) and SessionNone pass through.
+// Pure.
+func MirrorSession(s string) string {
+	if s == "" || s == SessionNone || strings.HasPrefix(s, mirrorSessionPrefix) {
+		return s
+	}
+	sum := sha256.Sum256([]byte(s))
+	return mirrorSessionPrefix + hex.EncodeToString(sum[:])[:16]
 }
 
 // ParseMirroredRecords extracts coord.Records from mirrored comment bodies — the
@@ -210,11 +369,13 @@ func cleared(recs []Record) map[string]bool {
 	return m
 }
 
-// ackedBy reports the set of announce ids that window `w` has acked.
-func ackedBy(recs []Record, w string) map[string]bool {
+// ackedBy reports the set of announce ids that self has acked. Another session's
+// ack in the same checkout is not self's (#163): it read the announcement, self
+// did not.
+func ackedBy(recs []Record, self Self) map[string]bool {
 	m := map[string]bool{}
 	for _, r := range recs {
-		if r.Kind == KindAck && r.Window == w && r.AckOf != "" {
+		if r.Kind == KindAck && r.AckOf != "" && self.Owns(r) {
 			m[r.AckOf] = true
 		}
 	}
@@ -232,15 +393,16 @@ func announcements(recs []Record) []Record {
 	return out
 }
 
-// Inbox returns announcements from OTHER windows that self has not acked and
-// that have not been all-cleared — i.e. the ones needing this window's
-// attention. Self's own announcements are excluded (you don't ack yourself).
-func Inbox(recs []Record, self string) []Record {
+// Inbox returns announcements from OTHER windows — or from another session in
+// this same checkout (#163) — that self has not acked and that have not been
+// all-cleared, i.e. the ones needing this session's attention. Self's own
+// announcements are excluded (you don't ack yourself).
+func Inbox(recs []Record, self Self) []Record {
 	cl := cleared(recs)
 	acked := ackedBy(recs, self)
 	var out []Record
 	for _, a := range announcements(recs) {
-		if a.Window == self || cl[a.ID] || acked[a.ID] {
+		if self.Owns(a) || cl[a.ID] || acked[a.ID] {
 			continue
 		}
 		out = append(out, a)
@@ -249,9 +411,9 @@ func Inbox(recs []Record, self string) []Record {
 }
 
 // PendingHolds returns the subset of this window's inbox (un-acked, un-cleared
-// announcements from OTHER windows) that declare a hold — the ones wt should
-// surface proactively before the window acts (the ambient-banner signal).
-func PendingHolds(recs []Record, self string) []Record {
+// announcements from OTHER windows or sessions) that declare a hold — the ones wt
+// should surface proactively before the window acts (the ambient-banner signal).
+func PendingHolds(recs []Record, self Self) []Record {
 	var out []Record
 	for _, a := range Inbox(recs, self) {
 		if len(a.Hold) > 0 {
@@ -292,12 +454,15 @@ func HoldCovers(hold []string, op string) bool {
 // switches within a checkout (#18). The old identity was the current branch, so
 // announcing a `--hold` from branch W then running `merge-pr` after the branch
 // flipped (the shared-checkout contamination of #15) made a window self-block on
-// its OWN hold: ActiveHolds already exempts own-window holds (a.Window == self),
-// but only if `self` is stable. Precedence:
+// its OWN hold: ActiveHolds exempts only holds self.Owns — same window AND same
+// session (#163) — so the window half must be stable. WindowID is only that half:
+// two sessions in one checkout get the SAME window id, and Self.Session (not this
+// function) tells them apart. Precedence:
 //
 //  1. WT_WINDOW env — explicit, survives dir AND branch changes; set per terminal
-//     to pin identity across checkouts (the only fix for announcing in one dir and
-//     merging from another) and to get a short readable label.
+//     to pin identity across checkouts (the fix for announcing in one dir and
+//     merging from another — within one session; a different agent session is a
+//     different party even under the same WT_WINDOW) and to get a short label.
 //  2. worktree toplevel PATH (canonical, full) — stable across `git checkout`
 //     within a dir (the branch flips, the dir doesn't), so announce + merge from
 //     one checkout keep one identity even if the branch changed between them.
@@ -324,16 +489,17 @@ func WindowID(env, toplevel, branch string) string {
 	return "detached"
 }
 
-// ActiveHolds returns announcements from OTHER windows whose hold covers op,
-// that have not been all-cleared and that self has not acked. These are the
-// holds that should block/warn an operation (e.g. merge-pr checking "merge-main").
-// Acking a hold clears it for self — you've acknowledged the coordination.
-func ActiveHolds(recs []Record, self, op string) []Record {
+// ActiveHolds returns announcements from OTHER windows (or another session in
+// this checkout, #163) whose hold covers op, that have not been all-cleared and
+// that self has not acked. These are the holds that should block/warn an
+// operation (e.g. merge-pr checking "merge-main"). Acking a hold clears it for
+// self — you've acknowledged the coordination. Only self.Owns exempts a hold.
+func ActiveHolds(recs []Record, self Self, op string) []Record {
 	cl := cleared(recs)
 	acked := ackedBy(recs, self)
 	var out []Record
 	for _, a := range announcements(recs) {
-		if a.Window == self || cl[a.ID] || acked[a.ID] {
+		if self.Owns(a) || cl[a.ID] || acked[a.ID] {
 			continue
 		}
 		if HoldCovers(a.Hold, op) {
@@ -431,7 +597,7 @@ func PruneLog(path string, now time.Time, blockMaxAge time.Duration) (dropped in
 // crashed/forgotten window — and callers should WARN rather than hard-block on
 // it, so a dead window's --hold can't wedge everyone's merge-pr forever. maxAge
 // <= 0 disables expiry (everything fresh — the pre-#32 behavior).
-func ActiveHoldsAt(recs []Record, self, op string, now time.Time, maxAge time.Duration) (fresh, stale []Record) {
+func ActiveHoldsAt(recs []Record, self Self, op string, now time.Time, maxAge time.Duration) (fresh, stale []Record) {
 	for _, a := range ActiveHolds(recs, self, op) {
 		if maxAge > 0 && Age(a, now) > maxAge {
 			stale = append(stale, a)
@@ -442,18 +608,183 @@ func ActiveHoldsAt(recs []Record, self, op string, now time.Time, maxAge time.Du
 	return fresh, stale
 }
 
-// OwnOpenAnnouncements returns THIS window's own announcements that have not been
-// all-cleared — the holds/announcements you still own and can `wt all-clear`
-// (#34). Includes both hold and plain announcements; excludes cleared ones.
-func OwnOpenAnnouncements(recs []Record, self string) []Record {
+// OwnOpenAnnouncements returns THIS session's own announcements that have not
+// been all-cleared — the holds/announcements you still own and can `wt
+// all-clear` (#34). Includes both hold and plain announcements; excludes cleared
+// ones, and another session's announcements in this same checkout (#163).
+func OwnOpenAnnouncements(recs []Record, self Self) []Record {
 	cl := cleared(recs)
 	var out []Record
 	for _, a := range announcements(recs) {
-		if a.Window == self && !cl[a.ID] {
+		if self.Owns(a) && !cl[a.ID] {
 			out = append(out, a)
 		}
 	}
 	return out
+}
+
+// SameCheckoutOpen returns the open (not all-cleared) announcements under self's
+// window that self does NOT own — another session's, in this same checkout
+// (#163). `wt holds` names them so reading your holds reveals a second party
+// instead of silently omitting it. Pure.
+func SameCheckoutOpen(recs []Record, self Self) []Record {
+	cl := cleared(recs)
+	var out []Record
+	for _, a := range announcements(recs) {
+		if self.SharesCheckout(a) && !cl[a.ID] {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// SharedCheckoutWindow bounds how recent another session's activity under this
+// checkout must be for wt doctor / wt status to warn that the checkout is shared
+// (#163). Matches the default hold_max_age.
+const SharedCheckoutWindow = 24 * time.Hour
+
+// SessionActivity summarizes one other session's records under self's window.
+type SessionActivity struct {
+	Session string    `json:"session"`
+	Records int       `json:"records"`
+	Last    time.Time `json:"last"`
+}
+
+// OtherSessions reports the sessions OTHER than self's that wrote records under
+// self's window within `within` of now (within <= 0 → any age) — evidence that
+// another session shares this checkout (#163). A pre-#163 record carries no
+// session and names no party, so it is skipped; so is everything when self has
+// no session (a zero Self). One entry per session, most recent first. Pure.
+func OtherSessions(recs []Record, self Self, now time.Time, within time.Duration) []SessionActivity {
+	if self.Session == "" {
+		return nil
+	}
+	idx := map[string]int{}
+	var out []SessionActivity
+	for _, r := range recs {
+		if !self.SharesCheckout(r) {
+			continue // another window, self's own session, or a pre-#163 record
+		}
+		t, err := time.Parse(time.RFC3339, r.TS)
+		if err != nil {
+			continue // undatable — can't call it recent
+		}
+		if within > 0 && now.Sub(t) > within {
+			continue
+		}
+		i, ok := idx[r.Session]
+		if !ok {
+			idx[r.Session] = len(out)
+			out = append(out, SessionActivity{Session: r.Session, Last: t})
+			i = len(out) - 1
+		}
+		out[i].Records++
+		if t.After(out[i].Last) {
+			out[i].Last = t
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Last.After(out[j].Last) })
+	return out
+}
+
+// SharedCheckoutWarning renders the wt doctor / wt status warning for other
+// sessions using self's checkout (#163): two lines, who and the remedy. "" when
+// there are none. others is OtherSessions' output (most recent first). The only
+// remedy is a separate worktree: a distinct WT_WINDOW splits the coordination
+// identity but not the tree, and it would also hide the other session from the
+// single-worktree per-turn hook. Pure.
+func SharedCheckoutWarning(others []SessionActivity, self Self, now time.Time) string {
+	if len(others) == 0 {
+		return ""
+	}
+	who := "another session"
+	if len(others) > 1 {
+		who = fmt.Sprintf("%d other sessions", len(others))
+	}
+	latest := others[0]
+	you := ShortSession(self.Session)
+	if self.Session == SessionNone {
+		you += " (set WT_SESSION)"
+	}
+	return fmt.Sprintf("checkout shared — %s posted from THIS checkout in the last %dh (latest: %s, %s); you: %s.\n"+
+		"  One working tree, no file-level warning between you: give one session its own worktree (`wt new <branch>`); its holds: `wt inbox`.",
+		who, int(SharedCheckoutWindow.Hours()), ShortSession(latest.Session), ago(now.Sub(latest.Last)), you)
+}
+
+// Thresholds for HoldLooksOrphaned (#163). A hold this old, or whose session has
+// written nothing for this long, has probably outlived the session that placed
+// it. Both sit well inside the default hold_max_age (24h), past which a hold
+// stops blocking at all.
+const (
+	HoldOrphanAge    = 12 * time.Hour
+	HoldOrphanSilent = 4 * time.Hour
+)
+
+// HoldLooksOrphaned reports whether hold h looks abandoned by the session that
+// placed it, and why: it is HoldOrphanAge old, or that session (h's window AND
+// session, the hold itself included) has written nothing for HoldOrphanSilent.
+// It is the ONLY condition under which wt suggests `wt all-clear` for a hold that
+// still gates: all-clear releases the hold for EVERY window, while `wt ack`
+// waives it only for the reader, so a live session's hold is acked, never
+// cleared. An undatable hold is not called orphaned. Pure.
+func HoldLooksOrphaned(recs []Record, h Record, now time.Time) (orphaned bool, why string) {
+	placed, err := time.Parse(time.RFC3339, h.TS)
+	if err != nil {
+		return false, ""
+	}
+	if age := now.Sub(placed); age >= HoldOrphanAge {
+		return true, "placed " + ago(age)
+	}
+	last := placed
+	for _, r := range recs {
+		if r.Window != h.Window || r.Session != h.Session {
+			continue
+		}
+		if t, err := time.Parse(time.RFC3339, r.TS); err == nil && t.After(last) {
+			last = t
+		}
+	}
+	if silent := now.Sub(last); silent >= HoldOrphanSilent {
+		return true, "its session last wrote " + ago(silent)
+	}
+	return false, ""
+}
+
+// ago is a compact age for messages built in this package.
+func ago(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	}
+}
+
+// InboxClearAmbiguous reports whether an empty inbox must NOT be presented as a
+// bare "inbox clear" (#163): this session has no session token (SessionNone),
+// yet a session-tagged record was written under its window within
+// SharedCheckoutWindow — so other sessions are actively posting from this
+// checkout, and any token-less one doing the same is indistinguishable from this
+// one. A hedge beats a false negative; bounding it by recency keeps an old,
+// long-finished session from hedging every token-less inbox forever (a permanent
+// hedge teaches people to ignore it). Pure.
+func InboxClearAmbiguous(recs []Record, self Self, now time.Time) bool {
+	if self.Session != SessionNone {
+		return false
+	}
+	for _, r := range recs {
+		if !self.SharesCheckout(r) {
+			continue // another window, a token-less writer (indistinguishable), or pre-#163
+		}
+		if t, err := time.Parse(time.RFC3339, r.TS); err == nil && now.Sub(t) <= SharedCheckoutWindow {
+			return true
+		}
+	}
+	return false
 }
 
 // OwnBlockReservations returns THIS window's block-id reservations, newest first
