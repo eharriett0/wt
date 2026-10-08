@@ -22,7 +22,7 @@ func TestMirrorRoundTrip(t *testing.T) {
 func TestParseMirroredRecords_SkipsNonRecords(t *testing.T) {
 	bodies := []string{
 		"just a human comment, no block",
-		"```wt-record\n{bad json\n```",       // malformed → skipped
+		"```wt-record\n{bad json\n```",        // malformed → skipped
 		"```wt-record\n{\"kind\":\"x\"}\n```", // no ID → skipped
 		"prefix\n```wt-record\n{\"id\":\"z\",\"kind\":\"ack\",\"ack_of\":\"abc\"}\n```\nsuffix",
 	}

@@ -44,6 +44,36 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   worktree is NEVER suppressed — even a far-behind base checkout stays HIGH and
   is only *labelled* "likely stale" (#87). Uncomputable/offline → surfaced, not
   hidden.
+- **A window's ranges are its OWN edits, in BASE line numbers (#29/#142/#184).**
+  Diffed straight from base, a branch BEHIND base reads every line base inserted
+  or modified after it forked as its own edit (it still holds the old text), so
+  any window editing those lines "overlapped" it: a false HIGH that blocked
+  pushes. `ChangedRanges` therefore diffs a behind branch from its merge base and
+  moves its hunks into base numbering through base's own hunks
+  (`mapHunksToBase`). ⚠ A base hunk that CONFLICTS with a branch hunk by git's
+  3-way rule (`hunksConflict`: they overlap, or touch with no unchanged line
+  between; checked against `git merge-file` on every 1-2 line shape) adds its
+  replacement to the branch's range: git merges the two as ONE conflict region,
+  so a window editing base's text there collides even on lines the branch never
+  had (branch edits l11, base rewrites l12-13, another window edits l13: merge-tree
+  conflicts). Mapping only the branch's own lines dropped exactly that case, and a
+  push main had blocked went through. An edit identical to one base also made
+  (a cherry-pick) stays the branch's: if the other window lands first, git
+  conflicts. `ChangedRangesNew` diffs from the merge base too.
+  ⚠ **A failed measurement never reads as "no edits":** the merge-base diffs
+  failing fall back to the plain base diff (over-reports); git failing outright
+  → `ChangedRangesChecked` ok=false, `ChangedRanges` nil (graders: indeterminate
+  = HIGH), `ChangedRangesNew` the whole file. `gitOutput` is the test seam.
+- **The pre-edit hooks grade what `wt check` will say once the edit is made
+  (#108/#184).** `regradePending`: every hunk-graded entry (HIGH *or* FYI: a
+  window whose earlier edits were disjoint can be about to overlap) is HIGH iff
+  this window's own ranges ∪ the pending edit overlap the other window's. The
+  pending edit is located in the on-disk file and moved into base numbering
+  through this worktree's own diff (`gitx.LinesToBase`, the same mapping with the
+  sides swapped), so a window that is behind base or already edited the file is
+  graded exactly, not file-level. Only when that can't be computed (a Write, a
+  non-unique `old_string`, a binary file, a git error) does an entry stay as a
+  file-level heads-up, and then it is never dropped.
 - **`ClassifyFacts` precedence:** open PR > merged PR > closed PR > dirty >
   unmerged > merged-by-ancestry. PR state outranks a dirty index (a
   merged/closed branch with leftover staged cruft is stale, not a permanent
@@ -138,13 +168,13 @@ exit 0** (advisory / fail-open; a coordination nicety must never break the sessi
   `wt status` uses, excluding the current window (`collide.LabelForWorktree`).
 - `wt _hook codex-edit` (**PreToolUse**, matcher `apply_patch`): parses the patch's
   `*** {Update|Add|Delete|Move} File:` targets, grades them via `buildCheckReport`
-  (the same grader as `wt check`), then RE-grades each `CatBlocking` entry against
-  the patch's actual hunks — localized in the current file via `locateRange`
-  (`parseCodexPatch` → per-hunk pre-image of context+removed lines) — but **only
-  when frame-safe** (this worktree's file is unchanged vs base, i.e.
-  `ChangedRanges(root,base,path)` empty; the #108 lesson). A disjoint patch to a
-  shared file therefore stays silent. Emits `additionalContext` on overlap;
-  `WT_CODEX_HOOK_BLOCK=1` upgrades a **confirmed** HIGH (frame-safe hunk overlap) to
+  (the same grader as `wt check`), then RE-grades each hunk-graded entry (HIGH or
+  FYI) against this window's own ranges plus the patch's actual hunks — localized
+  in the current file via `locateRange` (`parseCodexPatch` → per-hunk pre-image of
+  context+removed lines) and moved into base numbering by `gitx.LinesToBase` —
+  with the same `regradePending` as the Claude hook (#108/#184). A disjoint patch
+  to a shared file therefore stays silent. Emits `additionalContext` on overlap;
+  `WT_CODEX_HOOK_BLOCK=1` upgrades a **confirmed** HIGH (a computed hunk overlap) to
   `deny` — a file-level-only match never denies.
 
 Key facts: `.codex/hooks.json` uses the **same nested shape** as Claude's

@@ -57,7 +57,8 @@ Append-heavy files — an image-inventory YAML, a kustomize `resources:` list, a
 changelog — get edited by many windows at once where every edit is a disjoint
 append; the real conflict risk is ~zero, yet a file-level check lights up a `💥`
 wall on exactly the files touched most. `wt` diffs the **pending hunks** of each
-window (`git diff -U0`, uncommitted ∪ committed-vs-base) and grades the overlap:
+window (`git diff -U0`, uncommitted ∪ committed since its merge base with
+base) and grades the overlap:
 
 ```
 config.yaml   — overlapping L88-95  → HIGH   (exit 3, blocks)
@@ -66,7 +67,11 @@ inventory.yaml — 6 windows, 0 overlapping hunks → low (FYI, exit 0)
 
 Only **overlapping line ranges** (or an indeterminate case where your side has
 no edits yet — kept blocking, to be safe) count as HIGH and drive exit 3.
-Provably-disjoint hunks are downgraded to a non-blocking FYI. Two escape hatches
+Provably-disjoint hunks are downgraded to a non-blocking FYI. A branch that has
+fallen behind base is graded on its own edits only: a line base added or changed
+after it forked is never counted as that branch's edit, unless the branch's own
+edit touches it (no unchanged line between), where git would conflict. Two
+escape hatches
 make files always-advisory regardless of hunks: `shared_docs` (basename match,
 default `CLAUDE.md,MEMORY.md`) and `append_only_paths` (globs — changelogs,
 inventory lists).
@@ -327,8 +332,9 @@ hooks = false
 - Both hooks are injected **only when** another live window overlaps a file
   (silent otherwise), with the current window excluded and a `wt check <file>`
   reminder.
-- The edit hook re-grades against the patch's actual hunks when it's frame-safe
-  (this worktree's file is unchanged vs base), so a **disjoint** patch to a shared
+- The edit hook re-grades against the patch's actual hunks, moved into base line
+  numbers through this worktree's own diff (so it stays exact when the worktree is
+  behind base or already edited the file), so a **disjoint** patch to a shared
   file stays silent — no crying wolf on parallel appends.
 - Advisory by default. Set `WT_CODEX_HOOK_BLOCK=1` to have the edit hook `deny`
   a **confirmed** HIGH overlap (a heads-up-only file-level match never denies).

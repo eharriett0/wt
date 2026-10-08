@@ -72,9 +72,9 @@ func claudeDecision(file string, high []CheckEntry, block, fileLevel bool) (stri
 			"Coordinate before editing to avoid a merge conflict / duplicate PR. If you've already coordinated, set WT_SKIP_COLLISION=1.",
 			file, strings.Join(who, ", "), file)
 	} else {
-		msg = fmt.Sprintf("wt collision: your edit OVERLAPS a region of %s that %s is also editing. "+
+		msg = fmt.Sprintf("wt collision: with this edit, your version of %s OVERLAPS a region that %s is also editing (`wt check %s` will grade it HIGH). "+
 			"Coordinate before editing to avoid a merge conflict / duplicate PR. If you've already coordinated, set WT_SKIP_COLLISION=1.",
-			file, strings.Join(who, ", "))
+			file, strings.Join(who, ", "), file)
 	}
 
 	var out struct {
@@ -164,53 +164,98 @@ func hookClaudeEdit(r io.Reader) int {
 		return 0
 	}
 	entries := buildCheckReport(c, ws, root, []string{rel}, false)
+	if len(entries) == 0 {
+		return 0
+	}
 
-	// #108: the hook fires at PRE-edit time, so buildCheckReport's "current" side
-	// (this worktree's diff vs base) doesn't yet include the edit the agent is
-	// ABOUT to make — an empty current side fail-safes to HIGH, so the hook
-	// reported "overlapping hunks" on files it hadn't touched, contradicting
-	// `wt check`. Re-grade each HIGH against the agent's ACTUAL pending edit range
-	// (located from old_string): a disjoint pending edit is dropped; only a real
-	// overlap fires with the "overlapping" wording. When the region can't be
-	// located (Write, or old_string not uniquely found), keep it but word it as a
-	// file-level heads-up instead of overstating a hunk overlap it can't compute.
-	// The pending-edit re-grade is only FRAME-SAFE when this worktree's file is
-	// unchanged vs base: then the agent's pending edit, located by line number in
-	// the on-disk file, is in the same (base) line frame as e.OtherRanges
-	// (ChangedRanges → base-side hunk coords). If the current file has already
-	// diverged from base, the frames skew by the net line-delta above the edit, so
-	// re-grading could DROP a real overlap — there we keep the entry and word it
-	// file-level instead of silently suppressing it.
-	curEmpty := len(gitx.ChangedRanges(root, c.Base, rel)) == 0
+	// #108/#184: the hook fires at PRE-edit time, so buildCheckReport's "current"
+	// side (this worktree's own edits) doesn't yet include the edit the agent is
+	// ABOUT to make. Re-grade every entry the way `wt check` will once it's made:
+	// this window's own ranges plus the pending edit (located from old_string in
+	// the on-disk file, then moved into base line numbers through this worktree's
+	// own diff, gitx.LinesToBase) against the other window's ranges. When that
+	// grade can't be computed (a Write, an old_string that isn't unique, a git
+	// error) the entry stays as a file-level heads-up instead of being dropped.
+	cur, curOK := ownRanges(root, c.Base, rel)
 	var pending []gitx.LineRange
 	pendingOK := false
-	if curEmpty {
-		if data, err := os.ReadFile(filepath.Join(root, rel)); err == nil {
-			pending, pendingOK = claudeEditRanges(b, string(data))
+	if data, err := os.ReadFile(filepath.Join(root, rel)); err == nil {
+		if onDisk, ok := claudeEditRanges(b, string(data)); ok {
+			pending, pendingOK = gitx.LinesToBase(root, c.Base, rel, onDisk)
 		}
 	}
+	byLabel := windowByLabel(ws)
+	graded := regradePending(entries, cur, curOK, pending, pendingOK, func(e CheckEntry) bool {
+		return subsumedByBase(byLabel[e.Window].Worktree, c.Base, rel)
+	})
 
 	var high []CheckEntry
 	fileLevel := false
-	for _, e := range entries {
-		if e.Category != CatBlocking {
-			continue
+	for _, g := range graded {
+		high = append(high, g.entry)
+		if !g.confirmed {
+			fileLevel = true
 		}
-		if pendingOK && len(e.OtherRanges) > 0 {
-			if collide.ConflictSeverity(pending, e.OtherRanges, false) != collide.SevHigh {
-				continue // frame-safe (cur empty): pending disjoint from other → not a real overlap
-			}
-			// confirmed overlap in a shared frame → keep, "OVERLAPS" wording
-		} else {
-			fileLevel = true // couldn't confirm a frame-safe hunk overlap → file-level wording
-		}
-		high = append(high, e)
 	}
-
 	if out, has := claudeDecision(rel, high, os.Getenv("WT_CLAUDE_HOOK_BLOCK") == "1", fileLevel); has {
 		fmt.Println(out)
 	}
 	return 0
+}
+
+// ownRanges is gitx.ChangedRangesChecked: this window's own ranges, ok=false when
+// git couldn't measure them. A var only so the fail-safe test can make that
+// measurement fail and pin that the hooks then keep a file-level heads-up rather
+// than grade the pending edit against an empty set (#184 review).
+var ownRanges = gitx.ChangedRangesChecked
+
+// pendingGrade is one collision entry regradePending keeps for a pending edit.
+// confirmed: graded from the edit itself (the file collides once it's made);
+// false: a file-level heads-up, kept because that grade couldn't be computed.
+type pendingGrade struct {
+	entry     CheckEntry
+	confirmed bool
+}
+
+// regradePending keeps exactly the entries `wt check` will grade HIGH once an
+// agent's pending edit is made, the pre-edit hooks' block predicate (it MUST
+// equal `wt check`'s, #92/#108). cur is this window's own ranges and pending the
+// edit's, both in base line numbers (ChangedRangesChecked, LinesToBase); a
+// hunk-graded entry, HIGH or FYI alike, is HIGH afterwards iff cur ∪ pending
+// overlaps the other window's ranges. An FYI entry is re-graded too: a window
+// whose earlier edits were disjoint can still be about to overlap (#184 review).
+// A newly-HIGH entry is then put through the #122 subsumed check `wt check`
+// applies to every HIGH (subsumed is only called for those).
+//
+// When that grade can't be computed (curOK/pendingOK false, or an entry graded
+// without line ranges: an indeterminate side, a structured-doc section) the entry
+// is kept as a file-level heads-up if it could become HIGH: never dropped on an
+// unknown. Left out: entries no edit of this window can make HIGH (stale, already
+// merged, untracked, subsumed, append-only), and shared-doc advisories, which
+// the hooks have never graded per edit (a structured doc's section grade is
+// `wt check`'s and pre-push's). Pure.
+func regradePending(entries []CheckEntry, cur []gitx.LineRange, curOK bool, pending []gitx.LineRange, pendingOK bool, subsumed func(CheckEntry) bool) []pendingGrade {
+	var out []pendingGrade
+	for _, e := range entries {
+		hunkGraded := len(e.OtherRanges) > 0 && !e.Subsumed && (e.Category == CatBlocking || e.Category == CatFYI)
+		if e.Category != CatBlocking && !hunkGraded {
+			continue
+		}
+		if !hunkGraded || !curOK || !pendingOK {
+			out = append(out, pendingGrade{entry: e})
+			continue
+		}
+		after := make([]gitx.LineRange, 0, len(cur)+len(pending))
+		after = append(append(after, cur...), pending...)
+		if collide.ConflictSeverity(after, e.OtherRanges, false) != collide.SevHigh {
+			continue
+		}
+		if e.Category != CatBlocking && subsumed(e) {
+			continue
+		}
+		out = append(out, pendingGrade{entry: e, confirmed: true})
+	}
+	return out
 }
 
 // locateRange finds old in content and returns the 1-based inclusive line range
