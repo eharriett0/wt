@@ -141,7 +141,7 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 
 | Command | What it does |
 |---|---|
-| `wt status [--json]` | All windows + files each touches + severity-graded overlaps. `[--blocking]` = only HIGH, exit 3 (a gate). `[--max-age D]` |
+| `wt status [--json]` | All windows + files each touches + severity-graded overlaps. An overlap lists only live windows: merged, closed-PR and (with `max_age`) dormant ones are left out of its `windows`, and one left with fewer than two counts in `benign_count`. A file is HIGH when some pair of its windows would each block in `wt check`; a window whose copy is already on base, whose change already landed, or whose copy is untracked contests nothing, so two windows creating the same new file read advisory until one commits it. `[--blocking]` = only HIGH, exit 3 (a gate): it exits 0 when those were the only HIGHs. `[--max-age D]` |
 | `wt status --epic <id>` | Aggregate an epic's claims + live PR states across sibling repos |
 | `wt check <paths…>` | Is another window touching these paths? `[--show-diff] [--json] [--blocking] [--include-stale] [--allow-missing] [--max-age D]` (exit 3 = HIGH). `--blocking` prints only HIGH (a scriptable gate). Refuses a path that doesn't exist, isn't tracked, and no window is touching — a typo must never falsely report "clear" (`--allow-missing` opts into a deleted/other-branch/about-to-create path) |
 | `wt where <issue\|branch>` | Print that window's worktree path — `cd $(wt where 42)` |
@@ -273,6 +273,15 @@ usual failure mode is that the *agents doing the editing* never run `wt check`.
   snapshot of what other live windows are doing: cross-window file overlaps
   **plus** un-acked coordination signals — a `merge-main` hold another window
   placed, or an announcement you haven't acked (each with a `wt ack <id>`).
+  A file you are editing lists the windows `wt check <file>` would (merged,
+  closed-PR and, with `max_age`, dormant branches are left out) and reads HIGH
+  only where `wt check` would block. One difference is deliberate: when your own
+  copy of the file is already on base, or your change to it already landed, it
+  reads "same file" while `wt check` still flags it as a pre-edit heads-up,
+  because you hold nothing that can collide. A new file another window has not
+  committed yet shows as advisory (untracked there) until it is committed, in
+  `wt status` and every other window's banner; `wt check` and the banner in the
+  window holding the untracked copy still flag it.
 
 ```
 wt install-claude-hook            # prints the .claude/settings.json snippet (both hooks)

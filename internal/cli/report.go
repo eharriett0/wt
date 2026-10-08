@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/eharriett0/wt/internal/collide"
 	"github.com/eharriett0/wt/internal/config"
@@ -112,83 +114,218 @@ func untrackedInOther(otherWorktree, path string) bool {
 	return otherWorktree != "" && gitx.IsUntracked(otherWorktree, path)
 }
 
+// gradeFacts are the per-(worktree, path) git observations the `wt check` grade
+// reads. gradeEntry asks for them lazily, in decision order, so an early verdict
+// (stale, already merged, shared doc, append-only) never pays for a diff, and the
+// subsumption merge (the costliest) runs only for a would-be HIGH. Injected so
+// the decision is table-testable without a repo; production is gitGradeFacts.
+type gradeFacts interface {
+	// AlreadyMerged: the window's content for path is byte-identical to the
+	// upstream base (#109). false when it can't tell (keep the collision).
+	AlreadyMerged(worktree, path string) bool
+	// Untracked: the window's only claim on path is an untracked file (#113).
+	Untracked(worktree, path string) bool
+	// Ranges: the window's changed line ranges for path, in the BASE frame
+	// (#29/#108), so two windows' ranges are comparable.
+	Ranges(worktree, path string) []gitx.LineRange
+	// Subsumed: the window's change to path is already on base (#122).
+	Subsumed(worktree, path string) bool
+	// SharedSections: the structured-doc section grade across worktrees (#22),
+	// single-sourced in collide.SharedSectionsAcross (#98).
+	SharedSections(worktrees []string, path, delimiter string) (shared []string, graded bool)
+}
+
+// factKey memoizes one (worktree, path) observation.
+type factKey struct{ worktree, path string }
+
+// gitGradeFacts is the production gradeFacts: the gitx shell-outs, memoized per
+// (worktree, path). One report grades the same window against several others
+// (the banner and `wt status` grade every pair on a file), and without the memo
+// each pair would re-run the same diffs. The memo is a set of plain maps, so an
+// instance must never be shared between goroutines: the concurrent overlap
+// grading takes a fresh one per overlap from gitFactsFor
+// (TestGitFactsFor_FreshInstancePerCall).
+type gitGradeFacts struct {
+	base      string
+	src       factSource
+	merged    map[factKey]bool
+	untracked map[factKey]bool
+	subsumed  map[factKey]bool
+	ranges    map[factKey][]gitx.LineRange
+	rangesNew map[factKey][]gitx.LineRange
+}
+
+// factSource is the uncached lookups behind gitGradeFacts: the gitx shell-outs
+// in production (gitFactSource), a fake in the memo's own test.
+type factSource struct {
+	alreadyMerged func(worktree, base, path string) bool
+	untracked     func(worktree, path string) bool
+	subsumed      func(worktree, base, path string) bool
+	ranges        func(worktree, base, path string) []gitx.LineRange // base frame (#29/#108)
+	rangesNew     func(worktree, base, path string) []gitx.LineRange // new frame (#123)
+}
+
+var gitFactSource = factSource{
+	alreadyMerged: alreadyMerged,
+	untracked:     untrackedInOther,
+	subsumed:      subsumedByBase,
+	ranges:        gitx.ChangedRanges,
+	rangesNew:     gitx.ChangedRangesNew,
+}
+
+func newGitGradeFacts(base string) *gitGradeFacts {
+	return newMemoFacts(base, gitFactSource)
+}
+
+func newMemoFacts(base string, src factSource) *gitGradeFacts {
+	return &gitGradeFacts{
+		base:      base,
+		src:       src,
+		merged:    map[factKey]bool{},
+		untracked: map[factKey]bool{},
+		subsumed:  map[factKey]bool{},
+		ranges:    map[factKey][]gitx.LineRange{},
+		rangesNew: map[factKey][]gitx.LineRange{},
+	}
+}
+
+func memoBool(m map[factKey]bool, k factKey, f func() bool) bool {
+	if v, ok := m[k]; ok {
+		return v
+	}
+	v := f()
+	m[k] = v
+	return v
+}
+
+func memoRanges(m map[factKey][]gitx.LineRange, k factKey, f func() []gitx.LineRange) []gitx.LineRange {
+	if v, ok := m[k]; ok {
+		return v
+	}
+	v := f()
+	m[k] = v
+	return v
+}
+
+func (g *gitGradeFacts) AlreadyMerged(wt, path string) bool {
+	return memoBool(g.merged, factKey{wt, path}, func() bool { return g.src.alreadyMerged(wt, g.base, path) })
+}
+
+func (g *gitGradeFacts) Untracked(wt, path string) bool {
+	return memoBool(g.untracked, factKey{wt, path}, func() bool { return g.src.untracked(wt, path) })
+}
+
+func (g *gitGradeFacts) Subsumed(wt, path string) bool {
+	return memoBool(g.subsumed, factKey{wt, path}, func() bool { return g.src.subsumed(wt, g.base, path) })
+}
+
+func (g *gitGradeFacts) Ranges(wt, path string) []gitx.LineRange {
+	return memoRanges(g.ranges, factKey{wt, path}, func() []gitx.LineRange { return g.src.ranges(wt, g.base, path) })
+}
+
+// SharedSections attributes each window's diff to its OWN current-content
+// sections, so it reads NEW-frame ranges (#123), memoized like the rest.
+func (g *gitGradeFacts) SharedSections(worktrees []string, path, delimiter string) ([]string, bool) {
+	newFrame := func(wt, base, p string) []gitx.LineRange {
+		return memoRanges(g.rangesNew, factKey{wt, p}, func() []gitx.LineRange { return g.src.rangesNew(wt, base, p) })
+	}
+	return collide.SharedSectionsAcross(g.base, worktrees, path, delimiter, newFrame)
+}
+
+// gradeEntry is THE `wt check` decision for one path × other window: how the
+// file grades from currentWorktree's side against otherWt. buildCheckReport
+// (`wt check`, the MCP wt_check and both edit hooks) and gradeOverlaps (`wt
+// status`, MCP wt_status and the per-turn agent banner) both grade through it,
+// so they cannot drift apart again (#182: the banner had its own grade and said
+// HIGH where `wt check` said low). Pure given f.
+//
+// cf.Path is what the caller asked about (it may be a basename), so it is what
+// the shared-doc / append-only globs match; cf.MatchedFile is the resolved repo-
+// relative file every git lookup uses.
+func gradeEntry(c *config.Config, f gradeFacts, currentWorktree, otherWt string, cf collide.Conflict, wl collide.WindowLiveness) CheckEntry {
+	e := CheckEntry{Path: cf.Path, Window: cf.Window, Liveness: wl.Label()}
+
+	// Use the resolved repo-relative file (cf.MatchedFile) for hunk / blob
+	// lookup — cf.Path may be a basename that git pathspec can't resolve for a
+	// nested file.
+	rangesPath := cf.MatchedFile
+	if rangesPath == "" {
+		rangesPath = cf.Path
+	}
+
+	switch {
+	case wl.Level.IsSuppressed():
+		e.Category, e.Severity = CatStale, "low"
+	case f.AlreadyMerged(otherWt, rangesPath):
+		// #109: a stale index/worktree holding ALREADY-MERGED content (blob
+		// identical to origin/base) is not a live collision — nothing unmerged
+		// to clash with. Surface it (still listed) as informational, not HIGH,
+		// so it's distinguishable from a real one instead of blocking on nothing.
+		e.Category, e.Severity, e.AlreadyMerged = CatFYI, "low", true
+	case f.Untracked(otherWt, rangesPath):
+		// #113: the other window's only claim on this path is an UNTRACKED file
+		// — never added/staged/committed there, so it has no diff and can't be
+		// pushed. It cannot collide until it's committed (at which point it
+		// grades normally). Advisory, still listed, labelled untracked — not a
+		// permanent HIGH on a phantom "uncommitted edits" line range.
+		e.Category, e.Severity, e.Untracked = CatFYI, "low", true
+	case collide.IsSharedDoc(cf.Path, c.SharedDocs):
+		e.Category, e.Severity = CatAdvisory, "low"
+		// #22: a STRUCTURED shared doc (configured section delimiter) grades
+		// by SECTION — both windows editing the SAME section is HIGH; disjoint
+		// sections stay advisory. Falls back to the blanket advisory when it
+		// can't section-grade (not structured / bad regexp / doc untracked).
+		if delim, isStructured := c.StructuredDocs[filepath.Base(cf.Path)]; isStructured {
+			if shared, graded := f.SharedSections([]string{currentWorktree, otherWt}, rangesPath, delim); graded && len(shared) > 0 {
+				e.Category, e.Severity = CatBlocking, "HIGH"
+				e.SharedSections = shared
+			}
+		}
+	default:
+		appendOnly := collide.IsAppendOnly(cf.Path, c.AppendOnlyPaths)
+		var cur, other []gitx.LineRange
+		if !appendOnly {
+			cur = f.Ranges(currentWorktree, rangesPath)
+			if otherWt != "" {
+				other = f.Ranges(otherWt, rangesPath)
+			}
+		}
+		e.OtherRanges = other
+		sev := collide.ConflictSeverity(cur, other, appendOnly)
+		e.OverlapSpans = collide.OverlappingSpans(cur, other)
+		switch {
+		case sev != collide.SevHigh:
+			e.Category, e.Severity = CatFYI, "low"
+		case f.Subsumed(otherWt, rangesPath):
+			// #122: the phantom "overlap" is base's OWN change to this file,
+			// mis-attributed to a branch whose change already landed elsewhere.
+			e.Category, e.Severity, e.Subsumed = CatFYI, "low", true
+		default:
+			e.Category, e.Severity = CatBlocking, "HIGH"
+		}
+	}
+	return e
+}
+
 // buildCheckReport classifies + hunk-grades every conflict for the requested
 // paths. currentWorktree is the window running `check` (its own edits, if any,
-// drive overlap detection). includeStale keeps merged/dormant windows.
+// drive overlap detection). Stale (merged/dormant/closed) entries are always
+// returned, as CatStale, for the JSON + the stale count; the renderers drop them
+// unless includeStale.
 func buildCheckReport(c *config.Config, ws []collide.Window, currentWorktree string, paths []string, includeStale bool) []CheckEntry {
 	conflicts := collide.CheckPaths(ws, currentWorktree, paths)
 	live := collide.ClassifyWindows(ws, c.Base, collide.ConflictWindowSet(conflicts), c.MaxAge)
-	byLabel := windowByLabel(ws)
+	return checkEntries(c, newGitGradeFacts(c.Base), ws, currentWorktree, conflicts, live)
+}
 
+// checkEntries is buildCheckReport's decision: every conflict graded by
+// gradeEntry, sorted by path then window. Pure given f, which is what lets a test
+// hold the per-turn banner against `wt check` itself (#182).
+func checkEntries(c *config.Config, f gradeFacts, ws []collide.Window, currentWorktree string, conflicts []collide.Conflict, live map[string]collide.WindowLiveness) []CheckEntry {
+	byLabel := windowByLabel(ws)
 	var out []CheckEntry
 	for _, cf := range conflicts {
-		wl := live[cf.Window]
-		e := CheckEntry{Path: cf.Path, Window: cf.Window, Liveness: wl.Label()}
-
-		// Use the resolved repo-relative file (cf.MatchedFile) for hunk / blob
-		// lookup — cf.Path may be a basename that git pathspec can't resolve for a
-		// nested file.
-		rangesPath := cf.MatchedFile
-		if rangesPath == "" {
-			rangesPath = cf.Path
-		}
-		otherWt := byLabel[cf.Window].Worktree
-
-		switch {
-		case wl.Level.IsSuppressed():
-			e.Category, e.Severity = CatStale, "low"
-		case alreadyMerged(otherWt, c.Base, rangesPath):
-			// #109: a stale index/worktree holding ALREADY-MERGED content (blob
-			// identical to origin/base) is not a live collision — nothing unmerged
-			// to clash with. Surface it (still listed) as informational, not HIGH,
-			// so it's distinguishable from a real one instead of blocking on nothing.
-			e.Category, e.Severity, e.AlreadyMerged = CatFYI, "low", true
-		case untrackedInOther(otherWt, rangesPath):
-			// #113: the other window's only claim on this path is an UNTRACKED file
-			// — never added/staged/committed there, so it has no diff and can't be
-			// pushed. It cannot collide until it's committed (at which point it
-			// grades normally). Advisory, still listed, labelled untracked — not a
-			// permanent HIGH on a phantom "uncommitted edits" line range.
-			e.Category, e.Severity, e.Untracked = CatFYI, "low", true
-		case collide.IsSharedDoc(cf.Path, c.SharedDocs):
-			e.Category, e.Severity = CatAdvisory, "low"
-			// #22: a STRUCTURED shared doc (configured section delimiter) grades
-			// by SECTION — both windows editing the SAME section is HIGH; disjoint
-			// sections stay advisory. Falls back to the blanket advisory when it
-			// can't section-grade (not structured / bad regexp / doc untracked).
-			if delim, isStructured := c.StructuredDocs[filepath.Base(cf.Path)]; isStructured {
-				if shared, graded := sharedSectionsAcross(c, []string{currentWorktree, otherWt}, rangesPath, delim); graded && len(shared) > 0 {
-					e.Category, e.Severity = CatBlocking, "HIGH"
-					e.SharedSections = shared
-				}
-			}
-		default:
-			appendOnly := collide.IsAppendOnly(cf.Path, c.AppendOnlyPaths)
-			var cur, other []gitx.LineRange
-			if !appendOnly {
-				cur = gitx.ChangedRanges(currentWorktree, c.Base, rangesPath)
-				if otherWt != "" {
-					other = gitx.ChangedRanges(otherWt, c.Base, rangesPath)
-				}
-			}
-			e.OtherRanges = other
-			sev := collide.ConflictSeverity(cur, other, appendOnly)
-			e.OverlapSpans = collide.OverlappingSpans(cur, other)
-			switch {
-			case sev != collide.SevHigh:
-				e.Category, e.Severity = CatFYI, "low"
-			case subsumedByBase(otherWt, c.Base, rangesPath):
-				// #122: the phantom "overlap" is base's OWN change to this file,
-				// mis-attributed to a branch whose change already landed elsewhere.
-				e.Category, e.Severity, e.Subsumed = CatFYI, "low", true
-			default:
-				e.Category, e.Severity = CatBlocking, "HIGH"
-			}
-		}
-		if e.Category == CatStale && !includeStale {
-			// keep for JSON/stale-count, filtered at render time
-		}
-		out = append(out, e)
+		out = append(out, gradeEntry(c, f, currentWorktree, byLabel[cf.Window].Worktree, cf, live[cf.Window]))
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Path != out[j].Path {
@@ -375,83 +512,189 @@ type StatusOverlap struct {
 	Subsumed       bool             `json:"subsumed,omitempty"`        // #122: <2 windows genuinely contest it (others' change already on base)
 }
 
-// sharedSectionsAcross is a thin adapter over collide.SharedSectionsAcross,
-// which is where the #22 section grade now lives so `wt check` and both git
-// hooks single-source it (#98) — the hooks previously stopped at the blanket
-// shared-doc advisory, so a same-section collision blocked here and sailed
-// through the pre-push guard.
-func sharedSectionsAcross(c *config.Config, worktrees []string, rel, delimiter string) (shared []string, graded bool) {
-	return collide.SharedSectionsAcross(c.Base, worktrees, rel, delimiter, gitx.ChangedRangesNew)
+// gradeStatusOverlaps grades the ACTIVE overlaps (already partitioned, so each
+// lists only live windows) for `wt status` and the MCP wt_status: the
+// window-neutral view, through the same per-entry grade as `wt check` (#182).
+func gradeStatusOverlaps(c *config.Config, ws []collide.Window, active []collide.Overlap) []StatusOverlap {
+	return gradeOverlaps(c, gitFactsFor(c), ws, active, nil, collide.Self{})
 }
 
-// gradeStatusOverlaps hunk-grades the ACTIVE overlaps (already partitioned).
-func gradeStatusOverlaps(c *config.Config, ws []collide.Window, active []collide.Overlap) []StatusOverlap {
+// gitFactsFor returns the production facts factory: a FRESH memoized instance on
+// every call (one call per overlap graded). gitGradeFacts' memo is unsynchronized
+// maps, so returning one shared instance would race the concurrent grading.
+func gitFactsFor(c *config.Config) func() gradeFacts {
+	return func() gradeFacts { return newGitGradeFacts(c.Base) }
+}
+
+// gradeWorkers bounds the overlaps graded at once. Each grade is a handful of
+// git shell-outs (#109 blob reads, the #113 status, two diffs), and the per-turn
+// banner pays for every overlap in the repo on every prompt.
+const gradeWorkers = 8
+
+// gradeOverlaps grades partitioned overlaps with gradeEntry, the one decision
+// `wt check` makes (#182). The banner, `wt status` and wt_status used to run a
+// separate all-windows grade that `wt check` never ran: a merged branch whose
+// file equals base (no ranges, "indeterminate") or two OTHER windows overlapping
+// each other made a file HIGH that `wt check` grades low. Pure given newFacts.
+//
+// self is the window whose side to take: the per-turn agent banner passes the
+// current window, `wt status` passes the zero Self (no side).
+//
+//   - A file self is editing lists the windows `wt check <file>` lists there,
+//     and is HIGH iff the check grade from self blocks on at least one of them
+//     AND self's own claim on the file contests something. HIGH ⇒ `wt check`
+//     blocks, but NOT the converse, on purpose: when self's copy is already on
+//     base (#109) or its change already landed (#122), `wt check` still blocks,
+//     because self's empty or phantom ranges can't be proven disjoint (its
+//     pre-edit heads-up), yet self holds nothing that can collide. A window whose
+//     PR merged with its session still open would otherwise be told HIGH on every
+//     turn about every file a live window edits, the noise #182 removed. Do not
+//     tighten this back to "iff check blocks". An UNTRACKED self (#113) stays
+//     HIGH: it is about to commit an add/add, and check from its side blocks.
+//   - Any other file (and every file, for the zero Self) is HIGH iff some PAIR of
+//     its windows collides: `wt check` would block in BOTH windows of the pair.
+//     Both, because a window whose claim on the file is already merged (#109),
+//     untracked (#113) or already on base (#122) contests nothing; `wt check`
+//     run from inside it still says HIGH, but only as the pre-edit heads-up its
+//     own empty ranges produce, which is not a collision between the two. This
+//     keeps the #122 behaviour `wt status` already had and extends it to #109 and
+//     #113: two windows creating the same new file read advisory here until one
+//     of them commits it, while `wt check` from the untracked side still blocks.
+//
+// Windows are told apart by worktree, not label (#182): two worktrees that
+// claimed one issue are both "#N", and grading by label compared one of them
+// with itself and dropped the pair.
+//
+// live supplies the liveness label for the other window's entries; nil is fine
+// for an already-partitioned overlap (every window in it is live).
+//
+// Each overlap is ONE file, and every fact is keyed by (worktree, that file), so
+// no fact is shared across overlaps: each overlap grades with its own facts from
+// newFacts, concurrently (bounded by gradeWorkers), and the output keeps the
+// input order.
+func gradeOverlaps(c *config.Config, newFacts func() gradeFacts, ws []collide.Window, active []collide.Overlap, live map[string]collide.WindowLiveness, self collide.Self) []StatusOverlap {
 	byLabel := windowByLabel(ws)
-	var out []StatusOverlap
-	for _, o := range active {
-		so := StatusOverlap{File: o.File, Windows: o.Windows}
-		switch {
-		case collide.IsSharedDoc(o.File, c.SharedDocs):
-			so.Category, so.Severity = CatAdvisory, "low"
-			// #22: structured shared doc → grade by section across every window
-			// touching it. Any section edited by ≥2 windows is a HIGH collision.
-			if delim, isStructured := c.StructuredDocs[filepath.Base(o.File)]; isStructured {
-				var wts []string
-				for _, label := range o.Windows {
-					if w, ok := byLabel[label]; ok {
-						wts = append(wts, w.Worktree)
-					}
-				}
-				if shared, graded := sharedSectionsAcross(c, wts, o.File, delim); graded && len(shared) > 0 {
-					so.Category, so.Severity = CatBlocking, "HIGH"
-					so.SharedSections = shared
-				}
+	out := make([]StatusOverlap, len(active))
+	sem := make(chan struct{}, gradeWorkers)
+	var wg sync.WaitGroup
+	for i, o := range active {
+		wg.Add(1)
+		go func(i int, o collide.Overlap) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			out[i] = gradeOverlap(c, newFacts(), byLabel, o, live, self)
+		}(i, o)
+	}
+	wg.Wait()
+	return out
+}
+
+// overlapMember is one window of an overlap: its label (liveness, display) and
+// its worktree (identity, every git lookup).
+type overlapMember struct{ label, worktree string }
+
+// overlapMembers lists o's windows by worktree. An Overlap built by hand carries
+// labels only; those resolve through byLabel, one member per label. Pure.
+func overlapMembers(o collide.Overlap, byLabel map[string]collide.Window) []overlapMember {
+	if len(o.Worktrees) == len(o.Windows) {
+		ms := make([]overlapMember, len(o.Windows))
+		for i := range o.Windows {
+			ms[i] = overlapMember{o.Windows[i], o.Worktrees[i]}
+		}
+		return ms
+	}
+	var ms []overlapMember
+	for _, l := range windowsExcluding(o.Windows, "") {
+		ms = append(ms, overlapMember{l, byLabel[l].Worktree})
+	}
+	return ms
+}
+
+// isSelfMember reports whether m is self: by worktree, the identity, falling back
+// to the label only for a Self that carries none. Pure.
+func isSelfMember(self collide.Self, m overlapMember) bool {
+	if self.Worktree != "" {
+		return m.worktree == self.Worktree
+	}
+	return self.Label != "" && m.label == self.Label
+}
+
+// gradeOverlap grades ONE overlap, per the rules on gradeOverlaps. Pure given f.
+func gradeOverlap(c *config.Config, f gradeFacts, byLabel map[string]collide.Window, o collide.Overlap, live map[string]collide.WindowLiveness, self collide.Self) StatusOverlap {
+	ms := overlapMembers(o, byLabel)
+	grade := func(from, to overlapMember) CheckEntry {
+		cf := collide.Conflict{Path: o.File, Window: to.label, MatchedFile: o.File}
+		return gradeEntry(c, f, from.worktree, to.worktree, cf, live[to.label])
+	}
+	var blocking, rest []CheckEntry
+	if si := slices.IndexFunc(ms, func(m overlapMember) bool { return isSelfMember(self, m) }); si >= 0 {
+		me := ms[si]
+		// Asked only once an entry would block (the #122 merge is the costliest
+		// fact); memoized by f either way.
+		contestsNothing := func() bool {
+			return f.AlreadyMerged(me.worktree, o.File) || f.Subsumed(me.worktree, o.File)
+		}
+		for j, m := range ms {
+			if j == si {
+				continue
 			}
-		default:
-			appendOnly := collide.IsAppendOnly(o.File, c.AppendOnlyPaths)
-			type windowRanges struct {
-				w  collide.Window
-				rs []gitx.LineRange
+			e := grade(me, m)
+			if e.Category == CatBlocking && contestsNothing() {
+				e.Category, e.Severity = CatFYI, "low" // HIGH ⇒ check blocks, not ⟺ (see gradeOverlaps)
 			}
-			var all []windowRanges
-			if !appendOnly {
-				for _, label := range o.Windows {
-					if w, ok := byLabel[label]; ok {
-						all = append(all, windowRanges{w, gitx.ChangedRanges(w.Worktree, c.Base, o.File)})
-					}
-				}
-			}
-			allRanges := make([][]gitx.LineRange, len(all))
-			for i, x := range all {
-				allRanges[i] = x.rs
-			}
-			if collide.OverlapSeverity(allRanges, appendOnly) != collide.SevHigh {
-				so.OverlapSpans = allPairSpans(allRanges)
-				so.Category, so.Severity = CatFYI, "low"
-				break
-			}
-			// Would be HIGH — only NOW pay for the #122 subsumption check: a window
-			// whose change to this file already landed on base (via a different
-			// branch's squash) isn't genuinely contesting it (its "range" is base's
-			// own change). Drop such windows; if fewer than two remain, not contested.
-			var live [][]gitx.LineRange
-			for _, x := range all {
-				if subsumedByBase(x.w.Worktree, c.Base, o.File) {
-					continue
-				}
-				live = append(live, x.rs)
-			}
-			if len(live) < 2 {
-				so.OverlapSpans = allPairSpans(allRanges)
-				so.Category, so.Severity, so.Subsumed = CatFYI, "low", true
+			if e.Category == CatBlocking {
+				blocking = append(blocking, e)
 			} else {
-				so.OverlapSpans = allPairSpans(live)
-				so.Category, so.Severity = CatBlocking, "HIGH"
+				rest = append(rest, e)
 			}
 		}
-		out = append(out, so)
+		return summarizeOverlap(c, o, blocking, rest)
 	}
-	return out
+	for i := 0; i < len(ms); i++ {
+		for j := i + 1; j < len(ms); j++ {
+			a := grade(ms[i], ms[j])
+			if a.Category != CatBlocking {
+				rest = append(rest, a)
+				continue
+			}
+			if b := grade(ms[j], ms[i]); b.Category != CatBlocking {
+				rest = append(rest, b)
+				continue
+			}
+			blocking = append(blocking, a)
+		}
+	}
+	return summarizeOverlap(c, o, blocking, rest)
+}
+
+// summarizeOverlap folds one overlap's graded entries into its status line: HIGH
+// when any entry (or pair) blocks, carrying the overlapping spans / shared
+// sections that made it so; otherwise a shared-doc advisory or an FYI, with
+// Subsumed set when a would-be overlap was base's own change (#122). Pure.
+func summarizeOverlap(c *config.Config, o collide.Overlap, blocking, rest []CheckEntry) StatusOverlap {
+	so := StatusOverlap{File: o.File, Windows: o.Windows}
+	if len(blocking) > 0 {
+		so.Category, so.Severity = CatBlocking, "HIGH"
+		for _, e := range blocking {
+			so.OverlapSpans = appendNewSpans(so.OverlapSpans, e.OverlapSpans)
+			for _, s := range e.SharedSections {
+				if !slices.Contains(so.SharedSections, s) {
+					so.SharedSections = append(so.SharedSections, s)
+				}
+			}
+		}
+		return so
+	}
+	so.Category, so.Severity = CatFYI, "low"
+	if collide.IsSharedDoc(o.File, c.SharedDocs) {
+		so.Category = CatAdvisory
+	}
+	for _, e := range rest {
+		so.OverlapSpans = appendNewSpans(so.OverlapSpans, e.OverlapSpans)
+		so.Subsumed = so.Subsumed || e.Subsumed
+	}
+	return so
 }
 
 // StatusWindow is one window in the `wt status --json` payload.
@@ -495,14 +738,14 @@ func renderStatusJSON(ws []collide.Window, graded []StatusOverlap, benignCount i
 	return 0
 }
 
-// allPairSpans collects the overlapping spans across every window pair (for the
-// "overlap L88-95" display in status).
-func allPairSpans(rangesByWindow [][]gitx.LineRange) []gitx.LineRange {
-	var spans []gitx.LineRange
-	for i := 0; i < len(rangesByWindow); i++ {
-		for j := i + 1; j < len(rangesByWindow); j++ {
-			spans = append(spans, collide.OverlappingSpans(rangesByWindow[i], rangesByWindow[j])...)
+// appendNewSpans appends the spans not already present (for the "overlap
+// L88-95" display in status): several pairs on one file often intersect on the
+// same lines, and the old all-pairs list printed "L11-12,L11-12". Pure.
+func appendNewSpans(dst, spans []gitx.LineRange) []gitx.LineRange {
+	for _, s := range spans {
+		if !slices.Contains(dst, s) {
+			dst = append(dst, s)
 		}
 	}
-	return spans
+	return dst
 }
