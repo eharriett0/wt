@@ -92,6 +92,23 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   must pick out exactly ONE worktree (`CheckNames`): none is a typo, two is a
   directory name that is also another worktree's branch. Either stops the run
   with nothing cleaned, so a bad `-y` list never removes "the rest" of it.
+- **`wt adopt` never checks out a local branch that is not the target (#167).**
+  `git worktree add <path> <branch>` takes `refs/heads/<branch>` whenever it
+  exists, so a stale branch left by an earlier PR that reused the name was
+  adopted in place of the PR head (ahead 6, behind 285). After the fetch,
+  `prepareLocalBranch` compares it to the PR's `headRefOid` (`ghx.PRHead`), else
+  `origin/<branch>`, through the pure `ClassifyTips`/`DecideAdopt`: equal is
+  attached, only-behind is fast-forwarded (`gitx.FastForwardBranch`), and
+  anything with commits the target lacks, or that cannot be compared, is refused
+  with both SHAs. ⚠ Only a branch NO worktree is using is moved: moving one
+  underneath its worktree leaves its files at the old commit, and its next
+  commit reverts the move. ⚠ `git worktree list` cannot see a worktree that is
+  mid-rebase of the branch (its HEAD is detached), so the move goes through
+  `git branch -f`, whose own in-use check refuses it; `update-ref` moved it
+  (measured). ⚠ The fetch runs
+  BEFORE the existing-worktree short-circuit, so a re-run is checked too
+  (`DecideExisting`: behind or ahead is handed back with a note, diverged is
+  refused, and wt never moves an existing worktree's branch).
 - **"No PR" must be an `ok=false`, never a parsed placeholder (#168).**
   `PRForBranch`'s old `.[0] | …` query printed `null null` for a branch with
   no PR, which parsed as a PR in state `null`. Every caller then matched no

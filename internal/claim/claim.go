@@ -180,16 +180,21 @@ func Adopt(c *config.Config, target, epic string) error {
 	}
 	branch := target
 	prURL := ""
-	if issueRe.MatchString(target) { // a PR number → resolve its head branch
-		b, err := ghx.PRHeadBranch(target)
-		if err != nil || strings.TrimSpace(b) == "" {
-			return fmt.Errorf("resolve PR #%s head branch (is gh authed? `wt doctor`): %w", target, err)
+	want := worktree.AdoptWant{}
+	if issueRe.MatchString(target) { // a PR number → resolve its head branch AND head commit
+		// #167: the head commit is what a local branch of the same name must match
+		// before it is checked out; a stale one left by an earlier PR that reused
+		// the name is refused instead of silently adopted.
+		b, oid, err := ghx.PRHead(target)
+		if err != nil {
+			return fmt.Errorf("resolve PR #%s head (is gh authed? `wt doctor`): %w", target, err)
 		}
-		branch = strings.TrimSpace(b)
+		branch = b
+		want = worktree.AdoptWant{PR: target, PRHead: oid}
 		prURL = ghx.PRURL(target)
 	}
 
-	wtDir, err := worktree.Adopt(c, branch)
+	wtDir, err := worktree.Adopt(c, branch, want)
 	if err != nil {
 		return err
 	}

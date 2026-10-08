@@ -458,6 +458,49 @@ func PRForBranchOrTip(branch, baseRef string) (number, state string, viaTip, ok 
 	return n, s, found, found
 }
 
+// PRHead returns PR pr's head branch (headRefName) and head commit (headRefOid),
+// in one gh call. `wt adopt <pr#>` lands on that branch and needs the commit to
+// check that a local branch of the same name really is the PR head before it
+// checks it out (#167). An error when gh fails or does not return both.
+func PRHead(pr string) (branch, oid string, err error) {
+	out, err := run("pr", "view", pr, "--json", "headRefName,headRefOid",
+		"--jq", `"\(.headRefName // empty) \(.headRefOid // empty)"`)
+	if err != nil {
+		return "", "", err
+	}
+	branch, oid, ok := parsePRHead(out)
+	if !ok {
+		return "", "", fmt.Errorf("gh returned no head branch and commit for PR #%s (got %q)", pr, out)
+	}
+	return branch, oid, nil
+}
+
+// parsePRHead reads PRHead's `<headRefName> <headRefOid>` line. Only a branch
+// name followed by a full hex object id counts as a PR head; anything else is
+// ok=false, never a parsed placeholder (the #168 rule). The `// empty` query
+// prints nothing when either field is missing. Pure.
+func parsePRHead(out string) (branch, oid string, ok bool) {
+	f := strings.Fields(strings.TrimSpace(out))
+	if len(f) != 2 || !isObjectID(f[1]) {
+		return "", "", false
+	}
+	return f[0], strings.ToLower(f[1]), true
+}
+
+// isObjectID reports whether s is a full git object id: 40 hex digits (SHA-1)
+// or 64 (SHA-256). Pure.
+func isObjectID(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	for _, r := range s {
+		if !strings.ContainsRune("0123456789abcdefABCDEF", r) {
+			return false
+		}
+	}
+	return true
+}
+
 // PRHeadBranch returns the PR's head branch name (headRefName), for locating
 // the worktree to clean up after a merge.
 func PRHeadBranch(pr string) (string, error) {

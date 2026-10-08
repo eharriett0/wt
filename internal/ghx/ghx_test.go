@@ -173,6 +173,37 @@ func TestParsePRForBranch(t *testing.T) {
 // TestParseCommitPRs pins the parse of PRForTip's --jq output (#168): one
 // `<number> <state> <merged>` line per PR, where state is the REST API's lower-case
 // "open"/"closed" and merged is whether merged_at is set.
+// #167: `wt adopt <pr#>` compares a local branch to the PR's headRefOid, so the
+// head read must refuse anything that is not a branch plus a full object id.
+// "null null" is the shape a pre-#168 style `.headRefName` query would print for
+// a missing field; it must never parse as a PR head.
+func TestParsePRHead(t *testing.T) {
+	sha1 := "9f8e7d6c5b4a39281706f5e4d3c2b1a098765432"
+	sha256 := "9f8e7d6c5b4a39281706f5e4d3c2b1a0987654329f8e7d6c5b4a39281706f5e4"
+	cases := []struct {
+		out, branch, oid string
+		ok               bool
+	}{
+		{"bot/image " + sha1, "bot/image", sha1, true},
+		{"bot/image " + sha1 + "\n", "bot/image", sha1, true},
+		{"feat-42-x " + strings.ToUpper(sha1), "feat-42-x", sha1, true}, // normalised to lower case
+		{"bot/image " + sha256, "bot/image", sha256, true},              // SHA-256 repo
+		{"", "", "", false},                             // the `// empty` output when a field is missing
+		{"null null", "", "", false},                    // the placeholder shape: never a PR head
+		{"bot/image null", "", "", false},               // branch without a commit
+		{"bot/image", "", "", false},                    // one field
+		{"bot/image 9f8e7d6c", "", "", false},           // abbreviated id: not comparable to a local tip
+		{"bot/image " + sha1[:39] + "g", "", "", false}, // not hex
+		{"a b " + sha1, "", "", false},                  // three fields
+	}
+	for _, c := range cases {
+		b, o, ok := parsePRHead(c.out)
+		if b != c.branch || o != c.oid || ok != c.ok {
+			t.Errorf("parsePRHead(%q) = (%q, %q, %v), want (%q, %q, %v)", c.out, b, o, ok, c.branch, c.oid, c.ok)
+		}
+	}
+}
+
 func TestParseCommitPRs(t *testing.T) {
 	got := parseCommitPRs(strings.Join([]string{
 		"1128 closed true", // squash-merged: REST state is "closed"
