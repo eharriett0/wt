@@ -216,6 +216,15 @@ The formula supports `head "…", branch: "main"` for `--HEAD` builds.
   is a bare `gh auth status`, deliberately (#100), and that validates EVERY
   configured host: about 6 s with two. Uncached, it ran once per PR lookup and
   made a two-worktree `wt clean` take 18 s instead of 6.
+  ⚠ **That bare check's exit code is an aggregate (#183):** one unreachable
+  Enterprise host fails it for a github.com login that is fine, and outside a
+  repo there is never a host to scope to. So `doctor` reads it per host
+  (`AuthStatusFor` → pure `parseAuthStatus`, from the SAME memoized run; the
+  active account decides a host). gh writes every host section to **stderr**
+  once any account fails, so `authCheck` captures BOTH streams; stdout alone
+  reads as unparseable. A timeout or unreadable output proves nothing about the
+  login → "could not be verified", never "NOT authenticated". `Authed()` stays
+  the exit code: it only gates gh calls that need the repo's host anyway.
 - **A backtick code span DOES suppress GitHub's linked-issue parser — measured, #164.**
   One PR, one already-closed issue, body varied and `closingIssuesReferences` sampled:
 
