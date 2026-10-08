@@ -242,6 +242,21 @@ The formula supports `head "…", branch: "main"` for `--HEAD` builds.
   — query via `gh api graphql … resource(url:){… on PullRequest{…}}`. It reads
   the PR body only, NOT the squash commit body (the `merge-pr` close-lint scans
   commit messages too — #77).
+  ⚠ **A body forwarded after `--` replaces the commit bodies in the squash (#180)**,
+  so the lint judges it instead (headlines stay: `--body` doesn't replace the
+  subject). `merge.ParseForwardedBody` reads the passthrough the way gh's pflag
+  does — last flag wins, a value flag eats a `-`-led next token, `--body` with
+  `--body-file` is gh's own error. A file or `-F -` body is read ONCE and handed
+  to gh on stdin with the flag re-pointed at `-`: `-F <(…)` is a pipe, and gh
+  re-opening it after wt read it would merge an EMPTY body. That handoff is
+  pinned by fake-`gh`-on-PATH tests (`ghx.MergePRSquash`, `merge.Run`), which put
+  the shim alone on PATH and refuse to run unless `gh` resolves to it.
+  ⚠ **wt's own gh flags go IN FRONT of the passthrough** (`--admin`, the WIP
+  `--subject`: `gh pr merge N --squash [wt flags] <passthrough>`). Appended, a
+  passthrough ending in a value flag (`-- --subject`) took `--admin` as its value
+  and gh merged the subject "--admin" with no admin; in front, gh fails on the
+  dangling flag, and an operator's own `--subject` beats the WIP strip (gh keeps
+  the last one).
 - macOS is the dev floor: bash 3.2 (no `mapfile`/`declare -A`), BSD `sed`/`stat`,
   `/var`→`/private/var` symlinks (resolve with `EvalSymlinks` before path
   compares).

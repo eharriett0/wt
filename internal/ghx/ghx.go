@@ -5,6 +5,7 @@ package ghx
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strconv"
@@ -659,12 +660,17 @@ func PRIsDraft(pr string) (bool, error) {
 	return strings.TrimSpace(out) == "true", nil
 }
 
-// MergePRSquash runs `gh pr merge <pr> --squash <extra...>`, inheriting stdio.
-func MergePRSquash(pr string, extra []string) error {
+// MergePRSquash runs `gh pr merge <pr> --squash <extra...>`, inheriting stdout
+// and stderr. gh reads stdin from the given reader, or wt's own stdin when it is
+// nil — merge-pr passes the forwarded squash body it already read (#180).
+func MergePRSquash(pr string, extra []string, stdin io.Reader) error {
 	args := append([]string{"pr", "merge", pr, "--squash"}, extra...)
 	cmd := exec.Command("gh", args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
+	if stdin != nil {
+		cmd.Stdin = stdin
+	}
 	return cmd.Run()
 }
