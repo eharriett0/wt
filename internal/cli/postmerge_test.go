@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -13,7 +14,8 @@ import (
 // whose body "Fixes #7" is its own closing reference. Its state lives in the
 // file "state"; `pr merge` exits 0 either way, and sets MERGED only when the
 // file "merges" exists — so gh can exit 0 without merging, as it does for
-// --help, --auto, --disable-auto, a merge queue and -R (#185).
+// --help, --auto, --disable-auto, a merge queue and -R (#185). Its head commit
+// (headRefOid) is the file "head", empty when gh does not know it (#187).
 const postMergeGh = `#!/bin/sh
 d=$(dirname "$0")
 case "$1 $2" in
@@ -24,6 +26,7 @@ case "$1 $2" in
 	*messageHeadline*) echo "Fix the widget" ;;
 	*join*) printf 'Fix the widget\nplain body\n' ;;
 	*headRefName*) echo feat-x ;;
+	*headRefOid*) cat "$d/head" ;;
 	*title*) echo "Fix the widget" ;;
 	*" body "*) echo "Fixes #7" ;;
 	*" url "*) echo "https://github.com/o/r/pull/99999" ;;
@@ -68,15 +71,23 @@ func TestCmdMergePR_keepsTheLaneUnlessMerged(t *testing.T) {
 	t.Cleanup(func() { postMergeSleep = time.Sleep })
 
 	for _, tc := range []struct {
-		name   string
-		args   []string
-		state  string // what `gh pr view --json state` prints before the merge
-		merges bool
-		kept   bool
+		name     string
+		args     []string
+		state    string // what `gh pr view --json state` prints before the merge
+		merges   bool
+		unpushed bool // the lane gets a commit after its tip became the PR's head
+		noHead   bool // gh does not know the PR's head commit
+		kept     bool
+		warn     string // in the warning when kept after a merge
 	}{
-		{"gh prints its help and exits 0", []string{"99999", "--", "--help"}, "OPEN", false, true},
-		{"gh exits 0 and the state cannot be read", []string{"99999"}, "", false, true},
-		{"gh merges", []string{"99999"}, "OPEN", true, false},
+		{"gh prints its help and exits 0", []string{"99999", "--", "--help"}, "OPEN", false, false, false, true, ""},
+		{"gh exits 0 and the state cannot be read", []string{"99999"}, "", false, false, false, true, ""},
+		{"gh merges", []string{"99999"}, "OPEN", true, false, false, false, ""},
+		// #187: the PR merged, but the lane has a commit that was not in it
+		{"gh merges, the lane has an unpushed commit", []string{"99999"}, "OPEN", true, true, false, true,
+			"feat-x has 1 commit(s) that were not in PR #99999; kept the worktree and branch"},
+		{"gh merges, its head commit is unknown", []string{"99999"}, "OPEN", true, false, true, true,
+			"feat-x may have commits that were not in PR #99999: wt could not read the PR's head commit"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			parent, err := filepath.EvalSymlinks(t.TempDir())
@@ -97,6 +108,19 @@ func TestCmdMergePR_keepsTheLaneUnlessMerged(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(ghDir, "state"), []byte(tc.state), 0o644); err != nil {
 				t.Fatal(err)
 			}
+			head, err := exec.Command(gitBin, "-C", lane, "rev-parse", "HEAD").Output()
+			if err != nil || tc.noHead {
+				head = nil
+			}
+			if err := os.WriteFile(filepath.Join(ghDir, "head"), head, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if tc.unpushed {
+				if out, err := exec.Command(gitBin, "-C", lane, "-c", "user.name=t", "-c", "user.email=t@t",
+					"commit", "-q", "--allow-empty", "-m", "never pushed").CombinedOutput(); err != nil {
+					t.Fatalf("git commit: %v\n%s", err, out)
+				}
+			}
 			_ = os.Remove(filepath.Join(ghDir, "merges"))
 			if tc.merges {
 				if err := os.WriteFile(filepath.Join(ghDir, "merges"), nil, 0o644); err != nil {
@@ -105,8 +129,20 @@ func TestCmdMergePR_keepsTheLaneUnlessMerged(t *testing.T) {
 			}
 			t.Chdir(repo)
 
-			if code := cmdMergePR(tc.args); code != 0 {
+			stderr, err := os.Create(filepath.Join(t.TempDir(), "stderr"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			old := os.Stderr
+			os.Stderr = stderr
+			code := cmdMergePR(tc.args)
+			os.Stderr = old
+			stderr.Close()
+			if code != 0 {
 				t.Fatalf("cmdMergePR(%q) = %d, want 0", tc.args, code)
+			}
+			if warned, _ := os.ReadFile(stderr.Name()); !strings.Contains(string(warned), tc.warn) {
+				t.Errorf("stderr = %q, want it to say %q", warned, tc.warn)
 			}
 			_, statErr := os.Stat(lane)
 			branchErr := exec.Command(gitBin, "-C", repo, "rev-parse", "-q", "--verify", "refs/heads/feat-x").Run()

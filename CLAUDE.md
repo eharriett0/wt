@@ -98,7 +98,12 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   that 0 as a merge removed the lane and `git branch -D`'d unpushed commits.
   `merge.ConfirmMerged` re-reads the state (2.5s at most, for API lag); anything
   but MERGED (OPEN, CLOSED, no answer) keeps the worktree, branch and claim for
-  `wt clean` to reap once the PR ships.
+  `wt clean` to reap once the PR ships. ⚠ **Even then, only a lane whose local
+  tip shipped (#187):** a squash leaves the branch unmerged in git's eyes, so the
+  auto-clean's `git branch -D` would drop commits made after the push.
+  `merge.LocalTipVerdict` needs the tip to BE the PR's `headRefOid` or an
+  ancestor of it; otherwise, or when it can't tell (no head, not fetched here),
+  the worktree and branch stay and the warning counts the commits not in the PR.
 - **"No PR" must be an `ok=false`, never a parsed placeholder (#168).**
   `PRForBranch`'s old `.[0] | …` query printed `null null` for a branch with
   no PR, which parsed as a PR in state `null`. Every caller then matched no

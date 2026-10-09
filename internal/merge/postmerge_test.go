@@ -1,7 +1,9 @@
 package merge
 
 import (
+	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -74,5 +76,57 @@ func TestConfirmMerged(t *testing.T) {
 					state, v, reads, waited, tc.wantState, tc.want, tc.wantReads, tc.wantWait)
 			}
 		})
+	}
+}
+
+func TestLocalTipVerdict(t *testing.T) {
+	const (
+		head = "1111111111111111111111111111111111111111"
+		tip  = "2222222222222222222222222222222222222222"
+	)
+	gitErr := errors.New("fatal: Not a valid commit name")
+	cases := []struct {
+		name        string
+		tip, head   string
+		ancestor    bool
+		ancestorErr error
+		want        TipVerdict
+	}{
+		{"the tip is the PR's head", head, head, false, nil, TipShipped},
+		{"the same commit in another case", strings.ToUpper(head), head, false, nil, TipShipped},
+		{"the tip is behind the PR's head", tip, head, true, nil, TipShipped},
+		{"the tip has commits the PR did not", tip, head, false, nil, TipUnshipped},
+		{"git could not compare (head not fetched)", tip, head, false, gitErr, TipUnknown},
+		{"an error outranks a stale true", tip, head, true, gitErr, TipUnknown},
+		{"no head commit from gh", tip, "", true, nil, TipUnknown},
+		{"no local tip", "", head, true, nil, TipUnknown},
+		{"neither", "", "", false, nil, TipUnknown},
+	}
+	for _, tc := range cases {
+		if got := LocalTipVerdict(tc.tip, tc.head, tc.ancestor, tc.ancestorErr); got != tc.want {
+			t.Errorf("%s: LocalTipVerdict = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestKeptLaneMessage(t *testing.T) {
+	const head = "1111111111111111111111111111111111111111"
+	kept := "; kept the worktree and branch (push them, or delete them yourself)"
+	cases := []struct {
+		v         TipVerdict
+		n         int
+		tip, head string
+		want      string
+	}{
+		{TipUnshipped, 2, "t", head, "feat-x has 2 commit(s) that were not in PR #5" + kept},
+		{TipUnshipped, -1, "t", head, "feat-x has commits that were not in PR #5 (wt could not count them)" + kept},
+		{TipUnknown, -1, "t", "", "feat-x may have commits that were not in PR #5: wt could not read the PR's head commit" + kept},
+		{TipUnknown, -1, "", head, "feat-x may have commits that were not in PR #5: wt could not read the branch's tip" + kept},
+		{TipUnknown, -1, "t", head, "feat-x may have commits that were not in PR #5: wt could not compare its tip with the PR's head 111111111111 (is that commit fetched here?)" + kept},
+	}
+	for _, tc := range cases {
+		if got := KeptLaneMessage(tc.v, "feat-x", "5", tc.n, tc.tip, tc.head); got != tc.want {
+			t.Errorf("KeptLaneMessage(%q, n=%d, tip=%q, head=%q) =\n %q\nwant\n %q", tc.v, tc.n, tc.tip, tc.head, got, tc.want)
+		}
 	}
 }

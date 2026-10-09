@@ -1,9 +1,11 @@
 package cli
 
 import (
+	"strings"
 	"time"
 
 	"github.com/eharriett0/wt/internal/ghx"
+	"github.com/eharriett0/wt/internal/gitx"
 	"github.com/eharriett0/wt/internal/merge"
 	"github.com/eharriett0/wt/internal/ui"
 )
@@ -31,4 +33,26 @@ func mergeConfirmed(pr string) bool {
 		ui.Info("gh exits 0 without merging when it arms auto-merge (--auto) or hands the PR to a merge queue, and GitHub merges it later (gh's output above says which); also for --help, --disable-auto and -R <another repo>")
 	}
 	return false
+}
+
+// unshippedLane returns "" when every commit on the merged PR's local branch
+// shipped in the PR, and otherwise the warning merge-pr prints instead of
+// removing the branch's worktree and deleting the branch (#187).
+func unshippedLane(pr, branch string) string {
+	head, _ := ghx.PRHeadOid(pr)
+	tip := gitx.BranchTip(branch)
+	var ancestor bool
+	var ancestorErr error
+	if tip != "" && head != "" && !strings.EqualFold(tip, head) {
+		ancestor, ancestorErr = gitx.IsAncestor(tip, head)
+	}
+	v := merge.LocalTipVerdict(tip, head, ancestor, ancestorErr)
+	if v == merge.TipShipped {
+		return ""
+	}
+	n := -1
+	if v == merge.TipUnshipped {
+		n = gitx.BehindCount(head, tip) // rev-list --count head..tip: the commits the PR lacks
+	}
+	return merge.KeptLaneMessage(v, branch, pr, n, tip, head)
 }

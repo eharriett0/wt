@@ -516,6 +516,13 @@ func autoCleanMergedWorktree(pr string) {
 		if br != branch {
 			continue
 		}
+		// #187: a squash merge leaves the branch unmerged in git's eyes, so
+		// Remove deletes it with -D. Only when every local commit shipped in
+		// the PR; otherwise keep the lane (and exit 0: the merge happened).
+		if msg := unshippedLane(pr, branch); msg != "" {
+			ui.Warn("%s", msg)
+			return
+		}
 		if err := worktree.Remove(c, wt, branch, false); err != nil {
 			ui.Warn("worktree for %s not auto-removed: %v", branch, err)
 			ui.Info("remove it manually once clean, or `wt clean -y`")
