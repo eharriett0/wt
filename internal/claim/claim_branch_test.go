@@ -28,7 +28,8 @@ const claimIssue = "42"
 const claimBranch = "feat-42-x"
 
 // fakeGhScript answers the gh calls `wt claim` makes and logs each one. The
-// issue is assigned while assigned-<n> exists.
+// issue is assigned while assigned-<n> exists. FAKEGH_ON_ASSIGN, when set, is
+// run as the issue is assigned: another window acting while gh runs.
 const fakeGhScript = `#!/bin/sh
 d=$(dirname "$0")
 printf '%s\n' "$*" >> "$d/gh.log"
@@ -46,7 +47,7 @@ case "$1 $2" in
     esac ;;
   "issue edit")
     case "$*" in
-      *--add-assignee*) touch "$d/assigned-$3"; exit 0 ;;
+      *--add-assignee*) touch "$d/assigned-$3"; if [ -n "$FAKEGH_ON_ASSIGN" ]; then sh -c "$FAKEGH_ON_ASSIGN"; fi; exit 0 ;;
       *--remove-assignee*) rm -f "$d/assigned-$3"; exit 0 ;;
     esac ;;
   "pr create") echo "https://github.com/o/r/pull/7"; exit 0 ;;
@@ -427,5 +428,283 @@ func TestRollbackFor(t *testing.T) {
 		if got := rollbackFor(c.newWorktree, c.newBranch); got != c.want {
 			t.Errorf("%s: rollbackFor(%v, %v) = %+v, want %+v", c.name, c.newWorktree, c.newBranch, got, c.want)
 		}
+	}
+}
+
+// #198 review (s1): a local branch another worktree has checked out is refused
+// before the issue is assigned, whatever its relation to origin. git refuses
+// the second checkout anyway, but only at worktree-add, after the assign: the
+// claim used to stop there with the issue assigned and a retry blocked as
+// "already assigned". Once the other worktree lets the branch go, it claims.
+func TestClaim_RefusesABranchCheckedOutElsewhereBeforeAssigning(t *testing.T) {
+	f := newClaimFixture(t)
+	tip := f.pushed()
+	elsewhere := filepath.Join(t.TempDir(), "elsewhere")
+	f.git(f.repo, "worktree", "add", "-q", elsewhere, claimBranch)
+	err := f.claim(true)
+	if !errors.Is(err, worktree.ErrBranchInUse) {
+		t.Fatalf("Claim = %v, want an ErrBranchInUse refusal", err)
+	}
+	f.assertRefusedBeforeAnything(err, tip, false)
+	f.git(f.repo, "worktree", "remove", elsewhere)
+	f.assertClaimedOn(f.claim(true), tip)
+}
+
+// #198 review (s2): a failure in Create after the assign (here git branch -f
+// refusing to fast-forward a branch another worktree is rebasing, which
+// `git worktree list` cannot see) unassigns the issue, so the retry is not
+// "already assigned". Nothing moved; after the rebase it claims.
+func TestClaim_UnassignsWhenCreateFailsAfterTheAssign(t *testing.T) {
+	f := newClaimFixture(t)
+	old := f.pushed()
+	head := f.onOrigin(old, "x 2")
+	elsewhere := filepath.Join(t.TempDir(), "elsewhere")
+	f.git(f.repo, "worktree", "add", "-q", elsewhere, claimBranch)
+	seq := filepath.Join(t.TempDir(), "seq.sh")
+	if err := os.WriteFile(seq, []byte("#!/bin/sh\nsed 's/^pick/edit/' \"$1\" > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rebase := exec.Command("git", "rebase", "-i", "HEAD~1")
+	rebase.Dir = elsewhere
+	rebase.Env = append(os.Environ(), "GIT_SEQUENCE_EDITOR="+seq)
+	if out, err := rebase.CombinedOutput(); err != nil {
+		t.Fatalf("starting the rebase: %v\n%s", err, out)
+	}
+
+	err := f.claim(true)
+	if err == nil {
+		t.Fatal("Claim fast-forwarded a branch another worktree is rebasing")
+	}
+	if f.assigned() {
+		t.Error("a claim that failed after the assign must unassign the issue")
+	}
+	if got := f.ref(f.repo, "refs/heads/"+claimBranch); got != old {
+		t.Errorf("the branch moved to %s, want it left at %s", got, old)
+	}
+	if _, serr := os.Stat(f.dir()); !os.IsNotExist(serr) {
+		t.Errorf("no worktree may be left at %s (stat: %v)", f.dir(), serr)
+	}
+
+	f.git(elsewhere, "rebase", "--abort")
+	f.git(f.repo, "worktree", "remove", elsewhere)
+	f.assertClaimedOn(f.claim(true), head)
+}
+
+// #198 review (s3): the branch moves while gh assigns the issue (another
+// window committed). Create refuses what it no longer checked, and the issue
+// is unassigned, so its "Re-run: wt claim 42" works: the retry claims the
+// branch where it now is.
+func TestClaim_UnassignsWhenTheBranchMovesDuringTheAssign(t *testing.T) {
+	f := newClaimFixture(t)
+	tip := f.pushed()
+	moved := f.commit(f.repo, tip, "committed by another window")
+	t.Setenv("FAKEGH_ON_ASSIGN", "git -C '"+f.repo+"' update-ref refs/heads/"+claimBranch+" "+moved)
+	err := f.claim(true)
+	if err == nil || !strings.Contains(err.Error(), "moved after wt checked it") {
+		t.Fatalf("Claim = %v, want the refusal for a branch that moved", err)
+	}
+	if f.assigned() {
+		t.Error("a claim that failed after the assign must unassign the issue")
+	}
+	if _, serr := os.Stat(f.dir()); !os.IsNotExist(serr) {
+		t.Errorf("no worktree may be left at %s (stat: %v)", f.dir(), serr)
+	}
+	t.Setenv("FAKEGH_ON_ASSIGN", "")
+	f.assertClaimedOn(f.claim(true), moved)
+}
+
+// #198 review (s4): claim's placeholder in a worktree it was handed back takes
+// none of the work staged there. It used to: the work went into "WIP: claim"
+// and was pushed, and `wt release --clean`, reading the subject, took the
+// branch for a placeholder and deleted it with the worktree and origin's
+// branch. Now the work stays staged, and release --clean keeps everything.
+func TestClaim_PlaceholderTakesNoStagedWork(t *testing.T) {
+	f := newClaimFixture(t)
+	if _, err := worktree.New(f.c, claimBranch); err != nil {
+		t.Fatalf("wt new: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir(), "work.txt"), []byte("work in progress\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.git(f.dir(), "add", "work.txt")
+	if err := f.claim(false); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	head := f.ref(f.dir(), "HEAD")
+	if got, want := f.ref(f.dir(), "HEAD^{tree}"), f.ref(f.dir(), "HEAD^^{tree}"); got != want {
+		t.Errorf("the placeholder changes files (tree %s, its parent's %s): it took the staged work", got, want)
+	}
+	if got := f.git(f.dir(), "diff", "--cached", "--name-only"); got != "work.txt" {
+		t.Errorf("staged after the claim = %q, want work.txt still staged", got)
+	}
+	if got := f.ref(f.origin, "refs/heads/"+claimBranch); got != head {
+		t.Errorf("origin has %s, want the placeholder %s", got, head)
+	}
+
+	if err := Release(f.c, claimIssue, true); err != nil {
+		t.Fatalf("Release --clean: %v", err)
+	}
+	if _, serr := os.Stat(filepath.Join(f.dir(), "work.txt")); serr != nil {
+		t.Errorf("release --clean removed the worktree holding the staged work (stat: %v)", serr)
+	}
+	if got := f.ref(f.repo, "refs/heads/"+claimBranch); got != head {
+		t.Errorf("release --clean left the branch at %q, want %s", got, head)
+	}
+	if got := f.ref(f.origin, "refs/heads/"+claimBranch); got != head {
+		t.Errorf("release --clean left origin's branch at %q, want %s", got, head)
+	}
+}
+
+// #198 review (s5): wt's worktree for the branch is detached at origin's tip.
+// The claim committed its placeholder there, its push of the branch went
+// "up to date", and it reported success with a PR. Refused before the assign.
+func TestClaim_RefusesAnExistingWorktreeOffTheBranch(t *testing.T) {
+	f := newClaimFixture(t)
+	tip := f.pushed()
+	f.git(f.repo, "worktree", "add", "-q", "--detach", f.dir(), tip)
+	err := f.claim(true)
+	if !errors.Is(err, worktree.ErrWorktreeOffBranch) {
+		t.Fatalf("Claim = %v, want an ErrWorktreeOffBranch refusal", err)
+	}
+	f.assertRefusedBeforeAnything(err, tip, true)
+}
+
+// #198 review (s6): the branch was pushed (with -u) and origin deleted it, as it
+// does when the PR merges. The claim would push it back, placeholder on top:
+// refused before the assign, and origin is left without it.
+func TestClaim_RefusesABranchDeletedOnOrigin(t *testing.T) {
+	f := newClaimFixture(t)
+	tip := f.commit(f.repo, f.base, "x 1")
+	f.local(tip)
+	f.git(f.repo, "push", "-q", "-u", "origin", claimBranch)
+	f.git(f.origin, "update-ref", "-d", "refs/heads/"+claimBranch)
+	err := f.claim(true)
+	if !errors.Is(err, worktree.ErrGoneFromOrigin) {
+		t.Fatalf("Claim = %v, want an ErrGoneFromOrigin refusal", err)
+	}
+	f.assertRefusedBeforeAnything(err, tip, false)
+	if got := f.ref(f.origin, "refs/heads/"+claimBranch); got != "" {
+		t.Errorf("origin has the branch again at %s; the refusal must not push it", got)
+	}
+}
+
+// #198 review (s13): no local branch, but origin has one of the claim's name (an
+// earlier claim's placeholder, say). The claim cut a new branch from the base,
+// origin rejected the push, and it rolled back with a bare push error, on every
+// retry. Refused before the assign, pointing at wt adopt.
+func TestClaim_RefusesWhenOriginAlreadyHasTheBranch(t *testing.T) {
+	f := newClaimFixture(t)
+	earlier := f.commit(f.repo, f.base, "WIP: an earlier claim")
+	f.git(f.repo, "push", "-q", "origin", earlier+":refs/heads/"+claimBranch)
+	f.git(f.repo, "update-ref", "-d", "refs/remotes/origin/"+claimBranch)
+	err := f.claim(true)
+	if !errors.Is(err, worktree.ErrOriginHasBranch) {
+		t.Fatalf("Claim = %v, want an ErrOriginHasBranch refusal", err)
+	}
+	f.assertRefusedBeforeAnything(err, "", false)
+	if got := f.ref(f.origin, "refs/heads/"+claimBranch); got != earlier {
+		t.Errorf("origin's branch moved to %q, want it left at %s", got, earlier)
+	}
+}
+
+// #198 review (s14b): worktree_root inside the repo and a leftover empty
+// directory at the claim's path. It is inside the main checkout, so the claim
+// took the main checkout for its worktree and committed its placeholder onto
+// main. It gets a real worktree on the branch, and main is untouched.
+func TestClaim_ALeftoverDirInsideTheCheckoutIsNotAWorktree(t *testing.T) {
+	f := newClaimFixture(t)
+	f.c.WorktreeRoot = filepath.Join(f.repo, ".worktrees")
+	if err := os.WriteFile(filepath.Join(f.repo, ".git", "info", "exclude"), []byte(".worktrees/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tip := f.commit(f.repo, f.base, "never pushed")
+	f.local(tip)
+	if err := os.MkdirAll(f.dir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.assertClaimedOn(f.claim(true), tip)
+	if got := f.git(f.dir(), "symbolic-ref", "HEAD"); got != "refs/heads/"+claimBranch {
+		t.Errorf("the claim's worktree is on %s, want refs/heads/%s", got, claimBranch)
+	}
+	if got := f.ref(f.repo, "refs/heads/main"); got != f.base {
+		t.Errorf("main moved to %s; it must stay at %s", got, f.base)
+	}
+}
+
+// #198 (M2 in the review's mutation run): a worktree the claim was handed back
+// held work before it, so a rejected push undoes only the placeholder. The
+// worktree stays, with its ignored files (`git worktree remove` deletes those
+// without asking), and so does the branch, at its pre-claim tip.
+func TestClaim_RollbackKeepsAnExistingWorktree(t *testing.T) {
+	f := newClaimFixture(t)
+	ahead := f.commit(f.repo, f.pushed(), "not pushed yet")
+	f.local(ahead)
+	f.git(f.repo, "worktree", "add", "-q", f.dir(), claimBranch)
+	if err := os.WriteFile(filepath.Join(f.repo, ".git", "info", "exclude"), []byte(".env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir(), ".env"), []byte("SECRET=1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.rejectPushes()
+	err := f.claim(true)
+	if err == nil || !strings.Contains(err.Error(), "rejected by the test") {
+		t.Fatalf("Claim = %v, want the push failure, with origin's reason", err)
+	}
+	if _, serr := os.Stat(filepath.Join(f.dir(), ".env")); serr != nil {
+		t.Errorf("the rollback removed the worktree it was handed back, ignored files and all (stat: %v)", serr)
+	}
+	if got := f.ref(f.dir(), "HEAD"); got != ahead {
+		t.Errorf("the worktree is at %s, want the placeholder undone back to %s", got, ahead)
+	}
+	if got := f.ref(f.repo, "refs/heads/"+claimBranch); got != ahead {
+		t.Errorf("the branch is at %q, want it kept at %s", got, ahead)
+	}
+	if f.assigned() {
+		t.Error("the rollback must unassign the issue")
+	}
+}
+
+// #198 review: the rollback unassigns only an assignment the claim made. A
+// --force re-claim of an issue already assigned to you keeps it.
+func TestClaim_RollbackKeepsAnAssignmentThatWasThere(t *testing.T) {
+	f := newClaimFixture(t)
+	if err := os.WriteFile(filepath.Join(f.gh, "assigned-"+claimIssue), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.rejectPushes()
+	if err := Claim(f.c, claimIssue, true, true, true, ""); err == nil {
+		t.Fatal("Claim succeeded although origin rejects every push")
+	}
+	if !f.assigned() {
+		t.Error("the rollback unassigned an issue that was assigned before the claim")
+	}
+}
+
+// #198 review: a worktree handed back in the middle of a merge. The placeholder
+// is refused there (it would have concluded the merge), and the claim rolls
+// back: the issue unassigned, the worktree and its merge left as they were,
+// nothing pushed.
+func TestClaim_RollsBackWhenThePlaceholderCannotBeMade(t *testing.T) {
+	f := newClaimFixture(t)
+	tip := f.pushed()
+	f.git(f.repo, "worktree", "add", "-q", f.dir(), claimBranch)
+	f.git(f.repo, "update-ref", "refs/heads/side", f.commit(f.repo, tip, "side"))
+	f.git(f.dir(), "merge", "-q", "--no-ff", "--no-commit", "side")
+	err := f.claim(true)
+	if err == nil || !strings.Contains(err.Error(), "placeholder commit") {
+		t.Fatalf("Claim = %v, want the placeholder commit failure", err)
+	}
+	if f.assigned() {
+		t.Error("the rollback must unassign the issue")
+	}
+	if got := f.ref(f.dir(), "HEAD"); got != tip {
+		t.Errorf("the worktree is at %s, want it left at %s", got, tip)
+	}
+	if f.ref(f.dir(), "MERGE_HEAD") == "" {
+		t.Error("the merge in progress is gone")
+	}
+	if got := f.ref(f.origin, "refs/heads/"+claimBranch); got != tip {
+		t.Errorf("origin has %s, want nothing pushed (%s)", got, tip)
 	}
 }

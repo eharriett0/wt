@@ -43,11 +43,13 @@ func Claim(c *config.Config, issue string, force, yes, openPR bool, epic string)
 	branch := BranchName(c.Prefix, issue, SlugFromTitle(title))
 	wtPath := filepath.Join(c.WorktreeRoot, strings.ReplaceAll(branch, "/", "-"))
 
+	user, _ := ghx.CurrentUser()
+
 	// Resume path (#41): an owned re-claim — this window is assigned, its
 	// worktree still exists, and there's an active-work section. Refresh the
 	// Last-seen timestamp and hand the worktree back, WITHOUT stacking a second
 	// placeholder commit / draft PR / duplicate section. No --force needed.
-	if user, _ := ghx.CurrentUser(); assignedTo(assignees, user) && isDir(wtPath) && hasSection(c, issue) {
+	if assignedTo(assignees, user) && isDir(wtPath) && hasSection(c, issue) {
 		content := activework.Read(c.ActiveWork)
 		e := activework.Entry{Issue: issue, Title: title, Branch: branch, Worktree: wtPath, Window: windowID(c), Epic: epic, When: time.Now()}
 		if err := activework.Write(c.ActiveWork, activework.UpsertSection(content, e)); err != nil {
@@ -122,9 +124,21 @@ func Claim(c *config.Config, issue string, force, yes, openPR bool, epic string)
 		return fmt.Errorf("assign issue: %w", err)
 	}
 	ui.OK("assigned #%s to @me", issue)
+	// Undoing a failed claim unassigns only an assignment it made (#198 review):
+	// a --force re-claim of an issue already yours keeps it.
+	undo := claimUndo{issue: issue, user: user, assigned: !assignedTo(assignees, user)}
 
+	// #159/#198 review: nothing durable is recorded until the push succeeds
+	// (active-work is appended only after it), so every failure from here on
+	// rolls back to a clean slate (the issue unassigned, and of the worktree and
+	// branch only what this claim made), or a retry trips "already assigned".
 	made, err := plan.Create()
 	if err != nil {
+		// Create leaves nothing to remove when it fails: it refused before acting,
+		// or removed the worktree it added again (verifyAdopted). A branch it
+		// fast-forwarded first only moved forward, onto origin/<branch>. Only the
+		// assignment is left to undo.
+		undo.unassign()
 		return err
 	}
 	wtDir := made.Dir
@@ -133,16 +147,14 @@ func Claim(c *config.Config, issue string, force, yes, openPR bool, epic string)
 	msg := fmt.Sprintf("WIP: claim #%s — %s\n\nPlaceholder commit for multi-window coordination (wt claim).\nReplaced by real work in subsequent commits.\n\nRefs #%s", issue, title60, issue)
 	before := gitx.HeadCommit(wtDir)
 	if err := gitx.CommitEmpty(wtDir, msg); err != nil {
+		// E.g. a worktree handed back in the middle of a merge, where the
+		// placeholder must not conclude it (gitx.CommitEmpty).
+		rollbackFailedClaim(c, branch, made, before, "", "placeholder commit failed", undo)
 		return fmt.Errorf("placeholder commit: %w", err)
 	}
 	placeholder := gitx.HeadCommit(wtDir)
 	if err := gitx.PushSetUpstream(wtDir, branch); err != nil {
-		// #159: nothing durable is recorded yet (active-work is appended only AFTER
-		// the push), so a failed push would strand a partial claim — issue assigned +
-		// worktree/branch created — which then blocks a retry with "already assigned".
-		// Roll back to a clean slate so re-running `wt claim` works, undoing only
-		// what this claim made (#198).
-		rollbackFailedClaim(c, issue, branch, made, before, placeholder)
+		rollbackFailedClaim(c, branch, made, before, placeholder, "push failed", undo)
 		return fmt.Errorf("push branch: %w", err)
 	}
 
@@ -311,20 +323,22 @@ func Release(c *config.Config, issue string, clean bool) error {
 	return nil
 }
 
-// rollbackFailedClaim undoes a claim whose push failed before anything durable
-// was recorded (#159): the issue is unassigned, so a retry starts clean instead
-// of tripping the already-assigned guard, and of the worktree and branch only
-// what this claim made goes (rollbackFor). A branch it cut from the base is
-// deleted with its new worktree, as before. A local branch it re-attached (#62),
-// or a worktree it was handed back, held work before the claim: the #159
-// rollback deleted them too, unpushed commits and all (#198). Now the
-// placeholder commit is taken back off (before is its parent) and they stay.
-// NON-force remove (#159 review): a worktree with uncommitted work is refused,
-// never discarded. Best-effort: each step reports but never masks the push error.
-func rollbackFailedClaim(c *config.Config, issue, branch string, made worktree.Created, before, placeholder string) {
-	ui.Info("rolling back partial claim of #%s (push failed) …", issue)
+// rollbackFailedClaim undoes a claim whose placeholder commit or push failed
+// before anything durable was recorded (#159): the issue is unassigned (when
+// this claim assigned it, claimUndo), so a retry starts clean instead of
+// tripping the already-assigned guard, and of the worktree and branch only what
+// this claim made goes (rollbackFor). A branch it cut from the base is deleted
+// with its new worktree, as before. A local branch it re-attached (#62), or a
+// worktree it was handed back, held work before the claim: the #159 rollback
+// deleted them too, unpushed commits and all (#198). Now the placeholder commit
+// is taken back off (before is its parent; placeholder is "" when the commit
+// itself failed) and they stay. NON-force remove (#159 review): a worktree with
+// uncommitted work is refused, never discarded. Best-effort: each step reports
+// but never masks the error that got here (why).
+func rollbackFailedClaim(c *config.Config, branch string, made worktree.Created, before, placeholder, why string, undo claimUndo) {
+	ui.Info("rolling back partial claim of #%s (%s) …", undo.issue, why)
 	s := rollbackFor(made.NewWorktree, made.NewBranch)
-	if s.undoPlaceholder {
+	if s.undoPlaceholder && placeholder != "" {
 		if err := gitx.UndoCommit(made.Dir, placeholder, before); err != nil {
 			ui.Warn("rollback: couldn't undo the placeholder commit in %s: %v", made.Dir, err)
 		} else {
@@ -346,11 +360,35 @@ func rollbackFailedClaim(c *config.Config, issue, branch string, made worktree.C
 	case !s.deleteBranch:
 		ui.Info("rollback: kept local branch %s: it existed before this claim", branch)
 	}
-	if user, err := ghx.CurrentUser(); err == nil && user != "" {
-		if err := ghx.IssueRemoveAssignee(issue, user); err == nil {
-			ui.Info("rollback: unassigned #%s", issue)
-		}
+	undo.unassign()
+}
+
+// claimUndo is what undoing a failed claim may do to its issue (#159, #198
+// review): unassign it, but only when this claim assigned it.
+type claimUndo struct {
+	issue, user string // user: the gh login the claim ran as, "" when gh could not say
+	assigned    bool   // this claim's assign added user: false for an issue that was user's already (a --force re-claim)
+}
+
+// unassign removes the claim's assignment, best-effort.
+func (u claimUndo) unassign() {
+	if !u.assigned {
+		ui.Info("rollback: left #%s assigned: it was yours before this claim", u.issue)
+		return
 	}
+	user := u.user
+	if user == "" {
+		user, _ = ghx.CurrentUser()
+	}
+	if user == "" {
+		ui.Warn("rollback: couldn't tell who to unassign from #%s; unassign yourself if you are", u.issue)
+		return
+	}
+	if err := ghx.IssueRemoveAssignee(u.issue, user); err != nil {
+		ui.Warn("rollback: couldn't unassign #%s: %v", u.issue, err)
+		return
+	}
+	ui.Info("rollback: unassigned #%s", u.issue)
 }
 
 // rollbackScope is what undoing a claim whose push failed may touch (#159,

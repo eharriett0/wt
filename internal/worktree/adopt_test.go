@@ -762,3 +762,54 @@ func TestAdopt_ReRunOnABehindWorktreeStillSucceeds(t *testing.T) {
 		t.Errorf("wt moved an existing worktree's branch to %s; it must leave it at %s", h, old)
 	}
 }
+
+// #198 review: a re-run checks the existing worktree's HEAD, not its branch's
+// tip. Here the branch matches origin, but wt's worktree for it sits detached on
+// a commit origin lacks (a rebase stopped halfway, say): that is not the branch,
+// so it is refused, and the advice keeps the detached commit by its sha rather
+// than with a `git -C <dir>` command, which would act on that worktree.
+func TestAdopt_ReRunChecksTheWorktreeHEADNotTheBranch(t *testing.T) {
+	f := newAdoptFixture(t)
+	tip := f.commitIn(f.repo, f.base, "pr 1")
+	gitW(t, f.repo, "update-ref", "refs/heads/bot/image", tip)
+	gitW(t, f.repo, "push", "-q", "origin", "bot/image")
+	wtDir := filepath.Join(f.c.WorktreeRoot, "bot-image")
+	detached := f.commitIn(f.repo, f.base, "a detached commit origin lacks")
+	gitW(t, f.repo, "worktree", "add", "-q", "--detach", wtDir, detached)
+	var err error
+	out := captureStdout(t, func() { _, err = Adopt(f.c, "bot/image", AdoptWant{}) })
+	if err == nil {
+		t.Fatal("Adopt handed back a worktree detached on a commit origin/bot/image lacks")
+	}
+	if h := f.tip(wtDir, "HEAD"); h != detached {
+		t.Errorf("wt moved the existing worktree to %s; it must stay at %s", h, detached)
+	}
+	if strings.Contains(out, "git -C") {
+		t.Errorf("the advice names a git -C command for a worktree that is not on the branch:\n%s", out)
+	}
+	if want := "git branch bot/image-wip-" + detached[:8] + " " + detached; !strings.Contains(out, want) {
+		t.Errorf("the advice should keep the detached commit with %q:\n%s", want, out)
+	}
+}
+
+// #198 review: wt's worktree for the branch has another branch checked out and
+// is behind origin/<branch>. adopt hands it back with a note, as before, but
+// names no `git -C <dir> merge --ff-only`, which would fast-forward whatever that
+// worktree has checked out (with worktree_root inside the repo it moved main).
+func TestAdopt_ReRunNamesNoCommandForAWorktreeOffTheBranch(t *testing.T) {
+	f := newAdoptFixture(t)
+	old, _ := f.behindBranch()
+	wtDir := filepath.Join(f.c.WorktreeRoot, "bot-image")
+	gitW(t, f.repo, "worktree", "add", "-q", "-b", "other", wtDir, old)
+	var err error
+	out := captureStdout(t, func() { _, err = Adopt(f.c, "bot/image", AdoptWant{}) })
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	if strings.Contains(out, "git -C") {
+		t.Errorf("the note names a git -C command for a worktree on another branch:\n%s", out)
+	}
+	if got := f.tip(f.repo, "refs/heads/other"); got != old {
+		t.Errorf("other moved to %s, want it left at %s", got, old)
+	}
+}
