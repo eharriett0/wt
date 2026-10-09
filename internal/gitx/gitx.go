@@ -91,6 +91,42 @@ func run(dir string, args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
+// runReporting is run for a command whose failure the operator has to act on
+// (#198 review): its error carries git's own stderr (gitStderr), wrapping the
+// *exec.ExitError. Fetch and PushSetUpstream failed with a bare "exit status
+// 128", so a branch origin had deleted read as being offline, and a rejected
+// push gave no reason at all.
+func runReporting(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	cmd.Env = scopedEnv()
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		if msg := gitStderr(stderr.String()); msg != "" {
+			err = fmt.Errorf("%w: %s", err, msg)
+		}
+	}
+	return strings.TrimSpace(string(out)), err
+}
+
+// gitStderr condenses git's stderr for an error message: blank lines and git's
+// "hint:" lines dropped, the rest joined with "; ". Pure.
+func gitStderr(s string) string {
+	var lines []string
+	for _, ln := range strings.Split(s, "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln == "" || strings.HasPrefix(ln, "hint:") {
+			continue
+		}
+		lines = append(lines, ln)
+	}
+	return strings.Join(lines, "; ")
+}
+
 // noRenames is the flag every `git diff --name-only` feeding the collision
 // engine passes: a move is listed by BOTH its old and new path, never just the
 // new one (#181 review). With rename detection on (git's default), a window that
@@ -284,29 +320,42 @@ func DefaultBranch() string {
 	return "main"
 }
 
-// Fetch updates remote/branch quietly (best-effort; error returned for caller).
+// Fetch updates refs/remotes/<remote>/<branch> from the remote's
+// refs/heads/<branch> (best-effort; the error, for the caller, carries git's
+// stderr).
+//
+// The refspec is spelled out (#198 review). `git fetch origin <branch>` writes
+// the remote-tracking ref only when the remote's configured fetch refspec covers
+// it, and a single-branch clone's (`--single-branch`, which every `--depth`
+// clone is) covers only its one branch: the fetch succeeded into FETCH_HEAD,
+// origin/<branch> was never written, and a stale local branch read as never
+// pushed. The leading + takes a force-push, as the default refspec does.
 func Fetch(remote, branch string) error {
-	_, err := Run("fetch", remote, branch)
+	_, err := runReporting("", "fetch", remote, "+refs/heads/"+branch+":refs/remotes/"+remote+"/"+branch)
 	return err
 }
 
-// WorktreeAdd creates a new worktree at path on a new branch from base.
-func WorktreeAdd(path, branch, base string) error {
-	// If the branch already exists (its previous worktree was removed out-of-band
-	// but the branch — and its commits — survived), re-attach it to a fresh
-	// worktree instead of `-b` (which errors "branch already exists") (#62).
-	if LocalBranchExists(branch) {
-		_, err := Run("worktree", "add", path, branch)
+// WorktreeAddNewBranch creates a new worktree at path on a NEW branch cut from
+// base. git refuses when the branch already exists, so it can never re-attach
+// one: `wt new` decides that itself, after checking the branch against
+// origin/<branch> (#198), and attaches with WorktreeAdopt. The error carries
+// git's own stderr.
+func WorktreeAddNewBranch(path, branch, base string) error {
+	cmd := exec.Command("git", "worktree", "add", "-b", branch, path, base)
+	cmd.Env = scopedEnv()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		if msg := strings.TrimSpace(string(out)); msg != "" {
+			return fmt.Errorf("%w: %s", err, msg)
+		}
 		return err
 	}
-	_, err := Run("worktree", "add", path, "-b", branch, base)
-	return err
+	return nil
 }
 
 // WorktreeAdopt attaches a worktree at path to an EXISTING branch — a local
 // refs/heads/<branch> or, via git worktree-add's DWIM, a lone remote
 // origin/<branch> (which materializes a local tracking branch). Unlike
-// WorktreeAdd it NEVER creates a branch from base: adopting someone else's or a
+// WorktreeAddNewBranch it NEVER creates a branch from base: adopting someone else's or a
 // previous session's PR branch must land on that exact branch, not a fresh fork
 // of it. On failure — the branch is absent, OR (common for adopt) already
 // checked out in another worktree — the error carries git's own stderr so the
@@ -323,24 +372,67 @@ func WorktreeAdopt(path, branch string) error {
 	return nil
 }
 
-// LocalBranchExists reports whether refs/heads/<branch> exists.
-func LocalBranchExists(branch string) bool {
-	_, err := Run("rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
-	return err == nil
-}
-
 // RemoteTrackingTip returns the commit refs/remotes/origin/<branch> points at, as
-// last fetched, or "" when there is no such ref. No network. `wt adopt <branch>`
-// checks a local branch of the same name against it (#167).
+// last fetched, or "" when no ref has EXACTLY that name. No network. `wt adopt
+// <branch>`, `wt new` and `wt claim` check a local branch of the same name
+// against it (#167, #198).
+//
+// It lists refs instead of resolving the name (#198 review). With
+// core.ignorecase a loose ref is a file, and its lookup ignores case, so
+// rev-parse of refs/remotes/origin/feat/x returned origin's Feat/x, another
+// branch, and `wt new feat/x` fast-forwarded a never-pushed feat/x onto its
+// commits. for-each-ref reads every name as stored, and the name must match.
 func RemoteTrackingTip(branch string) string {
 	if branch == "" {
 		return ""
 	}
-	out, err := Run("rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+branch+"^{commit}")
+	return exactRefTip("refs/remotes/origin/" + branch)
+}
+
+// exactRefTip returns the commit the ref named exactly ref points at, or "".
+func exactRefTip(ref string) string {
+	out, err := Run("for-each-ref", "--format=%(objectname) %(objecttype) %(refname)", ref)
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(out)
+	return pickExactRef(out, ref)
+}
+
+// pickExactRef reads `for-each-ref --format='%(objectname) %(objecttype)
+// %(refname)'` output and returns the commit of the line whose refname is
+// exactly ref, "" when none is or it is not a commit. A pattern also matches
+// refs below it (ref/x), and a name differing in case must not count. Pure.
+func pickExactRef(out, ref string) string {
+	for _, ln := range strings.Split(out, "\n") {
+		f := strings.SplitN(strings.TrimSpace(ln), " ", 3)
+		if len(f) == 3 && f[2] == ref && f[1] == "commit" {
+			return f[0]
+		}
+	}
+	return ""
+}
+
+// WorktreeToplevel returns the top directory of the work tree that holds dir
+// (`git rev-parse --show-toplevel`, run in dir), or "" when dir is in none. A
+// directory nested inside a checkout reports that checkout's top, which is how
+// wt tells its own worktree from a stray directory under the main checkout
+// (#198 review).
+func WorktreeToplevel(dir string) string {
+	out, err := RunDir(dir, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return ""
+	}
+	return out
+}
+
+// BranchUpstream returns branch.<branch>.remote and branch.<branch>.merge from
+// the repo's config, "" for either when unset (#198 review). Unlike HasUpstream
+// it needs no worktree on the branch, and it still answers once origin has
+// deleted the branch and the remote-tracking ref is gone.
+func BranchUpstream(branch string) (remote, merge string) {
+	remote, _ = Run("config", "--get", "branch."+branch+".remote")
+	merge, _ = Run("config", "--get", "branch."+branch+".merge")
+	return remote, merge
 }
 
 // HeadCommit returns the commit HEAD points at in the worktree at dir, or "" when
@@ -1409,15 +1501,57 @@ func IsClean(dir string) bool {
 	return strings.TrimSpace(out) == ""
 }
 
-// CommitEmpty makes an empty commit in dir with the given message.
+// CommitEmpty makes an empty commit in dir with the given message, and only
+// that: nothing staged goes into it (#198 review). `wt claim` makes its
+// placeholder with it, also in a worktree it was handed back, and a plain
+// `commit --allow-empty` committed whatever was staged there under the "WIP:
+// claim" subject and pushed it; `release --clean`, which reads that subject,
+// then took the branch for an abandoned placeholder and deleted it, locally and
+// on origin. `--only` with no paths commits none of the index, and git refuses
+// it in the middle of a merge or cherry-pick ("cannot do a partial commit"),
+// where a plain commit would have concluded the merge. The error carries git's
+// stderr.
 func CommitEmpty(dir, msg string) error {
-	_, err := RunDir(dir, "commit", "--allow-empty", "-m", msg)
+	_, err := runReporting(dir, "commit", "--allow-empty", "--only", "-m", msg)
 	return err
 }
 
-// PushSetUpstream pushes branch to origin and sets upstream, from dir.
+// UndoCommit moves the worktree at dir's HEAD, and so its branch, from commit
+// back to parent with `git reset --soft`: the index and the files stay as they
+// are. `wt claim` uses it to take its placeholder commit back off a branch it
+// did not create when the push fails (#198), instead of deleting the branch.
+//
+// It acts only on what a placeholder is: HEAD is still commit, parent is its
+// only parent, and it changes nothing (its tree is parent's). Resetting a merge
+// would drop its second parent with no MERGE_HEAD left to bring it back, and
+// one that changes files is somebody's work, not the claim's (#198 review).
+func UndoCommit(dir, commit, parent string) error {
+	if commit == "" || parent == "" {
+		return fmt.Errorf("undo needs a commit and its parent, got %q %q", commit, parent)
+	}
+	if cur := HeadCommit(dir); cur != commit {
+		return fmt.Errorf("HEAD is at %s now, not %s", cur, commit)
+	}
+	if got, err := RunDir(dir, "rev-parse", "--verify", "--quiet", commit+"^1"); err != nil || got != parent {
+		return fmt.Errorf("%s's parent is %q, not %s", commit, got, parent)
+	}
+	if _, err := RunDir(dir, "rev-parse", "--verify", "--quiet", commit+"^2"); err == nil {
+		return fmt.Errorf("%s is a merge commit, not a placeholder", commit)
+	}
+	ct, err1 := RunDir(dir, "rev-parse", "--verify", "--quiet", commit+"^{tree}")
+	pt, err2 := RunDir(dir, "rev-parse", "--verify", "--quiet", parent+"^{tree}")
+	if err1 != nil || err2 != nil || ct != pt {
+		return fmt.Errorf("%s changes files, so it is not an empty placeholder", commit)
+	}
+	_, err := RunDir(dir, "reset", "--soft", parent)
+	return err
+}
+
+// PushSetUpstream pushes branch to origin and sets upstream, from dir. The error
+// carries git's stderr (#198 review): a rejected push used to say only "exit
+// status 1".
 func PushSetUpstream(dir, branch string) error {
-	_, err := RunDir(dir, "push", "-u", "origin", branch)
+	_, err := runReporting(dir, "push", "-u", "origin", branch)
 	return err
 }
 
@@ -1463,18 +1597,29 @@ func IsAncestor(a, b string) (bool, error) {
 }
 
 // RemoteBranchTip returns the sha origin/branch points at (via ls-remote), or ""
-// when the remote branch doesn't exist. `release --clean` compares it to the local
-// placeholder tip before deleting, so a remote that diverged with real commits is
-// never force-deleted (#159 review).
+// when the remote branch doesn't exist; an error means origin could not be asked.
+// `release --clean` compares it to the local placeholder tip before deleting, so
+// a remote that diverged with real commits is never force-deleted (#159 review).
+// `wt new` and `wt claim` use it to tell a branch origin does not have (never
+// pushed, or deleted there) from an origin they cannot reach (#198 review).
 func RemoteBranchTip(dir, branch string) (string, error) {
 	out, err := RunDir(dir, "ls-remote", "origin", "refs/heads/"+branch)
 	if err != nil {
 		return "", err
 	}
-	if out = strings.TrimSpace(out); out == "" {
-		return "", nil
+	return pickLsRemote(out, "refs/heads/"+branch), nil
+}
+
+// pickLsRemote returns the sha of the `<sha>\t<ref>` line of ls-remote output
+// whose ref is exactly ref, or "" (#198 review): ls-remote matches a pattern
+// against the TAIL of a name, so the first line need not be that branch. Pure.
+func pickLsRemote(out, ref string) string {
+	for _, ln := range strings.Split(out, "\n") {
+		if sha, name, ok := strings.Cut(strings.TrimSpace(ln), "\t"); ok && name == ref {
+			return sha
+		}
 	}
-	return strings.Fields(out)[0], nil // "<sha>\trefs/heads/<branch>"
+	return ""
 }
 
 // Abs resolves a possibly-relative path against the repo root.
