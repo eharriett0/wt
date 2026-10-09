@@ -194,11 +194,38 @@ func New(c *config.Config, branch string) (string, error) {
 // then worktree-adds it (WorktreeAdopt — never `-b`, so it lands on that exact
 // branch). Same live-worktree short-circuit + stale-dir reconcile + link_files
 // wiring as New. (#134)
-func Adopt(c *config.Config, branch string) (string, error) {
+//
+// #167: worktree-add takes refs/heads/<branch> whenever it exists, so a stale
+// local branch left by an earlier PR that reused the name used to be checked out
+// in place of the PR head. Now, after the fetch, the target is origin/<branch>;
+// adopting by PR, it must first carry the PR's head (resolveAdoptTarget), or
+// nothing is checked out, created or moved: a fork PR's head is not on origin.
+// The local branch is then checked against it by prepareLocalBranch: equal or
+// only ahead (unpushed) is attached, only-behind is fast-forwarded first, and a
+// diverged one is refused with both SHAs. The new worktree must then be on the
+// branch at that commit (verifyAdopted). The fetch runs before the short-circuit
+// so an existing worktree is checked too (checkExistingWorktree) instead of being
+// handed back unchecked.
+func Adopt(c *config.Config, branch string, want AdoptWant) (string, error) {
 	slug := strings.ReplaceAll(branch, "/", "-")
 	wtDir := filepath.Join(c.WorktreeRoot, slug)
 
+	ui.Step("fetching origin/%s", branch)
+	fetchErr := gitx.Fetch("origin", branch)
+	if fetchErr != nil {
+		// Not fatal: the branch may be purely local, or origin may be offline —
+		// WorktreeAdopt still succeeds on a local ref and errors clearly otherwise.
+		ui.Warn("git fetch origin %s failed (trying local refs): %v", branch, fetchErr)
+	}
+	target, err := resolveAdoptTarget(branch, want, fetchErr == nil, c.WorktreeRoot)
+	if err != nil {
+		return "", err
+	}
+
 	if isValidWorktree(wtDir) {
+		if err := checkExistingWorktree(wtDir, branch, want, target); err != nil {
+			return "", err
+		}
 		ui.OK("worktree already exists at %s", wtDir)
 		ui.Step("cd %s", wtDir)
 		return wtDir, nil
@@ -206,12 +233,11 @@ func Adopt(c *config.Config, branch string) (string, error) {
 	if err := reconcileWorktreeDir(wtDir); err != nil {
 		return "", err
 	}
-
-	ui.Step("fetching origin/%s", branch)
-	if err := gitx.Fetch("origin", branch); err != nil {
-		// Not fatal: the branch may be purely local, or origin may be offline —
-		// WorktreeAdopt still succeeds on a local ref and errors clearly otherwise.
-		ui.Warn("git fetch origin %s failed (trying local refs): %v", branch, err)
+	// After the reconcile's prune, so a worktree whose directory is already gone
+	// does not count as having the branch checked out.
+	intended, err := prepareLocalBranch(branch, want, target)
+	if err != nil {
+		return "", err
 	}
 
 	if err := os.MkdirAll(c.WorktreeRoot, 0o755); err != nil {
@@ -224,6 +250,9 @@ func Adopt(c *config.Config, branch string) (string, error) {
 		// worktree (common for adopt), or absent locally and on origin. The
 		// error already carries git's own stderr with the real reason. (#134)
 		return "", fmt.Errorf("could not attach a worktree to branch %q — it may be checked out in another worktree, or absent locally and on origin: %w", branch, err)
+	}
+	if err := verifyAdopted(wtDir, branch, intended); err != nil {
+		return "", err
 	}
 
 	linkSharedFiles(c, wtDir)

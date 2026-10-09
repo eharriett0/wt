@@ -276,8 +276,17 @@ func hookVerdict(t *testing.T, out string) string {
 	}
 }
 
+// hermeticGitT keeps the runner's ~/.gitconfig and system config away from
+// every git the test runs (commit.gpgsign with an unusable key fails commits).
+func hermeticGitT(t *testing.T) {
+	t.Helper()
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+}
+
 func gitT(t *testing.T, dir string, args ...string) {
 	t.Helper()
+	hermeticGitT(t)
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	if out, err := cmd.CombinedOutput(); err != nil {

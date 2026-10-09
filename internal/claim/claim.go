@@ -164,6 +164,22 @@ func Claim(c *config.Config, issue string, force, yes, openPR bool, epic string)
 	return nil
 }
 
+// resolveAdopt turns `wt adopt`'s argument into the branch to adopt and what it
+// must land on (#167): a PR number becomes its head branch plus its head commit
+// (prHead is ghx.PRHead, in one gh call), which worktree.Adopt then requires
+// origin/<branch> to carry; anything else is a branch name, checked against
+// origin/<branch> alone. Pure apart from prHead.
+func resolveAdopt(target string, prHead func(string) (string, string, error)) (string, worktree.AdoptWant, error) {
+	if !issueRe.MatchString(target) {
+		return target, worktree.AdoptWant{}, nil
+	}
+	branch, oid, err := prHead(target)
+	if err != nil {
+		return "", worktree.AdoptWant{}, fmt.Errorf("resolve PR #%s head (is gh authed? `wt doctor`): %w", target, err)
+	}
+	return branch, worktree.AdoptWant{PR: target, PRHead: oid}, nil
+}
+
 // Release clears the claim's active-work entry and unassigns the issue. With
 // clean, it ALSO removes the worktree when the branch is abandoned — clean tree,
 // no open/merged PR, only WIP placeholder commits (#42) — so releasing actually
@@ -178,18 +194,16 @@ func Adopt(c *config.Config, target, epic string) error {
 	if strings.TrimSpace(target) == "" {
 		return fmt.Errorf("usage: wt adopt <branch|pr#>")
 	}
-	branch := target
+	branch, want, err := resolveAdopt(target, ghx.PRHead)
+	if err != nil {
+		return err
+	}
 	prURL := ""
-	if issueRe.MatchString(target) { // a PR number → resolve its head branch
-		b, err := ghx.PRHeadBranch(target)
-		if err != nil || strings.TrimSpace(b) == "" {
-			return fmt.Errorf("resolve PR #%s head branch (is gh authed? `wt doctor`): %w", target, err)
-		}
-		branch = strings.TrimSpace(b)
+	if want.PR != "" {
 		prURL = ghx.PRURL(target)
 	}
 
-	wtDir, err := worktree.Adopt(c, branch)
+	wtDir, err := worktree.Adopt(c, branch, want)
 	if err != nil {
 		return err
 	}
