@@ -81,6 +81,11 @@ type CheckEntry struct {
 	AlreadyMerged  bool             `json:"already_merged,omitempty"`  // #109: other window's blob == origin/base — stale index, not a live collision
 	Untracked      bool             `json:"untracked,omitempty"`       // #113: other window's claim is an untracked file — no committed content to collide with
 	Subsumed       bool             `json:"subsumed,omitempty"`        // #122: the other window's change to this file is already on base (landed elsewhere) — not contested
+
+	// otherWorktree is the worktree this entry was graded against (#193), for
+	// the pre-edit hooks' #122 re-check: Window is a label, and a label can name
+	// two windows. Not in the JSON.
+	otherWorktree string
 }
 
 // subsumedByBase reports whether the other window's change to path is already
@@ -243,7 +248,7 @@ func (g *gitGradeFacts) SharedSections(worktrees []string, path, delimiter strin
 // the shared-doc / append-only globs match; cf.MatchedFile is the resolved repo-
 // relative file every git lookup uses.
 func gradeEntry(c *config.Config, f gradeFacts, currentWorktree, otherWt string, cf collide.Conflict, wl collide.WindowLiveness) CheckEntry {
-	e := CheckEntry{Path: cf.Path, Window: cf.Window, Liveness: wl.Label()}
+	e := CheckEntry{Path: cf.Path, Window: cf.Window, Liveness: wl.Label(), otherWorktree: otherWt}
 
 	// Use the resolved repo-relative file (cf.MatchedFile) for hunk / blob
 	// lookup — cf.Path may be a fuzzy basename that git pathspec can't
@@ -323,17 +328,25 @@ func buildCheckReport(c *config.Config, ws []collide.Window, currentWorktree str
 // checkEntries is buildCheckReport's decision: every conflict graded by
 // gradeEntry, sorted by path then window. Pure given f, which is what lets a test
 // hold the per-turn banner against `wt check` itself (#182).
+//
+// Each conflict is graded against ITS window's worktree (collide.WorktreeOf,
+// #193), never the label's: two windows can share a label, and the label lookup
+// graded a real overlap against the namesake's disjoint hunks. Liveness stays
+// per label, which ClassifyWindows resolves to the least-suppressed namesake
+// (#182), so a shared label can only surface more, never hide.
 func checkEntries(c *config.Config, f gradeFacts, ws []collide.Window, currentWorktree string, conflicts []collide.Conflict, live map[string]collide.WindowLiveness) []CheckEntry {
-	byLabel := windowByLabel(ws)
 	var out []CheckEntry
 	for _, cf := range conflicts {
-		out = append(out, gradeEntry(c, f, currentWorktree, byLabel[cf.Window].Worktree, cf, live[cf.Window]))
+		out = append(out, gradeEntry(c, f, currentWorktree, collide.WorktreeOf(cf, ws), cf, live[cf.Window]))
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Path != out[j].Path {
 			return out[i].Path < out[j].Path
 		}
-		return out[i].Window < out[j].Window
+		if out[i].Window != out[j].Window {
+			return out[i].Window < out[j].Window
+		}
+		return out[i].otherWorktree < out[j].otherWorktree
 	})
 	return out
 }

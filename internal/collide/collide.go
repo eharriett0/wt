@@ -167,6 +167,30 @@ type Conflict struct {
 	// matched Path (may differ from Path when Path was a fuzzy basename/suffix
 	// query) — used for hunk-range lookup so basename checks on nested files
 	// still grade.
+	// Worktree is the other window's worktree path, as Scan recorded it (#193).
+	// A label is not an identity: two worktrees that claimed one issue are both
+	// "#N", and two detached ones whose directories share a name are both that
+	// name. Everything that reads the other window's files (ranges, blobs,
+	// untracked, subsumed) reads THIS worktree; resolving the label instead picked
+	// whichever namesake came last, and graded a real overlap against its
+	// disjoint hunks. "" only on a Conflict built by hand (WorktreeOf).
+	Worktree string
+}
+
+// WorktreeOf is the worktree conflict cf is with: the one CheckPaths recorded,
+// or, for a Conflict built by hand without one, the worktree of the window its
+// label names in ws (#193). Labels collide only between real windows, and a
+// CheckPaths conflict always carries its worktree. Pure.
+func WorktreeOf(cf Conflict, ws []Window) string {
+	if cf.Worktree != "" {
+		return cf.Worktree
+	}
+	for _, w := range ws {
+		if w.Label() == cf.Window {
+			return w.Worktree
+		}
+	}
+	return ""
 }
 
 // MatchMode is how a requested path is compared with a window's touched files.
@@ -270,7 +294,7 @@ func CheckPaths(ws []Window, currentWorktree string, qs []Query) []Conflict {
 			if matched, ok := matchTouched(q, w.Touched); ok {
 				if _, dup := seen[matched]; !dup {
 					seen[matched] = struct{}{}
-					out = append(out, Conflict{Path: q.Path, Window: w.Label(), MatchedFile: matched})
+					out = append(out, Conflict{Path: q.Path, Window: w.Label(), MatchedFile: matched, Worktree: w.Worktree})
 				}
 				continue
 			}
@@ -285,7 +309,7 @@ func CheckPaths(ws []Window, currentWorktree string, qs []Query) []Conflict {
 					continue
 				}
 				seen[f] = struct{}{}
-				out = append(out, Conflict{Path: f, Window: w.Label(), MatchedFile: f})
+				out = append(out, Conflict{Path: f, Window: w.Label(), MatchedFile: f, Worktree: w.Worktree})
 			}
 		}
 	}
@@ -293,7 +317,10 @@ func CheckPaths(ws []Window, currentWorktree string, qs []Query) []Conflict {
 		if out[i].Path != out[j].Path {
 			return out[i].Path < out[j].Path
 		}
-		return out[i].Window < out[j].Window
+		if out[i].Window != out[j].Window {
+			return out[i].Window < out[j].Window
+		}
+		return out[i].Worktree < out[j].Worktree // namesakes (#193)
 	})
 	return out
 }

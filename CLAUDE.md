@@ -148,7 +148,13 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   named by their directory. Overlaps carry worktrees (`Overlap.Worktrees`,
   `collide.Self`) and pairs grade by worktree; `ClassifyWindows` keeps a shared
   label's least-suppressed answer. Grading by label compared one window with
-  itself and dropped a real pair.
+  itself and dropped a real pair. **So do conflicts (#193):** `collide.Conflict`
+  carries the other window's `Worktree` (set in `CheckPaths`), and
+  `checkEntries`, `hooks.gradeConflicts` and the edit hooks' #122 re-check read
+  THAT worktree (`collide.WorktreeOf`), never the label's: the label lookup kept
+  the last namesake, so a real overlap was graded against its twin's disjoint
+  hunks and pre-push let it through. Liveness stays per label (least-suppressed,
+  so a shared label can only surface more).
 - **A real path matches EXACTLY; only a search term is fuzzy (#181).** Paths
   from git or a hook payload (pre-push outgoing, pre-commit staged,
   Claude/Codex edit targets) go through `collide.ExactQueries`. A `wt check` /

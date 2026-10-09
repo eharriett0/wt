@@ -222,9 +222,8 @@ func hookClaudeEdit(r io.Reader) int {
 			pending, pendingOK = gitx.LinesToBase(root, c.Base, rel, onDisk)
 		}
 	}
-	byLabel := windowByLabel(ws)
 	graded := regradePending(entries, cur, curOK, pending, pendingOK, func(e CheckEntry) bool {
-		return subsumedByBase(byLabel[e.Window].Worktree, c.Base, rel)
+		return subsumedByBase(e.otherWorktree, c.Base, rel) // that window's, not a namesake's (#193)
 	})
 
 	var high []CheckEntry

@@ -80,7 +80,7 @@ func TestCheckPaths(t *testing.T) {
 	}
 	// From window 2, about to edit internal/foo.go + README.md.
 	got := CheckPaths(ws, "/w/2", ExactQueries([]string{"internal/foo.go", "README.md"}))
-	want := []Conflict{{Path: "internal/foo.go", Window: "#1", MatchedFile: "internal/foo.go"}}
+	want := []Conflict{{Path: "internal/foo.go", Window: "#1", MatchedFile: "internal/foo.go", Worktree: "/w/1"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("CheckPaths =\n%#v\nwant\n%#v", got, want)
 	}
@@ -164,7 +164,7 @@ func TestCheckPaths_NamesTheFileThatActuallyCollides(t *testing.T) {
 		{Branch: "feat-a", Worktree: "/w/a"},
 	}
 	got := CheckPaths(ws, "/w/a", ExactQueries([]string{"README.md", "pkg/svc/README.md"}))
-	want := []Conflict{{Path: "pkg/svc/README.md", Window: "feat-b", MatchedFile: "pkg/svc/README.md"}}
+	want := []Conflict{{Path: "pkg/svc/README.md", Window: "feat-b", MatchedFile: "pkg/svc/README.md", Worktree: "/w/b"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("CheckPaths =\n%#v\nwant\n%#v", got, want)
 	}
@@ -181,13 +181,44 @@ func TestCheckPaths_ExactQueryNamesTheEntry(t *testing.T) {
 	fz, ex := Query{Path: "NEW.md", Mode: MatchFuzzy}, Query{Path: "pkg/svc/NEW.md"}
 	for _, qs := range [][]Query{{fz, ex}, {ex, fz}} {
 		got := CheckPaths(ws, "/w/a", qs)
-		want := []Conflict{{Path: "pkg/svc/NEW.md", Window: "feat-b", MatchedFile: "pkg/svc/NEW.md"}}
+		want := []Conflict{{Path: "pkg/svc/NEW.md", Window: "feat-b", MatchedFile: "pkg/svc/NEW.md", Worktree: "/w/b"}}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("CheckPaths(%+v) =\n%#v\nwant\n%#v", qs, got, want)
 		}
 	}
 	if got := exactFirst([]Query{fz, ex, {Path: "a"}}); !reflect.DeepEqual(got, []Query{ex, {Path: "a"}, fz}) {
 		t.Errorf("exactFirst = %+v, want exact ones in order, then fuzzy", got)
+	}
+}
+
+// #193: a label is not an identity. Two detached worktrees whose directories
+// share a name are both labelled by it; each conflict must say which worktree it
+// is with, so the grade reads that window's hunks and not its namesake's.
+func TestCheckPaths_NamesakesKeepTheirWorktrees(t *testing.T) {
+	ws := []Window{
+		{Branch: "HEAD", Worktree: "/p2/x", Touched: []string{"big.txt"}},
+		{Branch: "HEAD", Worktree: "/p1/x", Touched: []string{"big.txt"}},
+		{Branch: "cur", Worktree: "/wt/cur", Touched: []string{"big.txt"}},
+	}
+	got := CheckPaths(ws, "/wt/cur", ExactQueries([]string{"big.txt"}))
+	want := []Conflict{
+		{Path: "big.txt", Window: "x", MatchedFile: "big.txt", Worktree: "/p1/x"},
+		{Path: "big.txt", Window: "x", MatchedFile: "big.txt", Worktree: "/p2/x"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("CheckPaths =\n%#v\nwant\n%#v", got, want)
+	}
+	for _, cf := range got {
+		if w := WorktreeOf(cf, ws); w != cf.Worktree {
+			t.Errorf("WorktreeOf(%+v) = %q, want the recorded %q", cf, w, cf.Worktree)
+		}
+	}
+	// a Conflict built by hand, without a worktree, falls back to its label
+	if w := WorktreeOf(Conflict{Path: "big.txt", Window: "cur"}, ws); w != "/wt/cur" {
+		t.Errorf("WorktreeOf(by label) = %q, want /wt/cur", w)
+	}
+	if w := WorktreeOf(Conflict{Path: "big.txt", Window: "nobody"}, ws); w != "" {
+		t.Errorf("WorktreeOf(unknown label) = %q, want empty", w)
 	}
 }
 
@@ -304,8 +335,8 @@ func TestCheckPaths_DirectoryExpandsToFilesBeneathIt(t *testing.T) {
 	}
 	got := CheckPaths(ws, "/w/2", ExactQueries([]string{"envs/app/"}))
 	want := []Conflict{
-		{Path: "envs/app/kustomization.yaml", Window: "#1", MatchedFile: "envs/app/kustomization.yaml"},
-		{Path: "envs/app/netpol.yaml", Window: "#1", MatchedFile: "envs/app/netpol.yaml"},
+		{Path: "envs/app/kustomization.yaml", Window: "#1", MatchedFile: "envs/app/kustomization.yaml", Worktree: "/w/1"},
+		{Path: "envs/app/netpol.yaml", Window: "#1", MatchedFile: "envs/app/netpol.yaml", Worktree: "/w/1"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("directory must expand to the files beneath it =\n%#v\nwant\n%#v", got, want)
@@ -382,7 +413,7 @@ func TestCheckPaths_ExactFileMatchIsUnchangedByDirectorySupport(t *testing.T) {
 		{Issue: "2", Worktree: "/w/2", Touched: nil},
 	}
 	got := CheckPaths(ws, "/w/2", fuzzy("foo.go"))
-	want := []Conflict{{Path: "foo.go", Window: "#1", MatchedFile: "internal/foo.go"}}
+	want := []Conflict{{Path: "foo.go", Window: "#1", MatchedFile: "internal/foo.go", Worktree: "/w/1"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("file matching changed =\n%#v\nwant\n%#v", got, want)
 	}
