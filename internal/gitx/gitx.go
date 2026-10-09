@@ -27,17 +27,30 @@ var gitScopeEnvVars = []string{
 	"GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_NAMESPACE",
 }
 
+// gitPathspecEnvVars are git's global pathspec switches. git exports them to
+// the hooks of a `git --literal-pathspecs …` run (or --glob/--noglob/--icase).
+// Every path wt hands to git carries its own ":(literal)" magic (literalPath,
+// #204), and under GIT_LITERAL_PATHSPECS git reads that magic as part of the
+// file name, so the path matches nothing; icase would match a file whose name
+// differs only in case. Stripped like the scope vars, so a path means exactly
+// that file whatever the caller's git was told.
+var gitPathspecEnvVars = []string{
+	"GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS",
+}
+
 // scopedEnv returns the current environment with the repo/worktree-pinning git
-// vars removed, so a git subprocess discovers its repo from cwd / -C dir.
+// vars and the global pathspec switches removed, so a git subprocess discovers
+// its repo from cwd / -C dir and reads a path as that file.
 func scopedEnv() []string {
 	env := os.Environ()
 	out := env[:0:0]
 	for _, kv := range env {
 		drop := false
-		for _, v := range gitScopeEnvVars {
-			if strings.HasPrefix(kv, v+"=") {
-				drop = true
-				break
+		for _, vars := range [][]string{gitScopeEnvVars, gitPathspecEnvVars} {
+			for _, v := range vars {
+				if strings.HasPrefix(kv, v+"=") {
+					drop = true
+				}
 			}
 		}
 		if !drop {
@@ -46,6 +59,16 @@ func scopedEnv() []string {
 	}
 	return out
 }
+
+// literalPath is how a file's path is passed to git after "--" (#204). There
+// git reads it as a pathspec: "a[1].md" is a glob that also matches a1.md,
+// "*.md" every .md file and "?x" ax, and a leading ':' starts pathspec magic,
+// so ":colon.md" asked about colon.md. The ":(literal)" magic makes it match
+// that one file. A relative (../ included) or absolute path resolves as before.
+// Prefixing the path, rather than passing git-wide --literal-pathspecs, keeps
+// the subcommand at args[0], where the gitOutput failure-injection tests match
+// it. Pure.
+func literalPath(p string) string { return ":(literal)" + p }
 
 // gitOutput runs git with args in dir ("" = current dir), the repo-pinning env
 // stripped (scopedEnv), and returns its stdout. It is a var for exactly one
@@ -68,6 +91,42 @@ func run(dir string, args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
+// runReporting is run for a command whose failure the operator has to act on
+// (#198 review): its error carries git's own stderr (gitStderr), wrapping the
+// *exec.ExitError. Fetch and PushSetUpstream failed with a bare "exit status
+// 128", so a branch origin had deleted read as being offline, and a rejected
+// push gave no reason at all.
+func runReporting(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	cmd.Env = scopedEnv()
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		if msg := gitStderr(stderr.String()); msg != "" {
+			err = fmt.Errorf("%w: %s", err, msg)
+		}
+	}
+	return strings.TrimSpace(string(out)), err
+}
+
+// gitStderr condenses git's stderr for an error message: blank lines and git's
+// "hint:" lines dropped, the rest joined with "; ". Pure.
+func gitStderr(s string) string {
+	var lines []string
+	for _, ln := range strings.Split(s, "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln == "" || strings.HasPrefix(ln, "hint:") {
+			continue
+		}
+		lines = append(lines, ln)
+	}
+	return strings.Join(lines, "; ")
+}
+
 // noRenames is the flag every `git diff --name-only` feeding the collision
 // engine passes: a move is listed by BOTH its old and new path, never just the
 // new one (#181 review). With rename detection on (git's default), a window that
@@ -78,6 +137,62 @@ func run(dir string, args ...string) (string, error) {
 // direction a collision check can afford, and matches what the porcelain read
 // in TouchedFiles already does for a staged move (#28).
 const noRenames = "--no-renames"
+
+// nulPaths is the flag every git command that LISTS paths for the collision
+// engine passes (#200): print each path verbatim, NUL-terminated. Read line by
+// line, git C-quotes any path holding a byte it calls unusual: under the
+// default core.quotePath that is every non-ASCII byte, plus `"`, `\` and
+// control characters (a porcelain status quotes a space too). So `café.md` came
+// back as `"caf\303\251.md"`, was stored as the window's touched path, and
+// `wt check café.md`, the pre-push gate and both edit hooks, which all ask
+// about the real name, never matched it: a collision on any non-ASCII file went
+// unreported. -z output is never quoted, and a name holding a tab, quote or
+// newline survives it as well. Read it with runRaw and split it with splitNUL or
+// parsePorcelainZ, never trimmed: a name can start or end with a space.
+const nulPaths = "-z"
+
+// splitNUL splits a -z path list (`git diff --name-only -z`) into its paths,
+// dropping the empty record after the final NUL. Each path is verbatim:
+// unquoted, untrimmed. Pure (#200).
+func splitNUL(out string) []string {
+	var paths []string
+	for _, p := range strings.Split(out, "\x00") {
+		if p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths
+}
+
+// parsePorcelainZ returns every path `git status --porcelain -z` names (#200).
+// A record is "XY <path>": the two status columns, a space, the path verbatim.
+// A rename or copy (R or C in either column: a staged move, or an intent-to-add
+// one in the worktree) is followed by one more record, the ORIGINAL path. -z
+// writes the new path first, the reverse of the line format's "old -> new".
+// Both are returned (#28): window A renaming x.go while window B edits x.go is
+// a real conflict, and recording the old path can only add a flag. Pure.
+func parsePorcelainZ(out string) []string {
+	recs := strings.Split(out, "\x00")
+	var paths []string
+	for i := 0; i < len(recs); i++ {
+		rec := recs[i]
+		if len(rec) < 4 {
+			continue // the empty record after the final NUL
+		}
+		paths = append(paths, rec[3:])
+		if renameOrCopy(rec[0]) || renameOrCopy(rec[1]) {
+			i++ // the original path is the next record, not a status record
+			if i < len(recs) && recs[i] != "" {
+				paths = append(paths, recs[i])
+			}
+		}
+	}
+	return paths
+}
+
+// renameOrCopy reports whether a porcelain status column says the record
+// carries a second (original) path.
+func renameOrCopy(col byte) bool { return col == 'R' || col == 'C' }
 
 // StagedFiles returns the paths staged for the IN-PROGRESS commit. It PRESERVES
 // git's ambient environment (unlike run(), which strips GIT_INDEX_FILE) because
@@ -90,19 +205,14 @@ const noRenames = "--no-renames"
 // the cross-worktree `-C dir` scans need scopedEnv.
 //
 // --no-renames: a staged move is listed by BOTH paths (#181 review), as the
-// collision engine's other name sources are (noRenames).
+// collision engine's other name sources are (noRenames). -z: each path as it
+// is, never C-quoted (nulPaths, #200).
 func StagedFiles() ([]string, error) {
-	out, err := exec.Command("git", "diff", "--cached", "--name-only", noRenames).Output()
+	out, err := exec.Command("git", "diff", "--cached", "--name-only", noRenames, nulPaths).Output()
 	if err != nil {
 		return nil, err
 	}
-	var files []string
-	for _, ln := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if s := strings.TrimSpace(ln); s != "" {
-			files = append(files, s)
-		}
-	}
-	return files, nil
+	return splitNUL(string(out)), nil
 }
 
 // Run executes git in the current directory.
@@ -210,29 +320,42 @@ func DefaultBranch() string {
 	return "main"
 }
 
-// Fetch updates remote/branch quietly (best-effort; error returned for caller).
+// Fetch updates refs/remotes/<remote>/<branch> from the remote's
+// refs/heads/<branch> (best-effort; the error, for the caller, carries git's
+// stderr).
+//
+// The refspec is spelled out (#198 review). `git fetch origin <branch>` writes
+// the remote-tracking ref only when the remote's configured fetch refspec covers
+// it, and a single-branch clone's (`--single-branch`, which every `--depth`
+// clone is) covers only its one branch: the fetch succeeded into FETCH_HEAD,
+// origin/<branch> was never written, and a stale local branch read as never
+// pushed. The leading + takes a force-push, as the default refspec does.
 func Fetch(remote, branch string) error {
-	_, err := Run("fetch", remote, branch)
+	_, err := runReporting("", "fetch", remote, "+refs/heads/"+branch+":refs/remotes/"+remote+"/"+branch)
 	return err
 }
 
-// WorktreeAdd creates a new worktree at path on a new branch from base.
-func WorktreeAdd(path, branch, base string) error {
-	// If the branch already exists (its previous worktree was removed out-of-band
-	// but the branch — and its commits — survived), re-attach it to a fresh
-	// worktree instead of `-b` (which errors "branch already exists") (#62).
-	if LocalBranchExists(branch) {
-		_, err := Run("worktree", "add", path, branch)
+// WorktreeAddNewBranch creates a new worktree at path on a NEW branch cut from
+// base. git refuses when the branch already exists, so it can never re-attach
+// one: `wt new` decides that itself, after checking the branch against
+// origin/<branch> (#198), and attaches with WorktreeAdopt. The error carries
+// git's own stderr.
+func WorktreeAddNewBranch(path, branch, base string) error {
+	cmd := exec.Command("git", "worktree", "add", "-b", branch, path, base)
+	cmd.Env = scopedEnv()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		if msg := strings.TrimSpace(string(out)); msg != "" {
+			return fmt.Errorf("%w: %s", err, msg)
+		}
 		return err
 	}
-	_, err := Run("worktree", "add", path, "-b", branch, base)
-	return err
+	return nil
 }
 
 // WorktreeAdopt attaches a worktree at path to an EXISTING branch — a local
 // refs/heads/<branch> or, via git worktree-add's DWIM, a lone remote
 // origin/<branch> (which materializes a local tracking branch). Unlike
-// WorktreeAdd it NEVER creates a branch from base: adopting someone else's or a
+// WorktreeAddNewBranch it NEVER creates a branch from base: adopting someone else's or a
 // previous session's PR branch must land on that exact branch, not a fresh fork
 // of it. On failure — the branch is absent, OR (common for adopt) already
 // checked out in another worktree — the error carries git's own stderr so the
@@ -249,24 +372,67 @@ func WorktreeAdopt(path, branch string) error {
 	return nil
 }
 
-// LocalBranchExists reports whether refs/heads/<branch> exists.
-func LocalBranchExists(branch string) bool {
-	_, err := Run("rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
-	return err == nil
-}
-
 // RemoteTrackingTip returns the commit refs/remotes/origin/<branch> points at, as
-// last fetched, or "" when there is no such ref. No network. `wt adopt <branch>`
-// checks a local branch of the same name against it (#167).
+// last fetched, or "" when no ref has EXACTLY that name. No network. `wt adopt
+// <branch>`, `wt new` and `wt claim` check a local branch of the same name
+// against it (#167, #198).
+//
+// It lists refs instead of resolving the name (#198 review). With
+// core.ignorecase a loose ref is a file, and its lookup ignores case, so
+// rev-parse of refs/remotes/origin/feat/x returned origin's Feat/x, another
+// branch, and `wt new feat/x` fast-forwarded a never-pushed feat/x onto its
+// commits. for-each-ref reads every name as stored, and the name must match.
 func RemoteTrackingTip(branch string) string {
 	if branch == "" {
 		return ""
 	}
-	out, err := Run("rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+branch+"^{commit}")
+	return exactRefTip("refs/remotes/origin/" + branch)
+}
+
+// exactRefTip returns the commit the ref named exactly ref points at, or "".
+func exactRefTip(ref string) string {
+	out, err := Run("for-each-ref", "--format=%(objectname) %(objecttype) %(refname)", ref)
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(out)
+	return pickExactRef(out, ref)
+}
+
+// pickExactRef reads `for-each-ref --format='%(objectname) %(objecttype)
+// %(refname)'` output and returns the commit of the line whose refname is
+// exactly ref, "" when none is or it is not a commit. A pattern also matches
+// refs below it (ref/x), and a name differing in case must not count. Pure.
+func pickExactRef(out, ref string) string {
+	for _, ln := range strings.Split(out, "\n") {
+		f := strings.SplitN(strings.TrimSpace(ln), " ", 3)
+		if len(f) == 3 && f[2] == ref && f[1] == "commit" {
+			return f[0]
+		}
+	}
+	return ""
+}
+
+// WorktreeToplevel returns the top directory of the work tree that holds dir
+// (`git rev-parse --show-toplevel`, run in dir), or "" when dir is in none. A
+// directory nested inside a checkout reports that checkout's top, which is how
+// wt tells its own worktree from a stray directory under the main checkout
+// (#198 review).
+func WorktreeToplevel(dir string) string {
+	out, err := RunDir(dir, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return ""
+	}
+	return out
+}
+
+// BranchUpstream returns branch.<branch>.remote and branch.<branch>.merge from
+// the repo's config, "" for either when unset (#198 review). Unlike HasUpstream
+// it needs no worktree on the branch, and it still answers once origin has
+// deleted the branch and the remote-tracking ref is gone.
+func BranchUpstream(branch string) (remote, merge string) {
+	remote, _ = Run("config", "--get", "branch."+branch+".remote")
+	merge, _ = Run("config", "--get", "branch."+branch+".merge")
+	return remote, merge
 }
 
 // HeadCommit returns the commit HEAD points at in the worktree at dir, or "" when
@@ -566,9 +732,12 @@ func IsInsideWorktree(dir string) bool {
 
 // IsTracked reports whether path is known to git — tracked in the index (so a
 // path deleted in the working tree but still in git returns true). Used by
-// `wt check` to distinguish a deleted/renamed path from a typo (#93).
+// `wt check` to distinguish a deleted/renamed path from a typo (#93). The path
+// is that one file (literalPath, #204): read as a pattern, `sub/[y].md` was
+// "tracked" because sub/y.md is, and `wt check` cleared a path that names
+// nothing.
 func IsTracked(path string) bool {
-	_, err := Run("ls-files", "--error-unmatch", "--", path)
+	_, err := Run("ls-files", "--error-unmatch", "--", literalPath(path))
 	return err == nil
 }
 
@@ -576,7 +745,7 @@ func IsTracked(path string) bool {
 // current directory. MCP wt_check reads its paths from the repo root, whatever
 // directory the server was started in (#181 review).
 func IsTrackedIn(dir, path string) bool {
-	_, err := RunDir(dir, "ls-files", "--error-unmatch", "--", path)
+	_, err := RunDir(dir, "ls-files", "--error-unmatch", "--", literalPath(path))
 	return err == nil
 }
 
@@ -619,20 +788,15 @@ func AllZeroSHA(ref string) bool {
 // is the #106 family for the not-rebased case: #106 moved the `from` ref to base,
 // but two-dot still diverged whenever base wasn't already an ancestor of `to`.
 // For a fast-forward (from is an ancestor of to) three-dot == two-dot, so the FF
-// case is unchanged. A move is listed by both paths (noRenames). Runs in dir
-// (empty → cwd). Best-effort.
+// case is unchanged. A move is listed by both paths (noRenames), and every path
+// as it is, never C-quoted (nulPaths, #200). Runs in dir (empty → cwd).
+// Best-effort.
 func RangeChangedPaths(dir, from, to string) ([]string, error) {
-	out, err := RunDir(dir, "diff", "--name-only", noRenames, from+"..."+to)
+	out, err := runRaw(dir, "diff", "--name-only", noRenames, nulPaths, from+"..."+to)
 	if err != nil {
 		return nil, err
 	}
-	var paths []string
-	for _, ln := range strings.Split(out, "\n") {
-		if s := strings.TrimSpace(ln); s != "" {
-			paths = append(paths, s)
-		}
-	}
-	return paths, nil
+	return splitNUL(out), nil
 }
 
 // IsUntracked reports whether path exists in worktree but is NOT tracked by git
@@ -646,7 +810,10 @@ func IsUntracked(worktree, path string) bool {
 	}
 	// Read-only: this asks about ANOTHER window's worktree, once per prompt from
 	// the agent banner, so it must not take that window's index.lock (#182).
-	out, err := runRawReadOnly(worktree, "status", "--porcelain", "--untracked-files=all", "--", path)
+	// literalPath (#204): as a pattern, "a[1].md" also listed an untracked a1.md
+	// there, every line read "?? ", and a real collision on a committed a[1].md
+	// was downgraded to advisory.
+	out, err := runRawReadOnly(worktree, "status", "--porcelain", "--untracked-files=all", "--", literalPath(path))
 	if err != nil {
 		return false
 	}
@@ -656,6 +823,9 @@ func IsUntracked(worktree, path string) bool {
 	// committable deletion) and "?? foo". That deletion can collide (delete/modify)
 	// with another window's edit, so it must NOT be downgraded (mirrors the #109
 	// staged-deletion lesson). Any non-"?? " line → not purely untracked → false.
+	// Only the status columns are read, so this stays line-based, unlike the
+	// path listers (nulPaths): without -z every entry is one line, a newline in
+	// its name quoted (#200).
 	sawUntracked := false
 	for _, ln := range strings.Split(out, "\n") {
 		if ln == "" {
@@ -672,6 +842,7 @@ func IsUntracked(worktree, path string) bool {
 // WorktreeBlob returns the git blob hash of the WORKING-TREE file at path inside
 // worktree (`git hash-object`), and whether it could be hashed. Lets a caller
 // compare a window's on-disk content against a ref without a diff (#109).
+// hash-object takes a file, not a pathspec, so path is already literal.
 func WorktreeBlob(worktree, path string) (string, bool) {
 	out, err := RunDir(worktree, "hash-object", "--", path)
 	if err != nil || out == "" {
@@ -681,9 +852,15 @@ func WorktreeBlob(worktree, path string) (string, bool) {
 }
 
 // RefBlob returns the git blob hash of path at ref inside worktree (`ref:path`),
-// and whether it resolved. ref "" reads the STAGED blob (`:path`). Absent ref or
-// path → ("", false) via --verify --quiet, so the caller fails safe (#109).
+// and whether it resolved. ref "" reads the STAGED blob, as `:0:path`: in the
+// short `:path` form a name like "1:x.md" reads as stage 1 of x.md (#204).
+// Absent ref or path → ("", false) via --verify --quiet, so the caller fails
+// safe (#109). The path after a ref's colon is read literally, never as a
+// pattern.
 func RefBlob(worktree, ref, path string) (string, bool) {
+	if ref == "" {
+		ref = ":0"
+	}
 	out, err := RunDir(worktree, "rev-parse", "--verify", "--quiet", ref+":"+path)
 	if err != nil || out == "" {
 		return "", false
@@ -737,14 +914,15 @@ func BehindCount(head, base string) int {
 }
 
 // MergeTreeConflicts performs an in-memory 3-way merge of head into base via
-// `git merge-tree --write-tree --name-only` — NO network, NO worktree mutation,
-// NO index touch (git >= 2.38). It returns the conflicting repo-relative paths
-// (empty when clean), whether the merge conflicted, and an error ONLY when
-// merge-tree itself could not run (bad refs / ancient git) so the caller fails
-// open rather than blocking a push on a tooling gap. Backs the #78 "this PR
-// will get NO CI until rebased" warning.
+// `git merge-tree --write-tree --name-only -z` — NO network, NO worktree
+// mutation, NO index touch (git >= 2.38, which also has -z). It returns the
+// conflicting repo-relative paths, verbatim (nulPaths, #200), empty when clean,
+// whether the merge conflicted, and an error ONLY when merge-tree itself could
+// not run (bad refs / ancient git) so the caller fails open rather than blocking
+// a push on a tooling gap. Backs the #78 "this PR will get NO CI until rebased"
+// warning.
 func MergeTreeConflicts(base, head string) (paths []string, conflicted bool, err error) {
-	cmd := exec.Command("git", "merge-tree", "--write-tree", "--name-only", base, head)
+	cmd := exec.Command("git", "merge-tree", "--write-tree", "--name-only", nulPaths, base, head)
 	cmd.Env = scopedEnv()
 	out, runErr := cmd.Output()
 	if runErr == nil {
@@ -762,26 +940,26 @@ func MergeTreeConflicts(base, head string) (paths []string, conflicted bool, err
 }
 
 // parseMergeTreeConflictPaths pulls the conflicted paths out of `git merge-tree
-// --write-tree --name-only` stdout. The format is:
+// --write-tree --name-only -z` stdout. The format is NUL-terminated records:
 //
 //	<toplevel-tree-oid>
-//	<conflicted path>...        (one per line)
-//	                            (blank line)
-//	<informational messages>...
+//	<conflicted path>...        (one record each, verbatim)
+//	                            (an empty record)
+//	<informational messages>... (only with messages on, git's default)
 //
-// so we skip line 0 (the tree OID) and take lines up to the first blank line
-// (the separator before informational text). Pure — unit-tested.
+// so we skip record 0 (the tree OID) and take records up to the first empty one
+// (the separator before the messages). Pure — unit-tested.
 func parseMergeTreeConflictPaths(out string) []string {
-	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) <= 1 {
+	recs := strings.Split(out, "\x00")
+	if len(recs) <= 1 {
 		return nil
 	}
 	var paths []string
-	for _, ln := range lines[1:] {
-		if strings.TrimSpace(ln) == "" {
+	for _, r := range recs[1:] {
+		if r == "" {
 			break
 		}
-		paths = append(paths, strings.TrimSpace(ln))
+		paths = append(paths, r)
 	}
 	return paths
 }
@@ -792,9 +970,11 @@ func parseMergeTreeConflictPaths(out string) []string {
 func TouchedFiles(dir, base string) []string {
 	set := map[string]struct{}{}
 
-	// (a) uncommitted (staged + unstaged + untracked) via porcelain. Use the
-	// raw runner: the 2-char status code + space prefix is positional, so the
-	// path begins at byte 3 of every line — trimming the blob would corrupt it.
+	// (a) uncommitted (staged + unstaged + untracked) via porcelain, -z and
+	// raw-read (nulPaths, #200): each path verbatim, never C-quoted, and the
+	// positional "XY " status prefix intact. A rename/copy records BOTH sides
+	// (#28, parsePorcelainZ): keeping only the new path misses a rename/modify
+	// clash.
 	//
 	// --untracked-files=all (#27): git's DEFAULT untracked mode collapses a
 	// fully-untracked directory to a single "dir/" entry, which never
@@ -802,44 +982,19 @@ func TouchedFiles(dir, base string) []string {
 	// collision under a freshly-created dir goes silently undetected. -uall
 	// lists each new file at its full path. Gitignored files stay excluded, so
 	// the cost is bounded to genuinely-new files.
-	if out, err := runRaw(dir, "status", "--porcelain", "--untracked-files=all"); err == nil {
-		for _, ln := range strings.Split(out, "\n") {
-			if len(ln) < 4 {
-				continue
-			}
-			path := strings.TrimSpace(ln[3:])
-			// Rename/copy "old -> new" (#28): record BOTH sides. Keeping only
-			// the new path misses a rename/modify clash — window A renames
-			// x.go, window B edits x.go — a real 3-way conflict that would
-			// otherwise show no overlap. Recording old can only add a flag,
-			// never hide one (correct for a safety tool). Each side may be
-			// individually quoted when it contains special chars.
-			if i := strings.Index(path, " -> "); i >= 0 {
-				oldp := strings.Trim(strings.TrimSpace(path[:i]), "\"")
-				newp := strings.Trim(strings.TrimSpace(path[i+len(" -> "):]), "\"")
-				if oldp != "" {
-					set[oldp] = struct{}{}
-				}
-				if newp != "" {
-					set[newp] = struct{}{}
-				}
-				continue
-			}
-			path = strings.Trim(path, "\"")
-			if path != "" {
-				set[path] = struct{}{}
-			}
+	if out, err := runRaw(dir, "status", "--porcelain", nulPaths, "--untracked-files=all"); err == nil {
+		for _, p := range parsePorcelainZ(out) {
+			set[p] = struct{}{}
 		}
 	}
 
 	// (b) committed-on-branch vs base (three-dot = since merge-base). A COMMITTED
-	// move records both paths too (noRenames), like the staged one above.
+	// move records both paths too (noRenames), like the staged one above, and
+	// every path is verbatim (nulPaths).
 	for _, ref := range []string{"origin/" + base, base} {
-		if out, err := RunDir(dir, "diff", "--name-only", noRenames, ref+"...HEAD"); err == nil {
-			for _, ln := range strings.Split(out, "\n") {
-				if p := strings.TrimSpace(ln); p != "" {
-					set[p] = struct{}{}
-				}
+		if out, err := runRaw(dir, "diff", "--name-only", noRenames, nulPaths, ref+"...HEAD"); err == nil {
+			for _, p := range splitNUL(out) {
+				set[p] = struct{}{}
 			}
 			break // first ref that resolves wins
 		}
@@ -951,14 +1106,18 @@ func ChangedRanges(dir, base, file string) []LineRange {
 // ranges with others (the pre-edit hooks add an agent's pending edit to them)
 // must then fall back to a conservative grade: there an empty set would read as
 // "no edits", where the graders read it as indeterminate.
+//
+// Every diff names file as that one file (literalPath, #204). Read as a
+// pattern, "*.md" folded every .md file's hunks into this one's, and
+// ":colon.md" measured colon.md instead, so its own edits never counted.
 func ChangedRangesChecked(dir, base, file string) (ranges []LineRange, ok bool) {
 	ref, sha, hasBase := resolveBaseRef(dir, base)
 	if !hasBase {
 		return uncommittedRangesNew(dir, file)
 	}
 	if mb := behindMergeBase(dir, ref, sha, file); mb != "" {
-		own, ownErr := runRaw(dir, "diff", "-U0", mb, "--", file)
-		moved, movedErr := runRaw(dir, "diff", "-U0", mb, ref, "--", file)
+		own, ownErr := runRaw(dir, "diff", "-U0", mb, "--", literalPath(file))
+		moved, movedErr := runRaw(dir, "diff", "-U0", mb, ref, "--", literalPath(file))
 		if ownErr == nil && movedErr == nil {
 			return mapHunksToBase(parseHunks(own), parseHunks(moved)), true
 		}
@@ -966,7 +1125,7 @@ func ChangedRangesChecked(dir, base, file string) (ranges []LineRange, ok bool) 
 		// which over-reports (base's own edits read as the branch's). A noisy
 		// grade, never a hidden one.
 	}
-	out, err := runRaw(dir, "diff", "-U0", ref, "--", file)
+	out, err := runRaw(dir, "diff", "-U0", ref, "--", literalPath(file))
 	if err != nil {
 		return nil, false
 	}
@@ -1003,11 +1162,11 @@ func ChangedRangesNew(dir, base, file string) []LineRange {
 		return wholeFile
 	}
 	if mb := behindMergeBase(dir, ref, sha, file); mb != "" {
-		if out, err := runRaw(dir, "diff", "-U0", mb, "--", file); err == nil {
+		if out, err := runRaw(dir, "diff", "-U0", mb, "--", literalPath(file)); err == nil {
 			return parseHunkRanges(out)
 		}
 	}
-	out, err := runRaw(dir, "diff", "-U0", ref, "--", file)
+	out, err := runRaw(dir, "diff", "-U0", ref, "--", literalPath(file))
 	if err != nil {
 		return wholeFile
 	}
@@ -1033,14 +1192,14 @@ func LinesToBase(dir, base, file string, spans []LineRange) ([]LineRange, bool) 
 		// Base-less: every window self-reports its uncommitted NEW side, which is
 		// the on-disk frame only while nothing uncommitted (not even a binary
 		// change, which has no hunks) shifts it.
-		for _, args := range [][]string{{"diff", "--", file}, {"diff", "--cached", "--", file}} {
+		for _, args := range [][]string{{"diff", "--", literalPath(file)}, {"diff", "--cached", "--", literalPath(file)}} {
 			if out, err := runRaw(dir, args...); err != nil || out != "" {
 				return nil, false
 			}
 		}
 		return spans, true
 	}
-	out, err := runRaw(dir, "diff", "-U0", ref, "--", file)
+	out, err := runRaw(dir, "diff", "-U0", ref, "--", literalPath(file))
 	if err != nil {
 		return nil, false
 	}
@@ -1300,7 +1459,7 @@ func FileChangeSubsumed(worktree, base, path string) (subsumed, known bool) {
 // still self-reports. ok=false when either diff fails.
 func uncommittedRangesNew(dir, file string) (ranges []LineRange, ok bool) {
 	ok = true
-	for _, args := range [][]string{{"diff", "-U0", "--", file}, {"diff", "-U0", "--cached", "--", file}} {
+	for _, args := range [][]string{{"diff", "-U0", "--", literalPath(file)}, {"diff", "-U0", "--cached", "--", literalPath(file)}} {
 		out, err := runRaw(dir, args...)
 		if err != nil {
 			ok = false
@@ -1342,15 +1501,57 @@ func IsClean(dir string) bool {
 	return strings.TrimSpace(out) == ""
 }
 
-// CommitEmpty makes an empty commit in dir with the given message.
+// CommitEmpty makes an empty commit in dir with the given message, and only
+// that: nothing staged goes into it (#198 review). `wt claim` makes its
+// placeholder with it, also in a worktree it was handed back, and a plain
+// `commit --allow-empty` committed whatever was staged there under the "WIP:
+// claim" subject and pushed it; `release --clean`, which reads that subject,
+// then took the branch for an abandoned placeholder and deleted it, locally and
+// on origin. `--only` with no paths commits none of the index, and git refuses
+// it in the middle of a merge or cherry-pick ("cannot do a partial commit"),
+// where a plain commit would have concluded the merge. The error carries git's
+// stderr.
 func CommitEmpty(dir, msg string) error {
-	_, err := RunDir(dir, "commit", "--allow-empty", "-m", msg)
+	_, err := runReporting(dir, "commit", "--allow-empty", "--only", "-m", msg)
 	return err
 }
 
-// PushSetUpstream pushes branch to origin and sets upstream, from dir.
+// UndoCommit moves the worktree at dir's HEAD, and so its branch, from commit
+// back to parent with `git reset --soft`: the index and the files stay as they
+// are. `wt claim` uses it to take its placeholder commit back off a branch it
+// did not create when the push fails (#198), instead of deleting the branch.
+//
+// It acts only on what a placeholder is: HEAD is still commit, parent is its
+// only parent, and it changes nothing (its tree is parent's). Resetting a merge
+// would drop its second parent with no MERGE_HEAD left to bring it back, and
+// one that changes files is somebody's work, not the claim's (#198 review).
+func UndoCommit(dir, commit, parent string) error {
+	if commit == "" || parent == "" {
+		return fmt.Errorf("undo needs a commit and its parent, got %q %q", commit, parent)
+	}
+	if cur := HeadCommit(dir); cur != commit {
+		return fmt.Errorf("HEAD is at %s now, not %s", cur, commit)
+	}
+	if got, err := RunDir(dir, "rev-parse", "--verify", "--quiet", commit+"^1"); err != nil || got != parent {
+		return fmt.Errorf("%s's parent is %q, not %s", commit, got, parent)
+	}
+	if _, err := RunDir(dir, "rev-parse", "--verify", "--quiet", commit+"^2"); err == nil {
+		return fmt.Errorf("%s is a merge commit, not a placeholder", commit)
+	}
+	ct, err1 := RunDir(dir, "rev-parse", "--verify", "--quiet", commit+"^{tree}")
+	pt, err2 := RunDir(dir, "rev-parse", "--verify", "--quiet", parent+"^{tree}")
+	if err1 != nil || err2 != nil || ct != pt {
+		return fmt.Errorf("%s changes files, so it is not an empty placeholder", commit)
+	}
+	_, err := RunDir(dir, "reset", "--soft", parent)
+	return err
+}
+
+// PushSetUpstream pushes branch to origin and sets upstream, from dir. The error
+// carries git's stderr (#198 review): a rejected push used to say only "exit
+// status 1".
 func PushSetUpstream(dir, branch string) error {
-	_, err := RunDir(dir, "push", "-u", "origin", branch)
+	_, err := runReporting(dir, "push", "-u", "origin", branch)
 	return err
 }
 
@@ -1396,18 +1597,29 @@ func IsAncestor(a, b string) (bool, error) {
 }
 
 // RemoteBranchTip returns the sha origin/branch points at (via ls-remote), or ""
-// when the remote branch doesn't exist. `release --clean` compares it to the local
-// placeholder tip before deleting, so a remote that diverged with real commits is
-// never force-deleted (#159 review).
+// when the remote branch doesn't exist; an error means origin could not be asked.
+// `release --clean` compares it to the local placeholder tip before deleting, so
+// a remote that diverged with real commits is never force-deleted (#159 review).
+// `wt new` and `wt claim` use it to tell a branch origin does not have (never
+// pushed, or deleted there) from an origin they cannot reach (#198 review).
 func RemoteBranchTip(dir, branch string) (string, error) {
 	out, err := RunDir(dir, "ls-remote", "origin", "refs/heads/"+branch)
 	if err != nil {
 		return "", err
 	}
-	if out = strings.TrimSpace(out); out == "" {
-		return "", nil
+	return pickLsRemote(out, "refs/heads/"+branch), nil
+}
+
+// pickLsRemote returns the sha of the `<sha>\t<ref>` line of ls-remote output
+// whose ref is exactly ref, or "" (#198 review): ls-remote matches a pattern
+// against the TAIL of a name, so the first line need not be that branch. Pure.
+func pickLsRemote(out, ref string) string {
+	for _, ln := range strings.Split(out, "\n") {
+		if sha, name, ok := strings.Cut(strings.TrimSpace(ln), "\t"); ok && name == ref {
+			return sha
+		}
 	}
-	return strings.Fields(out)[0], nil // "<sha>\trefs/heads/<branch>"
+	return ""
 }
 
 // Abs resolves a possibly-relative path against the repo root.

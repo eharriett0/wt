@@ -1049,7 +1049,7 @@ func parseCheckArgs(args []string) (paths []string, includeStale, showDiff, asJS
 // matched (#181) and whether it is a typo (#93), gathered once so the two
 // decisions read the same facts.
 type checkArg struct {
-	arg     string        // as typed, trimmed
+	arg     string        // as typed, trimmed unless it names a real path as typed
 	query   collide.Query // how it is matched against each window's touched files
 	exists  bool          // present in the working tree
 	tracked bool          // known to git (a deleted-but-tracked path counts)
@@ -1105,19 +1105,32 @@ func rootArgBase(root string) argBase {
 // (cwdArgBase) and MCP wt_check (rootArgBase), so the two differ only in where a
 // relative path starts. Pure given base (an absolute argument also resolves
 // symlinks: repoRelativePath).
+//
+// An argument is trimmed unless, as typed, it names a real path: a file name can
+// begin or end with a space, and the pre-push and pre-commit checks, which read
+// it from git verbatim (#200), ask about the name as it is.
 func resolveCheckArgs(args []string, root string, base argBase, ws []collide.Window) []checkArg {
 	var out []checkArg
 	for _, a := range args {
-		a = strings.TrimSpace(a)
-		if a == "" {
+		t := strings.TrimSpace(a)
+		if t == "" {
 			continue
 		}
-		ca := checkArg{arg: a, exists: base.exists(a)}
-		ca.tracked = !ca.exists && base.tracked(a)
-		ca.query = collide.QueryFor(a, repoRelativePath(root, base.prefix, a), ca.exists || ca.tracked, ws)
+		ca := resolveCheckArg(a, root, base, ws)
+		if ca.query.Mode != collide.MatchExact && t != a {
+			ca = resolveCheckArg(t, root, base, ws)
+		}
 		out = append(out, ca)
 	}
 	return out
+}
+
+// resolveCheckArg is resolveCheckArgs for one argument, taken as given.
+func resolveCheckArg(a, root string, base argBase, ws []collide.Window) checkArg {
+	ca := checkArg{arg: a, exists: base.exists(a)}
+	ca.tracked = !ca.exists && base.tracked(a)
+	ca.query = collide.QueryFor(a, repoRelativePath(root, base.prefix, a), ca.exists || ca.tracked, ws)
+	return ca
 }
 
 // checkQueries returns the resolved query of each argument, in order. Pure.
