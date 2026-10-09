@@ -10,6 +10,11 @@
 // squash commit body, so the check judges that text instead of the commit
 // bodies (#180) — it used to read the commit bodies regardless, refusing a
 // forwarded body that closed nothing and passing one that did.
+//
+// The squash SUBJECT closes too, and it was never read (#196): a PR title
+// "Fixes #N" merged with two commits closed #N with no warning. The check now
+// judges the commit GitHub will write — merge.ShippedSquash models its subject
+// and body from what gh is handed and the repo's squash settings.
 package cli
 
 import (
@@ -28,14 +33,23 @@ import (
 
 // closePlan is the pre-merge close analysis, threaded to the post-merge verify.
 type closePlan struct {
-	refs    []merge.ClosingRef // every closing ref in the PR body + the squash commit text
+	refs    []merge.ClosingRef // every closing ref in the PR body + the squash commit's subject and body
 	extra   []int              // same-repo closings NOT in closingIssuesReferences (trap 2)
+	subjExt []int              // the part of extra the squash SUBJECT carries (#196)
 	suspect []merge.ClosingRef // closes whose phrasing says they are not meant (#164)
 	watch   []int              // same-repo issue numbers to re-check after the merge
 	before  map[int]string     // issue → state snapshot before the merge
 
-	forwarded string             // where a forwarded squash body came from; "" = none (#180)
-	replaced  []merge.ClosingRef // closes only in the commit bodies that body replaces
+	ship      merge.SquashText // the squash commit as GitHub will write it (#196)
+	subject   string           // the flag a forwarded squash subject came through; "" = none (#196)
+	forwarded string           // where a forwarded squash body came from; "" = none (#180)
+	leftOut   []leftOutRef     // closes only text the squash does not carry has (#180, #196)
+}
+
+// leftOutRef is a close that only text the squash commit does not carry has.
+type leftOutRef struct {
+	ref   merge.ClosingRef
+	where string // "the PR title", "the commit messages", or both
 }
 
 // squashBody is the squash commit body merge-pr forwards to gh, read ONCE so
@@ -48,6 +62,15 @@ type squashBody struct {
 }
 
 func (s squashBody) forwarded() bool { return s.src.Source != merge.BodyDefault }
+
+// override is the forwarded body as the squash model takes it (#196). An empty
+// forwarded body is still one: gh sends it, and GitHub writes an empty body.
+func (s squashBody) override() merge.Override {
+	if !s.forwarded() {
+		return merge.Override{}
+	}
+	return merge.Override{Set: true, Text: s.text, From: "the forwarded " + s.src.Describe()}
+}
 
 // readSquashBody resolves a parsed body source to its text, reading a file or
 // stdin exactly once. Either one is then re-pointed at "-" and its bytes handed
@@ -111,21 +134,43 @@ func emptyStdinBody(sq squashBody, tty bool) bool {
 // drive prepareMerge and analyzeClosings without gh (#180). liveCloseReads is
 // the real thing.
 type closeReads struct {
-	prBody      func(pr string) (string, error)
-	commitText  func(pr string) string // every commit's headline + body
-	headlines   func(pr string) []string
-	closingRefs func(pr string) []int // the PR's closingIssuesReferences
-	issueState  func(n string) (string, error)
-	issueTitle  func(n string) (string, error)
+	prBody         func(pr string) (string, error)
+	prTitle        func(pr string) (string, error)
+	commits        func(pr string) []merge.Commit // nil: they could not be read
+	squashSettings func() merge.SquashSettings    // a "" field: it could not be read
+	closingRefs    func(pr string) []int          // the PR's closingIssuesReferences
+	issueState     func(n string) (string, error)
+	issueTitle     func(n string) (string, error)
 }
 
 var liveCloseReads = closeReads{
-	prBody:      ghx.PRBody,
-	commitText:  ghx.PRCommitText,
-	headlines:   ghx.PRCommitSubjects,
-	closingRefs: ghx.PRClosingIssueNumbers,
-	issueState:  ghx.IssueState,
-	issueTitle:  ghx.IssueTitle,
+	prBody:         ghx.PRBody,
+	prTitle:        ghx.PRTitle,
+	commits:        livePRCommits,
+	squashSettings: liveSquashSettings,
+	closingRefs:    ghx.PRClosingIssueNumbers,
+	issueState:     ghx.IssueState,
+	issueTitle:     ghx.IssueTitle,
+}
+
+// livePRCommits reads PR pr's commits for the squash model; nil when gh fails.
+func livePRCommits(pr string) []merge.Commit {
+	cs, err := ghx.PRCommits(pr)
+	if err != nil {
+		return nil
+	}
+	out := make([]merge.Commit, len(cs))
+	for i, c := range cs {
+		out[i] = merge.NewCommit(c.Message, c.Parents)
+	}
+	return out
+}
+
+// liveSquashSettings reads this repo's squash settings; a "" field when gh
+// cannot, which merge.ShippedSquash over-scans.
+func liveSquashSettings() merge.SquashSettings {
+	title, message := ghx.RepoSquashSettings()
+	return merge.SquashSettings{Title: title, Message: message}
 }
 
 // closeOpts are merge-pr's flags that steer the pre-merge close check.
@@ -148,12 +193,13 @@ type mergePrep struct {
 // would do.
 //
 // A body forwarded after `--` (-b/--body, -F/--body-file, `-F -` for stdin) IS
-// the squash body, so the check reads it instead of the commit bodies. It is
-// read once and gh is handed those same bytes. If gh would not merge any body
-// that can be named (an unreadable file, --body with --body-file, a value flag
-// with no value) the merge is refused even with --close-ok: gh would fail on it,
-// and the check has nothing to judge. --no-close-check reads nothing, so gh
-// gets the passthrough untouched.
+// the squash body, so the check reads it instead of the default body. It is
+// read once and gh is handed those same bytes. A forwarded --subject/-t is the
+// squash subject the same way (#196). If gh would not merge any body that can
+// be named (an unreadable file, --body with --body-file, a value flag with no
+// value) the merge is refused even with --close-ok: gh would fail on it, and the
+// check has nothing to judge. --no-close-check reads nothing, so gh gets the
+// passthrough untouched.
 func prepareMerge(pr string, passthrough []string, o closeOpts, stdin io.Reader, tty bool, r closeReads) (mergePrep, bool) {
 	p := mergePrep{args: passthrough}
 	if o.skip {
@@ -169,7 +215,7 @@ func prepareMerge(pr string, passthrough []string, o closeOpts, stdin io.Reader,
 		return p, false
 	}
 	p.args, p.stdin = sq.ghArgs, sq.ghStdin
-	p.plan = analyzeClosings(pr, sq, r)
+	p.plan = analyzeClosings(pr, passthrough, sq, r)
 	if gate := renderClosePlan(p.plan, r); gate && !o.closeOK {
 		if o.dryRun {
 			ui.Warn("--dry-run: a real merge would REFUSE here. Verify the close set, then pass --close-ok.")
@@ -185,47 +231,60 @@ func prepareMerge(pr string, passthrough []string, o closeOpts, stdin io.Reader,
 // whose issues the post-merge verify re-reads. Pure.
 //
 // The gate reads the PR body (GitHub closes what that links, whatever the
-// squash says) plus what the squash COMMIT will carry. With no forwarded body
-// that is every commit message, which GitHub's default squash body is built
-// from. A forwarded body replaces the commit BODIES (#180): they never ship, so
-// a keyword left in them closes nothing, while one in the forwarded text does.
-// The commit headlines stay in. --body does not replace the squash SUBJECT, and
-// under GitHub's "Default message" squash setting a one-commit PR's subject is
-// that commit's title; a keyword there still closes, and over-reporting is the
-// cheap direction.
+// squash says) plus the squash commit's subject and body as GitHub will write
+// them (ship, from merge.ShippedSquash): a keyword in either closes its issue
+// when the commit lands, and closingIssuesReferences shows neither (#77 trap
+// 2). Text that does not ship is not judged: a forwarded body replaces the
+// commit bodies (#180), a forwarded --subject the PR title or the commit's
+// headline, and the repo's settings decide whether a PR title or the commit
+// messages ship at all (#196).
 //
-// The verify keeps watching the replaced bodies' issues too, so if the squash
-// closes one of them after all, the same command still says so.
-func closeCheckTexts(prBody, commitText string, headlines []string, sq squashBody) (gate, watch string) {
-	if !sq.forwarded() {
-		t := prBody + "\n\n" + commitText
-		return t, t
-	}
-	parts := append([]string{prBody}, headlines...)
-	gate = strings.Join(append(parts, sq.text), "\n\n")
-	return gate, gate + "\n\n" + commitText
+// The verify watches all of it — the PR title and every commit message too — so
+// if the squash closes one of those issues after all, the same command says so.
+func closeCheckTexts(prBody, prTitle string, commits []merge.Commit, ship merge.SquashText) (gate, watch string) {
+	gate = strings.Join([]string{prBody, ship.Subject, ship.Body}, "\n\n")
+	return gate, strings.Join([]string{gate, prTitle, merge.Messages(commits)}, "\n\n")
 }
 
-// replacedClosings returns the closes written in the commit messages that a
-// forwarded body keeps from shipping (#180) — in neither the gate text nor the
-// PR's own closingIssuesReferences (graph), which closes an issue linked in
-// GitHub's sidebar with no keyword anywhere — so the analysis can say why a
-// familiar warning is gone. Pure.
-func replacedClosings(commitText, gate string, graph []int) []merge.ClosingRef {
-	kept := map[string]bool{}
-	for _, r := range merge.ClosingRefs(gate) {
-		kept[refLabel(r)] = true
-	}
+// leftOutClosings returns the closes that only text the squash does not carry
+// has — in the watch text but in neither the gate text nor the PR's own
+// closingIssuesReferences (graph), which closes an issue linked in GitHub's
+// sidebar with no keyword anywhere — and where they are, so the analysis can
+// say why a familiar warning is gone (#180, #196). Pure.
+func leftOutClosings(watch, gate string, graph []int, prTitle, commitText string) []leftOutRef {
+	kept := labels(gate)
 	for _, n := range graph {
 		kept["#"+strconv.Itoa(n)] = true
 	}
-	var out []merge.ClosingRef
-	for _, r := range merge.ClosingRefs(commitText) {
-		if !kept[refLabel(r)] {
-			out = append(out, r)
+	inTitle, inCommits := labels(prTitle), labels(commitText)
+	var out []leftOutRef
+	for _, r := range merge.ClosingRefs(watch) {
+		l := refLabel(r)
+		if kept[l] {
+			continue
 		}
+		var where []string
+		if inTitle[l] {
+			where = append(where, "the PR title")
+		}
+		if inCommits[l] {
+			where = append(where, "the commit messages")
+		}
+		if len(where) == 0 { // only matched across two of the joined texts
+			where = append(where, "text the squash does not carry")
+		}
+		out = append(out, leftOutRef{ref: r, where: strings.Join(where, " and ")})
 	}
 	return out
+}
+
+// labels is the set of refLabels a text closes.
+func labels(text string) map[string]bool {
+	set := map[string]bool{}
+	for _, r := range merge.ClosingRefs(text) {
+		set[refLabel(r)] = true
+	}
+	return set
 }
 
 // refLabel renders a ClosingRef the way GitHub addresses it, so the warning can
@@ -237,19 +296,26 @@ func refLabel(r merge.ClosingRef) string {
 	return fmt.Sprintf("#%d", r.Number)
 }
 
-// analyzeClosings gathers what the squash will close (PR body + the squash
-// commit text: the full commit messages, or a forwarded body in place of their
-// bodies — closeCheckTexts), compares to the PR's own closingIssuesReferences,
+// analyzeClosings gathers what the squash will close — the PR body plus the
+// squash commit's subject and body as GitHub will write them (closeCheckTexts,
+// merge.ShippedSquash) — compares it to the PR's own closingIssuesReferences,
 // and snapshots the watched issues' states for the post-merge verify.
+// passthrough is merge-pr's gh passthrough, for a forwarded --subject (#196).
 // Best-effort — a gh failure yields an empty plan so it never blocks a merge.
-func analyzeClosings(pr string, sq squashBody, r closeReads) closePlan {
+func analyzeClosings(pr string, passthrough []string, sq squashBody, r closeReads) closePlan {
 	body, _ := r.prBody(pr)
-	commitText := r.commitText(pr)
-	var headlines []string
-	if sq.forwarded() {
-		headlines = r.headlines(pr)
+	title, _ := r.prTitle(pr)
+	commits := r.commits(pr)
+	// prepareMerge has refused a passthrough gh would fail on, which is the
+	// only thing these parses error on.
+	subject, _ := merge.SubjectOverride(title, passthrough)
+	fwdSubject, _ := merge.ParseForwardedSubject(passthrough)
+	var settings merge.SquashSettings
+	if !subject.Set || !sq.forwarded() {
+		settings = r.squashSettings() // only a half nothing replaces needs them
 	}
-	text, watchText := closeCheckTexts(body, commitText, headlines, sq)
+	ship := merge.ShippedSquash(settings, title, body, commits, subject, sq.override())
+	text, watchText := closeCheckTexts(body, title, commits, ship)
 
 	watchSet := map[int]bool{}
 	for _, n := range merge.SameRepoClosings(watchText) {
@@ -271,13 +337,18 @@ func analyzeClosings(pr string, sq squashBody, r closeReads) closePlan {
 	plan := closePlan{
 		refs:    merge.ClosingRefs(text),
 		extra:   merge.ExtraClosings(text, graph),
+		subjExt: merge.ExtraClosings(ship.Subject, graph),
 		suspect: merge.SuspectClosings(text),
 		watch:   watch,
 		before:  before,
+		ship:    ship,
+		leftOut: leftOutClosings(watchText, text, graph, title, merge.Messages(commits)),
+	}
+	if fwdSubject.Given && fwdSubject.Value != "" {
+		plan.subject = fwdSubject.Flag
 	}
 	if sq.forwarded() {
 		plan.forwarded = sq.src.Describe()
-		plan.replaced = replacedClosings(commitText, text, graph)
 	}
 	return plan
 }
@@ -288,18 +359,20 @@ func analyzeClosings(pr string, sq squashBody, r closeReads) closePlan {
 // references do NOT (the trap-2 signature). A normal "Fixes #N" PR prints its
 // close set but does NOT gate, so the warning stays meaningful.
 func renderClosePlan(p closePlan, reads closeReads) bool {
+	if p.subject != "" {
+		ui.Info("squash subject: forwarded via %s, so the close check reads it instead of the PR title or the commit's headline (#196)", p.subject)
+	}
 	if p.forwarded != "" {
-		ui.Info("squash body: forwarded via %s, so the close check reads it instead of the commit bodies (#180)", p.forwarded)
-		if len(p.replaced) > 0 {
-			labels := make([]string, len(p.replaced))
-			for i, r := range p.replaced {
-				labels[i] = refLabel(r)
-			}
-			ui.Info("the forwarded body leaves out the close of %s that only the commit bodies carry", strings.Join(labels, ", "))
-		}
+		ui.Info("squash body: forwarded via %s, so the close check reads it instead of the default squash body (#180)", p.forwarded)
+	}
+	for _, g := range groupLeftOut(p.leftOut) {
+		ui.Info("the squash commit leaves out the close of %s (only in %s), so it does not gate; the post-merge verify still watches it", g.labels, g.where)
 	}
 	if len(p.refs) == 0 {
 		return false
+	}
+	if p.ship.Unsure {
+		ui.Info("the repo's squash-merge settings could not be read, so the close check reads every text the squash could carry (subject: %s; body: %s)", p.ship.SubjectFrom, p.ship.BodyFrom)
 	}
 	ui.Info("this merge will CLOSE:")
 	for _, r := range p.refs {
@@ -315,10 +388,16 @@ func renderClosePlan(p closePlan, reads closeReads) bool {
 		fmt.Printf("    %s  %s  %s\n", ui.Bold("#"+strconv.Itoa(r.Number)), ui.Yellow("["+st+"]"), ui.Dim(title))
 	}
 	gate := false
-	if len(p.extra) > 0 {
+	if len(p.subjExt) > 0 {
+		ui.Warn("the squash SUBJECT (%s) will close %s — NOT in the PR's own closing references. "+
+			"GitHub's closingIssuesReferences reads the PR body alone, so this would close silently (#77 trap 2, #196).",
+			p.ship.SubjectFrom, joinNums(p.subjExt))
+		gate = true
+	}
+	if rest := withoutNums(p.extra, p.subjExt); len(rest) > 0 {
 		ui.Warn("the squash COMMIT body will close %s — NOT in the PR's own closing references. "+
 			"GitHub's closingIssuesReferences is blind to the commit body, so this would close silently (#77 trap 2).",
-			joinNums(p.extra))
+			joinNums(rest))
 		gate = true
 	}
 	// A close keyword written inside a negation or a qualifier is never a
@@ -350,6 +429,42 @@ func verifyClosings(p closePlan) {
 			ui.Info("verified: #%d is CLOSED", n)
 		}
 	}
+}
+
+// withoutNums is nums less those in drop, in order. Pure.
+func withoutNums(nums, drop []int) []int {
+	skip := map[int]bool{}
+	for _, n := range drop {
+		skip[n] = true
+	}
+	var out []int
+	for _, n := range nums {
+		if !skip[n] {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// leftOutGroup is the left-out closes found in the same place, for one line.
+type leftOutGroup struct{ labels, where string }
+
+// groupLeftOut groups left-out closes by where they are, in first-seen order.
+// Pure.
+func groupLeftOut(refs []leftOutRef) []leftOutGroup {
+	var order []string
+	by := map[string][]string{}
+	for _, r := range refs {
+		if _, ok := by[r.where]; !ok {
+			order = append(order, r.where)
+		}
+		by[r.where] = append(by[r.where], refLabel(r.ref))
+	}
+	out := make([]leftOutGroup, len(order))
+	for i, w := range order {
+		out[i] = leftOutGroup{labels: strings.Join(by[w], ", "), where: w}
+	}
+	return out
 }
 
 func joinNums(nums []int) string {
