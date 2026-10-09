@@ -258,6 +258,12 @@ func PRChangedFileCount(pr string) string {
 // PRChangedFiles returns the repo-relative paths changed in the PR diff vs base.
 // An error is returned (not swallowed to empty) so callers can fail CLOSED — a
 // deploy gate must not skip just because gh couldn't list the files.
+//
+// gh reads the names out of the diff's `diff --git` headers, where git C-quotes
+// a name holding a non-ASCII byte, a quote, a backslash or a control character,
+// and prints it that way: `"caf\303\251.md"`, which no deploy glob matches
+// (#200). There is no -z to ask gh for, so the quoting is undone here
+// (unquoteGitPath).
 func PRChangedFiles(pr string) ([]string, error) {
 	out, err := run("pr", "diff", pr, "--name-only")
 	if err != nil {
@@ -266,10 +272,62 @@ func PRChangedFiles(pr string) ([]string, error) {
 	var files []string
 	for _, ln := range strings.Split(out, "\n") {
 		if s := strings.TrimSpace(ln); s != "" {
-			files = append(files, s)
+			files = append(files, unquoteGitPath(s))
 		}
 	}
 	return files, nil
+}
+
+// unquoteGitPath reverses git's C-style quoting of a path (quote_c_style): a
+// name holding a byte git calls unusual is printed in double quotes, with \a \b
+// \t \n \v \f \r \" \\ and a three-digit octal escape for each other such byte
+// (under core.quotePath, which is on by default, every non-ASCII one). Anything
+// not in that form, a malformed quote included, comes back unchanged. Pure.
+func unquoteGitPath(s string) string {
+	if len(s) < 2 || s[0] != '"' || s[len(s)-1] != '"' {
+		return s
+	}
+	in := s[1 : len(s)-1]
+	octal := func(c byte) bool { return '0' <= c && c <= '7' }
+	var b strings.Builder
+	for i := 0; i < len(in); i++ {
+		c := in[i]
+		if c == '"' {
+			return s // an unescaped quote inside: not git's quoting
+		}
+		if c != '\\' {
+			b.WriteByte(c)
+			continue
+		}
+		if i++; i >= len(in) {
+			return s
+		}
+		switch e := in[i]; e {
+		case 'a':
+			b.WriteByte('\a')
+		case 'b':
+			b.WriteByte('\b')
+		case 't':
+			b.WriteByte('\t')
+		case 'n':
+			b.WriteByte('\n')
+		case 'v':
+			b.WriteByte('\v')
+		case 'f':
+			b.WriteByte('\f')
+		case 'r':
+			b.WriteByte('\r')
+		case '"', '\\':
+			b.WriteByte(e)
+		default: // \ooo, one byte: git writes "\%03o"
+			if e > '3' || !octal(e) || i+2 >= len(in) || !octal(in[i+1]) || !octal(in[i+2]) {
+				return s
+			}
+			b.WriteByte((e-'0')<<6 | (in[i+1]-'0')<<3 | (in[i+2] - '0'))
+			i += 2
+		}
+	}
+	return b.String()
 }
 
 // PRCommitSubjects returns one messageHeadline per commit on the PR.

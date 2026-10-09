@@ -182,6 +182,27 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   path in another window went unmatched. The fuzzy suffix tier used to hide that
   (README.md is a suffix of pkg/README.md); exact matching needs the old path
   listed, as the porcelain read already does for a staged move (#28).
+- **Paths from git are read NUL-separated, never quoted (#200).** Read line by
+  line, git C-quotes a path holding a byte it calls unusual: under the default
+  `core.quotePath` every non-ASCII byte, plus `"`, `\` and control characters
+  (porcelain status quotes a space too). `café.md` came back `"caf\303\251.md"`,
+  was stored as the window's touched path, and `wt check café.md`, pre-push and
+  both edit hooks never matched it: a real collision on any non-ASCII name went
+  unreported. Every path lister passes `-z` (`gitx.nulPaths`: TouchedFiles'
+  status and diff, StagedFiles, RangeChangedPaths, and MergeTreeConflicts for
+  the base-drift warning's names) and is read through `runRaw`, never the
+  trimming `run`/`RunDir` (a name can begin or end with a space), by the pure
+  `splitNUL` / `parsePorcelainZ`. ⚠ `status --porcelain -z` writes a rename or
+  copy as `XY <new>\0<orig>\0`, new FIRST: the reverse of the line format's
+  `orig -> new`. ⚠ So a real path is never trimmed downstream either:
+  `Query.cmpPath` trims only a fuzzy search term, `resolveCheckArgs` keeps an
+  argument's spaces when it names a real path as typed, and the Claude payload
+  path is used as sent. Line-based on purpose: `IsUntracked`, `IsClean` and the
+  dirty counts read only status columns (one line per entry, a newline in a
+  name is quoted), and `git worktree list --porcelain` prints paths unquoted
+  (its `-z` needs git 2.36; Ubuntu 22.04 ships 2.34). gh has no `-z`: `gh pr
+  diff --name-only` relays GitHub's quoted names, so `ghx.PRChangedFiles`
+  unquotes them (`unquoteGitPath`) before the deploy-path globs see them.
 - **`wt clean` is data-loss-critical.** `ReapVerdict` only reaps a *provably
   shipped* worktree (grace window, upstream, merged PR / cherry). Never
   force-remove a dirty worktree automatically — `--stale-index` is

@@ -79,6 +79,62 @@ func run(dir string, args ...string) (string, error) {
 // in TouchedFiles already does for a staged move (#28).
 const noRenames = "--no-renames"
 
+// nulPaths is the flag every git command that LISTS paths for the collision
+// engine passes (#200): print each path verbatim, NUL-terminated. Read line by
+// line, git C-quotes any path holding a byte it calls unusual: under the
+// default core.quotePath that is every non-ASCII byte, plus `"`, `\` and
+// control characters (a porcelain status quotes a space too). So `café.md` came
+// back as `"caf\303\251.md"`, was stored as the window's touched path, and
+// `wt check café.md`, the pre-push gate and both edit hooks, which all ask
+// about the real name, never matched it: a collision on any non-ASCII file went
+// unreported. -z output is never quoted, and a name holding a tab, quote or
+// newline survives it as well. Read it with runRaw and split it with splitNUL or
+// parsePorcelainZ, never trimmed: a name can start or end with a space.
+const nulPaths = "-z"
+
+// splitNUL splits a -z path list (`git diff --name-only -z`) into its paths,
+// dropping the empty record after the final NUL. Each path is verbatim:
+// unquoted, untrimmed. Pure (#200).
+func splitNUL(out string) []string {
+	var paths []string
+	for _, p := range strings.Split(out, "\x00") {
+		if p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths
+}
+
+// parsePorcelainZ returns every path `git status --porcelain -z` names (#200).
+// A record is "XY <path>": the two status columns, a space, the path verbatim.
+// A rename or copy (R or C in either column: a staged move, or an intent-to-add
+// one in the worktree) is followed by one more record, the ORIGINAL path. -z
+// writes the new path first, the reverse of the line format's "old -> new".
+// Both are returned (#28): window A renaming x.go while window B edits x.go is
+// a real conflict, and recording the old path can only add a flag. Pure.
+func parsePorcelainZ(out string) []string {
+	recs := strings.Split(out, "\x00")
+	var paths []string
+	for i := 0; i < len(recs); i++ {
+		rec := recs[i]
+		if len(rec) < 4 {
+			continue // the empty record after the final NUL
+		}
+		paths = append(paths, rec[3:])
+		if renameOrCopy(rec[0]) || renameOrCopy(rec[1]) {
+			i++ // the original path is the next record, not a status record
+			if i < len(recs) && recs[i] != "" {
+				paths = append(paths, recs[i])
+			}
+		}
+	}
+	return paths
+}
+
+// renameOrCopy reports whether a porcelain status column says the record
+// carries a second (original) path.
+func renameOrCopy(col byte) bool { return col == 'R' || col == 'C' }
+
 // StagedFiles returns the paths staged for the IN-PROGRESS commit. It PRESERVES
 // git's ambient environment (unlike run(), which strips GIT_INDEX_FILE) because
 // git points GIT_INDEX_FILE at a TEMPORARY index for a partial commit
@@ -90,19 +146,14 @@ const noRenames = "--no-renames"
 // the cross-worktree `-C dir` scans need scopedEnv.
 //
 // --no-renames: a staged move is listed by BOTH paths (#181 review), as the
-// collision engine's other name sources are (noRenames).
+// collision engine's other name sources are (noRenames). -z: each path as it
+// is, never C-quoted (nulPaths, #200).
 func StagedFiles() ([]string, error) {
-	out, err := exec.Command("git", "diff", "--cached", "--name-only", noRenames).Output()
+	out, err := exec.Command("git", "diff", "--cached", "--name-only", noRenames, nulPaths).Output()
 	if err != nil {
 		return nil, err
 	}
-	var files []string
-	for _, ln := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if s := strings.TrimSpace(ln); s != "" {
-			files = append(files, s)
-		}
-	}
-	return files, nil
+	return splitNUL(string(out)), nil
 }
 
 // Run executes git in the current directory.
@@ -619,20 +670,15 @@ func AllZeroSHA(ref string) bool {
 // is the #106 family for the not-rebased case: #106 moved the `from` ref to base,
 // but two-dot still diverged whenever base wasn't already an ancestor of `to`.
 // For a fast-forward (from is an ancestor of to) three-dot == two-dot, so the FF
-// case is unchanged. A move is listed by both paths (noRenames). Runs in dir
-// (empty → cwd). Best-effort.
+// case is unchanged. A move is listed by both paths (noRenames), and every path
+// as it is, never C-quoted (nulPaths, #200). Runs in dir (empty → cwd).
+// Best-effort.
 func RangeChangedPaths(dir, from, to string) ([]string, error) {
-	out, err := RunDir(dir, "diff", "--name-only", noRenames, from+"..."+to)
+	out, err := runRaw(dir, "diff", "--name-only", noRenames, nulPaths, from+"..."+to)
 	if err != nil {
 		return nil, err
 	}
-	var paths []string
-	for _, ln := range strings.Split(out, "\n") {
-		if s := strings.TrimSpace(ln); s != "" {
-			paths = append(paths, s)
-		}
-	}
-	return paths, nil
+	return splitNUL(out), nil
 }
 
 // IsUntracked reports whether path exists in worktree but is NOT tracked by git
@@ -656,6 +702,9 @@ func IsUntracked(worktree, path string) bool {
 	// committable deletion) and "?? foo". That deletion can collide (delete/modify)
 	// with another window's edit, so it must NOT be downgraded (mirrors the #109
 	// staged-deletion lesson). Any non-"?? " line → not purely untracked → false.
+	// Only the status columns are read, so this stays line-based, unlike the
+	// path listers (nulPaths): without -z every entry is one line, a newline in
+	// its name quoted (#200).
 	sawUntracked := false
 	for _, ln := range strings.Split(out, "\n") {
 		if ln == "" {
@@ -737,14 +786,15 @@ func BehindCount(head, base string) int {
 }
 
 // MergeTreeConflicts performs an in-memory 3-way merge of head into base via
-// `git merge-tree --write-tree --name-only` — NO network, NO worktree mutation,
-// NO index touch (git >= 2.38). It returns the conflicting repo-relative paths
-// (empty when clean), whether the merge conflicted, and an error ONLY when
-// merge-tree itself could not run (bad refs / ancient git) so the caller fails
-// open rather than blocking a push on a tooling gap. Backs the #78 "this PR
-// will get NO CI until rebased" warning.
+// `git merge-tree --write-tree --name-only -z` — NO network, NO worktree
+// mutation, NO index touch (git >= 2.38, which also has -z). It returns the
+// conflicting repo-relative paths, verbatim (nulPaths, #200), empty when clean,
+// whether the merge conflicted, and an error ONLY when merge-tree itself could
+// not run (bad refs / ancient git) so the caller fails open rather than blocking
+// a push on a tooling gap. Backs the #78 "this PR will get NO CI until rebased"
+// warning.
 func MergeTreeConflicts(base, head string) (paths []string, conflicted bool, err error) {
-	cmd := exec.Command("git", "merge-tree", "--write-tree", "--name-only", base, head)
+	cmd := exec.Command("git", "merge-tree", "--write-tree", "--name-only", nulPaths, base, head)
 	cmd.Env = scopedEnv()
 	out, runErr := cmd.Output()
 	if runErr == nil {
@@ -762,26 +812,26 @@ func MergeTreeConflicts(base, head string) (paths []string, conflicted bool, err
 }
 
 // parseMergeTreeConflictPaths pulls the conflicted paths out of `git merge-tree
-// --write-tree --name-only` stdout. The format is:
+// --write-tree --name-only -z` stdout. The format is NUL-terminated records:
 //
 //	<toplevel-tree-oid>
-//	<conflicted path>...        (one per line)
-//	                            (blank line)
-//	<informational messages>...
+//	<conflicted path>...        (one record each, verbatim)
+//	                            (an empty record)
+//	<informational messages>... (only with messages on, git's default)
 //
-// so we skip line 0 (the tree OID) and take lines up to the first blank line
-// (the separator before informational text). Pure — unit-tested.
+// so we skip record 0 (the tree OID) and take records up to the first empty one
+// (the separator before the messages). Pure — unit-tested.
 func parseMergeTreeConflictPaths(out string) []string {
-	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) <= 1 {
+	recs := strings.Split(out, "\x00")
+	if len(recs) <= 1 {
 		return nil
 	}
 	var paths []string
-	for _, ln := range lines[1:] {
-		if strings.TrimSpace(ln) == "" {
+	for _, r := range recs[1:] {
+		if r == "" {
 			break
 		}
-		paths = append(paths, strings.TrimSpace(ln))
+		paths = append(paths, r)
 	}
 	return paths
 }
@@ -792,9 +842,11 @@ func parseMergeTreeConflictPaths(out string) []string {
 func TouchedFiles(dir, base string) []string {
 	set := map[string]struct{}{}
 
-	// (a) uncommitted (staged + unstaged + untracked) via porcelain. Use the
-	// raw runner: the 2-char status code + space prefix is positional, so the
-	// path begins at byte 3 of every line — trimming the blob would corrupt it.
+	// (a) uncommitted (staged + unstaged + untracked) via porcelain, -z and
+	// raw-read (nulPaths, #200): each path verbatim, never C-quoted, and the
+	// positional "XY " status prefix intact. A rename/copy records BOTH sides
+	// (#28, parsePorcelainZ): keeping only the new path misses a rename/modify
+	// clash.
 	//
 	// --untracked-files=all (#27): git's DEFAULT untracked mode collapses a
 	// fully-untracked directory to a single "dir/" entry, which never
@@ -802,44 +854,19 @@ func TouchedFiles(dir, base string) []string {
 	// collision under a freshly-created dir goes silently undetected. -uall
 	// lists each new file at its full path. Gitignored files stay excluded, so
 	// the cost is bounded to genuinely-new files.
-	if out, err := runRaw(dir, "status", "--porcelain", "--untracked-files=all"); err == nil {
-		for _, ln := range strings.Split(out, "\n") {
-			if len(ln) < 4 {
-				continue
-			}
-			path := strings.TrimSpace(ln[3:])
-			// Rename/copy "old -> new" (#28): record BOTH sides. Keeping only
-			// the new path misses a rename/modify clash — window A renames
-			// x.go, window B edits x.go — a real 3-way conflict that would
-			// otherwise show no overlap. Recording old can only add a flag,
-			// never hide one (correct for a safety tool). Each side may be
-			// individually quoted when it contains special chars.
-			if i := strings.Index(path, " -> "); i >= 0 {
-				oldp := strings.Trim(strings.TrimSpace(path[:i]), "\"")
-				newp := strings.Trim(strings.TrimSpace(path[i+len(" -> "):]), "\"")
-				if oldp != "" {
-					set[oldp] = struct{}{}
-				}
-				if newp != "" {
-					set[newp] = struct{}{}
-				}
-				continue
-			}
-			path = strings.Trim(path, "\"")
-			if path != "" {
-				set[path] = struct{}{}
-			}
+	if out, err := runRaw(dir, "status", "--porcelain", nulPaths, "--untracked-files=all"); err == nil {
+		for _, p := range parsePorcelainZ(out) {
+			set[p] = struct{}{}
 		}
 	}
 
 	// (b) committed-on-branch vs base (three-dot = since merge-base). A COMMITTED
-	// move records both paths too (noRenames), like the staged one above.
+	// move records both paths too (noRenames), like the staged one above, and
+	// every path is verbatim (nulPaths).
 	for _, ref := range []string{"origin/" + base, base} {
-		if out, err := RunDir(dir, "diff", "--name-only", noRenames, ref+"...HEAD"); err == nil {
-			for _, ln := range strings.Split(out, "\n") {
-				if p := strings.TrimSpace(ln); p != "" {
-					set[p] = struct{}{}
-				}
+		if out, err := runRaw(dir, "diff", "--name-only", noRenames, nulPaths, ref+"...HEAD"); err == nil {
+			for _, p := range splitNUL(out) {
+				set[p] = struct{}{}
 			}
 			break // first ref that resolves wins
 		}
