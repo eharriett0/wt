@@ -90,20 +90,15 @@ func PushedUpstream(hasUpstream bool, mergeRef, base string) bool {
 	return hasUpstream && mergeRef != "" && mergeRef != "refs/heads/"+base
 }
 
-// dirtyCount counts uncommitted changes in the worktree at wt (porcelain lines),
-// for the --stale-index preview message; 0 on any error.
+// dirtyCount counts uncommitted changes in the worktree at wt for clean's
+// messages, untracked files included as IsClean counts them (#208); 0 on any
+// error.
 func dirtyCount(wt string) int {
-	out, err := gitx.RunDir(wt, "status", "--porcelain")
+	entries, err := gitx.StatusEntries(wt)
 	if err != nil {
 		return 0
 	}
-	n := 0
-	for _, ln := range strings.Split(out, "\n") {
-		if strings.TrimSpace(ln) != "" {
-			n++
-		}
-	}
-	return n
+	return len(entries)
 }
 
 // StaleIndexReportable decides whether `wt clean --stale-index` should REPORT a

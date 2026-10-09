@@ -657,15 +657,30 @@ func pathUnder(path, root string) bool {
 }
 
 // WorktreeRemove removes the worktree at path. force discards untracked/dirty
-// files (git refuses otherwise).
+// files (git refuses otherwise). Ignored files go with the worktree either way,
+// as git has always removed them.
+//
+// git's own refusal reads a status that honours status.showUntrackedFiles, so a
+// repo set to `no` let a non-force remove delete untracked files (#208,
+// measured on git 2.39): `wt clean -y`, merge-pr's auto-clean and `release
+// --clean` all reach here after wt's own check (IsClean). The command therefore
+// carries a scoped `-c status.showUntrackedFiles=normal`, which git hands to the
+// status it runs: one command's setting, never the process environment (the #92
+// env-scoping lesson). The error carries git's stderr.
 func WorktreeRemove(path string, force bool) error {
-	args := []string{"worktree", "remove"}
+	args := withUntrackedShown("worktree", "remove")
 	if force {
 		args = append(args, "--force")
 	}
-	args = append(args, path)
-	_, err := Run(args...)
+	_, err := runReporting("", append(args, path)...)
 	return err
+}
+
+// withUntrackedShown prefixes a git command with `-c
+// status.showUntrackedFiles=normal`, so any status it runs lists untracked files
+// whatever the repo's config says (#208). Pure.
+func withUntrackedShown(args ...string) []string {
+	return append([]string{"-c", "status.showUntrackedFiles=normal"}, args...)
 }
 
 // BranchDelete force-deletes local branch (git branch -D). Safe to call after a
@@ -1492,16 +1507,20 @@ func LastCommitAge(dir string, now time.Time) (time.Duration, error) {
 }
 
 // IsClean reports whether the worktree at dir has NO uncommitted changes
-// (staged, unstaged, or untracked). A dirty worktree means the window is
-// actively editing, which keeps it out of the "stale" collision bucket even
-// when its branch has no open PR. On error (dir gone, not a worktree) it
+// (staged, unstaged, or untracked-but-not-ignored). A dirty worktree means the
+// window is actively editing, which keeps it out of the "stale" collision bucket
+// even when its branch has no open PR. On error (dir gone, not a worktree) it
 // returns false — i.e. treat an unknowable worktree as potentially active.
+//
+// It reads StatusEntries, so untracked files count whatever
+// status.showUntrackedFiles says (#208). A plain porcelain status honours a
+// `no` there: a worktree holding only untracked work read as clean, and `wt
+// clean -y`, merge-pr's auto-clean and `release --clean`, which remove only a
+// clean worktree, removed it, untracked files and all. Ignored files never
+// counted, and still don't.
 func IsClean(dir string) bool {
-	out, err := runRaw(dir, "status", "--porcelain")
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(out) == ""
+	entries, err := StatusEntries(dir)
+	return err == nil && len(entries) == 0
 }
 
 // CommitEmpty makes an empty commit in dir with the given message, and only
@@ -1747,12 +1766,14 @@ func parseCommitLines(out string) []Commit {
 }
 
 // StatusEntries returns the worktree at dir's `git status --porcelain` lines:
-// one per uncommitted change, untracked-but-not-ignored files included (#177).
-// --untracked-files=normal overrides a status.showUntrackedFiles=no, which
-// hides untracked files from a plain porcelain status, and from `git worktree
-// remove`'s own check too: it deleted them with the worktree (measured, git
-// 2.39). Submodule changes are listed (--ignore-submodules=none). Read-only:
-// discard reads another window's worktree, and must not take its index.lock.
+// one per uncommitted change, untracked-but-not-ignored files included (#177,
+// #208). It is wt's one read of "what would a removal lose": IsClean and the
+// dirty counts go through it. --untracked-files=normal overrides a
+// status.showUntrackedFiles=no, which hides untracked files from a plain
+// porcelain status, and from `git worktree remove`'s own check too: it deleted
+// them with the worktree (measured, git 2.39). Ignored files are not listed.
+// Submodule changes are (--ignore-submodules=none). Read-only: it reads other
+// windows' worktrees, and must not take their index.lock.
 func StatusEntries(dir string) ([]string, error) {
 	out, err := runRawReadOnly(dir, "status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none")
 	if err != nil {
@@ -1765,17 +1786,6 @@ func StatusEntries(dir string) ([]string, error) {
 		}
 	}
 	return lines, nil
-}
-
-// RemoveCleanWorktree removes the worktree at path and never forces (#177): git
-// refuses one with uncommitted or untracked changes, a locked one, and one with
-// submodules. status.showUntrackedFiles is set to normal for git's own check,
-// which a repo's `no` blinds: the untracked files went with the worktree
-// (measured, git 2.39). git hands -c settings to the status it runs. The error
-// carries git's stderr.
-func RemoveCleanWorktree(path string) error {
-	_, err := runReporting("", "-c", "status.showUntrackedFiles=normal", "worktree", "remove", path)
-	return err
 }
 
 // DeleteBranchAt deletes local branch, and only while it still points at tip

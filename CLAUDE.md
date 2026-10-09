@@ -227,6 +227,14 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   on the BASE branch** (`ReapableBranch`): "patch-equivalent on base" is
   trivially true for the base itself, so every downstream verdict says shipped
   and the printed command becomes `git branch -D main` (#101).
+  ⚠ **Untracked files count whatever `status.showUntrackedFiles` says (#208).**
+  A repo set to `no` hid them from a plain porcelain status AND from `git
+  worktree remove`'s own check, so `clean -y`, merge-pr's auto-clean and
+  `release --clean` deleted a worktree's untracked work (measured, git 2.39).
+  `IsClean` and every dirty count read `gitx.StatusEntries`
+  (`--untracked-files=normal`); `WorktreeRemove` carries a scoped `-c
+  status.showUntrackedFiles=normal`, one command's argument, never the process
+  env (#92). Ignored files are unchanged: never dirty, deleted with the worktree.
   ⚠ **An upstream is not a push (#175).** `wt new` branches from
   `origin/<base>`, and git's default `branch.autoSetupMerge` records that as the
   new branch's upstream, so `HasUpstream` is true from birth. The "never pushed"
@@ -279,9 +287,10 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   removed, so a worktree with another inside is refused; and
   `status.showUntrackedFiles=no` blinds a plain porcelain status AND worktree
   remove's own check, which deleted the untracked files, so `StatusEntries`
-  passes `--untracked-files=normal` and `RemoveCleanWorktree` `-c
-  status.showUntrackedFiles=normal`. ⚠ With `core.ignorecase` a case twin is one
-  loose ref file and git's in-use check compares names exactly (#167), so the
+  passes `--untracked-files=normal` and `WorktreeRemove` a scoped `-c
+  status.showUntrackedFiles=normal` (every removal, #208). ⚠ With
+  `core.ignorecase` a case twin is one loose ref file and git's in-use check
+  compares names exactly (#167), so the
   base and branch-in-use checks fold case (`sameBranch`): `git branch -D Main`
   deletes main. A worktree whose directory is gone has nothing on disk to lose
   (git removes just its record, measured); one that is no longer a work tree's

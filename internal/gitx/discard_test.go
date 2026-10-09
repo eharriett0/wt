@@ -83,7 +83,7 @@ func TestCommitsOnlyOn(t *testing.T) {
 // status.showUntrackedFiles=no hides untracked files from a plain porcelain
 // status, and from `git worktree remove`'s own check, which then deleted them
 // with the worktree (measured, git 2.39). StatusEntries lists them anyway, and
-// RemoveCleanWorktree makes git's check see them too.
+// WorktreeRemove makes git's check see them too (#208).
 func TestUntrackedFilesHiddenByConfig(t *testing.T) {
 	dir := gitRepo(t)
 	t.Chdir(dir)
@@ -96,8 +96,8 @@ func TestUntrackedFilesHiddenByConfig(t *testing.T) {
 	if err != nil || len(got) != 1 || got[0] != "?? notes.txt" {
 		t.Fatalf("StatusEntries = %q, %v; want [?? notes.txt]", got, err)
 	}
-	if err := RemoveCleanWorktree(wt); err == nil {
-		t.Fatal("RemoveCleanWorktree removed a worktree holding an untracked file")
+	if err := WorktreeRemove(wt, false); err == nil {
+		t.Fatal("WorktreeRemove removed a worktree holding an untracked file")
 	}
 	if _, err := os.Stat(filepath.Join(wt, "notes.txt")); err != nil {
 		t.Fatalf("the untracked file is gone: %v", err)
@@ -112,8 +112,8 @@ func TestUntrackedFilesHiddenByConfig(t *testing.T) {
 	if got, err := StatusEntries(wt); err != nil || len(got) != 0 {
 		t.Fatalf("StatusEntries of a clean worktree = %q, %v", got, err)
 	}
-	if err := RemoveCleanWorktree(wt); err != nil {
-		t.Fatalf("RemoveCleanWorktree of a clean worktree: %v", err)
+	if err := WorktreeRemove(wt, false); err != nil {
+		t.Fatalf("WorktreeRemove of a clean worktree: %v", err)
 	}
 	if _, err := os.Stat(wt); !os.IsNotExist(err) {
 		t.Errorf("the worktree is still there (stat: %v)", err)

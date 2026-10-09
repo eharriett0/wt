@@ -400,7 +400,7 @@ func (r *DiscardResult) apply(c *config.Config) error {
 	if cur := gitx.BranchTip(r.Branch); cur != r.Tip {
 		return refuse(ErrDiscardRefused, "%s moved to %s after its commits were listed (at %s); re-run wt discard to see what it holds now. Nothing was discarded", r.Branch, short(cur), short(r.Tip))
 	}
-	if err := gitx.RemoveCleanWorktree(r.Dir); err != nil {
+	if err := gitx.WorktreeRemove(r.Dir, false); err != nil { // never forced; git's own check sees untracked files too (#208)
 		return fmt.Errorf("git worktree remove %s failed: %w; branch %s and its claim were left as they are", r.Dir, err, r.Branch)
 	}
 	ui.OK("removed worktree %s", r.Dir)
