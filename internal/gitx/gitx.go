@@ -100,6 +100,29 @@ func runRaw(dir string, args ...string) (string, error) {
 	return string(out), err
 }
 
+// runRawReadOnly is runRaw for a read-only query in ANOTHER window's worktree,
+// with readOnlyEnv. Use it only for a command that must not write there.
+func runRawReadOnly(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	cmd.Env = readOnlyEnv(scopedEnv())
+	out, err := cmd.Output()
+	return string(out), err
+}
+
+// readOnlyEnv adds GIT_OPTIONAL_LOCKS=0 to env: without it `git status`
+// opportunistically refreshes the worktree's index, which takes index.lock, so a
+// probe of another window can make that window's own `git add` or `git commit`
+// fail with "index.lock: File exists". The per-turn banner asks once per
+// overlapping window on every prompt (#182). Set on the one command, never
+// process-wide: the #92 lesson is that git env leaking into the wrong call breaks
+// it. Pure.
+func readOnlyEnv(env []string) []string {
+	return append(env[:len(env):len(env)], "GIT_OPTIONAL_LOCKS=0")
+}
+
 // Present reports whether the git binary is on PATH.
 func Present() bool {
 	_, err := exec.LookPath("git")
@@ -441,7 +464,9 @@ func IsUntracked(worktree, path string) bool {
 	if worktree == "" {
 		return false
 	}
-	out, err := runRaw(worktree, "status", "--porcelain", "--untracked-files=all", "--", path)
+	// Read-only: this asks about ANOTHER window's worktree, once per prompt from
+	// the agent banner, so it must not take that window's index.lock (#182).
+	out, err := runRawReadOnly(worktree, "status", "--porcelain", "--untracked-files=all", "--", path)
 	if err != nil {
 		return false
 	}

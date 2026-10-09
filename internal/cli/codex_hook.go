@@ -99,6 +99,99 @@ func codexContextMessage(overlaps []StatusOverlap, currentLabel string) (msg str
 	return msg, true
 }
 
+// agentContextOverlaps grades the cross-window overlaps for the per-turn banner
+// from the CURRENT window's side (#182) — the I/O half (classify via gh/git,
+// grade via git) of agentOverlaps. The current window's own liveness is never
+// consulted, so it isn't classified: one gh lookup fewer per turn.
+func agentContextOverlaps(c *config.Config, ws []collide.Window, root string) []StatusOverlap {
+	self := collide.SelfFor(ws, root)
+	ov := collide.Overlaps(ws)
+	labels := collide.OverlapWindowSet(ov)
+	if self.Label != "" {
+		// Another window sharing self's label goes unclassified with it, and so
+		// counts as live: never suppressed on ambiguity.
+		delete(labels, self.Label)
+	}
+	live := collide.ClassifyWindows(ws, c.Base, labels, c.MaxAge)
+	return agentOverlaps(c, gitFactsFor(c), ws, ov, live, self)
+}
+
+// agentOverlaps is the banner's decision (#182): which overlaps it lists, with
+// whom, and how they grade. The banner used to reuse `wt status`'s window-
+// neutral pipeline, so merged / dormant / closed-PR windows were listed and
+// graded, and two OTHER windows overlapping each other read as HIGH on a file
+// this window was editing; `wt check` from this window said low for all of them.
+// Now a file this window edits lists only the windows `wt check <file>` lists
+// by default, and reads HIGH only where `wt check` would block: HIGH ⇒ check
+// blocks, deliberately not the converse (gradeOverlaps says why). Pure given
+// newFacts.
+//
+// The returned Windows are display names: a window that shares a label with
+// self or with another window in the same overlap is suffixed with its worktree
+// (bannerWindows), so codexContextMessage, which tells self apart by label,
+// neither drops it as "self" nor merges two windows into one name.
+func agentOverlaps(c *config.Config, newFacts func() gradeFacts, ws []collide.Window, ov []collide.Overlap, live map[string]collide.WindowLiveness, self collide.Self) []StatusOverlap {
+	active, _ := collide.PartitionOverlapsFor(ov, live, self)
+	graded := gradeOverlaps(c, newFacts, ws, active, live, self)
+	for i := range graded {
+		graded[i].Windows = bannerWindows(active[i], self)
+	}
+	return graded
+}
+
+// bannerWindows names o's windows for the banner (#182). Self keeps its plain
+// label. Any other window whose label is self's, or is repeated within o, gets
+// the shortest tail of its worktree path that tells it apart from its namesakes,
+// "#77 (fix-77-b)" or "x (dupb/x)", so no two windows render alike and none
+// renders as self. Pure.
+func bannerWindows(o collide.Overlap, self collide.Self) []string {
+	count := map[string]int{}
+	for _, l := range o.Windows {
+		count[l]++
+	}
+	aligned := len(o.Worktrees) == len(o.Windows)
+	out := make([]string, len(o.Windows))
+	for i, l := range o.Windows {
+		out[i] = l
+		if !aligned || self.Is(o, i) || (count[l] < 2 && l != self.Label) {
+			continue
+		}
+		var namesakes []string
+		for j, wt := range o.Worktrees {
+			if j != i && o.Windows[j] == l {
+				namesakes = append(namesakes, wt)
+			}
+		}
+		if l == self.Label && self.Worktree != "" {
+			namesakes = append(namesakes, self.Worktree)
+		}
+		out[i] = l + " (" + distinctTail(o.Worktrees[i], namesakes) + ")"
+	}
+	return out
+}
+
+// distinctTail is the shortest run of trailing path segments of wt that none of
+// others ends with: "fix-77-b", or "dupb/x" when another namesake is ".../x".
+// The whole path when nothing shorter is distinct. Pure.
+func distinctTail(wt string, others []string) string {
+	segs := strings.Split(filepath.ToSlash(filepath.Clean(wt)), "/")
+	for k := 1; k < len(segs); k++ {
+		tail := strings.Join(segs[len(segs)-k:], "/")
+		clash := false
+		for _, o := range others {
+			o = filepath.ToSlash(filepath.Clean(o))
+			if o == tail || strings.HasSuffix(o, "/"+tail) {
+				clash = true
+				break
+			}
+		}
+		if !clash {
+			return tail
+		}
+	}
+	return wt
+}
+
 // hookAgentContext implements the per-turn UserPromptSubmit hooks
 // (`wt _hook codex-context` / `wt _hook claude-context` — both agents share the
 // cwd-in / additionalContext-out shape). Reads the payload from r, derives the
@@ -140,13 +233,8 @@ func hookAgentContext(r io.Reader) int {
 	if err != nil {
 		return 0
 	}
-	ov := collide.Overlaps(ws)
-	live := collide.ClassifyWindows(ws, c.Base, collide.OverlapWindowSet(ov), c.MaxAge)
-	active, _ := collide.PartitionOverlaps(ov, live)
-	graded := gradeStatusOverlaps(c, ws, active)
-
 	var parts []string
-	if msg, has := codexContextMessage(graded, collide.LabelForWorktree(ws, root)); has {
+	if msg, has := codexContextMessage(agentContextOverlaps(c, ws, root), collide.LabelForWorktree(ws, root)); has {
 		parts = append(parts, msg)
 	}
 	// Coordination signals — un-acked holds + announcements from other windows.

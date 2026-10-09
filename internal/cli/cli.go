@@ -763,7 +763,7 @@ func renderBlockingGate(graded []StatusOverlap, ws []collide.Window, live map[st
 	}
 	ui.Collision("%d file(s) with a HIGH-risk collision:", len(high))
 	for _, o := range high {
-		detail := ui.Yellow("indeterminate (untracked/binary — can't prove disjoint)")
+		detail := ui.Yellow("indeterminate (no line-level diff, e.g. binary — can't prove disjoint)")
 		if s := spansString(o.OverlapSpans); s != "" {
 			detail = ui.Yellow("overlap " + s)
 		} else if s := sectionsString(o.SharedSections); s != "" {
@@ -842,7 +842,7 @@ func statusReport(c *config.Config, asJSON, blocking bool) int {
 	if len(high) > 0 {
 		ui.Collision("%d file(s) with a HIGH-risk collision (overlapping hunks):", len(high))
 		for _, o := range high {
-			detail := ui.Yellow("indeterminate (untracked/binary — can't prove disjoint)")
+			detail := ui.Yellow("indeterminate (no line-level diff, e.g. binary — can't prove disjoint)")
 			if s := spansString(o.OverlapSpans); s != "" {
 				detail = ui.Yellow("overlap " + s)
 			} else if s := sectionsString(o.SharedSections); s != "" {

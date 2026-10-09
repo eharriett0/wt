@@ -56,6 +56,28 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   `collide.SharedSectionsAcross` — the hooks used to stop at the blanket
   shared-doc advisory, so the one case `structured_doc` exists to catch (two
   windows in the same lane) blocked in `check` and sailed through pre-push.
+  Inside `cli`, the per-entry decision is ONE function, `gradeEntry` (#182):
+  `wt check`/wt_check/both edit hooks AND `wt status`/wt_status/the per-turn
+  banner grade through it. The banner used to run its own all-windows grade, so
+  merged/dormant/closed windows rode along and it said HIGH where `check` said
+  low. For a file the current window edits, the banner lists what `check` lists
+  and is **HIGH ⇒ `check` blocks** (`TestAgentOverlaps_MatchesCheck`). ⚠ NOT ⟺,
+  on purpose: when this window's own copy is already on base (#109) or its change
+  already landed (#122), `check` still blocks (its pre-edit heads-up: empty or
+  phantom ranges can't be proven disjoint) but the banner reads "same file".
+  Re-tighten it and a session left open after its PR merged is told HIGH on
+  every turn, the #182 noise. An untracked copy (#113) stays HIGH in both.
+  Window-neutral (`wt status`, banner lines for files this window isn't
+  editing), a file is HIGH iff some pair blocks in BOTH directions: a window
+  whose claim is already merged, landed or untracked contests nothing. ⇒ Two
+  windows creating the same new file read advisory in status and in other
+  windows' banners until one commits it (consistent with #113), while `check`
+  from the untracked side still blocks. **A label is not an identity**: two
+  worktrees that claimed one issue are both `#N`, and detached worktrees are
+  named by their directory. Overlaps carry worktrees (`Overlap.Worktrees`,
+  `collide.Self`) and pairs grade by worktree; `ClassifyWindows` keeps a shared
+  label's least-suppressed answer. Grading by label compared one window with
+  itself and dropped a real pair.
 - **`wt clean` is data-loss-critical.** `ReapVerdict` only reaps a *provably
   shipped* worktree (grace window, upstream, merged PR / cherry). Never
   force-remove a dirty worktree automatically — `--stale-index` is
@@ -146,8 +168,11 @@ exit 0** (advisory / fail-open; a coordination nicety must never break the sessi
 `PreToolUse` fires on `apply_patch` and supports both `additionalContext` and
 `permissionDecision:"deny"` — so `wt install-codex-hook` wires two hooks:
 - `wt _hook codex-context` (**UserPromptSubmit**): each turn emits the cross-window
-  overlap summary from the SAME `collide.Overlaps` + `gradeStatusOverlaps` machinery
-  `wt status` uses, excluding the current window (`collide.LabelForWorktree`).
+  overlap summary (`agentOverlaps`: `collide.PartitionOverlapsFor` + `gradeOverlaps`)
+  from the CURRENT window's side, so a file this window edits lists the windows
+  `wt check <file>` would there and reads HIGH only where it blocks (#182); the
+  current window, identified by worktree (`collide.SelfFor`), is excluded. Same
+  builder as `claude-context`.
 - `wt _hook codex-edit` (**PreToolUse**, matcher `apply_patch`): parses the patch's
   `*** {Update|Add|Delete|Move} File:` targets, grades them via `buildCheckReport`
   (the same grader as `wt check`), then RE-grades each `CatBlocking` entry against
