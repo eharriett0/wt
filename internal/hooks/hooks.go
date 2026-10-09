@@ -338,7 +338,7 @@ func pushCollisionBlocks(c *config.Config, ws []collide.Window, root string, pat
 	if len(paths) == 0 {
 		return false
 	}
-	conflicts := collide.CheckPaths(ws, root, paths)
+	conflicts := pathConflicts(ws, root, paths)
 	if len(conflicts) == 0 {
 		return false
 	}
@@ -366,6 +366,18 @@ func pushCollisionBlocks(c *config.Config, ws []collide.Window, root string, pat
 	fmt.Fprintln(os.Stderr, ui.Yellow("   Coordinate with that window before pushing (run `wt check` for details)."))
 	fmt.Fprintln(os.Stderr, ui.Dim("   Bypass (you've coordinated): WT_SKIP_COLLISION=1 git push"))
 	return true
+}
+
+// pathConflicts runs the collision engine over paths that came from git — the
+// pre-push outgoing files, the pre-commit staged files — which are real
+// repo-relative paths and so match EXACTLY (#181). Fuzzy suffix/basename
+// matching made the root README.md "collide" with another window's
+// pkg/svc/README.md and blocked the push; worse, the dedupe then hid which file
+// actually collided when both were outgoing. Exact is also what `wt check`
+// does with an existing path, which keeps the block predicate equal to it.
+// Pure.
+func pathConflicts(ws []collide.Window, root string, paths []string) []collide.Conflict {
+	return collide.CheckPaths(ws, root, collide.ExactQueries(paths))
 }
 
 // distinctPaths returns the unique file paths across the conflicts.
@@ -410,11 +422,10 @@ type rangeFn func(worktree, base, path string) []gitx.LineRange
 // to its own current-content sections, #123). Same fn in tests, different in
 // production (gitx.ChangedRanges vs gitx.ChangedRangesNew).
 func gradeConflicts(c *config.Config, active []collide.Conflict, root string, ws []collide.Window, ranges, sectionRanges rangeFn) (hard, soft []collide.Conflict) {
-	wtByLabel := make(map[string]string, len(ws))
-	for _, w := range ws {
-		wtByLabel[w.Label()] = w.Worktree
-	}
 	for _, cf := range active {
+		// #193: the worktree that touches the file, never a namesake's. A label
+		// can name two windows, and the last one used to stand in for both.
+		otherWt := collide.WorktreeOf(cf, ws)
 		rangesPath := cf.MatchedFile
 		if rangesPath == "" {
 			rangesPath = cf.Path
@@ -422,14 +433,14 @@ func gradeConflicts(c *config.Config, active []collide.Conflict, root string, ws
 		// #109: an already-merged path — the other window's content is byte-identical
 		// to the upstream base (stale index / worktree) — is not a live collision.
 		// Advisory, never blocks; matches `wt check`'s already-merged downgrade.
-		if merged, known := collide.PathMatchesUpstream(wtByLabel[cf.Window], c.Base, rangesPath); known && merged {
+		if merged, known := collide.PathMatchesUpstream(otherWt, c.Base, rangesPath); known && merged {
 			soft = append(soft, cf)
 			continue
 		}
 		// #113: the other window's claim on this path is an UNTRACKED file — nothing
 		// committed/staged there, so it can't be pushed and can't collide until
 		// committed. Advisory, never blocks; matches `wt check`'s untracked downgrade.
-		if gitx.IsUntracked(wtByLabel[cf.Window], rangesPath) {
+		if gitx.IsUntracked(otherWt, rangesPath) {
 			soft = append(soft, cf)
 			continue
 		}
@@ -443,7 +454,7 @@ func gradeConflicts(c *config.Config, active []collide.Conflict, root string, ws
 			// straight through the pre-push guard.
 			if delim, isStructured := c.StructuredDocs[filepath.Base(cf.Path)]; isStructured {
 				if shared, graded := collide.SharedSectionsAcross(
-					c.Base, []string{root, wtByLabel[cf.Window]}, rangesPath, delim, collide.RangeFn(sectionRanges),
+					c.Base, []string{root, otherWt}, rangesPath, delim, collide.RangeFn(sectionRanges),
 				); graded && len(shared) > 0 {
 					hard = append(hard, cf)
 					continue
@@ -457,7 +468,7 @@ func gradeConflicts(c *config.Config, active []collide.Conflict, root string, ws
 			continue
 		}
 		cur := ranges(root, c.Base, rangesPath)
-		other := ranges(wtByLabel[cf.Window], c.Base, rangesPath)
+		other := ranges(otherWt, c.Base, rangesPath)
 		if collide.ConflictSeverity(cur, other, false) != collide.SevHigh {
 			soft = append(soft, cf)
 			continue
@@ -467,7 +478,7 @@ func gradeConflicts(c *config.Config, active []collide.Conflict, root string, ws
 		// the other window's change to this file is already on base (a clean 3-way
 		// merge into base is a no-op), it isn't contesting it. Fail-safe: an
 		// undeterminable check keeps the hard block.
-		if s, known := gitx.FileChangeSubsumed(wtByLabel[cf.Window], c.Base, rangesPath); known && s {
+		if s, known := gitx.FileChangeSubsumed(otherWt, c.Base, rangesPath); known && s {
 			soft = append(soft, cf)
 			continue
 		}
@@ -496,7 +507,7 @@ func HookPreCommit(c *config.Config) int {
 	root, _ := gitx.RepoRoot()
 
 	if len(stagedFiles) > 0 {
-		if conflicts := collide.CheckPaths(ws, root, stagedFiles); len(conflicts) > 0 {
+		if conflicts := pathConflicts(ws, root, stagedFiles); len(conflicts) > 0 {
 			// Suppress collisions against stale branches (merged / no open PR) —
 			// same liveness rule as `wt check`, so the hook doesn't cry wolf on
 			// every commit against long-dead branches that touched the same file.

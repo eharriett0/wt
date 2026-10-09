@@ -51,6 +51,18 @@ of files touched by more than one window. `wt check` exits **3** when another
 window is already in one of the given paths (so a script — or an agent in one
 window — can branch on "collision found"), **0** when clear.
 
+`wt check` reads a path relative to your current directory and compares it as
+that exact repo path: `wt check README.md` at the root asks about the root
+`README.md`, never about `pkg/svc/README.md`. A bare name that is no path in the
+repo is a search instead: `wt check foo.go` matches a touched file of that name
+in any directory. A file another window moved counts by both its old and its
+new path.
+
+In `wt check --json`, each entry's `path` is the repo-relative path that
+collides, not the argument as you typed it: `wt check ./svc/README.md` run in
+`pkg/` reports `pkg/svc/README.md`, and a directory argument lists one entry per
+file under it. Only a search keeps the argument as typed (`foo.go`).
+
 ### Hunk-level, not just file-level
 
 Append-heavy files — an image-inventory YAML, a kustomize `resources:` list, a
@@ -383,6 +395,8 @@ else is in this file?" mid-conversation:
 
 - **`wt_status`** — every active window + graded cross-window overlaps
 - **`wt_check`** — before editing given paths: is another live window in them?
+  Relative paths are read from the repo root, wherever the client started the
+  server.
 - **`wt_todos`** — what each window is working on
 - **`wt_where`** — resolve an issue/branch to its worktree path
 

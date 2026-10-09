@@ -616,6 +616,26 @@ func parseCodexPatch(patch string) []codexPatchFile {
 	return files
 }
 
+// repoRelativePatch rewrites each section's path (and move destination) from
+// the form apply_patch uses, relative to Codex's cwd (or absolute), to a
+// repo-relative one, via repoRelativePath. prefix is that cwd relative to the
+// repo root (`git rev-parse --show-prefix`). Matching is exact (#181), so a
+// Codex session started in pkg/ that patches "svc/README.md" must be checked as
+// pkg/svc/README.md; the old suffix match only reached it by accident, and the
+// pending-hunk read joined the wrong file onto root. A path outside the repo
+// becomes "", which patchPaths drops. Pure for relative paths.
+func repoRelativePatch(files []codexPatchFile, root, prefix string) []codexPatchFile {
+	out := make([]codexPatchFile, len(files))
+	for i, f := range files {
+		f.path = repoRelativePath(root, prefix, f.path)
+		if f.newPath != "" {
+			f.newPath = repoRelativePath(root, prefix, f.newPath)
+		}
+		out[i] = f
+	}
+	return out
+}
+
 // patchPaths returns every repo-relative path an apply_patch touches (update /
 // add / delete targets + move destinations), deduped. Pure.
 func patchPaths(files []codexPatchFile) []string {
@@ -721,25 +741,29 @@ func hookCodexEdit(r io.Reader) int {
 	if err != nil {
 		return 0
 	}
-	files := parseCodexPatch(patch)
+	prefix, _ := gitx.ShowPrefix()
+	files := repoRelativePatch(parseCodexPatch(patch), root, prefix)
 	paths := patchPaths(files)
 	if len(paths) == 0 {
 		return 0
 	}
 	byPath := map[string]codexPatchFile{}
 	for _, f := range files {
-		byPath[f.path] = f
+		if f.path != "" {
+			byPath[f.path] = f
+		}
 		if f.newPath != "" {
 			byPath[f.newPath] = f // a move grades the destination too (#117 review)
 		}
 	}
 
-	entries := buildCheckReport(c, ws, root, paths, false)
+	// #181: the patch's targets are real repo-relative paths, so they match
+	// EXACTLY, as the pre-push guard does; never by suffix or basename.
+	entries := buildCheckReport(c, ws, root, collide.ExactQueries(paths), false)
 	// Re-grade each path's entries against the patch's ACTUAL hunks the way `wt
 	// check` will grade the file once the patch is applied (regradePending, the
 	// same rule as the Claude hook): this window's own ranges plus the patch's,
 	// moved into base line numbers through this worktree's own diff (#108/#184).
-	byLabel := windowByLabel(ws)
 	byEntryPath := map[string][]CheckEntry{}
 	var order []string
 	for _, e := range entries {
@@ -754,7 +778,7 @@ func hookCodexEdit(r io.Reader) int {
 		cur, curOK := ownRanges(root, c.Base, path)
 		pending, pendingOK := pendingPatchRanges(byPath, path, root, c.Base)
 		graded := regradePending(byEntryPath[path], cur, curOK, pending, pendingOK, func(e CheckEntry) bool {
-			return subsumedByBase(byLabel[e.Window].Worktree, c.Base, path)
+			return subsumedByBase(e.otherWorktree, c.Base, path) // that window's, not a namesake's (#193)
 		})
 		for _, g := range graded {
 			high = append(high, codexGradedEntry{entry: g.entry, confirmed: g.confirmed})

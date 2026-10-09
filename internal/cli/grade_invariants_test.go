@@ -87,7 +87,7 @@ func TestAgentOverlaps_SelfContestsNothing(t *testing.T) {
 
 			// `wt check x.go` from cur blocks in every one of these cases
 			checkBlocks := false
-			for _, e := range checkEntries(gradeTestConfig(), ff, ws, "/wt/cur", collide.CheckPaths(ws, "/wt/cur", []string{file}), live) {
+			for _, e := range checkEntries(gradeTestConfig(), ff, ws, "/wt/cur", collide.CheckPaths(ws, "/wt/cur", collide.ExactQueries([]string{file})), live) {
 				checkBlocks = checkBlocks || e.Category == CatBlocking
 			}
 			if !checkBlocks {

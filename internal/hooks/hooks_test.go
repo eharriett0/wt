@@ -111,6 +111,39 @@ func TestGradeConflicts_UsesMatchedFileForRangeLookup(t *testing.T) {
 	}
 }
 
+// TestPathConflicts_GitPathsMatchExactly is the #181 regression at the hook
+// layer. Pre-push and pre-commit pass git's repo-relative paths, so a pushed
+// ROOT README.md must not "collide" with another window's pkg/svc/README.md —
+// that blocked the push for a file the other branch never touched. When both
+// are outgoing, the block must name the file that really collides: the fuzzy
+// match resolved README.md to the nested file first and the dedupe then hid the
+// real entry, so the message blamed the root README.md.
+func TestPathConflicts_GitPathsMatchExactly(t *testing.T) {
+	ws := []collide.Window{
+		{Branch: "feat-b", Worktree: "/wt/B", Touched: []string{"pkg/svc/README.md", "tools/Makefile", "site/docs/x.md"}},
+		{Branch: "feat-a", Worktree: testRoot},
+	}
+	cases := []struct {
+		outgoing []string
+		want     []string // "path→matched" per conflict
+	}{
+		{[]string{"README.md"}, nil},
+		{[]string{"Makefile", "go.mod"}, nil},
+		{[]string{"docs/x.md"}, nil},
+		{[]string{"pkg/svc/README.md"}, []string{"pkg/svc/README.md→pkg/svc/README.md"}},
+		{[]string{"README.md", "pkg/svc/README.md"}, []string{"pkg/svc/README.md→pkg/svc/README.md"}},
+	}
+	for _, tc := range cases {
+		var got []string
+		for _, cf := range pathConflicts(ws, testRoot, tc.outgoing) {
+			got = append(got, cf.Path+"→"+cf.MatchedFile)
+		}
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("pathConflicts(%v) = %v, want %v", tc.outgoing, got, tc.want)
+		}
+	}
+}
+
 // A file touched by several windows must count once per (path, window), and the
 // blocking-file count must be distinct paths — this is what keeps a 5-file
 // commit from reporting 88 (#92 / #97).

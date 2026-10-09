@@ -148,7 +148,40 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   named by their directory. Overlaps carry worktrees (`Overlap.Worktrees`,
   `collide.Self`) and pairs grade by worktree; `ClassifyWindows` keeps a shared
   label's least-suppressed answer. Grading by label compared one window with
-  itself and dropped a real pair.
+  itself and dropped a real pair. **So do conflicts (#193):** `collide.Conflict`
+  carries the other window's `Worktree` (set in `CheckPaths`), and
+  `checkEntries`, `hooks.gradeConflicts` and the edit hooks' #122 re-check read
+  THAT worktree (`collide.WorktreeOf`), never the label's: the label lookup kept
+  the last namesake, so a real overlap was graded against its twin's disjoint
+  hunks and pre-push let it through. Liveness stays per label (least-suppressed,
+  so a shared label can only surface more).
+- **A real path matches EXACTLY; only a search term is fuzzy (#181).** Paths
+  from git or a hook payload (pre-push outgoing, pre-commit staged,
+  Claude/Codex edit targets) go through `collide.ExactQueries`. A `wt check` /
+  `wt_check` argument goes through `collide.QueryFor`: exact when it names a
+  real path (on disk or tracked relative to the cwd, or touched at that exact
+  path by a window), fuzzy (suffix / basename / dir-suffix) only when it names
+  nothing. A root file has no `/` to anchor a suffix on, so fuzzy-matching every
+  path made the root `README.md` collide with another branch's
+  `pkg/svc/README.md` and blocked the push. The zero `MatchMode` is exact, so a
+  query whose mode was never decided can't invent a collision. A `wt check`
+  argument is read from the cwd (`git rev-parse --show-prefix`, `cwdArgBase`),
+  a `wt_check` one from the repo ROOT (`rootArgBase`: its schema says
+  repo-relative, and the server may run in a subdirectory); absolute ones go
+  through `resolveExisting`, which handles `/var`→`/private/var` even for a file
+  that doesn't exist yet. ⚠ So the #92 equality holds for every path that
+  names something; for a name that names nothing yet (not on disk, not
+  tracked, not touched at that path), `wt check` runs a fuzzy SEARCH and is a
+  superset of the edit hooks, which ask about the exact file being created and
+  stay silent about namesakes. That direction is safe; don't "fix" it by making
+  the hooks fuzzy. CheckPaths lets an exact query claim a file before a fuzzy
+  one (`exactFirst`), so an entry names the real path whatever the argument
+  order. ⚠ **Every `git diff --name-only` feeding the engine passes
+  `--no-renames`** (TouchedFiles, RangeChangedPaths, StagedFiles): with rename
+  detection a COMMITTED move listed only its new path, so an edit of the old
+  path in another window went unmatched. The fuzzy suffix tier used to hide that
+  (README.md is a suffix of pkg/README.md); exact matching needs the old path
+  listed, as the porcelain read already does for a staged move (#28).
 - **`wt clean` is data-loss-critical.** `ReapVerdict` only reaps a *provably
   shipped* worktree (grace window, upstream, merged PR / cherry). Never
   force-remove a dirty worktree automatically — `--stale-index` is

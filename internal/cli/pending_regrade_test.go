@@ -155,11 +155,7 @@ func TestPreEditHooks_UnmeasurableOwnRangesStayHeadsUp(t *testing.T) {
 // l02; wa edits l20. Returns wc (behind, no edits yet).
 func behindHookRepo(t *testing.T) (wc string) {
 	t.Helper()
-	bin := t.TempDir()
-	if err := os.WriteFile(filepath.Join(bin, "gh"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH")) // no real GitHub calls
+	offlineGH(t) // no real GitHub calls
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("WT_SKIP_COLLISION", "")
 	t.Setenv("HOOK_DISABLE_MULTIWINDOW_CHECK", "")
@@ -218,7 +214,7 @@ func postEditSeverity(t *testing.T, wc, target string) bool {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, e := range buildCheckReport(c, ws, wc, []string{"data.txt"}, false) {
+	for _, e := range buildCheckReport(c, ws, wc, collide.ExactQueries([]string{"data.txt"}), false) {
 		if e.Window == "wa" {
 			return e.Category == CatBlocking
 		}

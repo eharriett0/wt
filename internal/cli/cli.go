@@ -1025,31 +1025,109 @@ func parseCheckArgs(args []string) (paths []string, includeStale, showDiff, asJS
 	return
 }
 
+// checkArg is one `wt check` argument with the facts that decide both how it is
+// matched (#181) and whether it is a typo (#93), gathered once so the two
+// decisions read the same facts.
+type checkArg struct {
+	arg     string        // as typed, trimmed
+	query   collide.Query // how it is matched against each window's touched files
+	exists  bool          // present in the working tree
+	tracked bool          // known to git (a deleted-but-tracked path counts)
+}
+
+// argBase is the place a check's arguments are read from: prefix is its path
+// relative to the repo root (`git rev-parse --show-prefix`, "" = the root
+// itself), exists and tracked answer for an argument as typed. Injected so the
+// resolution is table-testable without a repo (resolveCheckArgs).
+type argBase struct {
+	prefix  string
+	exists  func(arg string) bool // present in the working tree
+	tracked func(arg string) bool // known to git (a deleted-but-tracked path counts)
+}
+
+// cwdArgBase is `wt check`'s: arguments are read relative to the current
+// directory, the way the operator typed them (README.md typed in pkg/svc/ is
+// pkg/svc/README.md). Asking git for the prefix avoids comparing os.Getwd, which
+// can return the logical /var/… path on macOS, with git's physical root.
+// IsTracked (git ls-files) is cwd-relative too, so the facts agree from a subdir
+// (#92 review). I/O.
+func cwdArgBase() argBase {
+	prefix, _ := gitx.ShowPrefix()
+	return argBase{
+		prefix:  prefix,
+		exists:  func(a string) bool { _, err := os.Stat(a); return err == nil },
+		tracked: gitx.IsTracked,
+	}
+}
+
+// rootArgBase is MCP wt_check's: arguments are read relative to the repo root,
+// whatever directory the client started `wt mcp` in (#181 review). Its schema
+// promises repo-relative paths, and a model has no way to know the server's cwd;
+// read from a subdirectory, README.md named that subdirectory's README.md and
+// missed a collision on the root one. I/O.
+func rootArgBase(root string) argBase {
+	at := func(a string) string {
+		if filepath.IsAbs(a) {
+			return a
+		}
+		return filepath.Join(root, a)
+	}
+	return argBase{
+		exists:  func(a string) bool { _, err := os.Stat(at(a)); return err == nil },
+		tracked: func(a string) bool { return gitx.IsTrackedIn(root, a) },
+	}
+}
+
+// resolveCheckArgs gathers each argument's facts from base and lets
+// collide.QueryFor decide its match mode: exact at the repo-relative path it
+// names when it names a real one, fuzzy as typed when it doesn't (#181). root is
+// the repo's top level, for an absolute argument. Shared by `wt check`
+// (cwdArgBase) and MCP wt_check (rootArgBase), so the two differ only in where a
+// relative path starts. Pure given base (an absolute argument also resolves
+// symlinks: repoRelativePath).
+func resolveCheckArgs(args []string, root string, base argBase, ws []collide.Window) []checkArg {
+	var out []checkArg
+	for _, a := range args {
+		a = strings.TrimSpace(a)
+		if a == "" {
+			continue
+		}
+		ca := checkArg{arg: a, exists: base.exists(a)}
+		ca.tracked = !ca.exists && base.tracked(a)
+		ca.query = collide.QueryFor(a, repoRelativePath(root, base.prefix, a), ca.exists || ca.tracked, ws)
+		out = append(out, ca)
+	}
+	return out
+}
+
+// checkQueries returns the resolved query of each argument, in order. Pure.
+func checkQueries(args []checkArg) []collide.Query {
+	qs := make([]collide.Query, 0, len(args))
+	for _, a := range args {
+		qs = append(qs, a.query)
+	}
+	return qs
+}
+
 // unknownCheckPaths returns the requested paths that are almost certainly typos
 // (#93): they look like a real path (contain '/' or whitespace) yet don't exist
-// in the working tree, aren't tracked by git, and aren't touched by any window.
-// A bare basename (no '/' or whitespace) is a legitimate fuzzy suffix query and
-// is never flagged.
-func unknownCheckPaths(paths []string, ws []collide.Window) []string {
+// in the working tree, aren't tracked by git, and match no window's touched
+// files under the mode they will actually be checked with (#181). A bare name
+// (no '/' or whitespace) is never flagged: when it names no path here it is a
+// legitimate fuzzy basename search. Pure.
+func unknownCheckPaths(args []checkArg, ws []collide.Window) []string {
 	var out []string
-	for _, p := range paths {
-		p = strings.TrimSpace(p)
-		if p == "" || !strings.ContainsAny(p, "/ \t") {
-			continue // bare single-token basename → fuzzy query, exempt
+	for _, a := range args {
+		if a.arg == "" || !strings.ContainsAny(a.arg, "/ \t") {
+			continue // bare single-token name → exact if it exists, else a fuzzy search; exempt
 		}
-		// cwd-relative (NOT root-relative): the operator types paths relative to
-		// where they are, and IsTracked (git ls-files) is also cwd-relative, so
-		// both agree from a subdir (#92 review).
-		if _, err := os.Stat(p); err == nil {
-			continue // exists in the working tree
+		if a.exists || a.tracked {
+			continue // exists in the working tree, or a deleted-but-tracked path (legit)
 		}
-		if gitx.IsTracked(p) {
-			continue // deleted-but-tracked path (legit)
-		}
-		if collide.PathTouchedByAny(p, ws) {
+		if collide.PathTouchedByAny(a.query, ws) {
 			continue // a window is genuinely touching it (collision / other-branch path)
 		}
-		out = append(out, p)
+		out = append(out, a.arg)
 	}
 	return out
 }
@@ -1082,18 +1160,22 @@ func cmdCheck(args []string) int {
 			return 1
 		}
 		root, _ := gitx.RepoRoot()
+		// #181: a path that names a real location (here, tracked, or touched at
+		// that exact path by a window) matches EXACTLY; only one that names
+		// nothing in the repo is a fuzzy basename/suffix search.
+		args := resolveCheckArgs(paths, root, cwdArgBase(), ws)
 		// #93: refuse a path that doesn't exist in the working tree, isn't tracked
 		// by git, and isn't touched by any window — a typo (or a zsh non-word-split
 		// single arg) that would otherwise falsely report '✓ clear'. Bare basenames
 		// (no '/' or space) are fuzzy suffix queries and exempt; --allow-missing
 		// opts into checking a genuinely-gone path.
 		if !allowMissing {
-			if unknown := unknownCheckPaths(paths, ws); len(unknown) > 0 {
+			if unknown := unknownCheckPaths(args, ws); len(unknown) > 0 {
 				ui.Err("wt check: no such path(s) — refusing to report 'clear' for path(s) that don't exist, aren't tracked, and no window is touching: %s. (typo, or zsh didn't word-split a $var? checking a path you're about to CREATE, or one that's deleted/on another branch? re-run with --allow-missing.)", strings.Join(unknown, ", "))
 				return 64
 			}
 		}
-		entries := buildCheckReport(c, ws, root, paths, includeStale)
+		entries := buildCheckReport(c, ws, root, checkQueries(args), includeStale)
 		if asJSON {
 			return renderCheckJSON(entries, includeStale)
 		}

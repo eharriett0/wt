@@ -86,6 +86,86 @@ func TestTouchedFiles_RenameRecordsBothPaths(t *testing.T) {
 	}
 }
 
+// #181 review: a COMMITTED move must list both paths too, in every name source
+// the collision engine reads. With git's default rename detection, `git diff
+// --name-only` printed only the new path, so a window that committed README.md →
+// pkg/README.md never matched another window's edit of README.md. Fuzzy suffix
+// matching hid that ("README.md" is a suffix of "pkg/README.md"); exact matching
+// relies on these. The file is large enough for git to detect the rename, or the
+// test would pass for the wrong reason (movedRepo asserts it).
+
+// movedRepo commits a 40-line README.md on main, then moves it to pkg/README.md
+// on branch feat; staged=true leaves the move staged instead of committed.
+func movedRepo(t *testing.T, staged bool) string {
+	t.Helper()
+	dir := gitRepo(t)
+	writeFile(t, dir, "README.md", strings.Repeat("readme line\n", 40))
+	runGit(t, dir, "add", "README.md")
+	runGit(t, dir, "commit", "-qm", "add readme")
+	runGit(t, dir, "checkout", "-qb", "feat")
+	if err := os.MkdirAll(filepath.Join(dir, "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, dir, "mv", "README.md", "pkg/README.md")
+	if !staged {
+		runGit(t, dir, "commit", "-qm", "move readme")
+	}
+	// precondition: git itself sees a rename, so rename detection would hide the old path
+	args := []string{"diff", "--name-status", "-M", "main"}
+	if staged {
+		args = append(args, "--cached")
+	} else {
+		args = append(args, "HEAD")
+	}
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil || !strings.HasPrefix(string(out), "R") {
+		t.Fatalf("precondition: git should detect the move as a rename, got %q (%v)", out, err)
+	}
+	return dir
+}
+
+func TestTouchedFiles_CommittedMoveRecordsBothPaths(t *testing.T) {
+	dir := movedRepo(t, false)
+	got := TouchedFiles(dir, "main")
+	for _, want := range []string{"README.md", "pkg/README.md"} {
+		if !touchedContains(got, want) {
+			t.Errorf("committed move: %s missing from the touched set %v", want, got)
+		}
+	}
+}
+
+// The other direction: THIS window made the move. Pre-push reads the outgoing
+// set (RangeChangedPaths), pre-commit the staged set (StagedFiles); both must
+// list the old path, or another window's edit of it is never checked.
+func TestRangeChangedPaths_MoveListsBothPaths(t *testing.T) {
+	dir := movedRepo(t, false)
+	got, err := RangeChangedPaths(dir, "main", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"README.md", "pkg/README.md"} {
+		if !touchedContains(got, want) {
+			t.Errorf("outgoing move: %s missing from %v", want, got)
+		}
+	}
+}
+
+func TestStagedFiles_MoveListsBothPaths(t *testing.T) {
+	dir := movedRepo(t, true)
+	t.Chdir(dir) // StagedFiles reads the invoking worktree's own index
+	got, err := StagedFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"README.md", "pkg/README.md"} {
+		if !touchedContains(got, want) {
+			t.Errorf("staged move: %s missing from %v", want, got)
+		}
+	}
+}
+
 // writeFile is a tiny helper for the range-scope tests below.
 func writeFile(t *testing.T, dir, rel, content string) {
 	t.Helper()

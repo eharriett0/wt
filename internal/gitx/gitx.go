@@ -68,6 +68,17 @@ func run(dir string, args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
+// noRenames is the flag every `git diff --name-only` feeding the collision
+// engine passes: a move is listed by BOTH its old and new path, never just the
+// new one (#181 review). With rename detection on (git's default), a window that
+// committed README.md → pkg/README.md listed only pkg/README.md, so an edit of
+// README.md in another window went unmatched. Fuzzy suffix matching used to
+// catch that by accident ("README.md" is a suffix of "pkg/README.md"); exact
+// matching depends on the old path being listed. It can only add paths, the
+// direction a collision check can afford, and matches what the porcelain read
+// in TouchedFiles already does for a staged move (#28).
+const noRenames = "--no-renames"
+
 // StagedFiles returns the paths staged for the IN-PROGRESS commit. It PRESERVES
 // git's ambient environment (unlike run(), which strips GIT_INDEX_FILE) because
 // git points GIT_INDEX_FILE at a TEMPORARY index for a partial commit
@@ -77,8 +88,11 @@ func run(dir string, args ...string) (string, error) {
 // collision notice would miss (or over-report) collisions (#92 review). This is
 // the invoking worktree's OWN read, so the ambient env is correct here — only
 // the cross-worktree `-C dir` scans need scopedEnv.
+//
+// --no-renames: a staged move is listed by BOTH paths (#181 review), as the
+// collision engine's other name sources are (noRenames).
 func StagedFiles() ([]string, error) {
-	out, err := exec.Command("git", "diff", "--cached", "--name-only").Output()
+	out, err := exec.Command("git", "diff", "--cached", "--name-only", noRenames).Output()
 	if err != nil {
 		return nil, err
 	}
@@ -136,6 +150,14 @@ func Present() bool {
 
 // RepoRoot returns the top-level dir of the repo containing cwd.
 func RepoRoot() (string, error) { return Run("rev-parse", "--show-toplevel") }
+
+// ShowPrefix returns cwd's path relative to the top of its worktree, as git
+// sees it: "pkg/svc/" in a subdirectory, "" at the root. Used to read a path the
+// operator typed relative to where they are as a repo-relative one (#181).
+// Asking git avoids comparing os.Getwd, which can return the logical /var/…
+// path on macOS, with --show-toplevel, which is always the physical
+// /private/var/… one.
+func ShowPrefix() (string, error) { return Run("rev-parse", "--show-prefix") }
 
 // CommonDir returns the absolute $GIT_COMMON_DIR (shared across all worktrees).
 func CommonDir() (string, error) {
@@ -550,6 +572,14 @@ func IsTracked(path string) bool {
 	return err == nil
 }
 
+// IsTrackedIn is IsTracked with path read relative to dir instead of the
+// current directory. MCP wt_check reads its paths from the repo root, whatever
+// directory the server was started in (#181 review).
+func IsTrackedIn(dir, path string) bool {
+	_, err := RunDir(dir, "ls-files", "--error-unmatch", "--", path)
+	return err == nil
+}
+
 // CountUnshipped counts cherry "+" lines (commits with no patch-equivalent on
 // base). Zero means the branch is fully shipped (squash-merge safe).
 func CountUnshipped(base, branchRef string) (int, error) {
@@ -589,9 +619,10 @@ func AllZeroSHA(ref string) bool {
 // is the #106 family for the not-rebased case: #106 moved the `from` ref to base,
 // but two-dot still diverged whenever base wasn't already an ancestor of `to`.
 // For a fast-forward (from is an ancestor of to) three-dot == two-dot, so the FF
-// case is unchanged. Runs in dir (empty → cwd). Best-effort.
+// case is unchanged. A move is listed by both paths (noRenames). Runs in dir
+// (empty → cwd). Best-effort.
 func RangeChangedPaths(dir, from, to string) ([]string, error) {
-	out, err := RunDir(dir, "diff", "--name-only", from+"..."+to)
+	out, err := RunDir(dir, "diff", "--name-only", noRenames, from+"..."+to)
 	if err != nil {
 		return nil, err
 	}
@@ -801,9 +832,10 @@ func TouchedFiles(dir, base string) []string {
 		}
 	}
 
-	// (b) committed-on-branch vs base (three-dot = since merge-base).
+	// (b) committed-on-branch vs base (three-dot = since merge-base). A COMMITTED
+	// move records both paths too (noRenames), like the staged one above.
 	for _, ref := range []string{"origin/" + base, base} {
-		if out, err := RunDir(dir, "diff", "--name-only", ref+"...HEAD"); err == nil {
+		if out, err := RunDir(dir, "diff", "--name-only", noRenames, ref+"...HEAD"); err == nil {
 			for _, ln := range strings.Split(out, "\n") {
 				if p := strings.TrimSpace(ln); p != "" {
 					set[p] = struct{}{}

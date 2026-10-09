@@ -450,7 +450,7 @@ func TestAgentOverlaps_MatchesCheck(t *testing.T) {
 		// `wt check <file>` from cur: what it lists by default, and whether it blocks
 		var checkListed []string
 		checkBlocks := false
-		for _, e := range checkEntries(c, ff, ws, "/wt/cur", collide.CheckPaths(ws, "/wt/cur", []string{file}), live) {
+		for _, e := range checkEntries(c, ff, ws, "/wt/cur", collide.CheckPaths(ws, "/wt/cur", collide.ExactQueries([]string{file})), live) {
 			if e.Category != CatStale {
 				checkListed = append(checkListed, e.Window)
 			}

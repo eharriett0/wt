@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -161,13 +162,60 @@ func TestClaudeEditRanges(t *testing.T) {
 }
 
 func TestRepoRelativePath(t *testing.T) {
-	// relative stays relative (cleaned)
-	if got := repoRelativePath("/repo", "internal/a.go"); got != "internal/a.go" {
-		t.Errorf("relative = %q", got)
+	cases := []struct {
+		name, prefix, file, want string
+	}{
+		{"relative at the root stays as-is (cleaned)", "", "internal/./a.go", "internal/a.go"},
+		// #181: matching is exact now, so a relative path must be read from the
+		// cwd. Read from the root instead, README.md typed in pkg/svc/ would be
+		// checked as the root README.md.
+		{"relative in a subdirectory joins the cwd's prefix", "pkg/svc/", "README.md", "pkg/svc/README.md"},
+		{"subdirectory-relative path with a directory component", "pkg/", "svc/README.md", "pkg/svc/README.md"},
+		{"../ out of a subdirectory reaches the root file", "pkg/", "../README.md", "README.md"},
+		{"a trailing slash (a directory) is cleaned", "", "envs/app/", "envs/app"},
+		{"relative path leaving the repo → none", "", "../x.go", ""},
+		{"the repo root itself → none", "pkg/", "..", ""},
+		{"absolute inside the repo", "", "/repo/internal/a.go", "internal/a.go"},
+		{"absolute inside the repo ignores the prefix", "pkg/", "/repo/README.md", "README.md"},
+		{"absolute outside the repo → none", "", "/elsewhere/x.go", ""},
+		{"absolute sibling with a shared name prefix → none", "", "/repo-2/x.go", ""},
 	}
-	// outside the repo → ""
-	if got := repoRelativePath("/repo", "/elsewhere/x.go"); got != "" {
-		t.Errorf("outside = %q, want empty", got)
+	for _, tc := range cases {
+		if got := repoRelativePath("/repo", tc.prefix, tc.file); got != tc.want {
+			t.Errorf("%s: repoRelativePath(%q, %q) = %q, want %q", tc.name, tc.prefix, tc.file, got, tc.want)
+		}
+	}
+}
+
+func TestRepoRelativePath_SymlinkedPathThatDoesNotExistYet(t *testing.T) {
+	// git reports the PHYSICAL root (macOS /private/var/…), while an agent may
+	// name a file through a symlinked parent (/var/…). EvalSymlinks fails for a
+	// file that doesn't exist yet (a Write creating it, a path that exists only
+	// on another branch), which left it on the logical side of the comparison,
+	// outside the repo, and unchecked. Build the symlink explicitly so this runs
+	// the same on Linux.
+	base := t.TempDir()
+	realDir := filepath.Join(base, "real-repo")
+	if err := os.MkdirAll(filepath.Join(realDir, "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "link-repo")
+	if err := os.Symlink(realDir, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	root, err := filepath.EvalSymlinks(realDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for file, want := range map[string]string{
+		filepath.Join(link, "pkg", "new.go"):        "pkg/new.go",     // parent exists, file doesn't
+		filepath.Join(link, "fresh", "dir", "x.go"): "fresh/dir/x.go", // several missing levels
+		filepath.Join(link, "pkg"):                  "pkg",            // exists
+		filepath.Join(base, "elsewhere", "x.go"):    "",               // outside, missing
+	} {
+		if got := repoRelativePath(root, "", file); got != want {
+			t.Errorf("repoRelativePath(%q) = %q, want %q", file, got, want)
+		}
 	}
 }
 
