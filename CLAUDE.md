@@ -92,6 +92,13 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   must pick out exactly ONE worktree (`CheckNames`): none is a typo, two is a
   directory name that is also another worktree's branch. Either stops the run
   with nothing cleaned, so a bad `-y` list never removes "the rest" of it.
+- **`merge-pr` auto-cleans only a PR that reads MERGED afterwards (#185).** `gh
+  pr merge` exits 0 WITHOUT merging for `--help`/`-h`, `--auto` (armed),
+  `--disable-auto`, a merge queue (queued) and `-R` (another repo's PR). Taking
+  that 0 as a merge removed the lane and `git branch -D`'d unpushed commits.
+  `merge.ConfirmMerged` re-reads the state (2.5s at most, for API lag); anything
+  but MERGED (OPEN, CLOSED, no answer) keeps the worktree, branch and claim for
+  `wt clean` to reap once the PR ships.
 - **"No PR" must be an `ok=false`, never a parsed placeholder (#168).**
   `PRForBranch`'s old `.[0] | …` query printed `null null` for a branch with
   no PR, which parsed as a PR in state `null`. Every caller then matched no

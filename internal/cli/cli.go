@@ -468,6 +468,13 @@ func cmdMergePR(args []string) int {
 	if err := merge.Run(pr, *dryRun, *bypass, *mergeForeign, wtBranches, ghArgs); err != nil {
 		return 1
 	}
+	// ⚠ gh exits 0 WITHOUT merging for --help, --auto, --disable-auto, a merge
+	// queue or -R, so only a PR that now reads MERGED is verified and auto-cleaned
+	// (#185). Still exit 0: gh did what it was asked (printed help, armed
+	// auto-merge, queued the PR), and keeping the worktree loses nothing.
+	if !*dryRun && !mergeConfirmed(pr) {
+		return 0
+	}
 	// Post-merge verification (#77): re-check the referenced issues + report any
 	// that changed state — catches a silent close (trap 2) in the same command.
 	if !*dryRun && !*noCloseCheck {
