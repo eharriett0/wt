@@ -182,6 +182,43 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   path in another window went unmatched. The fuzzy suffix tier used to hide that
   (README.md is a suffix of pkg/README.md); exact matching needs the old path
   listed, as the porcelain read already does for a staged move (#28).
+- **Paths from git are read NUL-separated, never quoted (#200).** Read line by
+  line, git C-quotes a path holding a byte it calls unusual: under the default
+  `core.quotePath` every non-ASCII byte, plus `"`, `\` and control characters
+  (porcelain status quotes a space too). `café.md` came back `"caf\303\251.md"`,
+  was stored as the window's touched path, and `wt check café.md`, pre-push and
+  both edit hooks never matched it: a real collision on any non-ASCII name went
+  unreported. Every path lister passes `-z` (`gitx.nulPaths`: TouchedFiles'
+  status and diff, StagedFiles, RangeChangedPaths, and MergeTreeConflicts for
+  the base-drift warning's names) and is read through `runRaw`, never the
+  trimming `run`/`RunDir` (a name can begin or end with a space), by the pure
+  `splitNUL` / `parsePorcelainZ`. ⚠ `status --porcelain -z` writes a rename or
+  copy as `XY <new>\0<orig>\0`, new FIRST: the reverse of the line format's
+  `orig -> new`. ⚠ So a real path is never trimmed downstream either:
+  `Query.cmpPath` trims only a fuzzy search term, `resolveCheckArgs` keeps an
+  argument's spaces when it names a real path as typed, and the Claude payload
+  path is used as sent. Line-based on purpose: `IsUntracked`, `IsClean` and the
+  dirty counts read only status columns (one line per entry, a newline in a
+  name is quoted), and `git worktree list --porcelain` prints paths unquoted
+  (its `-z` needs git 2.36; Ubuntu 22.04 ships 2.34). gh has no `-z`: `gh pr
+  diff --name-only` relays GitHub's quoted names, so `ghx.PRChangedFiles`
+  unquotes them (`unquoteGitPath`) before the deploy-path globs see them.
+- **A path handed to git means that one file, never a pattern (#204).** After
+  `--` git reads a path as a pathspec: `a[1].md` also matched an untracked
+  `a1.md`, so `IsUntracked` read a committed `a[1].md` as untracked and #113
+  downgraded a real collision; `*.md` folded every .md file's hunks into one
+  file's ranges; a leading `:` is magic (`:colon.md` measured `colon.md`). Every
+  `-- <path>` call passes `gitx.literalPath(p)` (`:(literal)<p>`): IsTracked*,
+  IsUntracked, ChangedRangesChecked/ChangedRangesNew, LinesToBase,
+  uncommittedRangesNew. Prefixing the path, not `git --literal-pathspecs`, keeps
+  the subcommand at `args[0]`, where the `gitOutput` failure-injection tests
+  match it (a per-call env var would need the seam itself changed). ⚠
+  `scopedEnv` strips `GIT_LITERAL_PATHSPECS` (and the glob/noglob/icase
+  switches): git exports it to the hooks of `git --literal-pathspecs …`, and
+  under it git reads `:(literal)` as part of the name, which then matches
+  nothing. Already literal, not pathspecs: `hash-object -- <file>` and
+  `<rev>:<path>` lookups. But `RefBlob`'s staged form is `:0:<path>`: in the
+  short `:<path>` form, `1:x.md` reads as stage 1 of `x.md`.
 - **`wt clean` is data-loss-critical.** `ReapVerdict` only reaps a *provably
   shipped* worktree (grace window, upstream, merged PR / cherry). Never
   force-remove a dirty worktree automatically — `--stale-index` is
@@ -272,7 +309,13 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   that 0 as a merge removed the lane and `git branch -D`'d unpushed commits.
   `merge.ConfirmMerged` re-reads the state (2.5s at most, for API lag); anything
   but MERGED (OPEN, CLOSED, no answer) keeps the worktree, branch and claim for
-  `wt clean` to reap once the PR ships. ⚠ **Even then, only a lane whose local
+  `wt clean` to reap once the PR ships. ⚠ **The converse holds too (#196): a
+  non-zero exit is not "not merged".** `-- -d` merges, then fails to delete a
+  local branch a wt worktree has checked out, and exits 1, so the close verify
+  and the auto-clean were skipped for a merged PR. `merge.Run` wraps gh's own
+  failure in `ErrMergeCommand` (a guard's refusal is not), and only that error
+  reads the state (`mergedDespiteFailure`, the same `ConfirmMerged`): MERGED
+  goes on to verify + auto-clean, anything else exits 1. ⚠ **Even then, only a lane whose local
   tip shipped (#187):** a squash leaves the branch unmerged in git's eyes, so the
   auto-clean's `git branch -D` would drop commits made after the push.
   `merge.LocalTipVerdict` needs the tip to BE the PR's `headRefOid` or an
@@ -441,8 +484,8 @@ The formula supports `head "…", branch: "main"` for `--HEAD` builds.
   the PR body only, NOT the squash commit body (the `merge-pr` close-lint scans
   commit messages too — #77).
   ⚠ **A body forwarded after `--` replaces the commit bodies in the squash (#180)**,
-  so the lint judges it instead (headlines stay: `--body` doesn't replace the
-  subject). `merge.ParseForwardedBody` reads the passthrough the way gh's pflag
+  so the lint judges it instead (the subject stays, and is judged as #196 below
+  says). `merge.ParseForwardedBody` reads the passthrough the way gh's pflag
   does — last flag wins, a value flag eats a `-`-led next token, `--body` with
   `--body-file` is gh's own error. A file or `-F -` body is read ONCE and handed
   to gh on stdin with the flag re-pointed at `-`: `-F <(…)` is a pipe, and gh
@@ -455,6 +498,30 @@ The formula supports `head "…", branch: "main"` for `--HEAD` builds.
   and gh merged the subject "--admin" with no admin; in front, gh fails on the
   dangling flag, and an operator's own `--subject` beats the WIP strip (gh keeps
   the last one).
+  ⚠ **The gate judges the squash commit GitHub will WRITE, subject included
+  (#196).** The subject was never read, so a PR title "Fixes #N" on a two-commit
+  PR closed #N silently, and a closing headline that a forwarded `--subject`
+  and `--body` kept out still refused. `merge.ShippedSquash` (pure) models it:
+  subject = a forwarded `--subject`/`-t` (`SubjectOverride`: the operator's, the
+  last one, else the WIP strip's; `--subject ""` makes gh send none), else
+  `squash_merge_commit_title` (PR_TITLE → title; COMMIT_OR_PR_TITLE → the one
+  commit's headline, else the title); body = a forwarded body, else
+  `squash_merge_commit_message` (PR_BODY / BLANK / COMMIT_MESSAGES: every
+  message, but ONE commit gives its body alone unless its headline differs from
+  the default subject, i.e. PR_TITLE with another title). The gate is the PR
+  body + that subject + body; the verify watches the title and every commit
+  message too. Measured against GitHub's own default text, GraphQL
+  `viewerMergeHeadlineText`/`viewerMergeBodyText(mergeType:SQUASH)`, on 785
+  merged PRs across all four setting pairs: subject, body (up to bullets,
+  wrapping and gathered trailers) and close set all matched. Merge commits are
+  neither counted nor listed; a headline is the WHOLE first line, while GraphQL
+  `messageHeadline` cuts it at 69 chars with "…" (rest into `messageBody`), so
+  `ghx.PRCommits` reads `message` + `parents{totalCount}`; gh sends no subject
+  unless `--subject` is non-empty. ⚠ **The settings come from GraphQL**
+  (`ghx.RepoSquashSettings`): REST `gh api repos/{owner}/{repo}` returns them as
+  null to a non-admin viewer. Unreadable → **over-scan** (the title AND the one
+  commit's headline; every commit message): a missed close is the #77 trap, a
+  false refusal costs a `--close-ok`.
 - macOS is the dev floor: bash 3.2 (no `mapfile`/`declare -A`), BSD `sed`/`stat`,
   `/var`→`/private/var` symlinks (resolve with `EvalSymlinks` before path
   compares).

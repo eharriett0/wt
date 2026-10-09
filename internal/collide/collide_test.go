@@ -136,6 +136,16 @@ func TestCheckPaths_ExactMatchTable(t *testing.T) {
 			[]string{"site/docs/x.md"}, Query{Path: "docs", Mode: MatchFuzzy}, []string{"site/docs/x.md"}},
 		{"fuzzy: still on a segment boundary",
 			[]string{"pkg/svc/NOTREADME.md"}, Query{Path: "README.md", Mode: MatchFuzzy}, nil},
+		// #200: git reports a name verbatim, so a real path is compared as it is,
+		// spaces at its ends included; only a search term is trimmed
+		{"exact: a name starting with a space", []string{" lead.md"}, Query{Path: " lead.md"}, []string{" lead.md"}},
+		{"exact: a name ending with a space", []string{"trail.md "}, Query{Path: "trail.md "}, []string{"trail.md "}},
+		{"exact: the trimmed name is another file", []string{" lead.md"}, Query{Path: "lead.md"}, nil},
+		{"exact: a directory starting with a space", []string{" dir/x.md"}, Query{Path: " dir/"}, []string{" dir/x.md"}},
+		{"exact: non-ASCII, a quote, a newline", []string{"café.md", `q"uote.md`, "new\nline.md"},
+			Query{Path: "new\nline.md"}, []string{"new\nline.md"}},
+		{"fuzzy: a search term is still trimmed",
+			[]string{"internal/foo.go"}, Query{Path: " foo.go ", Mode: MatchFuzzy}, []string{"internal/foo.go"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

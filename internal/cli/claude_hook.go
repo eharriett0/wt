@@ -42,8 +42,10 @@ func parseClaudeEdit(b []byte) (cwd, file string, relevant bool) {
 	default:
 		return p.CWD, "", false
 	}
-	f := strings.TrimSpace(p.ToolInput.FilePath)
-	return p.CWD, f, f != ""
+	// Not trimmed: a file name can begin or end with a space, and the path is
+	// asked about exactly (#181), as git reports it (#200).
+	f := p.ToolInput.FilePath
+	return p.CWD, f, strings.TrimSpace(f) != ""
 }
 
 // claudeDecision shapes the hook's stdout JSON from the collisions kept for the

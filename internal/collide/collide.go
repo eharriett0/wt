@@ -226,6 +226,18 @@ type Query struct {
 	Mode MatchMode
 }
 
+// cmpPath is q's path as it is compared with a window's touched files. A search
+// term is trimmed, as typed input always was. An exact query names a real path
+// (from git, a hook payload, or an argument naming one), and a real name may
+// begin or end with a space: git reports it verbatim (#200), so trimmed, it
+// matched no window. Pure.
+func (q Query) cmpPath() string {
+	if q.Mode == MatchFuzzy {
+		return strings.TrimSpace(q.Path)
+	}
+	return q.Path
+}
+
 // ExactQueries wraps repo-relative paths that came from git or a hook payload,
 // which name real locations and are never search terms (#181). Pure.
 func ExactQueries(paths []string) []Query {
@@ -287,8 +299,8 @@ func CheckPaths(ws []Window, currentWorktree string, qs []Query) []Conflict {
 		}
 		seen := map[string]struct{}{}
 		for _, q := range qs {
-			q.Path = strings.TrimSpace(q.Path)
-			if q.Path == "" {
+			q.Path = q.cmpPath()
+			if strings.TrimSpace(q.Path) == "" {
 				continue
 			}
 			if matched, ok := matchTouched(q, w.Touched); ok {
@@ -353,8 +365,8 @@ func exactFirst(qs []Query) []Query {
 // nonexistent path (#93) without false-refusing a path another window is
 // genuinely editing; and by QueryFor, to recognize such a path as real.
 func PathTouchedByAny(q Query, ws []Window) bool {
-	q.Path = strings.TrimSpace(q.Path)
-	if q.Path == "" {
+	q.Path = q.cmpPath()
+	if strings.TrimSpace(q.Path) == "" {
 		return false
 	}
 	for _, w := range ws {
@@ -413,8 +425,8 @@ func matchTouched(q Query, touched []string) (string, bool) {
 // and `wt check envs/app/` reporting differently from `wt check envs/app` would
 // be its own small trap.
 func matchTouchedDir(q Query, touched []string) []string {
-	p := strings.Trim(strings.TrimSpace(q.Path), "/")
-	if p == "" {
+	p := strings.Trim(q.cmpPath(), "/")
+	if strings.TrimSpace(p) == "" {
 		return nil // "/" or "" is the whole repo — not a question worth answering
 	}
 	fuzzy := q.Mode == MatchFuzzy

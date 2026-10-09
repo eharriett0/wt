@@ -35,6 +35,20 @@ func mergeConfirmed(pr string) bool {
 	return false
 }
 
+// mergedDespiteFailure reports whether PR pr reads MERGED although `gh pr
+// merge` exited non-zero (#196), and says so. gh can fail after the merge:
+// `-d` merges, then cannot delete a local branch that a wt worktree has checked
+// out. It re-reads the state as mergeConfirmed does; anything but MERGED
+// (OPEN, CLOSED, no answer) is a merge that failed, and merge-pr exits 1 on it
+// as before, gh's own error being what the operator needs.
+func mergedDespiteFailure(pr string) bool {
+	if _, v := merge.ConfirmMerged(func() string { return ghx.PRState(pr) }, postMergeSleep); v != merge.PostMerged {
+		return false
+	}
+	ui.Warn("gh pr merge exited non-zero, but PR #%s is MERGED: gh failed after the merge (its error is above; `-d` does when a wt worktree has the branch checked out), so merge-pr verifies the closes and cleans up as for any merge", pr)
+	return true
+}
+
 // unshippedLane returns "" when every commit on the merged PR's local branch
 // shipped in the PR, and otherwise the warning merge-pr prints instead of
 // removing the branch's worktree and deleting the branch (#187).
