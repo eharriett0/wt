@@ -22,8 +22,8 @@ func gitOut(t *testing.T, dir string, args ...string) string {
 }
 
 // #134: WorktreeAdopt must land the worktree on the EXISTING branch — carrying
-// that branch's commits — not fork a fresh branch off base the way WorktreeAdd
-// would. That distinction is the whole point of `wt adopt`: picking up an
+// that branch's commits — not fork a fresh branch off base the way
+// WorktreeAddNewBranch would. That distinction is the whole point of `wt adopt`: picking up an
 // in-flight PR branch, not creating a parallel one.
 func TestWorktreeAdopt_LandsOnExistingBranchNotAFork(t *testing.T) {
 	dir := gitRepo(t)

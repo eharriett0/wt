@@ -16,26 +16,48 @@ import (
 // says "Refs #7" (so closingIssuesReferences is empty), squashed with a body the
 // operator forwards to gh.
 const (
+	issuePRTitle    = "Add the widget"
 	issuePRBody     = "Refs #7"
 	issueHeadline   = "feat: add the widget"
 	issueCommitText = issueHeadline + "\nCloses #7"
 )
+
+// defaultSquash is GitHub's "Default message" squash setting (#196).
+var defaultSquash = merge.SquashSettings{Title: merge.TitleCommitOrPR, Message: merge.MessageCommits}
 
 // forwarded builds the squashBody a parsed `-b <text>` would produce.
 func forwarded(text string) squashBody {
 	return squashBody{src: merge.ForwardedBody{Source: merge.BodyText, Value: text, Flag: "-b"}, text: text}
 }
 
+// gateTexts is closeCheckTexts for a PR with the given title, body and commits
+// in a default-squash repo, with sq forwarded and no forwarded subject.
+func gateTexts(title, body string, commits []merge.Commit, sq squashBody) (gate, watch string) {
+	ship := merge.ShippedSquash(defaultSquash, title, body, commits, merge.Override{}, sq.override())
+	return closeCheckTexts(body, title, commits, ship)
+}
+
 func TestCloseCheckTexts(t *testing.T) {
-	// No forwarded body: exactly the pre-#180 text, for both gate and watch.
-	gate, watch := closeCheckTexts(issuePRBody, issueCommitText, []string{issueHeadline}, squashBody{})
-	if want := issuePRBody + "\n\n" + issueCommitText; gate != want || watch != want {
-		t.Fatalf("no override: gate %q watch %q, want both %q", gate, watch, want)
+	one := []merge.Commit{merge.NewCommit(issueCommitText, 1)}
+	// No forwarded body, one commit: the subject is its headline and the body
+	// its body, both judged (#77).
+	gate, watch := gateTexts(issuePRTitle, issuePRBody, one, squashBody{})
+	for _, part := range []string{issuePRBody, issueHeadline, "Closes #7"} {
+		if !strings.Contains(gate, part) {
+			t.Errorf("gate %q is missing %q", gate, part)
+		}
+	}
+	if strings.Contains(gate, issuePRTitle) {
+		t.Errorf("gate %q reads the PR title, which a one-commit squash does not ship (#196)", gate)
+	}
+	if !strings.Contains(watch, issuePRTitle) {
+		t.Errorf("watch %q dropped the PR title — the verify watches everything that could ship", watch)
 	}
 
-	// Forwarded: the PR body, the headline and the forwarded text are judged; the
-	// commit BODY is not, but the verify still watches it.
-	gate, watch = closeCheckTexts(issuePRBody, issueCommitText, []string{issueHeadline}, forwarded("Squash body."))
+	// Forwarded: the PR body, the headline (still the subject) and the
+	// forwarded text are judged; the commit BODY is not, but the verify still
+	// watches it.
+	gate, watch = gateTexts(issuePRTitle, issuePRBody, one, forwarded("Squash body."))
 	for _, part := range []string{issuePRBody, issueHeadline, "Squash body."} {
 		if !strings.Contains(gate, part) {
 			t.Errorf("forwarded gate %q is missing %q", gate, part)
@@ -47,6 +69,22 @@ func TestCloseCheckTexts(t *testing.T) {
 	if !strings.Contains(watch, "Closes #7") {
 		t.Errorf("forwarded watch %q dropped the replaced commit body — the post-merge verify must keep watching it", watch)
 	}
+
+	// Two commits and a merge commit: the subject is the PR title, the body
+	// every commit message but the merge's; the verify watches the merge's too.
+	two := []merge.Commit{merge.NewCommit("feat: one\n\nFixes #3", 1), merge.NewCommit("Merge branch 'main', closes #4", 2), merge.NewCommit("feat: two", 1)}
+	gate, watch = gateTexts("Fixes #5 the thing", issuePRBody, two, squashBody{})
+	for _, part := range []string{"Fixes #5 the thing", "Fixes #3", "feat: two"} {
+		if !strings.Contains(gate, part) {
+			t.Errorf("multi-commit gate %q is missing %q", gate, part)
+		}
+	}
+	if strings.Contains(gate, "closes #4") {
+		t.Errorf("multi-commit gate %q reads the merge commit, which a squash does not list", gate)
+	}
+	if !strings.Contains(watch, "closes #4") {
+		t.Errorf("multi-commit watch %q dropped the merge commit", watch)
+	}
 }
 
 // TestCloseCheck_forwardedBodyDecidesTheGate runs the gate's own decisions
@@ -54,23 +92,26 @@ func TestCloseCheckTexts(t *testing.T) {
 // picks. Before #180 the gate text ignored the forwarded body, so the first
 // override case refused over #7 and the "Fixes #9" case never saw #9.
 func TestCloseCheck_forwardedBodyDecidesTheGate(t *testing.T) {
+	one := func(msg string) []merge.Commit { return []merge.Commit{merge.NewCommit(msg, 1)} }
 	cases := []struct {
-		name      string
-		headlines []string
-		sq        squashBody
-		extra     []int  // trap-2: closes not in closingIssuesReferences (empty here)
-		suspect   string // "" = none, else the Suspect reason on the one ref
+		name    string
+		commits []merge.Commit
+		sq      squashBody
+		extra   []int  // trap-2: closes not in closingIssuesReferences (empty here)
+		suspect string // "" = none, else the Suspect reason on the one ref
 	}{
-		{"no override: the commit body's close still gates (#77)", []string{issueHeadline}, squashBody{}, []int{7}, ""},
-		{"keyword-free forwarded body: nothing ships, nothing gates", []string{issueHeadline}, forwarded("Squash body for the widget.\n\nRefs #7"), nil, ""},
-		{"forwarded body that closes another issue gates on THAT issue", []string{issueHeadline}, forwarded("Squash body.\n\nFixes #9"), []int{9}, ""},
-		{"#165 runs on the forwarded body", []string{issueHeadline}, forwarded("This does NOT close #7."), []int{7}, merge.SuspectNegated},
-		{"an empty forwarded body (--body=) closes nothing", []string{issueHeadline}, forwarded(""), nil, ""},
-		{"a close in a commit HEADLINE still ships as the squash subject", []string{"Fix #12 crash on start"}, forwarded("Squash body."), []int{12}, ""},
+		{"no override: the commit body's close still gates (#77)", one(issueCommitText), squashBody{}, []int{7}, ""},
+		{"keyword-free forwarded body: nothing ships, nothing gates", one(issueCommitText), forwarded("Squash body for the widget.\n\nRefs #7"), nil, ""},
+		{"forwarded body that closes another issue gates on THAT issue", one(issueCommitText), forwarded("Squash body.\n\nFixes #9"), []int{9}, ""},
+		{"#165 runs on the forwarded body", one(issueCommitText), forwarded("This does NOT close #7."), []int{7}, merge.SuspectNegated},
+		{"an empty forwarded body (--body=) closes nothing", one(issueCommitText), forwarded(""), nil, ""},
+		{"a close in a one-commit HEADLINE still ships as the squash subject", one("Fix #12 crash on start\nCloses #7"), forwarded("Squash body."), []int{12}, ""},
+		{"a close in one of two headlines does not ship past a forwarded body (#196)",
+			[]merge.Commit{merge.NewCommit("Fix #12 crash on start", 1), merge.NewCommit("feat: more", 1)}, forwarded("Squash body."), nil, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			gate, _ := closeCheckTexts(issuePRBody, issueCommitText, tc.headlines, tc.sq)
+			gate, _ := gateTexts(issuePRTitle, issuePRBody, tc.commits, tc.sq)
 			if got := merge.ExtraClosings(gate, nil); !reflect.DeepEqual(got, tc.extra) {
 				t.Errorf("ExtraClosings = %v, want %v (gate text %q)", got, tc.extra, gate)
 			}
@@ -85,30 +126,37 @@ func TestCloseCheck_forwardedBodyDecidesTheGate(t *testing.T) {
 	}
 }
 
-func TestReplacedClosings(t *testing.T) {
-	label := func(refs []merge.ClosingRef) []string {
+func TestLeftOutClosings(t *testing.T) {
+	label := func(refs []leftOutRef) []string {
 		var out []string
 		for _, r := range refs {
-			out = append(out, refLabel(r))
+			out = append(out, refLabel(r.ref)+" in "+r.where)
 		}
 		return out
 	}
-	commit := "feat: x\nCloses #7\nFixes owner/repo#3"
-	gate, _ := closeCheckTexts(issuePRBody, commit, []string{"feat: x"}, forwarded("plain"))
-	if got, want := label(replacedClosings(commit, gate, nil)), []string{"#7", "owner/repo#3"}; !reflect.DeepEqual(got, want) {
-		t.Errorf("replacedClosings = %v, want %v", got, want)
+	commits := []merge.Commit{merge.NewCommit("feat: x\nCloses #7\nFixes owner/repo#3", 1)}
+	msgs := merge.Messages(commits)
+	gate, watch := gateTexts(issuePRTitle, issuePRBody, commits, forwarded("plain"))
+	if got, want := label(leftOutClosings(watch, gate, nil, issuePRTitle, msgs)), []string{"#7 in the commit messages", "owner/repo#3 in the commit messages"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("leftOutClosings = %v, want %v", got, want)
 	}
-	// A close the forwarded body repeats is not "replaced": it still ships.
-	gate, _ = closeCheckTexts(issuePRBody, commit, []string{"feat: x"}, forwarded("Closes #7"))
-	if got, want := label(replacedClosings(commit, gate, nil)), []string{"owner/repo#3"}; !reflect.DeepEqual(got, want) {
-		t.Errorf("replacedClosings = %v, want %v", got, want)
+	// A close the forwarded body repeats is not left out: it still ships.
+	gate, watch = gateTexts(issuePRTitle, issuePRBody, commits, forwarded("Closes #7"))
+	if got, want := label(leftOutClosings(watch, gate, nil, issuePRTitle, msgs)), []string{"owner/repo#3 in the commit messages"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("leftOutClosings = %v, want %v", got, want)
 	}
 	// Nor is one the PR closes anyway: an issue linked in GitHub's sidebar is in
-	// closingIssuesReferences with no keyword anywhere, so saying the forwarded
-	// body "leaves it out" would be a false all-clear.
-	gate, _ = closeCheckTexts(issuePRBody, commit, []string{"feat: x"}, forwarded("plain"))
-	if got, want := label(replacedClosings(commit, gate, []int{7})), []string{"owner/repo#3"}; !reflect.DeepEqual(got, want) {
-		t.Errorf("replacedClosings with #7 in closingIssuesReferences = %v, want %v", got, want)
+	// closingIssuesReferences with no keyword anywhere, so saying the squash
+	// "leaves it out" would be a false all-clear.
+	gate, watch = gateTexts(issuePRTitle, issuePRBody, commits, forwarded("plain"))
+	if got, want := label(leftOutClosings(watch, gate, []int{7}, issuePRTitle, msgs)), []string{"owner/repo#3 in the commit messages"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("leftOutClosings with #7 in closingIssuesReferences = %v, want %v", got, want)
+	}
+	// A one-commit squash ships the headline, not the PR title (#196).
+	title := "Fixes #5, and see #6"
+	gate, watch = gateTexts(title, issuePRBody, commits, forwarded("plain"))
+	if got, want := label(leftOutClosings(watch, gate, nil, title, msgs)), []string{"#5 in the PR title", "#7 in the commit messages", "owner/repo#3 in the commit messages"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("leftOutClosings with a closing PR title = %v, want %v", got, want)
 	}
 }
 

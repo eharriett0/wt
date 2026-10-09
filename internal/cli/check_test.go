@@ -170,3 +170,30 @@ func TestResolveCheckArgs(t *testing.T) {
 		t.Errorf("blank arguments must be skipped, got %+v", got)
 	}
 }
+
+// A file name can begin or end with a space, and git reports it verbatim
+// (#200), so the pre-push and pre-commit checks ask about it as it is. An
+// argument that names such a path as typed keeps its spaces; one that names
+// nothing as typed is trimmed, as before.
+func TestResolveCheckArgs_SpacesInARealName(t *testing.T) {
+	ws := []collide.Window{{Branch: "feat-b", Worktree: "/repo-b", Touched: []string{" top.md"}}}
+	exact := func(p string) collide.Query { return collide.Query{Path: p, Mode: collide.MatchExact} }
+	cases := []struct {
+		name, arg string
+		base      argBase
+		want      collide.Query
+		wantArg   string
+	}{
+		{"on disk with a leading space", " lead.md", fakeBase("", []string{" lead.md"}, nil), exact(" lead.md"), " lead.md"},
+		{"on disk with a trailing space, in a subdirectory", "trail.md ", fakeBase("pkg/", []string{"trail.md "}, nil), exact("pkg/trail.md "), "trail.md "},
+		{"tracked, not on disk", " gone.md", fakeBase("", nil, []string{" gone.md"}), exact(" gone.md"), " gone.md"},
+		{"only on another branch, exactly there", " top.md", fakeBase("", nil, nil), exact(" top.md"), " top.md"},
+		{"names nothing as typed: trimmed", " README.md ", fakeBase("", []string{"README.md"}, nil), exact("README.md"), "README.md"},
+	}
+	for _, tc := range cases {
+		got := resolveCheckArgs([]string{tc.arg}, "/repo", tc.base, ws)
+		if len(got) != 1 || got[0].query != tc.want || got[0].arg != tc.wantArg {
+			t.Errorf("%s: resolveCheckArgs(%q) = %+v, want query %+v, arg %q", tc.name, tc.arg, got, tc.want, tc.wantArg)
+		}
+	}
+}

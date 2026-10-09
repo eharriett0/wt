@@ -139,29 +139,127 @@ func worktreeAge(wt string, now time.Time) (age time.Duration, ok bool) {
 	return now.Sub(fi.ModTime()), true
 }
 
-// isValidWorktree reports whether wtDir is a live git worktree — the directory
-// exists AND git recognizes it (#62). A leftover empty dir from an out-of-band
-// removal is NOT valid, so `wt new` recreates rather than short-circuiting.
+// isValidWorktree reports whether wtDir is a live git worktree: the directory
+// exists and is the TOP of a work tree (#62). A leftover empty dir from an
+// out-of-band removal is NOT valid, so `wt new` recreates rather than
+// short-circuiting.
+//
+// Being inside a work tree is not enough (#198 review). With worktree_root
+// inside the repo (a gitignored .worktrees/, say), a leftover directory there is
+// inside the main checkout, so git answers for that checkout: wt took the main
+// checkout for the branch's worktree, `wt claim` committed its placeholder onto
+// main, and a refusal printed a `git -C <dir> merge` that moved main.
 func isValidWorktree(wtDir string) bool {
-	return isDir(wtDir) && gitx.IsInsideWorktree(wtDir)
+	if !isDir(wtDir) {
+		return false
+	}
+	top := gitx.WorktreeToplevel(wtDir)
+	return top != "" && realPath(top) == realPath(wtDir)
 }
 
 // New creates a worktree for branch under c.WorktreeRoot, based on the repo's
 // base branch. Idempotent: if the worktree already exists, prints the cd hint
-// and returns its path. Returns the worktree path.
+// and returns its path. Returns the worktree path. It is PlanNew, then Create.
 func New(c *config.Config, branch string) (string, error) {
+	p, err := PlanNew(c, branch, NewFor{})
+	if err != nil {
+		return "", err
+	}
+	made, err := p.Create()
+	if err != nil {
+		return "", err
+	}
+	return made.Dir, nil
+}
+
+// NewFor says which command PlanNew runs for (#198), for its notes and the
+// re-run line a refusal prints. The zero value is `wt new <branch>`.
+type NewFor struct {
+	// ClaimIssue is the issue `wt claim` is claiming. A claim commits a
+	// placeholder on the branch and pushes it right after Create.
+	ClaimIssue string
+}
+
+func (f NewFor) attachFor(branch, dir string) attachFor {
+	if f.ClaimIssue != "" {
+		return attachFor{kind: forClaim, rerun: "wt claim " + f.ClaimIssue, dir: dir}
+	}
+	return attachFor{kind: forNew, rerun: "wt new " + branch, dir: dir}
+}
+
+// NewPlan is what `wt new <branch>` (and `wt claim`, through it) will do,
+// decided before anything is created, assigned or moved (#198). PlanNew makes
+// it and Create carries it out, so claim can refuse before it assigns the issue.
+type NewPlan struct {
+	c        *config.Config
+	branch   string
+	dir      string
+	who      attachFor
+	existing bool       // wt's live worktree for the branch is already there: handed back, never moved
+	attach   attachPlan // otherwise: what happens to a local branch of that name
+}
+
+// Created is what NewPlan.Create made (#198). A claim whose push fails undoes
+// only that: a branch it re-attached, or a worktree it was handed back, held
+// work before the claim.
+type Created struct {
+	Dir         string
+	NewWorktree bool // Create added the worktree; false when it handed back an existing one
+	NewBranch   bool // Create made the branch from the base; false when it attached an existing one (#62)
+}
+
+// PlanNew decides what `wt new <branch>` does, before anything is created,
+// assigned or moved (#198).
+//
+// A live worktree at wt's path for the branch is handed back (#62), after a
+// check against origin/<branch> as just fetched that never moves it
+// (checkExistingWorktree: a note when only behind or only ahead, a refusal when
+// diverged or not comparable, and for a claim a refusal when only behind too).
+//
+// Otherwise a local branch of that name is re-attached, as #62 wants for a
+// worktree whose directory went away, but first checked against origin/<branch>
+// exactly as `wt adopt` checks it (#167): equal is attached, only ahead
+// (unpushed commits) is attached with a note naming them, only behind is
+// fast-forwarded, and diverged or not comparable is refused with both tips, the
+// local-only commits and the ways on. A branch any worktree has checked out is
+// refused whatever its relation (DecideNew): git would refuse to check it out a
+// second time anyway, but only at worktree-add, which a claim reaches after it
+// assigned the issue. With no origin/<branch> to compare against (never pushed,
+// or never fetched and offline) it is attached as it is and labelled
+// unverified. Before #198 every one of those was attached silently: a branch
+// left by an earlier attempt that reused the name, or one behind or diverged
+// from what was pushed, was resumed, and a claim then committed on it, failed to
+// push, and its rollback deleted the branch. With no local branch, a new one is
+// cut from the base, as before.
+//
+// origin itself is asked too (#198 review). A branch that was pushed before and
+// that origin no longer has (deleted there, typically after its PR merged) is
+// refused for a claim, which would push it back, and attached with a warning by
+// new; the stale origin/<branch> a deletion leaves is not compared against. A
+// claim with no local branch refuses when origin already has the branch: its
+// new branch cut from the base could not be pushed over it.
+func PlanNew(c *config.Config, branch string, f NewFor) (*NewPlan, error) {
 	slug := strings.ReplaceAll(branch, "/", "-")
-	wtDir := filepath.Join(c.WorktreeRoot, slug)
+	dir := filepath.Join(c.WorktreeRoot, slug)
+	p := &NewPlan{c: c, branch: branch, dir: dir, who: f.attachFor(branch, dir)}
 
 	// Short-circuit only when it's a LIVE worktree (#62) — not a stale/empty dir
 	// left by another window's clean or an out-of-band `git worktree remove`.
-	if isValidWorktree(wtDir) {
-		ui.OK("worktree already exists at %s", wtDir)
-		ui.Step("cd %s", wtDir)
-		return wtDir, nil
+	if isValidWorktree(dir) {
+		o, err := p.origin(true)
+		if err != nil {
+			return nil, err
+		}
+		if err := checkExistingWorktree(dir, branch, o.target, p.who); err != nil {
+			return nil, err
+		}
+		p.existing = true
+		return p, nil
 	}
-	if err := reconcileWorktreeDir(wtDir); err != nil {
-		return "", err
+	// Before the in-use check: a worktree whose directory is already gone must
+	// not count as having the branch checked out (#167).
+	if err := reconcileWorktreeDir(dir); err != nil {
+		return nil, err
 	}
 
 	ui.Step("fetching origin/%s", c.Base)
@@ -169,20 +267,187 @@ func New(c *config.Config, branch string) (string, error) {
 		ui.Warn("git fetch failed (continuing with local refs): %v", err)
 	}
 
-	if err := os.MkdirAll(c.WorktreeRoot, 0o755); err != nil {
-		return "", fmt.Errorf("mkdir worktree root: %w", err)
+	fold := gitx.IgnoreCase()
+	if fold {
+		if err := refuseCaseTwin(branch, p.who); err != nil {
+			return nil, err
+		}
+	}
+	local := gitx.BranchTip(branch)
+	var target adoptTarget
+	switch {
+	case local != "":
+		o, err := p.origin(false)
+		if err != nil {
+			return nil, err
+		}
+		target = o.target
+	case p.who.pushes():
+		// No local branch: the claim cuts one from the base and pushes it, which
+		// origin rejects when it already has the branch (#198 review).
+		if o := fetchBranchTarget(branch, c.WorktreeRoot); o.state == originFetched && o.target.tip != "" {
+			return nil, refuseOriginHasBranch(branch, c.Base, o.target, p.who)
+		}
+	}
+	a, err := planAttach(branch, local, target, fold, p.who)
+	if err != nil {
+		return nil, err
+	}
+	p.attach = a
+	return p, nil
+}
+
+// originState is what fetching origin/<branch> told PlanNew (#198 review).
+type originState int
+
+const (
+	originFetched     originState = iota // fetched now: origin has the branch, and origin/<branch> is it
+	originLacks                          // origin answered without the branch: never pushed, or deleted there
+	originUnreachable                    // the fetch failed, and origin could not be asked (or has the branch after all): origin/<branch> as last fetched, if any
+)
+
+// originBranch is origin/<branch> as PlanNew found it (#198 review).
+type originBranch struct {
+	target adoptTarget // what a local branch, or wt's existing worktree, is checked against; tip "" for nothing
+	state  originState
+}
+
+// fetchBranchTarget fetches origin/<branch> and returns what a local branch, or
+// wt's existing worktree, is checked against (#198): the target `wt adopt
+// <branch>` uses (#167).
+//
+// When the fetch fails it asks origin whether it has the branch at all (#198
+// review): origin lacking it (never pushed, or deleted there after its PR
+// merged) fails the fetch just as an unreachable origin does, and the
+// origin/<branch> a deletion leaves behind is not what origin has, so it is not
+// compared against. Only an origin that cannot be asked leaves origin/<branch>
+// as last fetched as the target, labelled so.
+func fetchBranchTarget(branch, root string) originBranch {
+	ui.Step("fetching origin/%s", branch)
+	err := gitx.Fetch("origin", branch)
+	if err == nil {
+		t, _ := resolveAdoptTarget(branch, AdoptWant{}, true, root) // by branch name: never refuses
+		return originBranch{target: t, state: originFetched}
+	}
+	tip, lerr := gitx.RemoteBranchTip("", branch)
+	if lerr == nil && tip == "" {
+		return originBranch{state: originLacks}
+	}
+	t, _ := resolveAdoptTarget(branch, AdoptWant{}, false, root)
+	switch {
+	case t.tip != "":
+		ui.Warn("git fetch origin %s failed (comparing with origin/%s as last fetched): %v", branch, branch, err)
+	case lerr == nil:
+		ui.Warn("git fetch origin %s failed although origin has the branch (at %s), and this clone has no origin/%s to compare with: %v", branch, short(tip), branch, err)
+	default:
+		ui.Warn("git fetch origin %s failed, and origin could not be asked whether it has the branch (nothing to compare with): %v", branch, err)
+	}
+	return originBranch{target: t, state: originUnreachable}
+}
+
+// origin fetches origin/<branch> for PlanNew and settles a branch that was
+// pushed before and that origin no longer has (#198 review): a claim, which
+// pushes it, refuses; new attaches it with a warning. existing says wt's
+// worktree for the branch is there, for the advice.
+func (p *NewPlan) origin(existing bool) (originBranch, error) {
+	o := fetchBranchTarget(p.branch, p.c.WorktreeRoot)
+	if o.state != originLacks {
+		return o, nil
+	}
+	remote, merge := gitx.BranchUpstream(p.branch)
+	if !PushedUnderItsName(remote, merge, p.branch) {
+		return o, nil // never pushed (#62): nothing to compare against
+	}
+	return o, goneFromOrigin(p.branch, p.dir, existing, p.who)
+}
+
+// PushedUnderItsName reports whether a branch's upstream config (branch.<b>.remote
+// and branch.<b>.merge) shows it was pushed to origin under its own name (#198
+// review): what `git push -u origin <b>` records, and what `wt claim` and an
+// adopted branch carry. A `wt new` branch tracks the base until it is pushed
+// (#175), and a branch with no upstream proves nothing either way. Pure.
+func PushedUnderItsName(remote, merge, branch string) bool {
+	return remote == "origin" && merge == "refs/heads/"+branch
+}
+
+// goneFromOrigin handles a branch pushed before that origin no longer has (#198
+// review). Origin deletes a PR's branch when it merges, so the local branch is
+// most likely work that shipped. A claim would push it back, placeholder on
+// top: refused. `wt new` attaches it as it is, saying so.
+func goneFromOrigin(branch, dir string, existing bool, who attachFor) error {
+	tip := gitx.BranchTip(branch)
+	if !who.pushes() {
+		what := "attached"
+		if existing {
+			what = "handed back"
+		}
+		ui.Warn("origin no longer has %s, which was pushed there before: deleted on origin, typically after its PR merged. It is %s as it is (%s); check that its work did not ship before going on with it (%s)", branch, what, short(tip), who.tag())
+		return nil
+	}
+	ui.Warn("origin no longer has %s, which was pushed there before: deleted on origin, typically after its PR merged. A claim would push it back with its placeholder on top (%s)", branch, who.tag())
+	ui.Info("if its work shipped, set it aside and re-run, which cuts a new branch from the base:")
+	if existing {
+		fmt.Printf("  git worktree remove %s     # refuses while it holds uncommitted or untracked changes: commit or stash them first\n", dir)
+	}
+	fmt.Printf("  git branch -m %s %s-old-%s\n", branch, branch, short(tip))
+	fmt.Printf("  %s\n", who.rerun)
+	ui.Info("to go on with it instead, push it back yourself, then re-run:")
+	fmt.Printf("  git push -u origin %s\n", branch)
+	fmt.Printf("  %s\n", who.rerun)
+	return refuse(ErrGoneFromOrigin, "origin no longer has %q, which was pushed there before (deleted on origin, typically after its PR merged); %s", branch, who.didNot())
+}
+
+// refuseOriginHasBranch refuses a claim that would cut a new branch from the
+// base while origin already has one of that name (#198 review): origin rejects
+// the push, and the claim rolled back with a bare push error, every time.
+func refuseOriginHasBranch(branch, base string, target adoptTarget, who attachFor) error {
+	ui.Warn("origin already has %s (%s), and no local branch has that name: a claim would cut a new branch from the base, and origin would reject its push (%s)", branch, short(target.tip), who.tag())
+	ui.Info("it may hold an earlier claim's placeholder, or work pushed from another clone. Inspect it, and take it over with wt adopt:")
+	fmt.Printf("  git log --oneline origin/%s..origin/%s\n", base, branch)
+	fmt.Printf("  wt adopt %s\n", branch)
+	ui.Info("if it holds nothing you need, delete it on origin yourself, then re-run: %s", who.rerun)
+	return refuse(ErrOriginHasBranch, "origin already has %q (%s) and no local branch has that name; %s", branch, short(target.tip), who.didNot())
+}
+
+// Create carries out the plan (#198): hands back the existing worktree, or
+// fast-forwards a local branch that is only behind, attaches it (or cuts a new
+// branch from the base), and checks where the new worktree landed. A local
+// branch that changed after PlanNew looked is refused (apply).
+func (p *NewPlan) Create() (Created, error) {
+	if p.existing {
+		ui.OK("worktree already exists at %s", p.dir)
+		ui.Step("cd %s", p.dir)
+		return Created{Dir: p.dir}, nil
+	}
+	intended, err := p.attach.apply(p.who)
+	if err != nil {
+		return Created{}, err
+	}
+	if err := os.MkdirAll(p.c.WorktreeRoot, 0o755); err != nil {
+		return Created{}, fmt.Errorf("mkdir worktree root: %w", err)
+	}
+	made := Created{Dir: p.dir, NewWorktree: true}
+	if p.attach.action == AdoptCreate {
+		base := resolveBaseRef(p.c.Base)
+		ui.Step("creating worktree at %s on a new branch %s (from %s)", p.dir, p.branch, base)
+		if err := gitx.WorktreeAddNewBranch(p.dir, p.branch, base); err != nil {
+			return Created{}, fmt.Errorf("git worktree add: %w", err)
+		}
+		made.NewBranch = true
+	} else {
+		ui.Step("attaching worktree at %s to existing local branch %s", p.dir, p.branch)
+		if err := gitx.WorktreeAdopt(p.dir, p.branch); err != nil {
+			return Created{}, fmt.Errorf("could not attach a worktree to local branch %q (it may be checked out in another worktree): %w", p.branch, err)
+		}
+		if err := verifyAdopted(p.dir, p.branch, intended, p.who); err != nil {
+			return Created{}, err
+		}
 	}
 
-	base := resolveBaseRef(c.Base)
-	ui.Step("creating worktree at %s on %s (from %s)", wtDir, branch, base)
-	if err := gitx.WorktreeAdd(wtDir, branch, base); err != nil {
-		return "", fmt.Errorf("git worktree add: %w", err)
-	}
-
-	linkSharedFiles(c, wtDir)
+	linkSharedFiles(p.c, p.dir)
 	ui.OK("worktree ready")
-	ui.Step("cd %s", wtDir)
-	return wtDir, nil
+	ui.Step("cd %s", p.dir)
+	return made, nil
 }
 
 // Adopt attaches a worktree to an EXISTING branch — a colleague's or a previous
@@ -223,7 +488,7 @@ func Adopt(c *config.Config, branch string, want AdoptWant) (string, error) {
 	}
 
 	if isValidWorktree(wtDir) {
-		if err := checkExistingWorktree(wtDir, branch, want, target); err != nil {
+		if err := checkExistingWorktree(wtDir, branch, target, adoptFor(branch, want)); err != nil {
 			return "", err
 		}
 		ui.OK("worktree already exists at %s", wtDir)
@@ -251,7 +516,7 @@ func Adopt(c *config.Config, branch string, want AdoptWant) (string, error) {
 		// error already carries git's own stderr with the real reason. (#134)
 		return "", fmt.Errorf("could not attach a worktree to branch %q — it may be checked out in another worktree, or absent locally and on origin: %w", branch, err)
 	}
-	if err := verifyAdopted(wtDir, branch, intended); err != nil {
+	if err := verifyAdopted(wtDir, branch, intended, adoptFor(branch, want)); err != nil {
 		return "", err
 	}
 
@@ -264,10 +529,11 @@ func Adopt(c *config.Config, branch string, want AdoptWant) (string, error) {
 // reconcileWorktreeDir prunes git's worktree admin metadata and clears a
 // leftover EMPTY dir at wtDir so `git worktree add` won't refuse "already
 // exists" (#62). os.Remove only succeeds on an empty dir, so it never nukes
-// files.
+// files. A directory that is not a worktree's top counts as leftover even when
+// it sits inside a checkout (isValidWorktree, #198 review).
 func reconcileWorktreeDir(wtDir string) error {
 	_ = gitx.WorktreePrune()
-	if isDir(wtDir) && !gitx.IsInsideWorktree(wtDir) {
+	if isDir(wtDir) && !isValidWorktree(wtDir) {
 		if err := os.Remove(wtDir); err != nil {
 			return fmt.Errorf("stale worktree dir %s exists but isn't a git worktree and isn't empty; remove it and retry: %w", wtDir, err)
 		}

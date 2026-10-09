@@ -56,7 +56,9 @@ that exact repo path: `wt check README.md` at the root asks about the root
 `README.md`, never about `pkg/svc/README.md`. A bare name that is no path in the
 repo is a search instead: `wt check foo.go` matches a touched file of that name
 in any directory. A file another window moved counts by both its old and its
-new path.
+new path. Names are matched exactly as git stores them, non-ASCII ones
+(`café.md`) and names with spaces, quotes, newlines or glob characters
+(`a[1].md`) included.
 
 In `wt check --json`, each entry's `path` is the repo-relative path that
 collides, not the argument as you typed it: `wt check ./svc/README.md` run in
@@ -168,12 +170,12 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 | `wt status --epic <id>` | Aggregate an epic's claims + live PR states across sibling repos |
 | `wt check <paths…>` | Is another window touching these paths? `[--show-diff] [--json] [--blocking] [--include-stale] [--allow-missing] [--max-age D]` (exit 3 = HIGH). `--blocking` prints only HIGH (a scriptable gate). Refuses a path that doesn't exist, isn't tracked, and no window is touching — a typo must never falsely report "clear" (`--allow-missing` opts into a deleted/other-branch/about-to-create path) |
 | `wt where <issue\|branch>` | Print that window's worktree path — `cd $(wt where 42)` |
-| `wt new <branch>` | Create a worktree on a new branch from the base branch |
+| `wt new <branch>` | Create a worktree on a new branch from the base branch. A local branch of that name (say, one whose worktree directory went away) is re-attached instead, but only after it is compared with `origin/<branch>` as just fetched: equal is attached, one with unpushed commits on top is attached with a note naming them, one only behind is fast-forwarded (never while a worktree has it checked out), and one that diverged (typically left over from an earlier attempt that reused the name) is refused with both SHAs and the commits only it has, never silently resumed. A branch checked out in another worktree is refused, whatever its state. With no `origin/<branch>` (never pushed) it is attached as it is; one that was pushed before and that origin has since deleted (typically after its PR merged) is attached as it is with a warning, not compared with the stale `origin/<branch>`. A worktree already there for the branch is compared the same way but never moved: behind or ahead is handed back with a note, diverged is refused, and so is one that is not on the branch (another branch, or a detached HEAD). A directory at that path that is not a worktree of its own (say, a leftover one under a `worktree_root` inside the repo) is never taken for one |
 | `wt clean [-y] [<name>...]` | List worktrees whose branch already shipped (incl. squash-merged PRs); `-y` removes them. Name worktrees (a directory, a branch, or a path) to limit the run to those, so one session can remove its own without touching the others the list shows. Every name must pick out exactly one worktree: one that matches nothing (a typo) or more than one (a directory name that is also another worktree's branch; use the path) stops the run with nothing cleaned. A branch whose commits were pushed under **another** name (e.g. onto an automation's PR branch) is recognised by its tip commit: shipped when that commit is in a merged PR's final commits. Never reaps, or lists as removable, a just-created worktree (grace window), a never-pushed branch (no upstream of its own: the `origin/<base>` upstream a `wt new` branch starts with is where it was cut from, not a push), or one with uncommitted changes, which it names with a file count. `[--stale-index]` also **reports** (never auto-removes) a merged-PR worktree holding a leftover uncommitted index a plain clean can't touch, and prints the manual remove command. `[--all-roots]` additionally evaluates worktrees **outside** `worktree_root` — the collision engine scans those, so a legacy worktree root can hard-block pushes that a default clean never clears (all the data-loss guards still apply) |
-| `wt claim <issue>` | Assign a GitHub issue, make a worktree, open a draft PR, record the claim `[--force] [--no-pr] [--epic <id>]`. **Refuses (won't duplicate) when an open PR already references the issue** — including a plain `Refs #N` (which GitHub never treats as a linked/closing reference, so it's invisible to `closingIssuesReferences`); it names that PR and points at `wt adopt`. `--force` opens another anyway |
+| `wt claim <issue>` | Assign a GitHub issue, make a worktree, open a draft PR, record the claim `[--force] [--no-pr] [--epic <id>]`. **Refuses (won't duplicate) when an open PR already references the issue** — including a plain `Refs #N` (which GitHub never treats as a linked/closing reference, so it's invisible to `closingIssuesReferences`); it names that PR and points at `wt adopt`. `--force` opens another anyway. Before it assigns anything, a local branch (or worktree) of the claim's name is checked against `origin/<branch>` exactly as `wt new` checks it, and a diverged one is refused; so is a worktree already there that is only behind, since a placeholder on it could not be pushed, a branch origin has deleted since it was pushed (the claim would push it back), and, with no local branch, a branch origin already has (pointing at `wt adopt`). The placeholder commit never takes work staged in a worktree it reuses, and refuses one in the middle of a merge. If anything fails after the assign, the claim rolls back only what it did: the issue is unassigned (unless it was yours before), and a branch it re-attached, or a worktree it reused, keeps its commits, minus the placeholder |
 | `wt adopt <branch\|pr>` | Put a worktree on an **existing** branch (a colleague's or a previous session's PR branch) instead of forking a new one, and record it like `claim` — resolves a PR number to its head branch. This is the actionable half of `claim`'s refusal above, and the only command that lands a registered worktree on a branch you didn't just create `[--epic <id>]`. **Adopting by PR, `origin/<branch>` must carry the PR head first:** a PR from a fork (its head is on another repository, out of `git fetch origin`'s reach) or a failed fetch is refused before anything is checked out, created or moved, with a `gh pr checkout` recipe for the fork case. A local branch of that name is then compared with `origin/<branch>`: one that is only behind is fast-forwarded, one with unpushed commits on top is attached as it is with a note, and one that diverged (typically left over from an earlier PR that reused the name) is refused with both SHAs, never silently checked out. A re-run that finds the worktree already there is compared the same way but never moved: behind or ahead is handed back with a note, diverged is refused |
 | `wt release <issue>` | Drop the claim. `[--clean]` also removes the worktree when the branch is abandoned (clean tree, no live PR, WIP-only commits) |
-| `wt merge-pr <pr>` | Guarded squash-merge (PR-state precheck, strips a `WIP:` subject unless you forward `-- --subject`, refuses an empty/placeholder-only PR), then auto-removes the worktree + claim. Lints the closing keywords the squash will fire (PR body **and** commit bodies; a body forwarded with `-- --body/--body-file/-F -` is linted in place of the commit bodies) and verifies issue state after (skip both with `--no-close-check` for a PR that closes nothing) `[--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok] [--no-close-check]` |
+| `wt merge-pr <pr>` | Guarded squash-merge (PR-state precheck, strips a `WIP:` subject unless you forward `-- --subject`, refuses an empty/placeholder-only PR), then auto-removes the worktree + claim (also when `gh pr merge` fails after merging, as `-- -d` does when a worktree has the branch checked out). Lints the closing keywords the squash will fire: the PR body, plus the squash commit's **subject and body as GitHub will write them** (see [Merging](#merging-auto-cleanup-and-merge--deploy)), and verifies issue state after (skip both with `--no-close-check` for a PR that closes nothing) `[--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok] [--no-close-check]` |
 | `wt todos` | What every window is working on (mirrors each window's TODO list) |
 | **— cross-window coordination —** | |
 | `wt announce "<msg>"` | Tell other windows a change is starting `[--hold "merge-main,…"] [--issue N]` |
@@ -240,7 +242,26 @@ PR's worktree and local branch**. Guarded: it only removes a worktree under the
 configured root (never your primary or a foreign checkout) and never one with
 uncommitted changes. `--keep` opts out; if you were sitting inside the removed
 worktree it prints a `cd` hint back. `wt clean -y` sweeps any already-shipped
-worktrees the same way.
+worktrees the same way. If `gh pr merge` fails *after* merging (`-- -d` does
+when a worktree has the branch checked out), merge-pr sees the PR is MERGED and
+finishes the job: the close verify and the auto-clean still run.
+
+Before the squash, merge-pr lists every issue the merge will close and refuses
+(`--close-ok` proceeds) when one is closed by text the PR's own closing
+references don't show, or by phrasing that says it isn't meant ("does not fix
+#N"). It reads the PR body plus the squash commit **as GitHub will write it**:
+
+| | taken from |
+|---|---|
+| subject | a forwarded `--subject`/`-t` (or the `WIP:`-stripped PR title), else the repo's `squash_merge_commit_title`: the PR title, or with `COMMIT_OR_PR_TITLE` (GitHub's default) the commit's headline when the PR has one commit, merge commits not counted |
+| body | a forwarded `--body`/`--body-file`/`-F -`, else `squash_merge_commit_message`: the PR body, the commit messages (one commit under the default: its body only), or nothing |
+
+So `wt merge-pr <pr> -- --subject "…" --body "…"` drops a stray keyword from
+both halves without force-pushing. When the settings can't be read, it reads
+every subject and body the squash could carry: a false refusal costs a
+`--close-ok`, a missed close shuts an issue silently. After the merge it
+re-reads every issue a keyword in the PR title, body or commits would close,
+shipped or not, and says which changed state.
 
 In a **GitOps repo where merging to base auto-applies to prod** (Flux/Argo
 reconcile on push), that squash is far higher-stakes than normal. Set

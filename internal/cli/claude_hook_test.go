@@ -23,6 +23,11 @@ func TestParseClaudeEdit(t *testing.T) {
 	if _, f, ok := parseClaudeEdit([]byte(multi)); !ok || f != "c.go" {
 		t.Errorf("MultiEdit: (%q,%v)", f, ok)
 	}
+	// a real name can end with a space: the path is used as sent (#200)
+	trail := `{"tool_name":"Edit","tool_input":{"file_path":"/repo/trail.md "}}`
+	if _, f, ok := parseClaudeEdit([]byte(trail)); !ok || f != "/repo/trail.md " {
+		t.Errorf("trailing space: (%q,%v), want the path untrimmed", f, ok)
+	}
 	// non-editing tools + empty file_path + garbage → not relevant
 	for _, s := range []string{
 		`{"tool_name":"Bash","tool_input":{"command":"ls"}}`,

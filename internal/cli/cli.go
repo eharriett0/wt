@@ -4,6 +4,7 @@ package cli
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -443,10 +444,11 @@ func cmdMergePR(args []string) int {
 	// wt's own safety checks (which is exactly the value the raw `gh` fallback
 	// lost).
 	// Close-keyword lint (#77): merge-pr is the only place that sees BOTH the PR
-	// body and the squash commit body it forwards — the two texts that decide
-	// what auto-closes. Print the resolved close set; refuse only when the squash
-	// closes something the PR's own closing references don't (trap 2), unless
-	// --close-ok. Best-effort — a gh failure yields an empty plan (never blocks).
+	// body and the squash commit it forwards — subject and body (#196) — the
+	// texts that decide what auto-closes. Print the resolved close set; refuse
+	// only when the squash closes something the PR's own closing references don't
+	// (trap 2), unless --close-ok. Best-effort — a gh failure yields an empty plan
+	// (never blocks).
 	// ⚠ This runs on --dry-run TOO (#164). It used to be skipped there, which
 	// made the one command you would reach for to preview a merge the one that
 	// could not tell you what the merge closes — you had to perform the merge to
@@ -463,13 +465,19 @@ func cmdMergePR(args []string) int {
 		return 1
 	}
 	if err := merge.Run(pr, *dryRun, *bypass, *mergeForeign, wtBranches, merge.WithAdmin(*admin, prep.args), prep.stdin); err != nil {
-		return 1
-	}
-	// ⚠ gh exits 0 WITHOUT merging for --help, --auto, --disable-auto, a merge
-	// queue or -R, so only a PR that now reads MERGED is verified and auto-cleaned
-	// (#185). Still exit 0: gh did what it was asked (printed help, armed
-	// auto-merge, queued the PR), and keeping the worktree loses nothing.
-	if !*dryRun && !mergeConfirmed(pr) {
+		// ⚠ gh can fail AFTER merging (#196): `-- -d` merges, then cannot delete a
+		// local branch that a wt worktree has checked out, and exits non-zero. So a
+		// failed `gh pr merge` reads the PR state too, and only MERGED goes on to
+		// the verify and the auto-clean (#187's shipped-tip guard included); a
+		// guard's refusal, or any other state, exits 1 as before.
+		if !errors.Is(err, merge.ErrMergeCommand) || !mergedDespiteFailure(pr) {
+			return 1
+		}
+	} else if !*dryRun && !mergeConfirmed(pr) {
+		// ⚠ gh exits 0 WITHOUT merging for --help, --auto, --disable-auto, a merge
+		// queue or -R, so only a PR that now reads MERGED is verified and
+		// auto-cleaned (#185). Still exit 0: gh did what it was asked (printed help,
+		// armed auto-merge, queued the PR), and keeping the worktree loses nothing.
 		return 0
 	}
 	// Post-merge verification (#77): re-check the referenced issues + report any
@@ -1029,7 +1037,7 @@ func parseCheckArgs(args []string) (paths []string, includeStale, showDiff, asJS
 // matched (#181) and whether it is a typo (#93), gathered once so the two
 // decisions read the same facts.
 type checkArg struct {
-	arg     string        // as typed, trimmed
+	arg     string        // as typed, trimmed unless it names a real path as typed
 	query   collide.Query // how it is matched against each window's touched files
 	exists  bool          // present in the working tree
 	tracked bool          // known to git (a deleted-but-tracked path counts)
@@ -1085,19 +1093,32 @@ func rootArgBase(root string) argBase {
 // (cwdArgBase) and MCP wt_check (rootArgBase), so the two differ only in where a
 // relative path starts. Pure given base (an absolute argument also resolves
 // symlinks: repoRelativePath).
+//
+// An argument is trimmed unless, as typed, it names a real path: a file name can
+// begin or end with a space, and the pre-push and pre-commit checks, which read
+// it from git verbatim (#200), ask about the name as it is.
 func resolveCheckArgs(args []string, root string, base argBase, ws []collide.Window) []checkArg {
 	var out []checkArg
 	for _, a := range args {
-		a = strings.TrimSpace(a)
-		if a == "" {
+		t := strings.TrimSpace(a)
+		if t == "" {
 			continue
 		}
-		ca := checkArg{arg: a, exists: base.exists(a)}
-		ca.tracked = !ca.exists && base.tracked(a)
-		ca.query = collide.QueryFor(a, repoRelativePath(root, base.prefix, a), ca.exists || ca.tracked, ws)
+		ca := resolveCheckArg(a, root, base, ws)
+		if ca.query.Mode != collide.MatchExact && t != a {
+			ca = resolveCheckArg(t, root, base, ws)
+		}
 		out = append(out, ca)
 	}
 	return out
+}
+
+// resolveCheckArg is resolveCheckArgs for one argument, taken as given.
+func resolveCheckArg(a, root string, base argBase, ws []collide.Window) checkArg {
+	ca := checkArg{arg: a, exists: base.exists(a)}
+	ca.tracked = !ca.exists && base.tracked(a)
+	ca.query = collide.QueryFor(a, repoRelativePath(root, base.prefix, a), ca.exists || ca.tracked, ws)
+	return ca
 }
 
 // checkQueries returns the resolved query of each argument, in order. Pure.

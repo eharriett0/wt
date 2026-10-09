@@ -1,6 +1,9 @@
 package gitx
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 func TestDefaultBranchFromRef(t *testing.T) {
 	cases := map[string]string{
@@ -120,28 +123,92 @@ func TestAllZeroSHA(t *testing.T) {
 	}
 }
 
+// `git merge-tree --write-tree --name-only -z` output (#200): NUL-terminated
+// records, every path verbatim. The message records are the -z ones git 2.39
+// writes ("<n paths>\0<path>\0<type>\0<message>\0").
 func TestParseMergeTreeConflictPaths(t *testing.T) {
-	// clean merge output would never reach here (exit 0), but a 1-line blob is
-	// tolerated → no paths.
-	if got := parseMergeTreeConflictPaths("5ca6dbe8a5d360580d5ba525df2d7f3a109b6462"); got != nil {
-		t.Errorf("single-line = %v, want nil", got)
+	const oid = "0123456789abcdef0123456789abcdef01234567"
+	for _, tc := range []struct {
+		name, out string
+		want      []string
+	}{
+		// a clean merge exits 0 and never reaches the parser, but an OID alone is
+		// tolerated
+		{"tree OID only", oid + "\x00", nil},
+		{"empty", "", nil},
+		{"conflicts, then the messages after an empty record",
+			oid + "\x00internal/hooks/hooks.go\x00internal/gitx/gitx.go\x00\x00" +
+				"1\x00internal/hooks/hooks.go\x00Auto-merging\x00Auto-merging internal/hooks/hooks.go\n\x00" +
+				"1\x00internal/hooks/hooks.go\x00CONFLICT (contents)\x00CONFLICT (content): Merge conflict in internal/hooks/hooks.go\n\x00",
+			[]string{"internal/hooks/hooks.go", "internal/gitx/gitx.go"}},
+		{"--no-messages: no empty record", oid + "\x00a.go\x00", []string{"a.go"}},
+		{"names git would C-quote stay verbatim",
+			oid + "\x00café.md\x00dír é/new\nline.md\x00 lead \"q\" \\.md\x00\x00",
+			[]string{"café.md", "dír é/new\nline.md", " lead \"q\" \\.md"}},
+	} {
+		if got := parseMergeTreeConflictPaths(tc.out); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("%s: paths = %q, want %q", tc.name, got, tc.want)
+		}
 	}
-	// conflict shape: OID, then conflicted paths, blank line, informational text.
-	out := "0123456789abcdef0123456789abcdef01234567\n" +
-		"internal/hooks/hooks.go\n" +
-		"internal/gitx/gitx.go\n" +
-		"\n" +
-		"Auto-merging internal/hooks/hooks.go\n" +
-		"CONFLICT (content): Merge conflict in internal/hooks/hooks.go\n"
-	got := parseMergeTreeConflictPaths(out)
-	want := []string{"internal/hooks/hooks.go", "internal/gitx/gitx.go"}
-	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
-		t.Errorf("paths = %v, want %v", got, want)
+}
+
+// splitNUL reads `git diff --name-only -z` (#200): every path verbatim, which
+// a line read could not do (git C-quotes "unusual" names, and a trim eats a
+// leading or trailing space).
+func TestSplitNUL(t *testing.T) {
+	for _, tc := range []struct {
+		name, out string
+		want      []string
+	}{
+		{"empty", "", nil},
+		{"one", "a.go\x00", []string{"a.go"}},
+		{"several, in git's order", "b.go\x00a/c.go\x00", []string{"b.go", "a/c.go"}},
+		{"non-ASCII", "café.md\x00naïve/ü.txt\x00", []string{"café.md", "naïve/ü.txt"}},
+		{"space, tab, quote, backslash, newline",
+			"a b.md\x00tab\tname.md\x00q\"uote.md\x00back\\slash.md\x00new\nline.md\x00",
+			[]string{"a b.md", "tab\tname.md", "q\"uote.md", "back\\slash.md", "new\nline.md"}},
+		{"leading and trailing spaces kept", " lead.md\x00trail.md \x00", []string{" lead.md", "trail.md "}},
+		{"a missing final NUL keeps the last path", "a.go\x00b.go", []string{"a.go", "b.go"}},
+	} {
+		if got := splitNUL(tc.out); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("%s: splitNUL = %q, want %q", tc.name, got, tc.want)
+		}
 	}
-	// no blank separator (some git versions) → still stops before we mislabel,
-	// but at minimum captures the first path; empty blob → nil.
-	if got := parseMergeTreeConflictPaths(""); got != nil {
-		t.Errorf("empty = %v, want nil", got)
+}
+
+// parsePorcelainZ reads `git status --porcelain -z` (#200). A rename or copy
+// is "XY <new>\0<orig>\0", new FIRST (the line format's "orig -> new"
+// reversed); both are wanted (#28).
+func TestParsePorcelainZ(t *testing.T) {
+	for _, tc := range []struct {
+		name, out string
+		want      []string
+	}{
+		{"clean", "", nil},
+		{"modified, staged, untracked, deleted",
+			" M a.go\x00M  b.go\x00?? new/c.go\x00 D d.go\x00AM e.go\x00",
+			[]string{"a.go", "b.go", "new/c.go", "d.go", "e.go"}},
+		{"staged rename: new, then the original",
+			"R  pkg/README.md\x00README.md\x00", []string{"pkg/README.md", "README.md"}},
+		{"rename then more edits in the worktree", "RM new.go\x00old.go\x00", []string{"new.go", "old.go"}},
+		{"intent-to-add rename, in the worktree column",
+			" R moved.md\x00a b.md\x00", []string{"moved.md", "a b.md"}},
+		{"copy", "C  copy.go\x00orig.go\x00", []string{"copy.go", "orig.go"}},
+		{"the original is not read as a status record",
+			// "M  x" as an ORIGINAL path would otherwise parse as status "M " path "x"
+			"R  y.go\x00M  x\x00 M z.go\x00", []string{"y.go", "M  x", "z.go"}},
+		{"a short original path", "R  long-name.go\x00a\x00?? b\x00", []string{"long-name.go", "a", "b"}},
+		{"unmerged", "UU both.go\x00AA added.go\x00", []string{"both.go", "added.go"}},
+		{"names git would C-quote (porcelain quotes a space too)",
+			" M café.md\x00?? dír é/ü.md\x00M  q\"uote.md\x00 M back\\slash.md\x00?? tab\tname.md\x00 M new\nline.md\x00",
+			[]string{"café.md", "dír é/ü.md", "q\"uote.md", "back\\slash.md", "tab\tname.md", "new\nline.md"}},
+		{"leading and trailing spaces kept", " M  lead.md\x00?? trail.md \x00", []string{" lead.md", "trail.md "}},
+		{"a rename of odd names", "R  dír é/moved ü.md\x00q\"uote.md\x00", []string{"dír é/moved ü.md", "q\"uote.md"}},
+		{"a truncated rename keeps its new path", "R  new.go\x00", []string{"new.go"}},
+	} {
+		if got := parsePorcelainZ(tc.out); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("%s: parsePorcelainZ = %q, want %q", tc.name, got, tc.want)
+		}
 	}
 }
 
@@ -149,6 +216,8 @@ func TestScopedEnv(t *testing.T) {
 	t.Setenv("GIT_DIR", "/some/.git")
 	t.Setenv("GIT_INDEX_FILE", "/some/.git/index")
 	t.Setenv("GIT_WORK_TREE", "/some")
+	t.Setenv("GIT_LITERAL_PATHSPECS", "1") // #204: it would turn literalPath's magic into part of the name
+	t.Setenv("GIT_ICASE_PATHSPECS", "1")
 	t.Setenv("WT_KEEP_ME", "yes")
 	env := scopedEnv()
 	has := func(prefix string) bool {
@@ -159,7 +228,7 @@ func TestScopedEnv(t *testing.T) {
 		}
 		return false
 	}
-	for _, dropped := range []string{"GIT_DIR=", "GIT_INDEX_FILE=", "GIT_WORK_TREE="} {
+	for _, dropped := range []string{"GIT_DIR=", "GIT_INDEX_FILE=", "GIT_WORK_TREE=", "GIT_LITERAL_PATHSPECS=", "GIT_ICASE_PATHSPECS="} {
 		if has(dropped) {
 			t.Errorf("scopedEnv did not strip %s", dropped)
 		}
