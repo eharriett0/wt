@@ -2,8 +2,11 @@ package cli
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/eharriett0/wt/internal/gitx"
 )
 
 func TestParseCodexEdit(t *testing.T) {
@@ -200,14 +203,11 @@ func TestPatchRangesInFile(t *testing.T) {
 		t.Errorf("range=%+v want line 4 only (context excluded)", ranges[0])
 	}
 
-	// Pure-addition hunk (all context, nothing removed) modifies no existing line
-	// → contributes no range → the only-hunk case falls back to file-level.
-	fAdd := codexPatchFile{path: "x.go", hunks: []codexHunk{{
-		preImage: []string{"func f() {"},
-		removed:  nil,
-	}}}
-	if _, ok := patchRangesInFile(fAdd, content); ok {
-		t.Error("pure-addition hunk should produce no range")
+	// A hunk with nothing removed and nothing added edits nothing → the
+	// only-hunk case falls back to file-level.
+	fNone := codexPatchFile{path: "x.go", hunks: []codexHunk{{preImage: []string{"func f() {"}}}}
+	if _, ok := patchRangesInFile(fNone, content); ok {
+		t.Error("a hunk that edits nothing should produce no range")
 	}
 
 	// Non-unique block → cannot localize → ok=false (file-level fallback).
@@ -230,6 +230,62 @@ func TestPatchRangesInFile(t *testing.T) {
 	// No hunks at all (an add/delete) → ok=false.
 	if _, ok := patchRangesInFile(codexPatchFile{path: "x.go"}, content); ok {
 		t.Error("no-hunk file should not localize")
+	}
+}
+
+// #199: a run of added lines with no removed line beside it is an INSERTION into
+// the gap between its pre-image neighbours, graded by git's rule (it meets a
+// change of either neighbour). It used to contribute no range, so a patch that
+// only inserted next to another window's edit read as disjoint. A run git may
+// slide claims every gap it can land in; one beside removed lines is part of
+// that change.
+func TestPatchRangesInFile_Insertions(t *testing.T) {
+	content := "package x\n\nfunc f() {\n\treturn 1\n}\n\nfunc g() {\n\treturn 2\n}\n"
+	gap := func(p int) gitx.LineRange { return gitx.LineRange{Start: p, End: p + 1, Gap: true} }
+	chg := func(s, e int) gitx.LineRange { return gitx.LineRange{Start: s, End: e} }
+	cases := []struct {
+		name  string
+		patch string
+		want  []gitx.LineRange
+		ok    bool
+	}{
+		{"insertion between two context lines", "@@\n func f() {\n+\tx := 1\n \treturn 1\n", []gitx.LineRange{gap(3)}, true},
+		{"insertion after the hunk's last line", "@@\n func g() {\n \treturn 2\n+\ty := 2\n", []gitx.LineRange{gap(8)}, true},
+		{"insertion before the hunk's first line", "@@\n+// doc\n func g() {\n", []gitx.LineRange{gap(6)}, true},
+		{"added lines replacing removed ones: the change only", "@@\n func f() {\n-\treturn 1\n+\treturn 3\n+\t// more\n }\n", []gitx.LineRange{chg(4, 4)}, true},
+		{"added lines just before removed ones: the change only", "@@\n func f() {\n+\tz := 0\n-\treturn 1\n }\n", []gitx.LineRange{chg(4, 4)}, true},
+		{"a change and a separate insertion", "@@\n-func f() {\n \treturn 1\n+\t// end\n }\n", []gitx.LineRange{chg(3, 3), gap(4)}, true},
+		// The inserted line repeats the blank line below its gap: git may report
+		// it one gap down, so the claim covers both gaps (5 and 6) as line 6.
+		{"an insertion git may slide claims its slide", "@@\n }\n+\n \n func g() {\n", []gitx.LineRange{chg(6, 6)}, true},
+		{"a pure deletion: its line", "@@\n }\n-\n func g() {\n", []gitx.LineRange{chg(6, 6)}, true},
+		{"added lines with no pre-image: nothing to place them by", "@@\n+appended\n", nil, false},
+	}
+	for _, c := range cases {
+		files := parseCodexPatch("*** Begin Patch\n*** Update File: x.go\n" + c.patch + "*** End Patch\n")
+		if len(files) != 1 {
+			t.Fatalf("%s: parsed %d files", c.name, len(files))
+		}
+		got, ok := patchRangesInFile(files[0], content)
+		if ok != c.ok || !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s: patchRangesInFile = %v, %v; want %v, %v", c.name, got, ok, c.want, c.ok)
+		}
+	}
+	// A pure deletion of a line that repeats its neighbour: git may delete either.
+	files := parseCodexPatch("*** Update File: y.txt\n@@\n a\n-x\n x\n b\n")
+	if got, ok := patchRangesInFile(files[0], "a\nx\nx\nb\n"); !ok || !reflect.DeepEqual(got, []gitx.LineRange{chg(2, 3)}) {
+		t.Errorf("a deletion git may slide: %v, %v; want lines 2-3", got, ok)
+	}
+	// A slide reaches as far as the run repeats: "x" after a run of three x's
+	// can land in any of the four gaps around them.
+	if got := insertionClaim([]string{"a", "x", "x", "x", "b"}, 4, []string{"x"}); got != chg(2, 4) {
+		t.Errorf("insertionClaim through a run = %v, want lines 2-4", got)
+	}
+	if got := deletionClaim([]string{"a", "x", "x", "x", "b"}, 3, 3); got != chg(2, 4) {
+		t.Errorf("deletionClaim through a run = %v, want lines 2-4", got)
+	}
+	if got := deletionClaim([]string{"a", "x", "y", "b"}, 2, 3); got != chg(2, 3) {
+		t.Errorf("deletionClaim with nothing to slide = %v, want lines 2-3", got)
 	}
 }
 

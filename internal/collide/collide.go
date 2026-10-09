@@ -568,22 +568,25 @@ func (s Severity) String() string {
 	return "low"
 }
 
-// OverlappingSpans returns the intersections between two sets of line ranges
-// (empty ⇒ fully disjoint). O(n·m); the n,m here are per-file hunk counts, tiny.
-func OverlappingSpans(a, b []gitx.LineRange) []gitx.LineRange {
+// ConflictSpans returns where two windows' edits would be ONE conflict region in
+// a git 3-way merge (gitx.LineRange.Conflicts: they overlap, or touch with no
+// unchanged line between, an insertion meeting only a change of a line next to
+// its gap, #199), one span per conflicting pair: the lines both cover, or for two
+// edits that only touch, the line on each side of the seam (A edits L10, B edits
+// L11 → L10-11). Empty ⇒ git merges the two cleanly. O(n·m); the n,m here are
+// per-file hunk counts, tiny.
+func ConflictSpans(a, b []gitx.LineRange) []gitx.LineRange {
 	var hits []gitx.LineRange
 	for _, ra := range a {
 		for _, rb := range b {
-			if ra.Overlaps(rb) {
-				lo, hi := ra.Start, ra.End
-				if rb.Start > lo {
-					lo = rb.Start
-				}
-				if rb.End < hi {
-					hi = rb.End
-				}
-				hits = append(hits, gitx.LineRange{Start: lo, End: hi})
+			if !ra.Conflicts(rb) {
+				continue
 			}
+			lo, hi := max(ra.Start, rb.Start), min(ra.End, rb.End)
+			if lo > hi { // they only touch: the seam's two lines
+				lo, hi = hi, lo
+			}
+			hits = append(hits, gitx.LineRange{Start: lo, End: hi})
 		}
 	}
 	return hits
@@ -594,8 +597,13 @@ func OverlappingSpans(a, b []gitx.LineRange) []gitx.LineRange {
 //   - append-only path              → SevFYI
 //   - either side has no ranges yet → SevHigh (indeterminate — can't prove
 //     disjoint, so don't silently clear; preserves the pre-edit "heads up")
-//   - ranges provably disjoint      → SevFYI (the crying-wolf case #7 targets)
-//   - ranges overlap                → SevHigh
+//   - git would merge every pair cleanly (an unchanged line between each)
+//     → SevFYI (the crying-wolf case #7 targets)
+//   - some pair is one conflict region (ConflictSpans: overlapping, or touching
+//     with no unchanged line between, #199) → SevHigh
+//
+// The one grade `wt check`, the git hooks and the pre-edit hooks all apply
+// (#92/#108), so changing it changes every one of them.
 func ConflictSeverity(current, other []gitx.LineRange, appendOnly bool) Severity {
 	if appendOnly {
 		return SevFYI
@@ -603,7 +611,7 @@ func ConflictSeverity(current, other []gitx.LineRange, appendOnly bool) Severity
 	if len(current) == 0 || len(other) == 0 {
 		return SevHigh
 	}
-	if len(OverlappingSpans(current, other)) > 0 {
+	if len(ConflictSpans(current, other)) > 0 {
 		return SevHigh
 	}
 	return SevFYI
@@ -652,7 +660,8 @@ func PathMatchesUpstream(worktree, base, path string) (merged, known bool) {
 // if ANY participating window has no computable ranges (untracked/binary/diff
 // error), the overlap is indeterminate → SevHigh (can't prove disjoint, so
 // don't clear — mirrors ConflictSeverity's fail-safe). Else HIGH iff any pair
-// of windows has overlapping ranges; all-disjoint ⇒ FYI.
+// of windows has edits git would merge as one conflict region (ConflictSpans,
+// #199); all apart ⇒ FYI.
 func OverlapSeverity(rangesByWindow [][]gitx.LineRange, appendOnly bool) Severity {
 	if appendOnly {
 		return SevFYI
@@ -664,7 +673,7 @@ func OverlapSeverity(rangesByWindow [][]gitx.LineRange, appendOnly bool) Severit
 	}
 	for i := 0; i < len(rangesByWindow); i++ {
 		for j := i + 1; j < len(rangesByWindow); j++ {
-			if len(OverlappingSpans(rangesByWindow[i], rangesByWindow[j])) > 0 {
+			if len(ConflictSpans(rangesByWindow[i], rangesByWindow[j])) > 0 {
 				return SevHigh
 			}
 		}

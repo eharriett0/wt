@@ -47,6 +47,15 @@ func TestRegradePending(t *testing.T) {
 	}{
 		{"pending overlaps: HIGH entry fires, confirmed", []CheckEntry{blocking}, nil, true, spans(20, 20), true, never, kept{"blk": true}},
 		{"pending disjoint: HIGH entry dropped", []CheckEntry{blocking}, nil, true, spans(30, 30), true, never, kept{}},
+		// #199: the grade is git's rule, as in `wt check`: a pending edit touching
+		// the other window's line conflicts, one line clear of it doesn't; a
+		// pending insertion meets only a change of a line next to its gap.
+		{"pending touches the other's line: fires", []CheckEntry{fyi}, nil, true, spans(21, 21), true, never, kept{"fyi": true}},
+		{"pending touches from above: fires", []CheckEntry{blocking}, nil, true, spans(19, 19), true, never, kept{"blk": true}},
+		{"pending one line clear: dropped", []CheckEntry{blocking}, nil, true, spans(22, 22), true, never, kept{}},
+		{"pending insertion right after the other's line: fires", []CheckEntry{fyi}, nil, true, []gitx.LineRange{{Start: 20, End: 21, Gap: true}}, true, never, kept{"fyi": true}},
+		{"pending insertion one line clear: dropped", []CheckEntry{fyi}, nil, true, []gitx.LineRange{{Start: 21, End: 22, Gap: true}}, true, never, kept{}},
+		{"own edit touching it already: still HIGH after", []CheckEntry{blocking}, spans(21, 23), true, spans(30, 30), true, never, kept{"blk": true}},
 		{"FYI entry re-graded: pending overlaps → fires", []CheckEntry{fyi}, spans(35, 35), true, spans(20, 20), true, never, kept{"fyi": true}},
 		{"FYI entry, pending disjoint: stays silent", []CheckEntry{fyi}, spans(35, 35), true, spans(30, 30), true, never, kept{}},
 		{"own earlier edit already overlaps: still HIGH after", []CheckEntry{blocking}, spans(19, 21), true, spans(30, 30), true, never, kept{"blk": true}},

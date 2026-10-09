@@ -47,7 +47,7 @@ func TestChangedRanges_StaleBranchExcludesBaseInsertion(t *testing.T) {
 	runGit(t, dir, "worktree", "add", "-q", wt, "branch-a")
 
 	got := ChangedRanges(wt, "main", "data.txt")
-	want := []LineRange{{3, 3}}
+	want := []LineRange{span(3, 3)}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("ChangedRanges(stale branch-a) = %v, want %v — the base's inserted block (base lines 16-20) must NOT be attributed to A", got, want)
 	}
@@ -101,7 +101,7 @@ func TestChangedRanges_AdjacentEditKept(t *testing.T) {
 	}
 	// the edited content ("line16") sits at base-frame line 21 (after the block),
 	// and the block (base 16-20) touches it, so the conflict region is 16-21.
-	if want := []LineRange{{16, 21}}; !reflect.DeepEqual(got, want) {
+	if want := []LineRange{span(16, 21)}; !reflect.DeepEqual(got, want) {
 		t.Errorf("ChangedRanges = %v, want %v (A's edit at base line 21 plus the block git merges into its conflict)", got, want)
 	}
 }
@@ -162,7 +162,9 @@ func TestParseHunks(t *testing.T) {
 // line numbers, moved into base line numbers through base's hunks since the
 // merge base (old side = merge-base frame, new side = base frame). The own side
 // is hunks, not ranges, because git's conflict rule tells an insertion from a
-// two-line change: an insertion only meets changes touching its gap.
+// two-line change: an insertion only meets changes touching its gap. So is the
+// result (#199): a change, or a Gap where the branch's edit is an insertion, or
+// where base deleted every line the branch changed.
 func TestMapHunksToBase(t *testing.T) {
 	mod := func(start, n int) diffHunk { return diffHunk{oldStart: start, oldCount: n} } // branch changed n lines from start
 	ins := func(after int) diffHunk { return diffHunk{oldStart: after} }                 // branch inserted after line `after`
@@ -182,49 +184,64 @@ func TestMapHunksToBase(t *testing.T) {
 		own   []diffHunk
 		want  []LineRange
 	}{
-		{"base never touched the file: identity", nil, []diffHunk{mod(7, 1), mod(10, 3)}, []LineRange{{7, 7}, {10, 12}}},
-		{"base insert above shifts the line down", []diffHunk{ins5x3}, []diffHunk{mod(10, 1)}, []LineRange{{13, 13}}},
-		{"base insert below leaves the line", []diffHunk{{20, 0, 21, 3}}, []diffHunk{mod(10, 1)}, []LineRange{{10, 10}}},
-		{"base insert at the top shifts line 2", []diffHunk{insTop2}, []diffHunk{mod(2, 1)}, []LineRange{{4, 4}}},
-		{"base same-length modify above: no shift", []diffHunk{mod3}, []diffHunk{mod(10, 1)}, []LineRange{{10, 10}}},
-		{"base growing modify above shifts by +2", []diffHunk{grow3}, []diffHunk{mod(10, 1)}, []LineRange{{12, 12}}},
-		{"base shrinking modify above shifts by -2", []diffHunk{shrink}, []diffHunk{mod(10, 1)}, []LineRange{{8, 8}}},
-		{"base delete above shifts the line up", []diffHunk{del2to4}, []diffHunk{mod(10, 1)}, []LineRange{{7, 7}}},
-		{"base delete at the top shifts the line up", []diffHunk{delTop2}, []diffHunk{mod(10, 1)}, []LineRange{{8, 8}}},
-		{"line after the last hunk takes every shift", []diffHunk{grow3, {10, 0, 13, 1}}, []diffHunk{mod(20, 1)}, []LineRange{{23, 23}}},
+		{"base never touched the file: identity", nil, []diffHunk{mod(7, 1), mod(10, 3)}, []LineRange{span(7, 7), span(10, 12)}},
+		{"base insert above shifts the line down", []diffHunk{ins5x3}, []diffHunk{mod(10, 1)}, []LineRange{span(13, 13)}},
+		{"base insert below leaves the line", []diffHunk{{20, 0, 21, 3}}, []diffHunk{mod(10, 1)}, []LineRange{span(10, 10)}},
+		{"base insert at the top shifts line 2", []diffHunk{insTop2}, []diffHunk{mod(2, 1)}, []LineRange{span(4, 4)}},
+		{"base same-length modify above: no shift", []diffHunk{mod3}, []diffHunk{mod(10, 1)}, []LineRange{span(10, 10)}},
+		{"base growing modify above shifts by +2", []diffHunk{grow3}, []diffHunk{mod(10, 1)}, []LineRange{span(12, 12)}},
+		{"base shrinking modify above shifts by -2", []diffHunk{shrink}, []diffHunk{mod(10, 1)}, []LineRange{span(8, 8)}},
+		{"base delete above shifts the line up", []diffHunk{del2to4}, []diffHunk{mod(10, 1)}, []LineRange{span(7, 7)}},
+		{"base delete at the top shifts the line up", []diffHunk{delTop2}, []diffHunk{mod(10, 1)}, []LineRange{span(8, 8)}},
+		{"line after the last hunk takes every shift", []diffHunk{grow3, {10, 0, 13, 1}}, []diffHunk{mod(20, 1)}, []LineRange{span(23, 23)}},
 		// A line BOTH changed must keep overlapping base's version of it: that is
 		// a real 3-way conflict and must never be mapped away.
-		{"both modified the line: lands on base's rewrite", []diffHunk{mod3}, []diffHunk{mod(3, 1)}, []LineRange{{3, 3}}},
-		{"both modified, base grew it: whole replacement", []diffHunk{grow3}, []diffHunk{mod(3, 1)}, []LineRange{{3, 5}}},
-		{"both modified, base collapsed the block: its 1 line", []diffHunk{shrink}, []diffHunk{mod(4, 1)}, []LineRange{{3, 3}}},
-		{"branch edited a line base deleted: the gap's neighbours", []diffHunk{del2to4}, []diffHunk{mod(3, 1)}, []LineRange{{1, 2}}},
-		{"branch edited a line base deleted at the top", []diffHunk{delTop2}, []diffHunk{mod(2, 1)}, []LineRange{{0, 1}}},
+		{"both modified the line: lands on base's rewrite", []diffHunk{mod3}, []diffHunk{mod(3, 1)}, []LineRange{span(3, 3)}},
+		{"both modified, base grew it: whole replacement", []diffHunk{grow3}, []diffHunk{mod(3, 1)}, []LineRange{span(3, 5)}},
+		{"both modified, base collapsed the block: its 1 line", []diffHunk{shrink}, []diffHunk{mod(4, 1)}, []LineRange{span(3, 3)}},
+		// Base deleted every line the branch changed: no line is left to claim, so
+		// the claim is base's deletion point (a window touching either neighbour
+		// merges with that deletion), not both neighbours as lines.
+		{"branch edited a line base deleted: the deletion point", []diffHunk{del2to4}, []diffHunk{mod(3, 1)}, []LineRange{gapAt(1)}},
+		{"branch edited a line base deleted at the top", []diffHunk{delTop2}, []diffHunk{mod(2, 1)}, []LineRange{gapAt(0)}},
 		// A branch range spans its ends, so base content inserted INSIDE a branch
 		// hunk stays covered.
-		{"branch range straddling a base insert covers it", []diffHunk{ins5x3}, []diffHunk{mod(4, 4)}, []LineRange{{4, 10}}},
-		{"branch range across a base-modified line", []diffHunk{grow3}, []diffHunk{mod(2, 3)}, []LineRange{{2, 6}}},
-		{"branch range starting in a base deletion", []diffHunk{del2to4}, []diffHunk{mod(3, 4)}, []LineRange{{1, 3}}},
+		{"branch range straddling a base insert covers it", []diffHunk{ins5x3}, []diffHunk{mod(4, 4)}, []LineRange{span(4, 10)}},
+		{"branch range across a base-modified line", []diffHunk{grow3}, []diffHunk{mod(2, 3)}, []LineRange{span(2, 6)}},
+		// The branch's surviving lines 5-6 land on base 2-3; base's deletion point
+		// (after base 1) is at their edge, so a window editing base line 1 still
+		// conflicts with the claim, and base line 1 itself isn't claimed (#199).
+		{"branch range starting in a base deletion", []diffHunk{del2to4}, []diffHunk{mod(3, 4)}, []LineRange{span(2, 3)}},
+		{"branch range ending in a base deletion", []diffHunk{{7, 3, 6, 0}}, []diffHunk{mod(5, 3)}, []LineRange{span(5, 6)}},
 		// Base changes that TOUCH a branch hunk with no unchanged line between are
 		// the same conflict region in a git merge (#184 review): the branch claims
 		// base's replacement there too.
-		{"the chain: branch l11, base rewrites l12-13", []diffHunk{{12, 2, 12, 2}}, []diffHunk{mod(11, 1)}, []LineRange{{11, 13}}},
-		{"base rewrites the lines just above", []diffHunk{{9, 2, 9, 2}}, []diffHunk{mod(11, 1)}, []LineRange{{9, 11}}},
-		{"base deletes the lines just below", []diffHunk{{12, 2, 11, 0}}, []diffHunk{mod(11, 1)}, []LineRange{{11, 12}}},
-		{"one unchanged line between: no claim", []diffHunk{{13, 1, 13, 1}}, []diffHunk{mod(11, 1)}, []LineRange{{11, 11}}},
-		{"base insert right AFTER the line: claims the block", []diffHunk{{10, 0, 11, 3}}, []diffHunk{mod(10, 1)}, []LineRange{{10, 13}}},
-		{"base insert right BEFORE the line: claims the block", []diffHunk{{9, 0, 10, 3}}, []diffHunk{mod(10, 1)}, []LineRange{{10, 13}}},
-		{"base insert above line 1, branch edits line 1", []diffHunk{insTop2}, []diffHunk{mod(1, 1)}, []LineRange{{1, 3}}},
+		{"the chain: branch l11, base rewrites l12-13", []diffHunk{{12, 2, 12, 2}}, []diffHunk{mod(11, 1)}, []LineRange{span(11, 13)}},
+		{"base rewrites the lines just above", []diffHunk{{9, 2, 9, 2}}, []diffHunk{mod(11, 1)}, []LineRange{span(9, 11)}},
+		// Base's deletion point (after base 11) is at the line's edge: a window
+		// editing base line 12 touches the claim, one editing line 13 doesn't.
+		{"base deletes the lines just below", []diffHunk{{12, 2, 11, 0}}, []diffHunk{mod(11, 1)}, []LineRange{span(11, 11)}},
+		{"one unchanged line between: no claim", []diffHunk{{13, 1, 13, 1}}, []diffHunk{mod(11, 1)}, []LineRange{span(11, 11)}},
+		{"base insert right AFTER the line: claims the block", []diffHunk{{10, 0, 11, 3}}, []diffHunk{mod(10, 1)}, []LineRange{span(10, 13)}},
+		{"base insert right BEFORE the line: claims the block", []diffHunk{{9, 0, 10, 3}}, []diffHunk{mod(10, 1)}, []LineRange{span(10, 13)}},
+		{"base insert above line 1, branch edits line 1", []diffHunk{insTop2}, []diffHunk{mod(1, 1)}, []LineRange{span(1, 3)}},
 		{"several base hunks accumulate", multi,
 			[]diffHunk{mod(1, 1), mod(4, 1), mod(7, 1), mod(8, 1), mod(10, 1), mod(13, 1)},
-			[]LineRange{{1, 1}, {8, 9}, {9, 11}, {11, 11}, {13, 13}, {16, 18}}},
-		// A branch INSERTION reports as its gap's two neighbours [a, a+1] (the
-		// zero-count convention); it meets only base changes touching that gap.
-		{"branch insert at a base insert point covers base's block", []diffHunk{ins5x3}, []diffHunk{ins(5)}, []LineRange{{5, 9}}},
-		{"branch insert at the top vs a base insert at the top", []diffHunk{insTop2}, []diffHunk{ins(0)}, []LineRange{{0, 3}}},
-		{"branch insert at the top vs base rewriting line 1", []diffHunk{{1, 1, 1, 1}}, []diffHunk{ins(0)}, []LineRange{{0, 1}}},
-		{"branch insert below a base insert shifts", []diffHunk{insTop2}, []diffHunk{ins(7)}, []LineRange{{9, 10}}},
-		{"branch insert one line clear of a base rewrite: no claim", []diffHunk{{8, 1, 8, 1}}, []diffHunk{ins(6)}, []LineRange{{6, 7}}},
-		{"a two-line branch change there touches it: claims", []diffHunk{{8, 1, 8, 1}}, []diffHunk{mod(6, 2)}, []LineRange{{6, 8}}},
+			[]LineRange{span(1, 1), span(8, 9), span(9, 11), span(11, 11), span(13, 13), span(16, 18)}},
+		// A branch INSERTION no base hunk meets stays an insertion (a Gap) at its
+		// gap in base numbering. One that meets a base hunk sits inside or at the
+		// edge of base's text there and claims exactly that text: a window touching
+		// it merges with base's hunk, which conflicts with the insertion (#199: the
+		// gap's neighbours as lines would claim one line too many each side).
+		{"branch insert at a base insert point claims base's block", []diffHunk{ins5x3}, []diffHunk{ins(5)}, []LineRange{span(6, 8)}},
+		{"branch insert at the top vs a base insert at the top", []diffHunk{insTop2}, []diffHunk{ins(0)}, []LineRange{span(1, 2)}},
+		{"branch insert at the top vs base rewriting line 1", []diffHunk{{1, 1, 1, 1}}, []diffHunk{ins(0)}, []LineRange{span(1, 1)}},
+		{"branch insert just above a base rewrite", []diffHunk{{8, 1, 8, 2}}, []diffHunk{ins(7)}, []LineRange{span(8, 9)}},
+		{"branch insert just below a base deletion: its point", []diffHunk{{5, 2, 4, 0}}, []diffHunk{ins(6)}, []LineRange{gapAt(4)}},
+		{"branch insert below a base insert shifts", []diffHunk{insTop2}, []diffHunk{ins(7)}, []LineRange{gapAt(9)}},
+		{"branch insert one line clear of a base rewrite: no claim", []diffHunk{{8, 1, 8, 1}}, []diffHunk{ins(6)}, []LineRange{gapAt(6)}},
+		{"branch insert at the top, base untouched", nil, []diffHunk{ins(0)}, []LineRange{gapAt(0)}},
+		{"a two-line branch change there touches it: claims", []diffHunk{{8, 1, 8, 1}}, []diffHunk{mod(6, 2)}, []LineRange{span(6, 8)}},
 	}
 	for _, c := range cases {
 		if got := mapHunksToBase(c.own, c.hunks); !reflect.DeepEqual(got, c.want) {
@@ -335,11 +352,11 @@ func TestChangedRanges_StaleBranchExcludesBaseModification(t *testing.T) {
 		replaceLine("line10 changed-on-main", "line10 EDITED_BY_B"))
 
 	a := ChangedRanges(wtA, "main", "data.txt")
-	if want := []LineRange{{3, 3}}; !reflect.DeepEqual(a, want) {
+	if want := []LineRange{span(3, 3)}; !reflect.DeepEqual(a, want) {
 		t.Errorf("ChangedRanges(stale branch-a) = %v, want %v: lines main modified after A forked (10, 15) must NOT be attributed to A", a, want)
 	}
 	b := ChangedRanges(wtB, "main", "data.txt")
-	if want := []LineRange{{10, 10}}; !reflect.DeepEqual(b, want) {
+	if want := []LineRange{span(10, 10)}; !reflect.DeepEqual(b, want) {
 		t.Fatalf("precondition: ChangedRanges(branch-b) = %v, want %v", b, want)
 	}
 	if anyOverlap(a, b) {
@@ -356,7 +373,7 @@ func TestChangedRanges_StaleBranchSameLineStillOverlaps(t *testing.T) {
 		replaceLine("line10 changed-on-main", "line10 EDITED_BY_B"))
 
 	a := ChangedRanges(wtA, "main", "data.txt")
-	if want := []LineRange{{3, 3}, {10, 10}}; !reflect.DeepEqual(a, want) {
+	if want := []LineRange{span(3, 3), span(10, 10)}; !reflect.DeepEqual(a, want) {
 		t.Errorf("ChangedRanges(stale branch-a) = %v, want %v", a, want)
 	}
 	if b := ChangedRanges(wtB, "main", "data.txt"); !anyOverlap(a, b) {
@@ -375,7 +392,7 @@ func TestChangedRanges_StaleBranchMapsAcrossBaseDeletion(t *testing.T) {
 		replaceLine("line12", "line12 EDITED_BY_B"))
 
 	a := ChangedRanges(wtA, "main", "data.txt")
-	if want := []LineRange{{9, 9}}; !reflect.DeepEqual(a, want) {
+	if want := []LineRange{span(9, 9)}; !reflect.DeepEqual(a, want) {
 		t.Errorf("ChangedRanges(stale branch-a) = %v, want %v (A's edit, in base line numbers; no phantom for base's deletion)", a, want)
 	}
 	if b := ChangedRanges(wtB, "main", "data.txt"); !anyOverlap(a, b) {
@@ -400,7 +417,7 @@ func TestChangedRanges_StaleBranchCountsUncommittedEdits(t *testing.T) {
 	writeFile(t, wtA, "data.txt", replaceLine("line17", "line17 UNSTAGED")(string(cur)))
 
 	got := ChangedRanges(wtA, "main", "data.txt")
-	if want := []LineRange{{5, 5}, {9, 9}, {19, 19}}; !reflect.DeepEqual(got, want) {
+	if want := []LineRange{span(5, 5), span(9, 9), span(19, 19)}; !reflect.DeepEqual(got, want) {
 		t.Errorf("ChangedRanges = %v, want %v (committed line 3, staged line 7, unstaged line 17, each +2 in base; main's line 10 is not A's)", got, want)
 	}
 }
@@ -415,7 +432,7 @@ func TestChangedRangesNew_StaleBranchOwnLinesOnly(t *testing.T) {
 	})
 	wtA, _ := staleScenario(t, replaceLine("line03", "line03 EDITED_BY_A"), mainEdit, nil)
 
-	if got, want := ChangedRangesNew(wtA, "main", "data.txt"), []LineRange{{3, 3}}; !reflect.DeepEqual(got, want) {
+	if got, want := ChangedRangesNew(wtA, "main", "data.txt"), []LineRange{span(3, 3)}; !reflect.DeepEqual(got, want) {
 		t.Errorf("ChangedRangesNew(stale branch-a) = %v, want %v: main's rewrite of line 10 and its insert after 15 are not A's", got, want)
 	}
 }
@@ -442,7 +459,7 @@ func TestChangedRanges_AddAddKeepsBaseDiff(t *testing.T) {
 
 	wt := filepath.Join(t.TempDir(), "wt-a")
 	runGit(t, dir, "worktree", "add", "-q", wt, "branch-a")
-	if got, want := ChangedRanges(wt, "main", "shared.txt"), []LineRange{{1, 1}, {3, 3}}; !reflect.DeepEqual(got, want) {
+	if got, want := ChangedRanges(wt, "main", "shared.txt"), []LineRange{span(1, 1), span(3, 3)}; !reflect.DeepEqual(got, want) {
 		t.Errorf("ChangedRanges(add/add) = %v, want %v (the lines where the two added versions differ)", got, want)
 	}
 }
@@ -458,7 +475,7 @@ func TestChangedRanges_StaleBranchTouchingBaseHunkClaimsIt(t *testing.T) {
 		replaceLine("line13 changed-on-main", "line13 EDITED_BY_B"))
 
 	a := ChangedRanges(wtA, "main", "data.txt")
-	if want := []LineRange{{11, 13}}; !reflect.DeepEqual(a, want) {
+	if want := []LineRange{span(11, 13)}; !reflect.DeepEqual(a, want) {
 		t.Errorf("ChangedRanges(stale branch-a) = %v, want %v (A's line 11 plus base's touching rewrite of 12-13)", a, want)
 	}
 	if b := ChangedRanges(wtB, "main", "data.txt"); !anyOverlap(a, b) {
@@ -471,7 +488,7 @@ func TestChangedRanges_StaleBranchTouchingBaseHunkClaimsIt(t *testing.T) {
 		replaceLine("line10", "line10 EDITED_BY_A"),
 		chain(replaceLine("line12", "line12 changed-on-main"), replaceLine("line13", "line13 changed-on-main")),
 		nil)
-	if got, want := ChangedRanges(wtA2, "main", "data.txt"), []LineRange{{10, 10}}; !reflect.DeepEqual(got, want) {
+	if got, want := ChangedRanges(wtA2, "main", "data.txt"), []LineRange{span(10, 10)}; !reflect.DeepEqual(got, want) {
 		t.Errorf("ChangedRanges(one line clear) = %v, want %v", got, want)
 	}
 }
@@ -494,7 +511,7 @@ func TestChangedRanges_PrefersOriginBase(t *testing.T) {
 	wt := filepath.Join(t.TempDir(), "wt-a")
 	runGit(t, dir, "worktree", "add", "-q", wt, "branch-a")
 	writeFile(t, wt, "data.txt", replaceLine("line05", "line05 EDITED")(base))
-	if got, want := ChangedRanges(wt, "main", "data.txt"), []LineRange{{6, 6}}; !reflect.DeepEqual(got, want) {
+	if got, want := ChangedRanges(wt, "main", "data.txt"), []LineRange{span(6, 6)}; !reflect.DeepEqual(got, want) {
 		t.Errorf("ChangedRanges = %v, want %v: line 5 in origin/main's numbering (local main would say 5)", got, want)
 	}
 }
@@ -528,10 +545,10 @@ func TestChangedRanges_GitFailureNeverReadsAsNoEdits(t *testing.T) {
 
 	failGit(t, func(args []string) bool { return len(args) > 2 && args[0] == "diff" && args[2] == mb })
 	got, ok := ChangedRangesChecked(wtA, "main", "data.txt")
-	if want := []LineRange{{3, 3}, {10, 10}, {15, 15}}; !ok || !reflect.DeepEqual(got, want) {
+	if want := []LineRange{span(3, 3), span(10, 10), span(15, 15)}; !ok || !reflect.DeepEqual(got, want) {
 		t.Errorf("merge-base diff failing: ChangedRangesChecked = %v, %v, want %v, true (the plain base diff's over-report)", got, ok, want)
 	}
-	if got := ChangedRangesNew(wtA, "main", "data.txt"); !reflect.DeepEqual(got, []LineRange{{3, 3}, {10, 10}, {15, 15}}) {
+	if got := ChangedRangesNew(wtA, "main", "data.txt"); !reflect.DeepEqual(got, []LineRange{span(3, 3), span(10, 10), span(15, 15)}) {
 		t.Errorf("merge-base diff failing: ChangedRangesNew = %v, want the base diff's new side", got)
 	}
 
@@ -566,12 +583,17 @@ func TestLinesToBase(t *testing.T) {
 		}
 		return got
 	}
-	if got, want := at(dir, "data.txt", LineRange{5, 5}), []LineRange{{5, 5}}; !reflect.DeepEqual(got, want) {
+	if got, want := at(dir, "data.txt", span(5, 5)), []LineRange{span(5, 5)}; !reflect.DeepEqual(got, want) {
 		t.Errorf("up to date, untouched: %v, want identity %v", got, want)
+	}
+	// #199: a pending insertion keeps its shape, so it meets only edits next to
+	// its gap, as ChangedRanges will report it once made.
+	if got, want := at(dir, "data.txt", gapAt(5)), []LineRange{gapAt(5)}; !reflect.DeepEqual(got, want) {
+		t.Errorf("up to date, an insertion: %v, want the same gap %v", got, want)
 	}
 	// An uncommitted 2-line insert at the top: on-disk line 7 is base line 5.
 	writeFile(t, dir, "data.txt", "u1\nu2\n"+base)
-	if got, want := at(dir, "data.txt", LineRange{7, 7}), []LineRange{{5, 5}}; !reflect.DeepEqual(got, want) {
+	if got, want := at(dir, "data.txt", span(7, 7)), []LineRange{span(5, 5)}; !reflect.DeepEqual(got, want) {
 		t.Errorf("own insert above: %v, want %v", got, want)
 	}
 	writeFile(t, dir, "data.txt", base)
@@ -582,21 +604,27 @@ func TestLinesToBase(t *testing.T) {
 	wt := filepath.Join(t.TempDir(), "wt-behind")
 	runGit(t, dir, "worktree", "add", "-q", wt, "behind")
 
-	if got, want := at(wt, "data.txt", LineRange{5, 5}), []LineRange{{6, 6}}; !reflect.DeepEqual(got, want) {
+	if got, want := at(wt, "data.txt", span(5, 5)), []LineRange{span(6, 6)}; !reflect.DeepEqual(got, want) {
 		t.Errorf("behind, base inserted above: %v, want %v", got, want)
 	}
-	if got, want := at(wt, "data.txt", LineRange{10, 10}), []LineRange{{11, 11}}; !reflect.DeepEqual(got, want) {
+	if got, want := at(wt, "data.txt", gapAt(5)), []LineRange{gapAt(6)}; !reflect.DeepEqual(got, want) {
+		t.Errorf("behind, an insertion below base's insert: %v, want %v", got, want)
+	}
+	if got, want := at(wt, "data.txt", gapAt(10)), []LineRange{span(11, 11)}; !reflect.DeepEqual(got, want) {
+		t.Errorf("behind, an insertion right after a line base rewrote: %v, want base's rewrite %v", got, want)
+	}
+	if got, want := at(wt, "data.txt", span(10, 10)), []LineRange{span(11, 11)}; !reflect.DeepEqual(got, want) {
 		t.Errorf("behind, on a line base rewrote: %v, want base's rewrite %v", got, want)
 	}
-	if got, want := at(wt, "data.txt", LineRange{11, 11}), []LineRange{{11, 12}}; !reflect.DeepEqual(got, want) {
+	if got, want := at(wt, "data.txt", span(11, 11)), []LineRange{span(11, 12)}; !reflect.DeepEqual(got, want) {
 		t.Errorf("behind, touching a line base rewrote: %v, want %v (claims the rewrite, as ChangedRanges will)", got, want)
 	}
-	if got, want := at(wt, "other.txt", LineRange{1, 1}), []LineRange{{1, 1}}; !reflect.DeepEqual(got, want) {
+	if got, want := at(wt, "other.txt", span(1, 1)), []LineRange{span(1, 1)}; !reflect.DeepEqual(got, want) {
 		t.Errorf("behind, but base never touched other.txt: %v, want identity %v", got, want)
 	}
 	// The pending edit, once made, is reported by ChangedRanges exactly there.
 	writeFile(t, wt, "data.txt", replaceLine("line11", "line11 EDITED")(base))
-	if got, want := ChangedRanges(wt, "main", "data.txt"), []LineRange{{11, 12}}; !reflect.DeepEqual(got, want) {
+	if got, want := ChangedRanges(wt, "main", "data.txt"), []LineRange{span(11, 12)}; !reflect.DeepEqual(got, want) {
 		t.Errorf("after the edit, ChangedRanges = %v, want %v (what LinesToBase predicted)", got, want)
 	}
 
@@ -606,17 +634,17 @@ func TestLinesToBase(t *testing.T) {
 	runGit(t, dir, "add", "bin.dat")
 	runGit(t, dir, "commit", "-qm", "binary")
 	writeFile(t, dir, "bin.dat", "\x00\x01\x02 changed\n")
-	if _, ok := LinesToBase(dir, "main", "bin.dat", []LineRange{{1, 1}}); ok {
+	if _, ok := LinesToBase(dir, "main", "bin.dat", []LineRange{span(1, 1)}); ok {
 		t.Error("binary file that differs from base: want ok=false")
 	}
-	if _, ok := LinesToBase(dir, "no-such-base", "data.txt", []LineRange{{1, 1}}); !ok {
+	if _, ok := LinesToBase(dir, "no-such-base", "data.txt", []LineRange{span(1, 1)}); !ok {
 		t.Error("base-less, nothing uncommitted in data.txt: want the base-less fallback's identity")
 	}
-	if _, ok := LinesToBase(dir, "no-such-base", "bin.dat", []LineRange{{1, 1}}); ok {
+	if _, ok := LinesToBase(dir, "no-such-base", "bin.dat", []LineRange{span(1, 1)}); ok {
 		t.Error("base-less with an uncommitted change: want ok=false")
 	}
 	failGit(t, func(args []string) bool { return len(args) > 0 && args[0] == "diff" })
-	if _, ok := LinesToBase(wt, "main", "other.txt", []LineRange{{1, 1}}); ok {
+	if _, ok := LinesToBase(wt, "main", "other.txt", []LineRange{span(1, 1)}); ok {
 		t.Error("git diff failing: want ok=false, never the on-disk numbers")
 	}
 }
@@ -689,7 +717,7 @@ func TestChangedRanges_StaleBranchKeepsEditBaseAlsoMade(t *testing.T) {
 		replaceLine("line05", "line05 SAME"),
 		replaceLine("line05 SAME", "line05 EDITED_BY_B"))
 	a := ChangedRanges(wtA, "main", "data.txt")
-	if want := []LineRange{{5, 5}, {15, 15}}; !reflect.DeepEqual(a, want) {
+	if want := []LineRange{span(5, 5), span(15, 15)}; !reflect.DeepEqual(a, want) {
 		t.Errorf("ChangedRanges(stale branch-a) = %v, want %v", a, want)
 	}
 	if b := ChangedRanges(wtB, "main", "data.txt"); !anyOverlap(a, b) {

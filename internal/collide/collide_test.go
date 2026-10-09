@@ -655,15 +655,38 @@ func TestIsSharedDoc(t *testing.T) {
 
 func lr(s, e int) gitx.LineRange { return gitx.LineRange{Start: s, End: e} }
 
-func TestOverlappingSpans(t *testing.T) {
-	a := []gitx.LineRange{lr(10, 20), lr(50, 55)}
-	b := []gitx.LineRange{lr(18, 30), lr(100, 100)}
-	got := OverlappingSpans(a, b)
-	if len(got) != 1 || got[0] != lr(18, 20) {
-		t.Errorf("OverlappingSpans = %+v, want [{18 20}]", got)
+// gp is an insertion into the gap below line p.
+func gp(p int) gitx.LineRange { return gitx.LineRange{Start: p, End: p + 1, Gap: true} }
+
+// ConflictSpans pairs the edits git would merge as ONE conflict region (#199):
+// overlapping or touching changes, an insertion and a change of a line next to
+// its gap, two insertions at one gap. Each conflicting pair reports the lines
+// both cover, or the seam's two lines when they only touch.
+func TestConflictSpans(t *testing.T) {
+	cases := []struct {
+		name string
+		a, b []gitx.LineRange
+		want []gitx.LineRange
+	}{
+		{"overlap: the shared lines", []gitx.LineRange{lr(10, 20), lr(50, 55)}, []gitx.LineRange{lr(18, 30), lr(100, 100)}, []gitx.LineRange{lr(18, 20)}},
+		{"same line", []gitx.LineRange{lr(10, 10)}, []gitx.LineRange{lr(10, 10)}, []gitx.LineRange{lr(10, 10)}},
+		{"touching changes: the seam (#199)", []gitx.LineRange{lr(10, 10)}, []gitx.LineRange{lr(11, 11)}, []gitx.LineRange{lr(10, 11)}},
+		{"touching changes, other side", []gitx.LineRange{lr(6, 9)}, []gitx.LineRange{lr(1, 5)}, []gitx.LineRange{lr(5, 6)}},
+		{"one unchanged line between", []gitx.LineRange{lr(1, 5)}, []gitx.LineRange{lr(7, 9)}, nil},
+		{"insertion vs change of the line below its gap", []gitx.LineRange{gp(10)}, []gitx.LineRange{lr(11, 12)}, []gitx.LineRange{lr(11, 11)}},
+		{"insertion vs change of the line above its gap", []gitx.LineRange{gp(10)}, []gitx.LineRange{lr(8, 10)}, []gitx.LineRange{lr(10, 10)}},
+		{"insertion vs change two lines below", []gitx.LineRange{gp(10)}, []gitx.LineRange{lr(12, 12)}, nil},
+		{"insertion vs change two lines above", []gitx.LineRange{gp(10)}, []gitx.LineRange{lr(9, 9)}, nil},
+		{"insertions at one gap", []gitx.LineRange{gp(10)}, []gitx.LineRange{gp(10)}, []gitx.LineRange{lr(10, 11)}},
+		{"insertions at neighbouring gaps", []gitx.LineRange{gp(10)}, []gitx.LineRange{gp(11)}, nil},
 	}
-	if s := OverlappingSpans([]gitx.LineRange{lr(1, 5)}, []gitx.LineRange{lr(6, 9)}); len(s) != 0 {
-		t.Errorf("disjoint ranges should not overlap, got %+v", s)
+	for _, c := range cases {
+		if got := ConflictSpans(c.a, c.b); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s: ConflictSpans(%v, %v) = %v, want %v", c.name, c.a, c.b, got, c.want)
+		}
+		if got := ConflictSpans(c.b, c.a); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s (swapped): ConflictSpans(%v, %v) = %v, want %v", c.name, c.b, c.a, got, c.want)
+		}
 	}
 }
 
@@ -683,6 +706,26 @@ func TestConflictSeverity(t *testing.T) {
 	if ConflictSeverity(over, near, true) != SevFYI {
 		t.Error("append-only should force SevFYI even when ranges overlap")
 	}
+	// #199: git merges touching edits as ONE conflict region, so they are HIGH;
+	// one unchanged line between keeps them apart. An insertion meets only a change
+	// next to its gap, or another insertion at that gap.
+	for _, c := range []struct {
+		name     string
+		cur, oth []gitx.LineRange
+		wantHigh bool
+	}{
+		{"adjacent lines", []gitx.LineRange{lr(10, 10)}, []gitx.LineRange{lr(11, 11)}, true},
+		{"adjacent, other above", []gitx.LineRange{lr(11, 12)}, []gitx.LineRange{lr(7, 10)}, true},
+		{"one line between", []gitx.LineRange{lr(10, 10)}, []gitx.LineRange{lr(12, 12)}, false},
+		{"insertion next to a change", []gitx.LineRange{gp(10)}, []gitx.LineRange{lr(11, 11)}, true},
+		{"insertion two lines from a change", []gitx.LineRange{gp(10)}, []gitx.LineRange{lr(12, 12)}, false},
+		{"insertions at one gap", []gitx.LineRange{gp(10)}, []gitx.LineRange{gp(10)}, true},
+		{"insertions at neighbouring gaps", []gitx.LineRange{gp(10)}, []gitx.LineRange{gp(11)}, false},
+	} {
+		if got := ConflictSeverity(c.cur, c.oth, false) == SevHigh; got != c.wantHigh {
+			t.Errorf("%s: ConflictSeverity HIGH=%v, want %v", c.name, got, c.wantHigh)
+		}
+	}
 }
 
 func TestOverlapSeverity(t *testing.T) {
@@ -693,6 +736,10 @@ func TestOverlapSeverity(t *testing.T) {
 	overlapping := [][]gitx.LineRange{{lr(1, 5)}, {lr(4, 9)}}
 	if OverlapSeverity(overlapping, false) != SevHigh {
 		t.Error("overlapping windows should be SevHigh")
+	}
+	// #199: touching edits are one conflict region in git.
+	if OverlapSeverity([][]gitx.LineRange{{lr(1, 5)}, {lr(20, 25)}, {lr(6, 9)}}, false) != SevHigh {
+		t.Error("windows editing touching lines should be SevHigh")
 	}
 	if OverlapSeverity(overlapping, true) != SevFYI {
 		t.Error("append-only forces SevFYI")

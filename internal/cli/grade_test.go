@@ -97,6 +97,9 @@ func (f *fakeFacts) SharedSections(wts []string, p, _ string) ([]string, bool) {
 
 func rng(s, e int) gitx.LineRange { return gitx.LineRange{Start: s, End: e} }
 
+// gapRng is an insertion into the gap below line p (#199).
+func gapRng(p int) gitx.LineRange { return gitx.LineRange{Start: p, End: p + 1, Gap: true} }
+
 func gradeTestConfig() *config.Config {
 	return &config.Config{
 		Base:            "main",
@@ -152,6 +155,18 @@ func TestGradeEntry(t *testing.T) {
 			f: facts{cur: []gitx.LineRange{rng(1, 5)}, other: []gitx.LineRange{rng(40, 41)}}, cat: CatFYI, sev: "low"},
 		{name: "overlapping hunks are HIGH", path: "f.go", wl: collide.WindowLiveness{Level: collide.LiveUnmerged},
 			f: facts{cur: []gitx.LineRange{rng(10, 12)}, other: []gitx.LineRange{rng(11, 13)}}, cat: CatBlocking, sev: "HIGH", spans: []gitx.LineRange{rng(11, 12)}},
+		// #199: git merges touching edits as ONE conflict region; an insertion only
+		// meets a change of a line next to its gap, or another insertion there.
+		{name: "#199 touching hunks are HIGH: the seam's two lines", path: "f.go", wl: collide.WindowLiveness{Level: collide.LiveUnmerged},
+			f: facts{cur: []gitx.LineRange{rng(11, 11)}, other: []gitx.LineRange{rng(10, 10)}}, cat: CatBlocking, sev: "HIGH", spans: []gitx.LineRange{rng(10, 11)}},
+		{name: "#199 one unchanged line between is FYI", path: "f.go", wl: collide.WindowLiveness{Level: collide.LiveUnmerged},
+			f: facts{cur: []gitx.LineRange{rng(12, 12)}, other: []gitx.LineRange{rng(10, 10)}}, cat: CatFYI, sev: "low"},
+		{name: "#199 insertion next to a change is HIGH", path: "f.go", wl: collide.WindowLiveness{Level: collide.LiveUnmerged},
+			f: facts{cur: []gitx.LineRange{gapRng(10)}, other: []gitx.LineRange{rng(11, 11)}}, cat: CatBlocking, sev: "HIGH", spans: []gitx.LineRange{rng(11, 11)}},
+		{name: "#199 insertion two lines from a change is FYI", path: "f.go", wl: collide.WindowLiveness{Level: collide.LiveUnmerged},
+			f: facts{cur: []gitx.LineRange{gapRng(10)}, other: []gitx.LineRange{rng(12, 12)}}, cat: CatFYI, sev: "low"},
+		{name: "#199 insertions at neighbouring gaps are FYI", path: "f.go", wl: collide.WindowLiveness{Level: collide.LiveUnmerged},
+			f: facts{cur: []gitx.LineRange{gapRng(10)}, other: []gitx.LineRange{gapRng(11)}}, cat: CatFYI, sev: "low"},
 		{name: "#122 overlap that is base's own change → FYI", path: "f.go", wl: collide.WindowLiveness{Level: collide.LiveUnmerged},
 			f: facts{subsumed: true, cur: []gitx.LineRange{rng(10, 12)}, other: []gitx.LineRange{rng(11, 13)}}, cat: CatFYI, sev: "low", spans: []gitx.LineRange{rng(11, 12)}, flag: "Subsumed"},
 		{name: "this window has no ranges yet → indeterminate HIGH (pre-edit heads-up)", path: "f.go", wl: collide.WindowLiveness{Level: collide.LiveOpenPR},

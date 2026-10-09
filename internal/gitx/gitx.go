@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -852,69 +853,100 @@ func TouchedFiles(dir, base string) []string {
 	return files
 }
 
-// LineRange is a 1-based inclusive span of changed lines. ChangedRanges emits
-// these in BASE coordinates (the base ref's line numbers, #29) so two windows
-// that fork from the same base can be compared in one frame. A pure
-// insertion/deletion (count 0) is recorded spanning the gap boundary (the
-// surviving line before + after) so it still overlaps an edit of the same region
-// in another window — biasing toward flagging (a missed conflict is worse than
-// an extra heads-up for a safety tool).
-type LineRange struct{ Start, End int }
+// LineRange is a 1-based inclusive span of lines. ChangedRanges emits these in
+// BASE coordinates (the base ref's line numbers, #29) so two windows that fork
+// from the same base can be compared in one frame.
+//
+// A base-frame range is one edit, with its shape: a CHANGE of lines Start..End
+// (rewritten or deleted), or, with Gap set, a pure INSERTION into the gap
+// between lines Start and End = Start+1 (Start 0 is above line 1). The shape is
+// what git's 3-way rule needs (Conflicts, #199): two changes are one conflict
+// region whenever no unchanged line separates them, while an insertion meets
+// only a change to a line on either side of its gap, or another insertion at the
+// same gap. Spans alone can't say that: an insertion spans both neighbours of its
+// gap, so a touch rule over spans claims one line too many next to every
+// insertion. A NEW-frame range (ChangedRangesNew, the base-less fallback) never
+// sets Gap; a pure deletion there spans the gap's neighbours, so a change rule
+// over it errs toward flagging.
+type LineRange struct {
+	Start, End int
+	Gap        bool `json:"Gap,omitempty"`
+}
 
-// Overlaps reports whether two line ranges intersect.
+// Overlaps reports whether two line ranges intersect, as spans of lines (an
+// insertion's span is its gap's two neighbours). For matching lines (a section
+// heading, a display span), not for grading two edits: that is Conflicts.
 func (r LineRange) Overlaps(o LineRange) bool {
 	return r.Start <= o.End && o.Start <= r.End
 }
 
-var hunkRe = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
+// Conflicts reports whether the edits r and o, in one frame, are ONE conflict
+// region in a git 3-way merge (#199): two changes that overlap or touch with no
+// unchanged line between them (one window edits line 10, the other line 11), an
+// insertion and a change that includes a line on either side of its gap, or two
+// insertions at one gap. An insertion after line 10 and a change of line 12 stay
+// apart, as do insertions after lines 10 and 11. It is hunksConflict on the two
+// edits' old sides, the rule a behind branch's hunks are mapped by (#184), so
+// every grader that compares two windows follows git there too. Pure.
+func (r LineRange) Conflicts(o LineRange) bool {
+	return hunksConflict(r.oldSide(), o.oldSide())
+}
 
-// oldHunkRe captures the OLD-side (base) start+count of a -U0 hunk header (#29).
-var oldHunkRe = regexp.MustCompile(`^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@`)
+// oldSide is r as the old side of a diff hunk: a zero-count insertion after line
+// Start for a Gap, else a change of its lines (at least one). Pure.
+func (r LineRange) oldSide() diffHunk {
+	if r.Gap {
+		return diffHunk{oldStart: r.Start}
+	}
+	return diffHunk{oldStart: r.Start, oldCount: max(r.End-r.Start+1, 1)}
+}
+
+// gapAfter is the insertion into the gap below line p (0: above line 1).
+func gapAfter(p int) LineRange { return LineRange{Start: p, End: p + 1, Gap: true} }
 
 // parseHunkRanges extracts NEW-side line ranges from unified-diff (-U0) output.
+// A side with no lines (a pure deletion) spans the surviving lines around its gap
+// [start, start+1] and is not marked Gap: the new frame only attributes a diff to
+// the current file's lines (sections), it never grades two windows.
 func parseHunkRanges(diff string) []LineRange {
-	return parseHunkRangesWith(diff, hunkRe)
-}
-
-// parseHunkRangesOld extracts BASE-side (OLD) line ranges from -U0 output (#29).
-// Grading in base coordinates is what lets two windows' ranges be compared in a
-// single shared frame: once either has an insert/delete before a shared region,
-// their NEW-side numbers diverge and a same-base-line conflict grades disjoint.
-func parseHunkRangesOld(diff string) []LineRange {
-	return parseHunkRangesWith(diff, oldHunkRe)
-}
-
-// parseHunkRangesWith is the shared parser; re captures (start, optional count)
-// on whichever side. A zero count is a pure insertion/deletion on that side —
-// git reports the surviving line before the gap, so span [start, start+1] to
-// cover both neighbors (biases toward flagging, correct for a safety tool).
-func parseHunkRangesWith(diff string, re *regexp.Regexp) []LineRange {
 	var out []LineRange
-	for _, ln := range strings.Split(diff, "\n") {
-		m := re.FindStringSubmatch(ln)
-		if m == nil {
-			continue
-		}
-		start, _ := strconv.Atoi(m[1])
-		count := 1
-		if m[2] != "" {
-			count, _ = strconv.Atoi(m[2])
-		}
-		if count == 0 {
-			out = append(out, LineRange{start, start + 1})
-		} else {
-			out = append(out, LineRange{start, start + count - 1})
-		}
+	for _, h := range parseHunks(diff) {
+		out = append(out, sideRange(h.newStart, h.newCount))
 	}
 	return out
 }
 
-// ChangedRanges returns the line ranges file was changed on in the worktree at
-// dir, expressed in BASE coordinates (#29): line numbers of the base ref's copy
-// of the file. Every window is reported in that one shared frame, so
-// OverlappingSpans compares like-for-like even after one window has
+// parseHunkRangesOld extracts BASE-side (OLD) ranges from -U0 output (#29), one
+// edit per hunk with its shape: a pure insertion (no old line) is a Gap. Grading
+// in base coordinates is what lets two windows' ranges be compared in a single
+// shared frame: once either has an insert/delete before a shared region, their
+// NEW-side numbers diverge and a same-base-line conflict grades disjoint.
+func parseHunkRangesOld(diff string) []LineRange {
+	var out []LineRange
+	for _, h := range parseHunks(diff) {
+		out = append(out, editRange(h.oldStart, h.oldCount))
+	}
+	return out
+}
+
+// editRange is one side of a hunk as an edit in that side's frame: count lines
+// from start, or for a zero count the gap after start (git reports a side with no
+// lines by the line before its gap). Pure.
+func editRange(start, count int) LineRange {
+	if count == 0 {
+		return gapAfter(start)
+	}
+	return LineRange{Start: start, End: start + count - 1}
+}
+
+// ChangedRanges returns the edits made to file in the worktree at dir, expressed
+// in BASE coordinates (#29): line numbers of the base ref's copy of the file.
+// Every window is reported in that one shared frame, so the graders
+// (collide.ConflictSpans) compare like-for-like even after one window has
 // inserts/deletes before a shared edit region (the pre-#29 latent false
-// negative: NEW-side numbers from separate diffs, in separate frames).
+// negative: NEW-side numbers from separate diffs, in separate frames). Each edit
+// keeps its shape, a change or an insertion (LineRange.Gap), which is what
+// grading two windows by git's 3-way rule needs (#199).
 //
 // The ranges are the window's OWN edits (committed + staged + unstaged), never
 // the base's. For a branch up to date with base that is the old side of one
@@ -930,9 +962,9 @@ func parseHunkRangesWith(diff string, re *regexp.Regexp) []LineRange {
 // Where a branch edit and a base edit meet (they overlap, or touch with no
 // unchanged line between: git's 3-way conflict rule), the branch's range also
 // covers base's replacement text there, so a window editing that text still
-// overlaps it: a real conflict is never mapped away. A file absent at the merge
-// base (each side added its own: an add/add) keeps the plain base diff, which
-// compares the two versions directly (#142 review).
+// conflicts with it: a real conflict is never mapped away. A file absent at the
+// merge base (each side added its own: an add/add) keeps the plain base diff,
+// which compares the two versions directly (#142 review).
 //
 // nil when git could not measure the file at all (ChangedRangesChecked has the
 // explicit ok): the graders read an empty side as indeterminate, so that grades
@@ -976,7 +1008,7 @@ func ChangedRangesChecked(dir, base, file string) (ranges []LineRange, ok bool) 
 // wholeFile is what ChangedRangesNew reports when git can't measure the file: a
 // span over every line, so a failed measurement grades as "edited every section"
 // (HIGH against any window editing the doc), never as "edited nothing".
-var wholeFile = []LineRange{{1, math.MaxInt32}}
+var wholeFile = []LineRange{{Start: 1, End: math.MaxInt32}}
 
 // ChangedRangesNew is ChangedRanges but NEW-frame (current/`+` side). Use it to
 // attribute a window's diff to its OWN current-content sections (#22 structured
@@ -1014,16 +1046,18 @@ func ChangedRangesNew(dir, base, file string) []LineRange {
 	return parseHunkRanges(out)
 }
 
-// LinesToBase moves line spans of the worktree's CURRENT copy of file (an agent's
-// pending edit, located in the on-disk file) into base line numbers, the frame
-// every window's ChangedRanges are reported in. It maps through the worktree's
-// own diff against base with the sides swapped (worktree → base), by the same
-// rule as ChangedRanges: a span on a line the worktree holds differently from
-// base (its own edit, or a base edit it is behind on) lands on base's text there,
-// and a span touching such a region claims it too. So the result is where
-// ChangedRanges will report the edit once it is made, whether the branch is up
-// to date, behind, or already edited (#184; the #108 frame lesson without giving
-// up on a worktree that differs from base). ok=false when that can't be measured
+// LinesToBase moves edits of the worktree's CURRENT copy of file (an agent's
+// pending edit, located in the on-disk file: changed lines, or a Gap for lines
+// it only inserts) into base line numbers, the frame every window's
+// ChangedRanges are reported in. It maps through the worktree's own diff against
+// base with the sides swapped (worktree → base), by the same rule as
+// ChangedRanges (mapHunksToBase): an edit of a line the worktree holds
+// differently from base (its own edit, or a base edit it is behind on) lands on
+// base's text there, an edit touching such a region claims it too, and an edit
+// meeting none keeps its shape. So the result is where ChangedRanges will report
+// the edit once it is made, whether the branch is up to date, behind, or already
+// edited (#184/#199; the #108 frame lesson without giving up on a worktree that
+// differs from base). ok=false when that can't be measured
 // (a git error, a binary file, or a base-less repo with uncommitted changes); the
 // caller must then fall back to a conservative grade, never treat on-disk line
 // numbers as base's. Pure mapping over one git call.
@@ -1054,7 +1088,7 @@ func LinesToBase(dir, base, file string, spans []LineRange) ([]LineRange, bool) 
 	}
 	own := make([]diffHunk, len(spans))
 	for i, sp := range spans {
-		own[i] = diffHunk{oldStart: sp.Start, oldCount: sp.End - sp.Start + 1}
+		own[i] = sp.oldSide()
 	}
 	return mapHunksToBase(own, toBase), true
 }
@@ -1121,50 +1155,122 @@ func parseHunks(diff string) []diffHunk {
 	return out
 }
 
-// sideRange is one side of a hunk as a LineRange: [start, start+count-1], or for a
-// zero-count side the gap's two neighbours [start, start+1] (parseHunkRangesWith's
-// convention). Pure.
+// sideRange is one side of a hunk as a span of lines: [start, start+count-1], or
+// for a zero-count side the gap's two neighbours [start, start+1]. The NEW-frame
+// convention (parseHunkRanges); a base-frame edit has a shape (editRange). Pure.
 func sideRange(start, count int) LineRange {
 	if count == 0 {
-		return LineRange{start, start + 1}
+		return LineRange{Start: start, End: start + 1}
 	}
-	return LineRange{start, start + count - 1}
+	return LineRange{Start: start, End: start + count - 1}
 }
 
 // mapHunksToBase moves a branch's OWN hunks from MERGE-BASE line numbers (the old
 // side of `git diff -U0 <merge-base> -- <file>` in its worktree) into BASE line
 // numbers, given base's hunks since that merge base (old side = merge-base frame,
-// new side = base frame), and returns them as LineRanges in parseHunkRangesWith's
-// convention. Pure (#184).
+// new side = base frame), as edits with their shape (editRange). Pure (#184/#199).
 //
-// Each end of a hunk's range is mapped on its own (mapLine), so the range keeps
-// covering everything between its ends. And every base hunk that CONFLICTS with
-// the branch hunk by git's 3-way rule (hunksConflict: they overlap, or touch with
-// no unchanged line between) adds its whole replacement to the range: in a merge
-// the two are one conflict region, so a window editing base's text anywhere in it
-// collides with this branch even on lines the branch never had. The chain shape:
-// a stale branch edits line 11, base rewrites lines 12-13, another window edits
-// line 13 — git merge-tree conflicts, so this must overlap.
+// A hunk no base hunk meets keeps its shape and moves by the net size of the base
+// hunks above it: a change of n lines stays one, an insertion stays an insertion
+// (a Gap). A hunk that CONFLICTS with base hunks by git's 3-way rule
+// (hunksConflict: they overlap, or touch with no unchanged line between) claims
+// their whole replacement too: in a merge they are one conflict region, so a
+// window editing base's text anywhere in it collides with this branch even on
+// lines the branch never had. The chain shape: a stale branch edits line 11, base
+// rewrites lines 12-13, another window edits line 13, and git merge-tree
+// conflicts, so this must conflict. The claim is then one change over the
+// branch's own lines base left alone and base's replacement lines (mapHunk).
 func mapHunksToBase(own, base []diffHunk) []LineRange {
 	out := make([]LineRange, 0, len(own))
 	for _, o := range own {
-		r := sideRange(o.oldStart, o.oldCount)
-		m := LineRange{mapLine(r.Start, base).Start, mapLine(r.End, base).End}
-		for _, h := range base {
-			if !hunksConflict(o, h) {
-				continue
-			}
-			n := sideRange(h.newStart, h.newCount)
-			if n.Start < m.Start {
-				m.Start = n.Start
-			}
-			if n.End > m.End {
-				m.End = n.End
-			}
-		}
-		out = append(out, m)
+		out = append(out, mapHunk(o, base)...)
 	}
 	return out
+}
+
+// mapHunk is mapHunksToBase for one hunk o. Its base-frame claim is exact under
+// git's rule: another window's edit conflicts with it iff that edit conflicts
+// with the branch's own lines, or merges with a conflicting base hunk into one
+// hunk of the merge (it overlaps or touches that hunk's replacement), and that is
+// the edit conflicting with the claim by LineRange.Conflicts. So:
+//   - The claim spans the branch's own lines base left alone (keptEnds, moved by
+//     shiftLine) and every conflicting base hunk's replacement lines: one
+//     contiguous change, since those hunks meet the branch's lines.
+//   - A conflicting base DELETION has no line to claim; its deletion point is a
+//     gap, inside or at the edge of that span, which then adds nothing to it. Only
+//     a branch change base deleted outright (no line left) claims the gap alone:
+//     a window touching either neighbour of it merges with base's deletion.
+//   - A branch insertion that meets a base hunk sits inside or at the edge of
+//     that hunk's region, so it adds nothing to the hunk's claim. One no base
+//     hunk meets moves to the same gap in base numbering.
+//
+// Spans that over-claim here (the gap's two neighbours instead of the gap) would
+// flag a window editing the line just past them, a false HIGH (#199). Pure.
+func mapHunk(o diffHunk, base []diffHunk) []LineRange {
+	var claim LineRange
+	have := false
+	widen := func(start, end int) {
+		if !have {
+			claim, have = LineRange{Start: start, End: end}, true
+			return
+		}
+		claim.Start, claim.End = min(claim.Start, start), max(claim.End, end)
+	}
+	var gaps []LineRange
+	for _, h := range base {
+		if !hunksConflict(o, h) {
+			continue
+		}
+		if h.newCount == 0 {
+			if g := gapAfter(h.newStart); !slices.Contains(gaps, g) {
+				gaps = append(gaps, g)
+			}
+			continue
+		}
+		widen(h.newStart, h.newStart+h.newCount-1)
+	}
+	if o.oldCount == 0 {
+		if !have && len(gaps) == 0 {
+			return []LineRange{gapAfter(shiftLine(o.oldStart, base))}
+		}
+	} else if first, last, ok := keptEnds(o, base); ok {
+		widen(shiftLine(first, base), shiftLine(last, base))
+	}
+	if have {
+		return []LineRange{claim}
+	}
+	return gaps
+}
+
+// keptEnds returns the first and last of change o's old lines that no base hunk
+// changed; ok=false when base changed (or deleted) every one of them. Pure.
+func keptEnds(o diffHunk, base []diffHunk) (first, last int, ok bool) {
+	first, last = o.oldStart, o.oldStart+o.oldCount-1
+	for first <= last {
+		h, in := changedBy(first, base)
+		if !in {
+			break
+		}
+		first = h.oldStart + h.oldCount
+	}
+	for last >= first {
+		h, in := changedBy(last, base)
+		if !in {
+			break
+		}
+		last = h.oldStart - 1
+	}
+	return first, last, first <= last
+}
+
+// changedBy returns the hunk whose old side holds line, if any. Pure.
+func changedBy(line int, hunks []diffHunk) (diffHunk, bool) {
+	for _, h := range hunks {
+		if h.oldCount > 0 && h.oldStart <= line && line < h.oldStart+h.oldCount {
+			return h, true
+		}
+	}
+	return diffHunk{}, false
 }
 
 // hunksConflict reports whether two hunks against the SAME old file are one
@@ -1193,34 +1299,23 @@ func insertTouches(p int, h diffHunk) bool {
 	return h.oldStart <= p+1 && p <= h.oldStart+h.oldCount-1
 }
 
-// mapLine maps ONE merge-base line into base line numbers (#184). Pure.
-//
-//   - A line base left alone moves by the net size change (newCount-oldCount)
-//     of every base hunk above it. A pure insertion (oldCount 0) sits AFTER old
-//     line oldStart, so it moves only the lines below that point.
-//   - A line base modified or deleted lands on that hunk's whole new side. A
-//     deletion has no new side, so it maps to the gap's two neighbours
-//     [newStart, newStart+1], the same zero-count convention as
-//     parseHunkRangesWith.
-func mapLine(line int, hunks []diffHunk) LineRange {
+// shiftLine maps a merge-base line base left alone (or 0, above line 1) into base
+// line numbers (#184): it moves by the net size change (newCount-oldCount) of
+// every base hunk above it. A pure insertion (oldCount 0) sits AFTER old line
+// oldStart, so it moves only the lines below that point. Pure.
+func shiftLine(line int, hunks []diffHunk) int {
 	shift := 0
 	for _, h := range hunks {
-		if h.oldCount == 0 { // pure insertion below old line h.oldStart
+		if h.oldCount == 0 {
 			if line <= h.oldStart {
 				break
 			}
-			shift += h.newCount
-			continue
-		}
-		if line < h.oldStart {
+		} else if line < h.oldStart {
 			break
-		}
-		if line < h.oldStart+h.oldCount { // base modified or deleted this line
-			return sideRange(h.newStart, h.newCount)
 		}
 		shift += h.newCount - h.oldCount
 	}
-	return LineRange{line + shift, line + shift}
+	return line + shift
 }
 
 // FileChangeSubsumed reports whether the worktree's branch contributes NOTHING

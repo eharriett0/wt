@@ -64,10 +64,43 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   failing fall back to the plain base diff (over-reports); git failing outright
   → `ChangedRangesChecked` ok=false, `ChangedRanges` nil (graders: indeterminate
   = HIGH), `ChangedRangesNew` the whole file. `gitOutput` is the test seam.
+- **Two windows' edits are graded by git's 3-way rule, which needs each edit's
+  SHAPE (#199).** git merges two edits as ONE conflict region unless an
+  unchanged line separates them, so windows editing lines 10 and 11 conflict,
+  yet every grader called them disjoint (line OVERLAP): 32 of 170 real
+  conflicts in an 800-scenario fuzz vs `git merge-tree`, 24 with both windows
+  current. All of them (`check`, status, banner, pre-push/pre-commit,
+  `regradePending`) go through `collide.ConflictSeverity`/`ConflictSpans`, which
+  compare edits with `LineRange.Conflicts` (= `hunksConflict` on their old
+  sides): changes conflict when they overlap or touch; an insertion only with a
+  change that includes a line on either side of its gap, or another insertion at
+  that gap. ⚠ **A span can't say that**: it encodes an insertion as both
+  neighbours of its gap, so a touch rule over spans claims a line too many next
+  to every insertion, and plain overlap flagged insertions at neighbouring gaps
+  (git merges them cleanly: all 5 of main's false HIGHs where git is clean every
+  way). So a base-frame `LineRange` carries `Gap` (an insertion between `Start`
+  and `End`=`Start+1`): `parseHunkRangesOld` sets it; `mapHunk` keeps an
+  unconflicted behind-branch hunk's shape and makes a conflicting one claim
+  exactly its surviving lines plus base's replacement (a base deletion is its
+  deletion point, a Gap, never its neighbours as lines); `LinesToBase` keeps a
+  pending edit's, and the pending edit is what git will report: a Codex run of
+  added lines beside no removed line is an insertion (it used to be dropped), a
+  Claude Edit claims what replacing `old_string` with `new_string` changes
+  (`claudeEditClaim`: not the context lines it carries to be unique, which
+  under the touch rule would deny an edit beside another window's), each pure
+  insertion/deletion widened over every position git may slide it to
+  (`insertionClaim`/`deletionClaim`). NEW-frame ranges never set Gap (a span
+  there only errs toward flagging); `Overlaps` stays the span intersection, for
+  sections. After: 0 conflicts graded low and 0 false HIGHs on the same 800
+  scenarios (and on 400 with repeated lines);
+  `TestLineRangeConflicts_MatchesGitMergeFile` holds real `git diff -U0` ranges
+  to `git merge-file` on 766 single-edit pairs. A touching pair's display span
+  is the seam's two lines (`overlap L10-11`).
 - **The pre-edit hooks grade what `wt check` will say once the edit is made
   (#108/#184).** `regradePending`: every hunk-graded entry (HIGH *or* FYI: a
   window whose earlier edits were disjoint can be about to overlap) is HIGH iff
-  this window's own ranges ∪ the pending edit overlap the other window's. The
+  this window's own ranges ∪ the pending edit conflict with the other window's,
+  by the rule `wt check` grades by (`collide.ConflictSeverity`, #199). The
   pending edit is located in the on-disk file and moved into base numbering
   through this worktree's own diff (`gitx.LinesToBase`, the same mapping with the
   sides swapped), so a window that is behind base or already edited the file is
@@ -120,7 +153,8 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   merged/closed branch with leftover staged cruft is stale, not a permanent
   HIGH — #79), except a MERGED PR found only by the tip commit (#168, below).
 - **The hook block predicate MUST equal `wt check`.** Advisory means advisory in
-  both; disjoint hunks don't block in either. `pushCollisionBlocks` mirrors
+  both; disjoint hunks (an unchanged line between) don't block in either, and
+  touching ones block in both (#199). `pushCollisionBlocks` mirrors
   `buildCheckReport`'s hunk grading on purpose (#92). If you change the grading,
   change both (or they'll disagree and get bypassed). The **structured-doc
   SECTION grade** is part of that equality (#98) and is single-sourced in
@@ -313,8 +347,10 @@ exit 0** (advisory / fail-open; a coordination nicety must never break the sessi
   (the same grader as `wt check`), then RE-grades each hunk-graded entry (HIGH or
   FYI) against this window's own ranges plus the patch's actual hunks — localized
   in the current file via `locateRange` (`parseCodexPatch` → per-hunk pre-image of
-  context+removed lines) and moved into base numbering by `gitx.LinesToBase` —
-  with the same `regradePending` as the Claude hook (#108/#184). A disjoint patch
+  context+removed lines; removed runs are changes, a run of added lines beside no
+  removed line an insertion, #199) and moved into base numbering by
+  `gitx.LinesToBase` — with the same `regradePending` as the Claude hook
+  (#108/#184). A disjoint patch
   to a shared file therefore stays silent. Emits `additionalContext` on overlap;
   `WT_CODEX_HOOK_BLOCK=1` upgrades a **confirmed** HIGH (a computed hunk overlap) to
   `deny` — a file-level-only match never denies.

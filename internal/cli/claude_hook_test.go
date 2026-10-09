@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/eharriett0/wt/internal/gitx"
 )
 
 func TestParseClaudeEdit(t *testing.T) {
@@ -141,6 +143,11 @@ func TestClaudeEditRanges(t *testing.T) {
 	if r, ok := claudeEditRanges([]byte(raw), content); !ok || len(r) != 1 || r[0].Start != 2 || r[0].End != 2 {
 		t.Errorf("Edit: (%+v, %v)", r, ok)
 	}
+	// #199: the claim is what the edit changes, not the context old_string carries
+	ctx := `{"tool_name":"Edit","tool_input":{"file_path":"x","old_string":"a\nb\nc\n","new_string":"a\nB\nc\n"}}`
+	if r, ok := claudeEditRanges([]byte(ctx), content); !ok || len(r) != 1 || r[0] != (gitx.LineRange{Start: 2, End: 2}) {
+		t.Errorf("Edit with context lines: (%+v, %v), want line 2 only", r, ok)
+	}
 	// MultiEdit unions all locatable ranges
 	multi := `{"tool_name":"MultiEdit","tool_input":{"file_path":"x","edits":[{"old_string":"b\n"},{"old_string":"e\n"}]}}`
 	if r, ok := claudeEditRanges([]byte(multi), content); !ok || len(r) != 2 {
@@ -158,6 +165,40 @@ func TestClaudeEditRanges(t *testing.T) {
 	mixed := `{"tool_name":"MultiEdit","tool_input":{"edits":[{"old_string":"b\n"},{"old_string":"zzz\n"}]}}`
 	if _, ok := claudeEditRanges([]byte(mixed), content); ok {
 		t.Error("MultiEdit with an unlocatable edit should fall back")
+	}
+}
+
+// #199: a pending Edit claims what git will report once it is made: the lines it
+// changes, not the context its old_string carries to be unique (since touching
+// edits conflict, claiming a context line would flag a window editing the line
+// beside it), and an Edit that only adds or drops lines is that insertion or
+// deletion, over every position git may slide it to.
+func TestClaudeEditClaim(t *testing.T) {
+	content := "a\nb\nc\nd\ne\nf\n" // lines 1..6
+	gap := func(p int) gitx.LineRange { return gitx.LineRange{Start: p, End: p + 1, Gap: true} }
+	chg := func(s, e int) gitx.LineRange { return gitx.LineRange{Start: s, End: e} }
+	cases := []struct {
+		name, content, old, new string
+		want                    gitx.LineRange
+	}{
+		{"rewrite a line", content, "b\n", "B\n", chg(2, 2)},
+		{"context lines are not claimed", content, "a\nb\nc\n", "a\nB\nc\n", chg(2, 2)},
+		{"two changed lines inside context", content, "b\nc\nd\n", "b\nC\nD\n", chg(3, 4)},
+		{"append after a line: an insertion", content, "c\n", "c\nX\n", gap(3)},
+		{"prepend before a line: an insertion", content, "c\n", "X\nc\n", gap(2)},
+		{"insert between two context lines", content, "b\nc\n", "b\nX\nc\n", gap(2)},
+		{"drop a line between context lines", content, "b\nc\nd\n", "b\nd\n", chg(3, 3)},
+		{"drop the whole old_string", content, "b\n", "", chg(2, 2)},
+		{"a mid-line old_string claims its whole line", content, "d", "D", chg(4, 4)},
+		{"joining the next line claims it too", content, "c\n", "c", chg(3, 4)},
+		{"a no-op claims what it touches", content, "c\n", "c\n", chg(3, 3)},
+		{"an insertion git may slide claims its slide", "a\nx\nx\nb\n", "a\nx\n", "a\nx\nx\n", chg(2, 3)},
+		{"the unterminated last line: what it touches", "a\nb", "b", "B", chg(2, 2)},
+	}
+	for _, c := range cases {
+		if got := claudeEditClaim(c.content, c.old, c.new); got != c.want {
+			t.Errorf("%s: claudeEditClaim(%q -> %q) = %v, want %v", c.name, c.old, c.new, got, c.want)
+		}
 	}
 }
 

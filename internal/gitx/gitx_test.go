@@ -19,6 +19,10 @@ func TestDefaultBranchFromRef(t *testing.T) {
 	}
 }
 
+// span is a change of lines s..e; gapAt the insertion below line p (#199).
+func span(s, e int) LineRange { return LineRange{Start: s, End: e} }
+func gapAt(p int) LineRange   { return gapAfter(p) }
+
 func TestParseHunkRanges(t *testing.T) {
 	// Synthetic `git diff -U0` headers → expected NEW-side ranges.
 	cases := []struct {
@@ -26,14 +30,14 @@ func TestParseHunkRanges(t *testing.T) {
 		diff string
 		want []LineRange
 	}{
-		{"single-line edit", "@@ -5 +5 @@ ctx", []LineRange{{5, 5}}},
-		{"multi-line edit", "@@ -10,3 +10,4 @@", []LineRange{{10, 13}}},
-		{"count omitted = 1", "@@ -1 +7 @@", []LineRange{{7, 7}}},
-		{"pure addition", "@@ -5,0 +6,3 @@", []LineRange{{6, 8}}},
+		{"single-line edit", "@@ -5 +5 @@ ctx", []LineRange{span(5, 5)}},
+		{"multi-line edit", "@@ -10,3 +10,4 @@", []LineRange{span(10, 13)}},
+		{"count omitted = 1", "@@ -1 +7 @@", []LineRange{span(7, 7)}},
+		{"pure addition", "@@ -5,0 +6,3 @@", []LineRange{span(6, 8)}},
 		// Pure deletion: git reports the surviving line before the gap; we span
 		// [start, start+1] so an edit of the removed region overlaps.
-		{"pure deletion spans gap", "@@ -2 +1,0 @@", []LineRange{{1, 2}}},
-		{"non-header lines ignored", "diff --git a/x b/x\n+added\n@@ -3 +3 @@\n-removed", []LineRange{{3, 3}}},
+		{"pure deletion spans gap", "@@ -2 +1,0 @@", []LineRange{span(1, 2)}},
+		{"non-header lines ignored", "diff --git a/x b/x\n+added\n@@ -3 +3 @@\n-removed", []LineRange{span(3, 3)}},
 		{"empty", "", nil},
 	}
 	for _, c := range cases {
@@ -58,12 +62,14 @@ func TestParseHunkRangesOld(t *testing.T) {
 		diff string
 		want []LineRange
 	}{
-		{"single-line edit", "@@ -5 +5 @@ ctx", []LineRange{{5, 5}}},
-		{"multi-line edit", "@@ -10,3 +10,4 @@", []LineRange{{10, 12}}},
-		{"count omitted = 1", "@@ -7 +1 @@", []LineRange{{7, 7}}},
-		// Pure addition: 0 lines on the OLD side → span the insertion-gap neighbors.
-		{"pure addition spans gap", "@@ -5,0 +6,3 @@", []LineRange{{5, 6}}},
-		{"pure deletion", "@@ -2,3 +1,0 @@", []LineRange{{2, 4}}},
+		{"single-line edit", "@@ -5 +5 @@ ctx", []LineRange{span(5, 5)}},
+		{"multi-line edit", "@@ -10,3 +10,4 @@", []LineRange{span(10, 12)}},
+		{"count omitted = 1", "@@ -7 +1 @@", []LineRange{span(7, 7)}},
+		// Pure addition: 0 lines on the OLD side → an insertion into the gap after
+		// line 5 (#199: it meets only edits of line 5 or 6, or another at that gap).
+		{"pure addition is a gap", "@@ -5,0 +6,3 @@", []LineRange{gapAt(5)}},
+		{"addition at the very top", "@@ -0,0 +1,2 @@", []LineRange{gapAt(0)}},
+		{"pure deletion", "@@ -2,3 +1,0 @@", []LineRange{span(2, 4)}},
 		{"empty", "", nil},
 	}
 	for _, c := range cases {

@@ -535,10 +535,20 @@ func parseCodexEdit(b []byte) (cwd, patch string, relevant bool) {
 // removed (leading '-'), so we can range the MODIFIED lines precisely and NOT
 // the surrounding context (which anchors the hunk but isn't a change — including
 // it would false-flag edits merely adjacent to another window's, defeating wt's
-// -U0 exact-hunk grading; #117 review).
+// -U0 exact-hunk grading; #117 review). added holds each run of added lines
+// ('+') and where it goes, so a run that only INSERTS (no removed line next to
+// it) is graded as the insertion git will see (#199).
 type codexHunk struct {
 	preImage []string
 	removed  []int
+	added    []codexAdd
+}
+
+// codexAdd is one run of consecutive added lines, inserted before preImage[at]
+// (at == len(preImage): after the hunk's last line).
+type codexAdd struct {
+	at    int
+	lines []string
 }
 
 // codexPatchFile is one file section of an apply_patch payload: its repo-relative
@@ -556,11 +566,16 @@ func parseCodexPatch(patch string) []codexPatchFile {
 	var cur *codexPatchFile
 	var pre []string
 	var rem []int
+	var adds []codexAdd
+	adding := false // the open section is an Add File: its '+' lines are the file, not a hunk
 	flushHunk := func() {
-		if cur != nil && len(pre) > 0 {
-			cur.hunks = append(cur.hunks, codexHunk{preImage: pre, removed: rem})
+		// An update hunk with added lines but no pre-image is kept too: it has
+		// nothing to locate it by, which patchRangesInFile must report, not skip
+		// (#199).
+		if cur != nil && (len(pre) > 0 || (len(adds) > 0 && !adding)) {
+			cur.hunks = append(cur.hunks, codexHunk{preImage: pre, removed: rem, added: adds})
 		}
-		pre, rem = nil, nil
+		pre, rem, adds = nil, nil, nil
 	}
 	flushFile := func() {
 		flushHunk()
@@ -572,6 +587,7 @@ func parseCodexPatch(patch string) []codexPatchFile {
 	start := func(ln, prefix string) {
 		flushFile()
 		cur = &codexPatchFile{path: strings.TrimSpace(strings.TrimPrefix(ln, prefix))}
+		adding = prefix == "*** Add File: "
 	}
 	lines := strings.Split(patch, "\n")
 	// Drop the single trailing "" a terminating newline produces, so it isn't
@@ -600,7 +616,14 @@ func parseCodexPatch(patch string) []codexPatchFile {
 		case cur == nil:
 			// preamble noise
 		case strings.HasPrefix(ln, "+"):
-			// added line — NOT in the current file; skip
+			// added line — NOT in the current file, so not pre-image; recorded
+			// with where it goes (a run continues while no pre-image line comes
+			// between)
+			if n := len(adds); n > 0 && adds[n-1].at == len(pre) {
+				adds[n-1].lines = append(adds[n-1].lines, ln[1:])
+			} else {
+				adds = append(adds, codexAdd{at: len(pre), lines: []string{ln[1:]}})
+			}
 		case strings.HasPrefix(ln, "-"):
 			rem = append(rem, len(pre))
 			pre = append(pre, ln[1:]) // removed line — present in the current file
@@ -672,29 +695,54 @@ func contiguousRuns(offsets []int) [][2]int {
 	return append(runs, [2]int{s, e})
 }
 
-// patchRangesInFile locates each hunk's pre-image in content, then ranges only
-// the REMOVED lines within it — matching wt's -U0 exact-hunk grading. Pure-add
-// hunks (no removed lines) modify no existing line, so they contribute no range
-// (an insertion adjacent to another window's edit isn't a conflict). ok=false
-// when a hunk can't be uniquely located, or nothing is a real modification — the
-// caller then falls back to a file-level advisory. The ranges are on-disk line
-// numbers; moving them into base numbers is the caller's job (pendingPatchRanges
-// → gitx.LinesToBase, the #108 lesson). Reuses locateRange.
+// patchRangesInFile locates each hunk's pre-image in content and returns the
+// edits the patch makes there, the way git's -U0 diff will report them once it is
+// applied (#199): each run of REMOVED lines is a change of those lines (the
+// context around it anchors the hunk but isn't a change: ranging it would flag
+// edits merely next to another window's, #117 review), and each run of added
+// lines with no removed line beside it is an INSERTION (a Gap) between its two
+// pre-image neighbours. An insertion meets another window's change of either
+// neighbour in git, so skipping it (as this did before #199) let a patch that
+// only inserts next to another window's edit read as disjoint. A pure insertion
+// or deletion git may slide (lines that repeat the ones beside it, which git
+// shifts to align) claims every position it can slide to (insertionClaim,
+// deletionClaim), so the grade can't miss where git puts it.
+//
+// ok=false when a hunk can't be uniquely located (or has added lines and no
+// pre-image to locate them by), or the patch edits nothing — the caller then
+// falls back to a file-level advisory. The ranges are on-disk line numbers;
+// moving them into base numbers is the caller's job (pendingPatchRanges →
+// gitx.LinesToBase, the #108 lesson). Reuses locateRange. Pure.
 func patchRangesInFile(f codexPatchFile, content string) ([]gitx.LineRange, bool) {
+	file := fileLines(content)
 	var ranges []gitx.LineRange
 	for _, h := range f.hunks {
 		if len(h.preImage) == 0 {
+			if len(h.added) > 0 {
+				return nil, false // an insertion with nothing to place it by
+			}
 			continue
 		}
 		r, ok := locateRange(content, strings.Join(h.preImage, "\n"))
 		if !ok {
 			return nil, false
 		}
-		if len(h.removed) == 0 {
-			continue // pure addition — no existing line modified
+		addedAt := func(lo, hi int) bool { // an added run goes in at an offset in [lo, hi]
+			return slices.ContainsFunc(h.added, func(a codexAdd) bool { return lo <= a.at && a.at <= hi })
 		}
 		for _, run := range contiguousRuns(h.removed) {
-			ranges = append(ranges, gitx.LineRange{Start: r.Start + run[0], End: r.Start + run[1]})
+			start, end := r.Start+run[0], r.Start+run[1]
+			if addedAt(run[0], run[1]+1) {
+				ranges = append(ranges, gitx.LineRange{Start: start, End: end}) // a replacement
+			} else {
+				ranges = append(ranges, deletionClaim(file, start, end))
+			}
+		}
+		for _, a := range h.added {
+			if slices.Contains(h.removed, a.at-1) || slices.Contains(h.removed, a.at) {
+				continue // replaces removed lines: their change covers it
+			}
+			ranges = append(ranges, insertionClaim(file, r.Start+a.at-1, a.lines))
 		}
 	}
 	if len(ranges) == 0 {
