@@ -96,6 +96,13 @@ type CoordHealth struct {
 	OwnBlockReserves int    `json:"own_block_reservations"`
 	Prunable         int    `json:"prunable"`
 	Err              string `json:"err,omitempty"`
+
+	// #163: this process's identity, and any OTHER session that recently posted
+	// under the same window id — i.e. shares this checkout.
+	Window        string                  `json:"window"`
+	Session       string                  `json:"session"`                  // token, or coord.SessionNone
+	SessionSource string                  `json:"session_source,omitempty"` // env var it came from; "" = none set
+	OtherSessions []coord.SessionActivity `json:"other_sessions,omitempty"`
 }
 
 // Preflight is the create-time viability of worktree_root + base branch.
@@ -405,13 +412,17 @@ func coordHealth(c *config.Config) *CoordHealth {
 	path := coord.LogPath(home, repoName(c))
 	h := &CoordHealth{Path: path}
 	branch, _ := gitx.CurrentBranch()
-	self := coord.WindowID(os.Getenv("WT_WINDOW"), c.Root, branch)
+	// The SAME identity coordCtx builds (cli): window + session (#163).
+	self := coord.CurrentSelf(os.Getenv, c.Root, branch)
+	h.Window, h.Session = self.Window, self.Session
+	_, h.SessionSource = coord.SessionToken(os.Getenv)
 	// Block reservations live in per-file ledgers (independent of THIS repo's coord
 	// log), so count them regardless of whether the per-repo log exists yet — else a
 	// block-only repo reports 0 while `wt holds` shows the reservation (#152).
+	// They stay keyed by window only (#163 leaves block-id unsplit by session).
 	if home, herr := os.UserHomeDir(); herr == nil && home != "" {
 		ledger := coord.LoadBlockLedgers(home)
-		h.OwnBlockReserves = len(coord.OwnBlockReservations(ledger, self))
+		h.OwnBlockReserves = len(coord.OwnBlockReservations(ledger, self.Window))
 		_, h.Prunable = coord.PruneRecords(ledger, time.Now(), pruneBlockMaxAge)
 	}
 	if _, err := os.Stat(path); err != nil {
@@ -426,6 +437,7 @@ func coordHealth(c *config.Config) *CoordHealth {
 	h.Readable = true
 	h.Records = len(recs)
 	h.OwnOpen = len(coord.OwnOpenAnnouncements(recs, self))
+	h.OtherSessions = coord.OtherSessions(recs, self, time.Now(), coord.SharedCheckoutWindow)
 	if _, p := coord.PruneRecords(recs, time.Now(), pruneBlockMaxAge); p > 0 {
 		h.Prunable += p
 	}
@@ -497,6 +509,8 @@ func render(rep *Report) {
 	}
 	br, _ := gitx.CurrentBranch()
 	ui.Info("%-18s %s", "window id", coord.WindowID(os.Getenv("WT_WINDOW"), rep.Repo, br))
+	tok, src := coord.SessionToken(os.Getenv)
+	ui.Info("%-18s %s", "session", sessionLine(tok, src))
 
 	// structured_doc regex validation.
 	for _, dc := range rep.Structured {
@@ -532,6 +546,11 @@ func render(rep *Report) {
 			ui.OK("coord log — %d record(s)%s", h.Records, extra)
 			if h.Prunable > 0 {
 				ui.Warn("coord log — %d resolved/expired record(s) prunable (run `wt prune-coord`)", h.Prunable)
+			}
+			// #163: another session posting under THIS window id shares the checkout.
+			self := coord.Self{Window: h.Window, Session: h.Session}
+			if msg := coord.SharedCheckoutWarning(h.OtherSessions, self, time.Now()); msg != "" {
+				ui.Warn("%s", msg)
 			}
 		}
 	}
@@ -660,6 +679,18 @@ func hostAuthPhrase(h ghx.HostAuth) string {
 		return h.Host + " timed out"
 	}
 	return h.Host + " unreadable"
+}
+
+// sessionLine renders the doctor's "session" row (#163): the token, shortened
+// (coord.ShortToken; `doctor --json` keeps it whole), and the env var it came
+// from — or, with none set, what that means and how to fix it. Pure.
+func sessionLine(token, source string) string {
+	if token == "" {
+		return coord.SessionNone + " — neither " + strings.Join(coord.SessionEnvVars, " nor ") +
+			" is set (terminal tab ids are deliberately not used), so this shell can't be told apart from another" +
+			" token-less session in the same checkout (set WT_SESSION)"
+	}
+	return coord.ShortToken(token) + " (from " + source + ")"
 }
 
 func refExists(dir, ref string) bool {

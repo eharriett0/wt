@@ -194,12 +194,14 @@ func distinctTail(wt string, others []string) string {
 
 // hookAgentContext implements the per-turn UserPromptSubmit hooks
 // (`wt _hook codex-context` / `wt _hook claude-context` — both agents share the
-// cwd-in / additionalContext-out shape). Reads the payload from r, derives the
+// cwd-in / additionalContext-out shape; codex says which one this is, for the
+// session fallback in agentHookSession). Reads the payload from r, derives the
 // repo from its cwd, and injects the multi-window awareness the window should see
 // this turn: cross-window file overlaps PLUS un-acked coordination signals (holds
-// + announcements) from other windows. Always exits 0 (fail-open); silent when
-// there's nothing to say or the repo has ≤1 worktree.
-func hookAgentContext(r io.Reader) int {
+// + announcements) from other windows and from another session in this checkout.
+// Always exits 0 (fail-open); silent when there's nothing to say, or when the
+// repo has ≤1 worktree and no coordination log (hookPlan).
+func hookAgentContext(r io.Reader, codex bool) int {
 	if os.Getenv("WT_SKIP_COLLISION") == "1" || os.Getenv("HOOK_DISABLE_MULTIWINDOW_CHECK") == "1" {
 		return 0
 	}
@@ -216,32 +218,35 @@ func hookAgentContext(r io.Reader) int {
 			return 0
 		}
 	}
-	// Cheap on the common case: a repo with ≤1 worktree is not multi-window, so
-	// there are no other windows to collide with OR to have posted coordination.
-	if paths, err := gitx.WorktreePaths(); err != nil || len(paths) <= 1 {
+	paths, err := gitx.WorktreePaths()
+	if err != nil {
+		return 0
+	}
+	run, overlaps := hookPlan(len(paths), coordLogExists)
+	if !run {
 		return 0
 	}
 	c, err := config.Load()
 	if err != nil {
 		return 0
 	}
-	root, err := gitx.RepoRoot()
-	if err != nil {
-		return 0
-	}
-	ws, err := collide.Scan(c)
-	if err != nil {
-		return 0
-	}
+
 	var parts []string
-	if msg, has := codexContextMessage(agentContextOverlaps(c, ws, root), collide.LabelForWorktree(ws, root)); has {
-		parts = append(parts, msg)
+	if overlaps {
+		if msg, has := hookOverlapMessage(c); has {
+			parts = append(parts, msg)
+		}
 	}
-	// Coordination signals — un-acked holds + announcements from other windows.
-	// Fail-open: a coord read error just omits this block (never breaks the turn).
+	// Coordination signals — un-acked holds + announcements from other windows,
+	// and from another session sharing this checkout (#163). The session is the
+	// one this agent's own `wt` commands stamp on their records: the hook's env
+	// (coordCtx), with Codex's payload fallback (agentHookSession). Fail-open: a
+	// coord read error just omits this block (never breaks the turn).
 	if logPath, self := coordCtx(c); logPath != "" {
+		self.Session = agentHookSession(self.Session, codex, parseHookSessionID(b))
 		if recs, rerr := coord.Load(logPath); rerr == nil {
-			if msg, has := coordContextMessage(coord.Inbox(recs, self), c.MaxAge, time.Now()); has {
+			box := hookInbox(coord.Inbox(recs, self), self, overlaps)
+			if msg, has := coordContextMessage(box, c.MaxAge, time.Now()); has {
 				parts = append(parts, msg)
 			}
 		}
@@ -250,6 +255,125 @@ func hookAgentContext(r io.Reader) int {
 		emitAgentContext(strings.Join(parts, "\n\n"))
 	}
 	return 0
+}
+
+// hookPlan decides what the per-turn hook does, staying cheap on the common case.
+// A repo with ≤1 worktree has no other WINDOW to collide with, so the file-overlap
+// scan is skipped — but it CAN have another SESSION working in its one checkout
+// (#163: two agents started in the same primary checkout), whose announcements and
+// holds must still reach this one. So a single-worktree repo runs only when it has
+// a coordination log (hasCoordLog is consulted ONLY then: one git call + a stat),
+// where it used to return before even looking. Pure given hasCoordLog.
+func hookPlan(worktrees int, hasCoordLog func() bool) (run, overlaps bool) {
+	if worktrees > 1 {
+		return true, true
+	}
+	return hasCoordLog(), false
+}
+
+// hookOverlapMessage is the per-turn cross-window file-overlap block (the
+// multi-worktree half of hookAgentContext). has=false on any scan error
+// (fail-open) or when nothing collides.
+func hookOverlapMessage(c *config.Config) (string, bool) {
+	root, err := gitx.RepoRoot()
+	if err != nil {
+		return "", false
+	}
+	ws, err := collide.Scan(c)
+	if err != nil {
+		return "", false
+	}
+	// Graded the way `wt check` grades from THIS window (#182) — the banner used
+	// to run its own all-windows grade and said HIGH where check said low.
+	return codexContextMessage(agentContextOverlaps(c, ws, root), collide.LabelForWorktree(ws, root))
+}
+
+// coordLogExists reports whether this repo has a coordination log yet — the
+// cheap gate that lets the per-turn hook stay near-free in a single-worktree repo
+// while still delivering another same-checkout session's signals (#163). It
+// resolves the SAME path coordCtx does (repoNameFrom).
+func coordLogExists() bool {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return false
+	}
+	common, _ := gitx.CommonDir()
+	root := ""
+	if common == "" || filepath.Base(common) != ".git" {
+		root, _ = gitx.RepoRoot() // unusual layout: the name falls back to the toplevel
+	}
+	_, err = os.Stat(coord.LogPath(home, repoNameFrom(common, root)))
+	return err == nil
+}
+
+// agentHookSession is the session the per-turn hook reads the log as (#163): the
+// one this agent's own `wt` commands stamp. That is the hook's inherited env
+// (envSession, coordCtx's resolver) — except for Codex, which exports
+// CODEX_SESSION_ID to every shell command but NOT to hook processes: a Codex hook
+// runs with the Codex process's own environment snapshot. Its payload's
+// session_id is filled from the same Session::session_id() that feeds
+// CODEX_SESSION_ID, so for codex-context ONLY a token-less env falls back to it;
+// without that, every Codex turn would show the session its own holds as another
+// session's. Claude Code sets CLAUDE_CODE_SESSION_ID in hook processes itself, so
+// its payload is never consulted: a Claude Code too old to set the variable stamps
+// SessionNone from its shells, and taking the payload id would split one session
+// into two parties. Pure.
+func agentHookSession(envSession string, codex bool, payloadSessionID string) string {
+	if !codex || envSession != coord.SessionNone {
+		return envSession
+	}
+	if id := strings.TrimSpace(payloadSessionID); id != "" {
+		return id
+	}
+	return envSession
+}
+
+// parseHookSessionID extracts the agent hook payload's "session_id" ("" when
+// absent or unparseable). Pure.
+func parseHookSessionID(b []byte) string {
+	var p struct {
+		SessionID string `json:"session_id"`
+	}
+	if json.Unmarshal(b, &p) != nil {
+		return ""
+	}
+	return strings.TrimSpace(p.SessionID)
+}
+
+// hookInbox picks the coordination entries for the per-turn context. With other
+// worktrees present it is the whole inbox, as before #163. In a single-worktree
+// repo (where the hook used to stay silent altogether) it is everything from
+// another session in this same checkout (#163) PLUS every un-acked HOLD from
+// another window: the merge gate enforces those whether or not that window's
+// worktree still exists (a removed worktree's hold, a WT_WINDOW-pinned session in
+// this very checkout, a same-named clone sharing the log), so the hook never
+// hides one. Plain announcements from other windows stay out, as before. Entries
+// come back labelled (labelForContext). Pure.
+func hookInbox(box []coord.Record, self coord.Self, otherWorktrees bool) []coord.Record {
+	if !otherWorktrees {
+		var keep []coord.Record
+		for _, r := range box {
+			if self.SharesCheckout(r) || len(r.Hold) > 0 {
+				keep = append(keep, r)
+			}
+		}
+		box = keep
+	}
+	return labelForContext(box, self)
+}
+
+// labelForContext readies inbox entries for the per-turn context:
+// coordContextMessage shows each entry's Window as who posted it, and an entry
+// from another session in THIS checkout carries the reader's own window id — so
+// it is relabelled "same checkout, another session (…)" (#163). Returns copies.
+// Pure.
+func labelForContext(box []coord.Record, self coord.Self) []coord.Record {
+	out := make([]coord.Record, len(box))
+	for i, r := range box {
+		r.Window = postedBy(r, self)
+		out[i] = r
+	}
+	return out
 }
 
 // coordMaxEntryChars caps a single announcement's free-text in the per-turn hook
