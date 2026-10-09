@@ -465,6 +465,13 @@ func cmdMergePR(args []string) int {
 	if err := merge.Run(pr, *dryRun, *bypass, *mergeForeign, wtBranches, merge.WithAdmin(*admin, prep.args), prep.stdin); err != nil {
 		return 1
 	}
+	// ⚠ gh exits 0 WITHOUT merging for --help, --auto, --disable-auto, a merge
+	// queue or -R, so only a PR that now reads MERGED is verified and auto-cleaned
+	// (#185). Still exit 0: gh did what it was asked (printed help, armed
+	// auto-merge, queued the PR), and keeping the worktree loses nothing.
+	if !*dryRun && !mergeConfirmed(pr) {
+		return 0
+	}
 	// Post-merge verification (#77): re-check the referenced issues + report any
 	// that changed state — catches a silent close (trap 2) in the same command.
 	if !*dryRun && !*noCloseCheck {
@@ -505,6 +512,13 @@ func autoCleanMergedWorktree(pr string) {
 		br, _ := gitx.CurrentBranchIn(wt)
 		if br != branch {
 			continue
+		}
+		// #187: a squash merge leaves the branch unmerged in git's eyes, so
+		// Remove deletes it with -D. Only when every local commit shipped in
+		// the PR; otherwise keep the lane (and exit 0: the merge happened).
+		if msg := unshippedLane(pr, branch); msg != "" {
+			ui.Warn("%s", msg)
+			return
 		}
 		if err := worktree.Remove(c, wt, branch, false); err != nil {
 			ui.Warn("worktree for %s not auto-removed: %v", branch, err)
