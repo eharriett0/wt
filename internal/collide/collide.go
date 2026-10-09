@@ -113,12 +113,19 @@ func scanWorkers() int {
 type Overlap struct {
 	File    string
 	Windows []string // window labels touching the file
+	// Worktrees are the same windows' worktree paths, index-aligned with Windows
+	// (#182). A label is not an identity: two worktrees that claimed one issue
+	// are both "#N", and detached worktrees are named by their directory. Anything
+	// that must tell two windows apart, such as grading a pair, keys on these.
+	// nil on an Overlap built by hand; readers then fall back to the label.
+	Worktrees []string
 }
 
-// Overlaps returns files touched by ≥2 windows (pure; sorted by file). This is
-// the headline collision signal across all windows.
+// Overlaps returns files touched by ≥2 windows (pure; sorted by file, then by
+// label and worktree). This is the headline collision signal across all windows.
 func Overlaps(ws []Window) []Overlap {
-	hits := map[string][]string{}
+	type member struct{ label, worktree string }
+	hits := map[string][]member{}
 	for _, w := range ws {
 		label := w.Label()
 		seen := map[string]bool{}
@@ -127,15 +134,26 @@ func Overlaps(ws []Window) []Overlap {
 				continue
 			}
 			seen[f] = true
-			hits[f] = append(hits[f], label)
+			hits[f] = append(hits[f], member{label, w.Worktree})
 		}
 	}
 	var out []Overlap
-	for f, labels := range hits {
-		if len(labels) >= 2 {
-			sort.Strings(labels)
-			out = append(out, Overlap{File: f, Windows: labels})
+	for f, ms := range hits {
+		if len(ms) < 2 {
+			continue
 		}
+		sort.Slice(ms, func(i, j int) bool {
+			if ms[i].label != ms[j].label {
+				return ms[i].label < ms[j].label
+			}
+			return ms[i].worktree < ms[j].worktree
+		})
+		o := Overlap{File: f}
+		for _, m := range ms {
+			o.Windows = append(o.Windows, m.label)
+			o.Worktrees = append(o.Worktrees, m.worktree)
+		}
+		out = append(out, o)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].File < out[j].File })
 	return out
@@ -535,6 +553,40 @@ func LabelForWorktree(ws []Window, worktree string) string {
 	return ""
 }
 
+// Self is the window a per-window view is taken from (the per-turn banner,
+// #182): its label, which is what the reader calls it, and its worktree, which
+// is what it is. Two windows can share a label, so whenever an Overlap carries
+// worktrees, membership is decided by the worktree. The zero Self is "no side":
+// the window-neutral view.
+type Self struct{ Label, Worktree string }
+
+// SelfFor identifies the window whose worktree is worktree (symlink-normalized),
+// with the worktree path as Scan recorded it, so it compares equal to
+// Overlap.Worktrees. Zero Self when no window matches.
+func SelfFor(ws []Window, worktree string) Self {
+	for _, w := range ws {
+		if sameWorktree(w.Worktree, worktree) {
+			return Self{Label: w.Label(), Worktree: w.Worktree}
+		}
+	}
+	return Self{}
+}
+
+// IsZero reports whether s is "no side" (the window-neutral view).
+func (s Self) IsZero() bool { return s == Self{} }
+
+// Is reports whether o's i-th window is s: by worktree when o carries
+// worktrees, else by label. Pure.
+func (s Self) Is(o Overlap, i int) bool {
+	if s.IsZero() {
+		return false
+	}
+	if len(o.Worktrees) == len(o.Windows) && s.Worktree != "" {
+		return o.Worktrees[i] == s.Worktree
+	}
+	return o.Windows[i] == s.Label
+}
+
 func realPath(p string) string {
 	if r, err := filepath.EvalSymlinks(p); err == nil {
 		return r
@@ -838,40 +890,54 @@ func Classify(w Window, base string, maxAge time.Duration, now time.Time) Window
 // is in `labels` (the small set actually involved in a collision — NOT all
 // windows, which would be one gh call each). Keyed by window label. maxAge
 // enables dormancy suppression (0 = off).
+//
+// A label is not unique (#182): two worktrees that claimed one issue are both
+// "#N". Every window carrying a requested label is classified, and the label
+// keeps the answer that suppresses LEAST (keepLeastSuppressed). The map can't
+// say which of them a collision is with, so suppressing on the strength of the
+// other one would hide a live window; this used to keep whichever came first.
 func ClassifyWindows(ws []Window, base string, labels map[string]bool, maxAge time.Duration) map[string]WindowLiveness {
 	type job struct {
 		label string
 		w     Window
 	}
 	var jobs []job
-	seen := map[string]bool{}
 	for _, w := range ws {
-		l := w.Label()
-		if labels[l] && !seen[l] {
-			seen[l] = true
+		if l := w.Label(); labels[l] {
 			jobs = append(jobs, job{l, w})
 		}
 	}
 
-	out := make(map[string]WindowLiveness, len(jobs))
+	res := make([]WindowLiveness, len(jobs))
 	now := time.Now()
-	var mu sync.Mutex
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 8) // bound concurrent gh/git shell-outs
-	for _, j := range jobs {
+	for i, j := range jobs {
 		wg.Add(1)
-		go func(j job) {
+		go func(i int, j job) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			wl := Classify(j.w, base, maxAge, now)
-			mu.Lock()
-			out[j.label] = wl
-			mu.Unlock()
-		}(j)
+			res[i] = Classify(j.w, base, maxAge, now)
+		}(i, j)
 	}
 	wg.Wait()
+	out := make(map[string]WindowLiveness, len(jobs))
+	for i, j := range jobs { // worktree order, so the answer doesn't depend on timing
+		held, ok := out[j.label]
+		out[j.label] = keepLeastSuppressed(held, ok, res[i])
+	}
 	return out
+}
+
+// keepLeastSuppressed folds one more classification of a label into the one held
+// so far (ok=false: none yet). The held answer stands unless it is suppressed and
+// the new one is not: never suppress on ambiguity (#182). Pure.
+func keepLeastSuppressed(held WindowLiveness, ok bool, next WindowLiveness) WindowLiveness {
+	if !ok || (held.Level.IsSuppressed() && !next.Level.IsSuppressed()) {
+		return next
+	}
+	return held
 }
 
 // ConflictWindowSet is the set of OTHER-window labels appearing in conflicts —
@@ -910,20 +976,93 @@ func PartitionConflicts(cs []Conflict, live map[string]WindowLiveness) (active, 
 	return active, stale
 }
 
+// isLiveWindow reports whether a window's collisions should be surfaced: its
+// level is not suppressed (merged / dormant / closed PR). Missing liveness counts
+// as live (never suppress on ambiguity), and a dirty window is never suppressed.
+func isLiveWindow(live map[string]WindowLiveness, label string) bool {
+	wl, ok := live[label]
+	return !ok || !wl.Level.IsSuppressed()
+}
+
 // PartitionOverlaps splits `status` overlaps into active vs benign (pure). An
 // overlap is a real cross-window collision only when ≥2 of its windows are
 // non-stale — one live editor plus N merged branches cannot conflict. Missing/
 // unknown liveness counts as live (conservative).
+//
+// An ACTIVE overlap keeps only its live windows (#182). The suppressed ones used
+// to ride along into the grade and the listing whenever two others were live, so
+// a merged branch whose file now equals base (no ranges → "indeterminate") or a
+// dormant branch's old hunk graded the file HIGH, in `wt status` and in the
+// per-turn agent banner, while `wt check` hid both. A benign overlap is returned
+// as-is (it is only counted).
 func PartitionOverlaps(ov []Overlap, live map[string]WindowLiveness) (active, benign []Overlap) {
 	for _, o := range ov {
-		liveCount := 0
-		for _, w := range o.Windows {
-			if wl, ok := live[w]; !ok || !wl.Level.IsSuppressed() {
-				liveCount++
+		var idx []int
+		for i, w := range o.Windows {
+			if isLiveWindow(live, w) {
+				idx = append(idx, i)
 			}
 		}
-		if liveCount >= 2 {
-			active = append(active, o)
+		if len(idx) >= 2 {
+			active = append(active, o.keep(idx))
+		} else {
+			benign = append(benign, o)
+		}
+	}
+	return active, benign
+}
+
+// keep returns o restricted to the windows at idx, with Worktrees kept aligned
+// (and nil when o carries none). o itself is not modified.
+func (o Overlap) keep(idx []int) Overlap {
+	k := Overlap{File: o.File}
+	aligned := len(o.Worktrees) == len(o.Windows)
+	for _, i := range idx {
+		k.Windows = append(k.Windows, o.Windows[i])
+		if aligned {
+			k.Worktrees = append(k.Worktrees, o.Worktrees[i])
+		}
+	}
+	return k
+}
+
+// PartitionOverlapsFor is PartitionOverlaps from ONE window's side: the per-turn
+// agent banner (#182), which answers the question `wt check` answers from that
+// window. Pure.
+//
+// For a file self is editing, the overlap is active when at least ONE other
+// window is live, and it lists self plus those live windows. Self's own liveness
+// is not consulted, because `wt check` never consults it: a window still editing
+// after its PR merged must still be told who it collides with. A file self is
+// NOT editing is a heads-up about other windows and partitions exactly as
+// PartitionOverlaps does. A zero self (the current window couldn't be
+// identified) is PartitionOverlaps.
+//
+// Self is matched by worktree (Self.Is), so another window that merely shares
+// self's label is an OTHER window, never folded into self (#182).
+func PartitionOverlapsFor(ov []Overlap, live map[string]WindowLiveness, self Self) (active, benign []Overlap) {
+	if self.IsZero() {
+		return PartitionOverlaps(ov, live)
+	}
+	for _, o := range ov {
+		participant, others := false, 0
+		var idx []int
+		for i, w := range o.Windows {
+			switch {
+			case self.Is(o, i):
+				participant = true
+				idx = append(idx, i)
+			case isLiveWindow(live, w):
+				others++
+				idx = append(idx, i)
+			}
+		}
+		need := 2
+		if participant {
+			need = 1
+		}
+		if others >= need {
+			active = append(active, o.keep(idx))
 		} else {
 			benign = append(benign, o)
 		}
