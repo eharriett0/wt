@@ -32,6 +32,12 @@ type Report struct {
 	Repo     string `json:"repo"` // "" when not in a git repository
 	GH       bool   `json:"gh"`
 	GHAuthed bool   `json:"gh_authed"`
+	// An auth check with no forge host to scope to (outside a repo, or a
+	// local-path origin) asks gh about EVERY host, so doctor reads it per host
+	// (#183). Both stay empty for a check scoped to the repo's host (#100/#102),
+	// and for one that passed.
+	GHHosts       []ghx.HostAuth `json:"gh_hosts,omitempty"`
+	GHAuthUnknown bool           `json:"gh_auth_unknown,omitempty"` // that check proved nothing either way
 
 	Config      map[string]string `json:"config,omitempty"`          // all resolved settings
 	Structured  []DocCheck        `json:"structured_docs,omitempty"` // regex validation per structured_doc
@@ -90,6 +96,13 @@ type CoordHealth struct {
 	OwnBlockReserves int    `json:"own_block_reservations"`
 	Prunable         int    `json:"prunable"`
 	Err              string `json:"err,omitempty"`
+
+	// #163: this process's identity, and any OTHER session that recently posted
+	// under the same window id — i.e. shares this checkout.
+	Window        string                  `json:"window"`
+	Session       string                  `json:"session"`                  // token, or coord.SessionNone
+	SessionSource string                  `json:"session_source,omitempty"` // env var it came from; "" = none set
+	OtherSessions []coord.SessionActivity `json:"other_sessions,omitempty"`
 }
 
 // Preflight is the create-time viability of worktree_root + base branch.
@@ -131,7 +144,9 @@ func build(c *config.Config) *Report {
 		rep.Healthy = false
 	}
 	rep.GH = ghx.Present()
-	rep.GHAuthed = rep.GH && ghx.Authed()
+	if rep.GH {
+		rep.GHAuthed, rep.GHHosts, rep.GHAuthUnknown = ghAuth(ghx.RepoAuthStatus())
+	}
 
 	if c == nil || c.Root == "" {
 		return rep
@@ -150,6 +165,36 @@ func build(c *config.Config) *Report {
 	// the wt pre-push guard blocks a base push regardless — so it's a warn/info,
 	// never a ✗ that fails doctor.
 	return rep
+}
+
+// ghAuth reads doctor's gh verdict from one auth check (#183). Pure.
+//
+// A check scoped to the repo's forge host (#100/#102), or one that passed, is read
+// exactly as before: gh's exit code. An UNSCOPED check (no forge host: outside a
+// repo, or a local-path origin) asks gh about every configured host, and its exit
+// code is an aggregate: one unreachable Enterprise host fails it for a github.com
+// login that is fine, the #100 false positive. So that one is read per host:
+//   - a host authenticated → authed; the failing ones are named, not hidden
+//   - every host failed to log in, or gh has no host at all → NOT authenticated
+//   - otherwise (a timeout, or output wt cannot read) → unknown: nothing was
+//     proven about the login, so doctor must not claim "NOT authenticated"
+func ghAuth(st ghx.AuthStatus) (authed bool, hosts []ghx.HostAuth, unknown bool) {
+	if st.Host != "" || st.OK {
+		return st.OK, nil, false
+	}
+	if !st.Parsed {
+		return false, nil, true
+	}
+	for _, h := range st.Hosts {
+		switch h.State {
+		case ghx.HostAuthOK:
+			return true, st.Hosts, false
+		case ghx.HostAuthFailed:
+		default: // timeout, unknown: no claim about the login
+			unknown = true
+		}
+	}
+	return false, st.Hosts, unknown
 }
 
 // upstreamChecks flags every worktree whose branch tracks the base ref (under
@@ -367,13 +412,17 @@ func coordHealth(c *config.Config) *CoordHealth {
 	path := coord.LogPath(home, repoName(c))
 	h := &CoordHealth{Path: path}
 	branch, _ := gitx.CurrentBranch()
-	self := coord.WindowID(os.Getenv("WT_WINDOW"), c.Root, branch)
+	// The SAME identity coordCtx builds (cli): window + session (#163).
+	self := coord.CurrentSelf(os.Getenv, c.Root, branch)
+	h.Window, h.Session = self.Window, self.Session
+	_, h.SessionSource = coord.SessionToken(os.Getenv)
 	// Block reservations live in per-file ledgers (independent of THIS repo's coord
 	// log), so count them regardless of whether the per-repo log exists yet — else a
 	// block-only repo reports 0 while `wt holds` shows the reservation (#152).
+	// They stay keyed by window only (#163 leaves block-id unsplit by session).
 	if home, herr := os.UserHomeDir(); herr == nil && home != "" {
 		ledger := coord.LoadBlockLedgers(home)
-		h.OwnBlockReserves = len(coord.OwnBlockReservations(ledger, self))
+		h.OwnBlockReserves = len(coord.OwnBlockReservations(ledger, self.Window))
 		_, h.Prunable = coord.PruneRecords(ledger, time.Now(), pruneBlockMaxAge)
 	}
 	if _, err := os.Stat(path); err != nil {
@@ -388,6 +437,7 @@ func coordHealth(c *config.Config) *CoordHealth {
 	h.Readable = true
 	h.Records = len(recs)
 	h.OwnOpen = len(coord.OwnOpenAnnouncements(recs, self))
+	h.OtherSessions = coord.OtherSessions(recs, self, time.Now(), coord.SharedCheckoutWindow)
 	if _, p := coord.PruneRecords(recs, time.Now(), pruneBlockMaxAge); p > 0 {
 		h.Prunable += p
 	}
@@ -430,13 +480,10 @@ func render(rep *Report) {
 	} else {
 		ui.Err("repo — not inside a git repository")
 	}
-	switch {
-	case rep.GHAuthed:
-		ui.OK("gh — authenticated")
-	case rep.GH:
-		ui.Warn("gh — found but NOT authenticated (claim/release/merge-pr need `gh auth login`)")
-	default:
-		ui.Warn("gh — not found (claim/release/merge-pr need it; new/clean/status/check/hooks don't)")
+	if warn, msg := ghLine(rep); warn {
+		ui.Warn("%s", msg)
+	} else {
+		ui.OK("%s", msg)
 	}
 
 	if rep.Repo == "" {
@@ -462,6 +509,8 @@ func render(rep *Report) {
 	}
 	br, _ := gitx.CurrentBranch()
 	ui.Info("%-18s %s", "window id", coord.WindowID(os.Getenv("WT_WINDOW"), rep.Repo, br))
+	tok, src := coord.SessionToken(os.Getenv)
+	ui.Info("%-18s %s", "session", sessionLine(tok, src))
 
 	// structured_doc regex validation.
 	for _, dc := range rep.Structured {
@@ -497,6 +546,11 @@ func render(rep *Report) {
 			ui.OK("coord log — %d record(s)%s", h.Records, extra)
 			if h.Prunable > 0 {
 				ui.Warn("coord log — %d resolved/expired record(s) prunable (run `wt prune-coord`)", h.Prunable)
+			}
+			// #163: another session posting under THIS window id shares the checkout.
+			self := coord.Self{Window: h.Window, Session: h.Session}
+			if msg := coord.SharedCheckoutWarning(h.OtherSessions, self, time.Now()); msg != "" {
+				ui.Warn("%s", msg)
 			}
 		}
 	}
@@ -573,6 +627,70 @@ func render(rep *Report) {
 	if !rep.Healthy {
 		ui.Err("unhealthy — fix the above")
 	}
+}
+
+// ghLine is doctor's gh line: whether it warns, and what it says. Pure. A check
+// scoped to the repo's host only ever reaches the three pre-#183 lines, unchanged.
+func ghLine(rep *Report) (warn bool, msg string) {
+	switch {
+	case rep.GHAuthed && len(rep.GHHosts) > 0: // an unscoped check, read per host (#183)
+		var ok, failing []string
+		for _, h := range rep.GHHosts {
+			if h.State == ghx.HostAuthOK {
+				ok = append(ok, h.Host)
+			} else {
+				failing = append(failing, hostAuthPhrase(h))
+			}
+		}
+		msg = "gh — authenticated on " + strings.Join(ok, ", ")
+		switch len(failing) {
+		case 0:
+		case 1:
+			msg += " (1 other host failing: " + failing[0] + ")"
+		default:
+			msg += fmt.Sprintf(" (%d other hosts failing: %s)", len(failing), strings.Join(failing, ", "))
+		}
+		return false, msg
+	case rep.GHAuthed:
+		return false, "gh — authenticated"
+	case rep.GH && rep.GHAuthUnknown && len(rep.GHHosts) > 0:
+		var hs []string
+		for _, h := range rep.GHHosts {
+			hs = append(hs, hostAuthPhrase(h))
+		}
+		return true, "gh — found, but auth could not be verified: " + strings.Join(hs, ", ")
+	case rep.GH && rep.GHAuthUnknown:
+		return true, "gh — found, but auth could not be verified: with no repository host to scope it to, `gh auth status` checks every configured host, and it failed with output wt could not read (run it to see why)"
+	case rep.GH:
+		return true, "gh — found but NOT authenticated (claim/release/merge-pr need `gh auth login`)"
+	default:
+		return true, "gh — not found (claim/release/merge-pr need it; new/clean/status/check/hooks don't)"
+	}
+}
+
+// hostAuthPhrase names a host and what gh said about it, in gh's own terms.
+func hostAuthPhrase(h ghx.HostAuth) string {
+	switch h.State {
+	case ghx.HostAuthOK:
+		return h.Host + " authenticated"
+	case ghx.HostAuthFailed:
+		return h.Host + " failed to log in"
+	case ghx.HostAuthTimeout:
+		return h.Host + " timed out"
+	}
+	return h.Host + " unreadable"
+}
+
+// sessionLine renders the doctor's "session" row (#163): the token, shortened
+// (coord.ShortToken; `doctor --json` keeps it whole), and the env var it came
+// from — or, with none set, what that means and how to fix it. Pure.
+func sessionLine(token, source string) string {
+	if token == "" {
+		return coord.SessionNone + " — neither " + strings.Join(coord.SessionEnvVars, " nor ") +
+			" is set (terminal tab ids are deliberately not used), so this shell can't be told apart from another" +
+			" token-less session in the same checkout (set WT_SESSION)"
+	}
+	return coord.ShortToken(token) + " (from " + source + ")"
 }
 
 func refExists(dir, ref string) bool {

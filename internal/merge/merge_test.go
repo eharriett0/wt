@@ -73,11 +73,13 @@ func TestWithAdmin(t *testing.T) {
 	}{
 		{"off: nil unchanged", false, nil, nil},
 		{"off: extra passthrough unchanged", false, []string{"--delete-branch"}, []string{"--delete-branch"}},
-		{"on: appends to nil", true, nil, []string{"--admin"}},
-		{"on: appends after existing passthrough", true, []string{"--delete-branch"}, []string{"--delete-branch", "--admin"}},
-		{"on: dedups when passthrough already has --admin", true, []string{"--admin"}, []string{"--admin"}},
-		{"on: dedups whitespace-padded --admin", true, []string{" --admin "}, []string{" --admin "}},
-		{"on: dedups --admin alongside other args", true, []string{"--delete-branch", "--admin"}, []string{"--delete-branch", "--admin"}},
+		{"on: --admin alone", true, nil, []string{"--admin"}},
+		// #180: in FRONT of the passthrough, never after it
+		{"on: goes before the passthrough", true, []string{"--delete-branch"}, []string{"--admin", "--delete-branch"}},
+		{"on: a dangling passthrough flag cannot take it as its value", true, []string{"--subject"}, []string{"--admin", "--subject"}},
+		// no dedupe: gh takes a repeated bool fine, and a token match misreads a VALUE
+		{"on: a forwarded --admin is just repeated", true, []string{"--admin"}, []string{"--admin", "--admin"}},
+		{"on: the body text --admin keeps the real flag (M13)", true, []string{"-b", "--admin"}, []string{"--admin", "-b", "--admin"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -98,8 +100,31 @@ func TestWithAdminDoesNotMutateCaller(t *testing.T) {
 	if len(extra) != 1 || extra[0] != "--delete-branch" {
 		t.Errorf("caller slice mutated: %v", extra)
 	}
-	if want := []string{"--delete-branch", "--admin"}; !reflect.DeepEqual(got, want) {
+	if want := []string{"--admin", "--delete-branch"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("WithAdmin returned %v, want %v", got, want)
+	}
+}
+
+// TestWithSubject pins the WIP strip's --subject IN FRONT of the passthrough
+// (#180): gh keeps the last --subject, so an operator's own forwarded one wins,
+// and a dangling passthrough flag cannot take wt's subject as its value.
+func TestWithSubject(t *testing.T) {
+	cases := []struct {
+		args, want []string
+	}{
+		{nil, []string{"--subject", "Real title"}},
+		{[]string{"--admin"}, []string{"--subject", "Real title", "--admin"}},
+		{[]string{"--subject", "Operator's"}, []string{"--subject", "Real title", "--subject", "Operator's"}},
+		{[]string{"-b"}, []string{"--subject", "Real title", "-b"}},
+	}
+	for _, tc := range cases {
+		in := append([]string(nil), tc.args...)
+		if got := WithSubject("Real title", in); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("WithSubject(%q) = %q, want %q", tc.args, got, tc.want)
+		}
+		if !reflect.DeepEqual(in, tc.args) {
+			t.Errorf("WithSubject mutated its input: %q, was %q", in, tc.args)
+		}
 	}
 }
 
@@ -281,5 +306,168 @@ func TestSentenceAround(t *testing.T) {
 	lo, hi := sentenceAround(text, start, start+2)
 	if got := text[lo:hi]; strings.TrimSpace(got) != "beta #1 gamma" {
 		t.Fatalf("sentenceAround = %q, want %q", got, "beta #1 gamma")
+	}
+}
+
+// TestParseForwardedBody pins the gh-faithful reading of a merge-pr passthrough
+// (#180): which squash body `gh pr merge` (gh v2.68.1 / pflag v1.0.6) will use.
+// The close check judges that body, so a misread here judges the wrong text.
+func TestParseForwardedBody(t *testing.T) {
+	type want struct {
+		src   BodySource
+		value string
+		flag  string
+	}
+	none := want{BodyDefault, "", ""}
+	cases := []struct {
+		name string
+		args []string
+		want want
+	}{
+		{"no passthrough", nil, none},
+		{"unrelated flags only", []string{"--delete-branch", "--admin", "-d"}, none},
+
+		// --body / -b, every spelling
+		{"--body x", []string{"--body", "x"}, want{BodyText, "x", "--body"}},
+		{"--body=x", []string{"--body=x"}, want{BodyText, "x", "--body"}},
+		{"-b x", []string{"-b", "x"}, want{BodyText, "x", "-b"}},
+		{"-bx attached", []string{"-bx"}, want{BodyText, "x", "-b"}},
+		{"-b=x", []string{"-b=x"}, want{BodyText, "x", "-b"}},
+		{"-b= is the text '=' (pflag)", []string{"-b="}, want{BodyText, "=", "-b"}},
+		{"--body= is SET and empty", []string{"--body="}, want{BodyText, "", "--body"}},
+		{"--body '' is SET and empty", []string{"--body", ""}, want{BodyText, "", "--body"}},
+		{"value with spaces and #", []string{"-b", "Squash body.\n\nFixes #9, see #10"}, want{BodyText, "Squash body.\n\nFixes #9, see #10", "-b"}},
+
+		// --body-file / -F, every spelling
+		{"--body-file f", []string{"--body-file", "f.txt"}, want{BodyFile, "f.txt", "--body-file"}},
+		{"--body-file=f", []string{"--body-file=f.txt"}, want{BodyFile, "f.txt", "--body-file"}},
+		{"-F f", []string{"-F", "f.txt"}, want{BodyFile, "f.txt", "-F"}},
+		{"-Ff attached", []string{"-Ff.txt"}, want{BodyFile, "f.txt", "-F"}},
+		{"-F=f", []string{"-F=f.txt"}, want{BodyFile, "f.txt", "-F"}},
+		{"path with spaces and #", []string{"-F", "my dir/body #2.txt"}, want{BodyFile, "my dir/body #2.txt", "-F"}},
+
+		// stdin
+		{"-F -", []string{"-F", "-"}, want{BodyStdin, "-", "-F"}},
+		{"--body-file -", []string{"--body-file", "-"}, want{BodyStdin, "-", "--body-file"}},
+		{"--body-file=-", []string{"--body-file=-"}, want{BodyStdin, "-", "--body-file"}},
+		{"-F- attached", []string{"-F-"}, want{BodyStdin, "-", "-F"}},
+
+		// shorthand clusters: bools first, a value flag ends the cluster
+		{"-dF f", []string{"-dF", "f.txt"}, want{BodyFile, "f.txt", "-F"}},
+		{"-dFf", []string{"-dFf.txt"}, want{BodyFile, "f.txt", "-F"}},
+		{"-sdb text", []string{"-sdb", "text"}, want{BodyText, "text", "-b"}},
+		{"-Fd is the file d", []string{"-Fd"}, want{BodyFile, "d", "-F"}},
+		{"-d=false then -b", []string{"-d=false", "-b", "x"}, want{BodyText, "x", "-b"}},
+
+		// repeats: the last occurrence wins
+		{"--body twice", []string{"--body", "Closes #5", "--body", "plain"}, want{BodyText, "plain", "--body"}},
+		{"-F twice", []string{"-F", "a.txt", "--body-file", "b.txt"}, want{BodyFile, "b.txt", "--body-file"}},
+		{"-F then -F -", []string{"-F", "a.txt", "-F", "-"}, want{BodyStdin, "-", "-F"}},
+		{"-F - then -F file", []string{"-F", "-", "-F", "a.txt"}, want{BodyFile, "a.txt", "-F"}},
+		// gh tests `bodyFile != ""`, so a final empty --body-file is no override
+		{"-F then empty -F", []string{"-F", "a.txt", "-F", ""}, none},
+		{"--body then empty --body-file", []string{"--body", "x", "--body-file="}, want{BodyText, "x", "--body"}},
+
+		// a value flag swallows the next token even if it looks like a flag
+		{"--subject -b: -b is the subject", []string{"--subject", "-b", "x"}, none},
+		{"-t -b: -b is the subject", []string{"-t", "-b", "x"}, none},
+		{"-t-b attached subject", []string{"-t-b"}, none},
+		{"--subject=--body", []string{"--subject=--body", "x"}, none},
+		{"-R -F: -F is the repo", []string{"-R", "-F", "f.txt"}, none},
+		{"-R o/r then -F", []string{"-R", "o/r", "-F", "f.txt"}, want{BodyFile, "f.txt", "-F"}},
+		{"--body --admin: body is the text --admin", []string{"--body", "--admin"}, want{BodyText, "--admin", "--body"}},
+		{"--body --: body is the text --", []string{"--body", "--"}, want{BodyText, "--", "--body"}},
+
+		// `--` ends the flags
+		{"-- before the body flag", []string{"--", "--body", "x"}, none},
+		{"body, then -- then another", []string{"--body", "x", "--", "-F", "y"}, want{BodyText, "x", "--body"}},
+
+		// flags gh rejects or skips do not derail the read
+		{"bool with = then body", []string{"--squash=false", "-b", "x"}, want{BodyText, "x", "-b"}},
+		{"-test.v is skipped", []string{"-test.v", "-b", "x"}, want{BodyText, "x", "-b"}},
+		{"positional tokens skipped", []string{"stray", "-", "-b", "x"}, want{BodyText, "x", "-b"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ParseForwardedBody(tc.args)
+			if err != nil {
+				t.Fatalf("ParseForwardedBody(%q) error: %v", tc.args, err)
+			}
+			if got.Source != tc.want.src || got.Value != tc.want.value || got.Flag != tc.want.flag {
+				t.Fatalf("ParseForwardedBody(%q) = {%v %q %q}, want {%v %q %q}",
+					tc.args, got.Source, got.Value, got.Flag, tc.want.src, tc.want.value, tc.want.flag)
+			}
+		})
+	}
+}
+
+// No single body can be named → an error, never a guess: gh refuses --body with
+// --body-file, and a body flag with no value would make gh take whatever wt
+// appends next (--admin, --subject …) as its value.
+func TestParseForwardedBody_errors(t *testing.T) {
+	for _, args := range [][]string{
+		{"--body"},
+		{"-b"},
+		{"--body-file"},
+		{"-F"},
+		{"-dF"},
+		{"--admin", "-b"},
+		// #180: ANY value flag left dangling at the end, body or not — wt's own
+		// flags go in front now, so gh fails on it ("flag needs an argument")
+		{"-b", "x", "--subject"},
+		{"-t"},
+		{"--repo"},
+		{"-dR"},
+		{"--match-head-commit"},
+		{"-F", "f.txt", "-A"},
+		{"-b", "x", "-F", "f.txt"},
+		{"--body-file=f.txt", "--body", "x"},
+		{"--body=", "--body-file=f.txt"}, // an EMPTY --body still counts as given
+		{"-F", "-", "-b", "x"},
+	} {
+		if got, err := ParseForwardedBody(args); err == nil {
+			t.Errorf("ParseForwardedBody(%q) = %+v, want an error", args, got)
+		}
+	}
+}
+
+func TestRedirectToStdin(t *testing.T) {
+	cases := []struct {
+		args, want []string
+	}{
+		{[]string{"-F", "f.txt"}, []string{"-F", "-"}},
+		{[]string{"--body-file", "f.txt"}, []string{"--body-file", "-"}},
+		{[]string{"--body-file=f.txt"}, []string{"--body-file=-"}},
+		{[]string{"-F=f.txt"}, []string{"-F=-"}},
+		{[]string{"-Ff.txt"}, []string{"-F-"}},
+		{[]string{"-dFf.txt"}, []string{"-dF-"}},
+		{[]string{"-dF", "f.txt"}, []string{"-dF", "-"}},
+		{[]string{"-F", "-"}, []string{"-F", "-"}},
+		// only the occurrence gh uses (the last) is re-pointed
+		{[]string{"--admin", "-F", "a.txt", "-d", "-F", "b.txt"}, []string{"--admin", "-F", "a.txt", "-d", "-F", "-"}},
+		// not a file source → unchanged
+		{[]string{"-b", "text"}, []string{"-b", "text"}},
+		{[]string{"--delete-branch"}, []string{"--delete-branch"}},
+		{nil, nil},
+	}
+	for _, tc := range cases {
+		b, err := ParseForwardedBody(tc.args)
+		if err != nil {
+			t.Fatalf("ParseForwardedBody(%q): %v", tc.args, err)
+		}
+		in := append([]string(nil), tc.args...)
+		got := b.RedirectToStdin(in)
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("RedirectToStdin(%q) = %q, want %q", tc.args, got, tc.want)
+		}
+		if !reflect.DeepEqual(in, tc.args) {
+			t.Errorf("RedirectToStdin mutated its input: %q, was %q", in, tc.args)
+		}
+		// Whatever the source was, gh must now read the body from stdin.
+		if b.Source == BodyFile || b.Source == BodyStdin {
+			if after, err := ParseForwardedBody(got); err != nil || after.Source != BodyStdin {
+				t.Errorf("after RedirectToStdin(%q) gh would read %+v (err %v), want stdin", tc.args, after, err)
+			}
+		}
 	}
 }

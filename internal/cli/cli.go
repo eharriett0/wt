@@ -438,7 +438,7 @@ func cmdMergePR(args []string) int {
 		wtBranches, _ = gitx.WorktreeBranchesUnder(c.WorktreeRoot)
 	}
 	// --admin forwards through to `gh pr merge` for the required-review-branch
-	// maintainer bypass (wt#20). Appended only here — AFTER the deploy-gate +
+	// maintainer bypass (wt#20). Added only here — AFTER the deploy-gate +
 	// coord + guard checks above — so it bypasses GitHub branch protection, not
 	// wt's own safety checks (which is exactly the value the raw `gh` fallback
 	// lost).
@@ -452,26 +452,30 @@ func cmdMergePR(args []string) int {
 	// could not tell you what the merge closes — you had to perform the merge to
 	// find out. The analysis is read-only, so previewing costs nothing, and a
 	// dry-run reports what it WOULD refuse instead of refusing.
-	var plan closePlan
-	if !*noCloseCheck {
-		plan = analyzeClosings(pr)
-		if gate := renderClosePlan(plan); gate && !*closeOK {
-			if *dryRun {
-				ui.Warn("--dry-run: a real merge would REFUSE here. Verify the close set, then pass --close-ok.")
-			} else {
-				ui.Err("refusing to merge — the squash would close issues the PR doesn't declare, or close one whose phrasing says it is not meant (see above). Verify, then pass --close-ok to proceed.")
-				return 1
-			}
-		}
-	}
-	ghArgs = merge.WithAdmin(*admin, ghArgs)
-	if err := merge.Run(pr, *dryRun, *bypass, *mergeForeign, wtBranches, ghArgs); err != nil {
+	// ⚠ A body forwarded after `--` IS the squash body, so the check reads it
+	// instead of the commit bodies, and gh is handed the same bytes (#180) —
+	// prepareMerge has the rules. wt's own gh flags (--admin here, the WIP
+	// --subject in merge.Run) go IN FRONT of the passthrough, so a dangling
+	// passthrough flag fails in gh instead of taking one of them as its value.
+	prep, ok := prepareMerge(pr, ghArgs, closeOpts{dryRun: *dryRun, closeOK: *closeOK, skip: *noCloseCheck},
+		os.Stdin, stdinIsTTY(), liveCloseReads)
+	if !ok {
 		return 1
+	}
+	if err := merge.Run(pr, *dryRun, *bypass, *mergeForeign, wtBranches, merge.WithAdmin(*admin, prep.args), prep.stdin); err != nil {
+		return 1
+	}
+	// ⚠ gh exits 0 WITHOUT merging for --help, --auto, --disable-auto, a merge
+	// queue or -R, so only a PR that now reads MERGED is verified and auto-cleaned
+	// (#185). Still exit 0: gh did what it was asked (printed help, armed
+	// auto-merge, queued the PR), and keeping the worktree loses nothing.
+	if !*dryRun && !mergeConfirmed(pr) {
+		return 0
 	}
 	// Post-merge verification (#77): re-check the referenced issues + report any
 	// that changed state — catches a silent close (trap 2) in the same command.
 	if !*dryRun && !*noCloseCheck {
-		verifyClosings(plan)
+		verifyClosings(prep.plan)
 	}
 	// Auto-clean: the PR just shipped, so its worktree is done. Only on a real
 	// merge (not dry-run) and unless -keep. Best-effort — a cleanup miss must
@@ -508,6 +512,13 @@ func autoCleanMergedWorktree(pr string) {
 		br, _ := gitx.CurrentBranchIn(wt)
 		if br != branch {
 			continue
+		}
+		// #187: a squash merge leaves the branch unmerged in git's eyes, so
+		// Remove deletes it with -D. Only when every local commit shipped in
+		// the PR; otherwise keep the lane (and exit 0: the merge happened).
+		if msg := unshippedLane(pr, branch); msg != "" {
+			ui.Warn("%s", msg)
+			return
 		}
 		if err := worktree.Remove(c, wt, branch, false); err != nil {
 			ui.Warn("worktree for %s not auto-removed: %v", branch, err)
@@ -687,9 +698,17 @@ func deployGate(pr string, confirmed bool) int {
 
 // stdinIsTTY reports whether stdin is an interactive terminal (so we only
 // prompt a human; an agent/pipe must pass --confirm-deploy explicitly).
+// ⚠ /dev/null is a character device too, and it is how an agent or CI runs
+// with no stdin (Go also opens it in place of a closed fd 0), so it is not a
+// terminal: read as one, a `-F -` with nothing piped in printed "end it with
+// Ctrl-D" and skipped the empty-body warning (#180).
 func stdinIsTTY() bool {
 	fi, err := os.Stdin.Stat()
-	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+		return false
+	}
+	null, err := os.Stat(os.DevNull)
+	return err != nil || !os.SameFile(fi, null)
 }
 
 func cmdStatus(args []string) int {
@@ -744,7 +763,7 @@ func renderBlockingGate(graded []StatusOverlap, ws []collide.Window, live map[st
 	}
 	ui.Collision("%d file(s) with a HIGH-risk collision:", len(high))
 	for _, o := range high {
-		detail := ui.Yellow("indeterminate (untracked/binary — can't prove disjoint)")
+		detail := ui.Yellow("indeterminate (no line-level diff, e.g. binary — can't prove disjoint)")
 		if s := spansString(o.OverlapSpans); s != "" {
 			detail = ui.Yellow("overlap " + s)
 		} else if s := sectionsString(o.SharedSections); s != "" {
@@ -760,6 +779,7 @@ func statusReport(c *config.Config, asJSON, blocking bool) int {
 	if !asJSON {
 		peerHoldBanner(c)
 		blockReservationBanner(c)
+		sharedCheckoutBanner(c) // #163: another session posting from THIS checkout
 	}
 	ws, err := collide.Scan(c)
 	if err != nil {
@@ -823,7 +843,7 @@ func statusReport(c *config.Config, asJSON, blocking bool) int {
 	if len(high) > 0 {
 		ui.Collision("%d file(s) with a HIGH-risk collision (overlapping hunks):", len(high))
 		for _, o := range high {
-			detail := ui.Yellow("indeterminate (untracked/binary — can't prove disjoint)")
+			detail := ui.Yellow("indeterminate (no line-level diff, e.g. binary — can't prove disjoint)")
 			if s := spansString(o.OverlapSpans); s != "" {
 				detail = ui.Yellow("overlap " + s)
 			} else if s := sectionsString(o.SharedSections); s != "" {
@@ -1227,7 +1247,7 @@ func runHook(args []string) int {
 	// repo from the stdin payload's cwd and always exit 0 (fail-open context), so
 	// they run without a pre-loaded config.
 	if args[0] == "codex-context" || args[0] == "claude-context" {
-		return hookAgentContext(os.Stdin)
+		return hookAgentContext(os.Stdin, args[0] == "codex-context")
 	}
 	// codex-edit is a Codex CLI PreToolUse hook on apply_patch (#117): it derives
 	// the repo from its stdin payload's cwd and always exits 0 (fail-open), so it

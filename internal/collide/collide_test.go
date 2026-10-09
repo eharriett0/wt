@@ -28,10 +28,25 @@ func TestOverlaps(t *testing.T) {
 	}
 	got := Overlaps(ws)
 	want := []Overlap{
-		{File: "b.go", Windows: []string{"#1", "#2"}},
-		{File: "c.go", Windows: []string{"#2", "feat-3"}},
+		{File: "b.go", Windows: []string{"#1", "#2"}, Worktrees: []string{"/w/1", "/w/2"}},
+		{File: "c.go", Windows: []string{"#2", "feat-3"}, Worktrees: []string{"/w/2", "/w/3"}},
 	}
 	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Overlaps =\n%#v\nwant\n%#v", got, want)
+	}
+}
+
+// Two worktrees that claimed one issue share the label "#77" (#182): the
+// overlap keeps BOTH, told apart by worktree, instead of one label twice that
+// nothing downstream can resolve to two windows.
+func TestOverlaps_SharedLabelKeepsBothWorktrees(t *testing.T) {
+	ws := []Window{
+		{Issue: "77", Branch: "fix-77-b", Worktree: "/w/b", Touched: []string{"x.go"}},
+		{Issue: "77", Branch: "fix-77-a", Worktree: "/w/a", Touched: []string{"x.go"}},
+		{Branch: "c", Worktree: "/w/c", Touched: []string{"x.go"}},
+	}
+	want := []Overlap{{File: "x.go", Windows: []string{"#77", "#77", "c"}, Worktrees: []string{"/w/a", "/w/b", "/w/c"}}}
+	if got := Overlaps(ws); !reflect.DeepEqual(got, want) {
 		t.Errorf("Overlaps =\n%#v\nwant\n%#v", got, want)
 	}
 }

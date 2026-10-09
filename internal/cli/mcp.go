@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/eharriett0/wt/internal/collide"
 	"github.com/eharriett0/wt/internal/config"
@@ -138,7 +139,9 @@ func mcpToolDescriptors() []map[string]any {
 		{
 			"name": "wt_status",
 			"description": "Every active window in this repo (worktree, branch, claimed issue, files touched) " +
-				"plus graded cross-window overlaps (HIGH = overlapping hunks). Read-only.",
+				"plus graded cross-window overlaps. An overlap lists only live windows (merged, closed-PR and dormant ones are left out) " +
+				"and is HIGH when some pair of them would each block in wt_check (overlapping hunks, or the same section of a structured doc); " +
+				"a window whose copy is already on base, already landed, or untracked contests nothing. Read-only.",
 			"inputSchema": obj(map[string]any{
 				"blocking": map[string]any{"type": "boolean", "description": "return only HIGH-risk overlaps"},
 			}),
@@ -168,13 +171,15 @@ func mcpToolDescriptors() []map[string]any {
 		{
 			"name": "wt_inbox",
 			"description": "Un-acked coordination announcements from OTHER windows (a window signalling a " +
-				"disruptive change — an incident, a roll, a deploy). Each carries an id to `wt ack`. Read-only, local.",
+				"disruptive change — an incident, a roll, a deploy), including another session working in THIS " +
+				"same checkout (same_checkout: true). Each carries an id to `wt ack`. Read-only, local.",
 			"inputSchema": obj(map[string]any{}),
 		},
 		{
 			"name": "wt_holds",
-			"description": "Active HOLDS from other windows — an operation (e.g. merge-main, rebase) another " +
-				"window asked you to avoid until it posts all-clear. Check before advising a merge/rebase. Read-only, local.",
+			"description": "Active HOLDS from other windows (or another session in this same checkout) — an " +
+				"operation (e.g. merge-main, rebase) another window asked you to avoid until it posts all-clear. " +
+				"Check before advising a merge/rebase. Read-only, local.",
 			"inputSchema": obj(map[string]any{}),
 		},
 	}
@@ -328,19 +333,25 @@ type mcpTodoWindow struct {
 type mcpCoordRecord struct {
 	ID      string   `json:"id"`
 	Window  string   `json:"window"`
+	Session string   `json:"session,omitempty"` // #163: the posting session
 	Message string   `json:"message,omitempty"`
 	Hold    []string `json:"hold,omitempty"`
 	Issue   int      `json:"issue,omitempty"`
 	TS      string   `json:"ts,omitempty"`
+	// SameCheckout marks a record from ANOTHER session in this very checkout
+	// (#163): its window equals "self", so a client can't tell it apart otherwise.
+	SameCheckout bool `json:"same_checkout,omitempty"`
 }
 
-func toMCPCoord(r coord.Record) mcpCoordRecord {
-	return mcpCoordRecord{ID: r.ID, Window: r.Window, Message: r.Message, Hold: r.Hold, Issue: r.Issue, TS: r.TS}
+func toMCPCoord(r coord.Record, self coord.Self) mcpCoordRecord {
+	return mcpCoordRecord{ID: r.ID, Window: r.Window, Session: r.Session, Message: r.Message, Hold: r.Hold,
+		Issue: r.Issue, TS: r.TS, SameCheckout: self.SharesCheckout(r)}
 }
 
-// mcpInbox returns un-acked announcements from other windows (coord.Inbox).
-// Local-only — it never folds in the GitHub-issue mirror, so the tool does no
-// network I/O. A missing coordination log is an empty inbox, not an error.
+// mcpInbox returns un-acked announcements from other windows/sessions
+// (coord.Inbox). Local-only — it never folds in the GitHub-issue mirror, so the
+// tool does no network I/O. A missing coordination log is an empty inbox, not an
+// error. "self" stays the window id (its pre-#163 shape); "session" is added.
 func mcpInbox(c *config.Config) (string, bool) {
 	logPath, self := coordCtx(c)
 	recs, err := coord.Load(logPath)
@@ -350,13 +361,20 @@ func mcpInbox(c *config.Config) (string, bool) {
 	box := coord.Inbox(recs, self)
 	out := make([]mcpCoordRecord, 0, len(box))
 	for _, r := range box {
-		out = append(out, toMCPCoord(r))
+		out = append(out, toMCPCoord(r, self))
 	}
-	return jsonText(map[string]any{"self": self, "inbox": out}), false
+	res := map[string]any{"self": self.Window, "session": self.Session, "inbox": out}
+	if len(box) == 0 {
+		if msg, hedged := inboxClearMessage(recs, self, time.Now()); hedged {
+			res["note"] = msg // #163: never a silent "clear" the session can't vouch for
+		}
+	}
+	return jsonText(res), false
 }
 
-// mcpHolds returns the active holds from other windows (coord.PendingHolds) — the
-// subset of the inbox carrying a hold on some operation. Local-only.
+// mcpHolds returns the active holds from other windows/sessions
+// (coord.PendingHolds) — the subset of the inbox carrying a hold on some
+// operation. Local-only.
 func mcpHolds(c *config.Config) (string, bool) {
 	logPath, self := coordCtx(c)
 	recs, err := coord.Load(logPath)
@@ -366,9 +384,9 @@ func mcpHolds(c *config.Config) (string, bool) {
 	holds := coord.PendingHolds(recs, self)
 	out := make([]mcpCoordRecord, 0, len(holds))
 	for _, r := range holds {
-		out = append(out, toMCPCoord(r))
+		out = append(out, toMCPCoord(r, self))
 	}
-	return jsonText(map[string]any{"self": self, "holds": out}), false
+	return jsonText(map[string]any{"self": self.Window, "session": self.Session, "holds": out}), false
 }
 
 func mcpTodos(c *config.Config) (string, bool) {

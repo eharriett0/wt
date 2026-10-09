@@ -166,7 +166,11 @@ func cmdBlockID(args []string) int {
 	// per-file ledger. See canonicalFilePath.
 	absFile := canonicalFilePath(file)
 	return withConfig(func(c *config.Config) int {
-		path, window := coordCtx(c)
+		path, self := coordCtx(c)
+		// Block reservations stay keyed by WINDOW (the checkout): splitting them by
+		// session is out of scope for #163. Records still carry the session
+		// (newRecord) as provenance.
+		window := self.Window
 		// block-id coordinates on the shared FILE, not the repo: use a per-file
 		// ledger so windows in ANY repo editing this append-log share one lock +
 		// reservation namespace (#152). Fall back to the per-repo log only if HOME
@@ -198,7 +202,7 @@ func cmdBlockID(args []string) int {
 					*written, window, file)
 				return 1
 			}
-			m := newRecord(c, window, coord.KindBlockWritten)
+			m := newRecord(c, self, coord.KindBlockWritten)
 			m.File, m.Block, m.AckOf = absFile, *written, res.ID
 			if err := coord.Append(ledger, m); err != nil {
 				ui.Err("could not record block-written: %v", err)
@@ -221,7 +225,7 @@ func cmdBlockID(args []string) int {
 					*abandon, window)
 				return 1
 			}
-			m := newRecord(c, window, coord.KindBlockAbandoned)
+			m := newRecord(c, self, coord.KindBlockAbandoned)
 			m.File, m.Block, m.AckOf = absFile, *abandon, res.ID
 			if err := coord.Append(ledger, m); err != nil {
 				ui.Err("could not record block-abandoned: %v", err)
@@ -231,7 +235,7 @@ func cmdBlockID(args []string) int {
 			return 0
 		}
 
-		r := newRecord(c, window, coord.KindBlockReserve)
+		r := newRecord(c, self, coord.KindBlockReserve)
 		out, rerr := coord.ReserveBlock(ledger, r, absFile, func() (int, error) {
 			return scanFileMaxBlock(absFile, re)
 		})
@@ -264,7 +268,8 @@ func blockReservationBanner(c *config.Config) {
 	if c == nil {
 		return
 	}
-	_, window := coordCtx(c)
+	_, self := coordCtx(c)
+	window := self.Window // block reservations are window-keyed (#163 leaves them so)
 	home, herr := os.UserHomeDir()
 	if herr != nil || home == "" {
 		return
