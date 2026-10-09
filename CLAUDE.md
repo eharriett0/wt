@@ -249,6 +249,23 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   worktree, and only it, is removed. A re-run is checked too (`DecideExisting`:
   behind or ahead is handed back with a note, diverged is refused, and wt never
   moves an existing worktree's branch).
+- **`wt new` / `wt claim` re-attach a same-named local branch only after #167's
+  check (#198).** #62 re-attaches an existing local branch so a worktree whose
+  directory went away keeps its work; unchecked, that resumed a branch left by an
+  earlier attempt that reused the name, or one behind or diverged from what was
+  pushed. `PlanNew` fetches `origin/<branch>` (failed: as last fetched; none: attach
+  unverified, the #62 never-pushed case) and decides through adopt's own
+  `DecideAdopt`/`planAttach`: equal or only-ahead attached (ahead names the unpushed
+  commits), only-behind fast-forwarded with #167's guards (in use, case twin,
+  `branch -f`), diverged or uncomparable refused. An existing worktree is checked
+  like adopt's re-run and never moved (`DecideExistingFor`: for claim, only-behind
+  is refused too, its placeholder could not be pushed). ⚠ Claim calls `PlanNew`
+  BEFORE assigning the issue and `Create` after, so a refusal leaves no partial
+  claim; `Create` re-checks the planned tip (gh and a prompt run in between).
+  ⚠ **The #159 rollback removes only what the claim made (`rollbackFor`)**: it
+  used to `git branch -D` a branch the claim had merely re-attached, never-pushed
+  work and all. Now that branch, or a worktree claim was handed back, gets the
+  placeholder undone (`gitx.UndoCommit`) and stays.
 - **`merge-pr` auto-cleans only a PR that reads MERGED afterwards (#185).** `gh
   pr merge` exits 0 WITHOUT merging for `--help`/`-h`, `--auto` (armed),
   `--disable-auto`, a merge queue (queued) and `-R` (another repo's PR). Taking

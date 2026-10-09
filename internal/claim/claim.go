@@ -97,6 +97,18 @@ func Claim(c *config.Config, issue string, force, yes, openPR bool, epic string)
 		}
 	}
 
+	// #198: decide what to do with a local branch (or worktree) of this name
+	// BEFORE anything is assigned, created or moved. An existing local branch is
+	// re-attached (#62), and before #198 that happened unchecked: a branch left by
+	// an earlier attempt, or one behind or diverged from origin/<branch>, got the
+	// placeholder commit, the push was rejected, and the #159 rollback deleted the
+	// branch. PlanNew checks it as `wt adopt` does (#167); a refusal here leaves no
+	// partial claim behind, and Create acts on the plan after the assignment.
+	plan, err := worktree.PlanNew(c, branch, worktree.NewFor{ClaimIssue: issue})
+	if err != nil {
+		return err
+	}
+
 	// #157: nothing above catches claiming the WRONG (unassigned) issue number —
 	// the assign + dup-PR guards only fire on issues someone/something already
 	// touched. Surface the title (a wrong number is obvious from it) and, on an
@@ -111,22 +123,26 @@ func Claim(c *config.Config, issue string, force, yes, openPR bool, epic string)
 	}
 	ui.OK("assigned #%s to @me", issue)
 
-	wtDir, err := worktree.New(c, branch)
+	made, err := plan.Create()
 	if err != nil {
 		return err
 	}
+	wtDir := made.Dir
 
 	title60 := truncate(title, 60)
 	msg := fmt.Sprintf("WIP: claim #%s — %s\n\nPlaceholder commit for multi-window coordination (wt claim).\nReplaced by real work in subsequent commits.\n\nRefs #%s", issue, title60, issue)
+	before := gitx.HeadCommit(wtDir)
 	if err := gitx.CommitEmpty(wtDir, msg); err != nil {
 		return fmt.Errorf("placeholder commit: %w", err)
 	}
+	placeholder := gitx.HeadCommit(wtDir)
 	if err := gitx.PushSetUpstream(wtDir, branch); err != nil {
 		// #159: nothing durable is recorded yet (active-work is appended only AFTER
 		// the push), so a failed push would strand a partial claim — issue assigned +
 		// worktree/branch created — which then blocks a retry with "already assigned".
-		// Roll back to a clean slate so re-running `wt claim` works.
-		rollbackFailedClaim(c, issue, wtDir, branch)
+		// Roll back to a clean slate so re-running `wt claim` works, undoing only
+		// what this claim made (#198).
+		rollbackFailedClaim(c, issue, branch, made, before, placeholder)
 		return fmt.Errorf("push branch: %w", err)
 	}
 
@@ -295,24 +311,78 @@ func Release(c *config.Config, issue string, clean bool) error {
 	return nil
 }
 
-// rollbackFailedClaim undoes a claim that failed before anything durable was
-// recorded (#159): remove the just-created worktree + local branch and unassign
-// the issue, so a retry starts clean instead of tripping the already-assigned
-// guard. NON-force remove (#159 review): a freshly-created worktree holds only our
-// committed placeholder so it's clean and removes cleanly, but if worktree.New
-// short-circuited to a PRE-EXISTING worktree with uncommitted work, the clean guard
-// refuses rather than discarding it. Best-effort: each step reports but never masks
-// the push error.
-func rollbackFailedClaim(c *config.Config, issue, wtDir, branch string) {
+// rollbackFailedClaim undoes a claim whose push failed before anything durable
+// was recorded (#159): the issue is unassigned, so a retry starts clean instead
+// of tripping the already-assigned guard, and of the worktree and branch only
+// what this claim made goes (rollbackFor). A branch it cut from the base is
+// deleted with its new worktree, as before. A local branch it re-attached (#62),
+// or a worktree it was handed back, held work before the claim: the #159
+// rollback deleted them too, unpushed commits and all (#198). Now the
+// placeholder commit is taken back off (before is its parent) and they stay.
+// NON-force remove (#159 review): a worktree with uncommitted work is refused,
+// never discarded. Best-effort: each step reports but never masks the push error.
+func rollbackFailedClaim(c *config.Config, issue, branch string, made worktree.Created, before, placeholder string) {
 	ui.Info("rolling back partial claim of #%s (push failed) …", issue)
-	if err := worktree.Remove(c, wtDir, branch, false); err != nil {
-		ui.Warn("rollback: couldn't remove worktree %s: %v", wtDir, err)
+	s := rollbackFor(made.NewWorktree, made.NewBranch)
+	if s.undoPlaceholder {
+		if err := gitx.UndoCommit(made.Dir, placeholder, before); err != nil {
+			ui.Warn("rollback: couldn't undo the placeholder commit in %s: %v", made.Dir, err)
+		} else {
+			ui.Info("rollback: took the placeholder commit back off %s (at %s again)", branch, abbrev(before))
+		}
+	}
+	if s.removeWorktree {
+		del := ""
+		if s.deleteBranch {
+			del = branch
+		}
+		if err := worktree.Remove(c, made.Dir, del, false); err != nil {
+			ui.Warn("rollback: couldn't remove worktree %s: %v", made.Dir, err)
+		}
+	}
+	switch {
+	case !s.removeWorktree:
+		ui.Info("rollback: kept worktree %s and its branch %s: they were there before this claim", made.Dir, branch)
+	case !s.deleteBranch:
+		ui.Info("rollback: kept local branch %s: it existed before this claim", branch)
 	}
 	if user, err := ghx.CurrentUser(); err == nil && user != "" {
 		if err := ghx.IssueRemoveAssignee(issue, user); err == nil {
 			ui.Info("rollback: unassigned #%s", issue)
 		}
 	}
+}
+
+// rollbackScope is what undoing a claim whose push failed may touch (#159,
+// #198).
+type rollbackScope struct {
+	undoPlaceholder bool // take the claim's placeholder commit back off the branch
+	removeWorktree  bool // the claim added the worktree
+	deleteBranch    bool // the claim cut the branch from the base
+}
+
+// rollbackFor decides the rollback from what worktree.Create made: only that
+// is removed (#198). A branch the claim re-attached, or a worktree it was handed
+// back, keeps everything but the placeholder commit. A new branch always comes
+// with a new worktree, so newBranch without newWorktree cannot happen, and it
+// deletes nothing. Pure.
+func rollbackFor(newWorktree, newBranch bool) rollbackScope {
+	switch {
+	case newWorktree && newBranch:
+		return rollbackScope{removeWorktree: true, deleteBranch: true}
+	case newWorktree:
+		return rollbackScope{undoPlaceholder: true, removeWorktree: true}
+	default:
+		return rollbackScope{undoPlaceholder: true}
+	}
+}
+
+// abbrev shortens a commit id for a message.
+func abbrev(sha string) string {
+	if len(sha) > 8 {
+		return sha[:8]
+	}
+	return sha
 }
 
 // cleanAbandonedWorktree removes the released claim's worktree iff it's under

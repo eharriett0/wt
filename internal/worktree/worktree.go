@@ -148,20 +148,93 @@ func isValidWorktree(wtDir string) bool {
 
 // New creates a worktree for branch under c.WorktreeRoot, based on the repo's
 // base branch. Idempotent: if the worktree already exists, prints the cd hint
-// and returns its path. Returns the worktree path.
+// and returns its path. Returns the worktree path. It is PlanNew, then Create.
 func New(c *config.Config, branch string) (string, error) {
+	p, err := PlanNew(c, branch, NewFor{})
+	if err != nil {
+		return "", err
+	}
+	made, err := p.Create()
+	if err != nil {
+		return "", err
+	}
+	return made.Dir, nil
+}
+
+// NewFor says which command PlanNew runs for (#198), for its notes and the
+// re-run line a refusal prints. The zero value is `wt new <branch>`.
+type NewFor struct {
+	// ClaimIssue is the issue `wt claim` is claiming. A claim commits a
+	// placeholder on the branch and pushes it right after Create.
+	ClaimIssue string
+}
+
+func (f NewFor) attachFor(branch, dir string) attachFor {
+	if f.ClaimIssue != "" {
+		return attachFor{kind: forClaim, rerun: "wt claim " + f.ClaimIssue, dir: dir}
+	}
+	return attachFor{kind: forNew, rerun: "wt new " + branch, dir: dir}
+}
+
+// NewPlan is what `wt new <branch>` (and `wt claim`, through it) will do,
+// decided before anything is created, assigned or moved (#198). PlanNew makes
+// it and Create carries it out, so claim can refuse before it assigns the issue.
+type NewPlan struct {
+	c        *config.Config
+	branch   string
+	dir      string
+	who      attachFor
+	existing bool       // wt's live worktree for the branch is already there: handed back, never moved
+	attach   attachPlan // otherwise: what happens to a local branch of that name
+}
+
+// Created is what NewPlan.Create made (#198). A claim whose push fails undoes
+// only that: a branch it re-attached, or a worktree it was handed back, held
+// work before the claim.
+type Created struct {
+	Dir         string
+	NewWorktree bool // Create added the worktree; false when it handed back an existing one
+	NewBranch   bool // Create made the branch from the base; false when it attached an existing one (#62)
+}
+
+// PlanNew decides what `wt new <branch>` does, before anything is created,
+// assigned or moved (#198).
+//
+// A live worktree at wt's path for the branch is handed back (#62), after a
+// check against origin/<branch> as just fetched that never moves it
+// (checkExistingWorktree: a note when only behind or only ahead, a refusal when
+// diverged or not comparable, and for a claim a refusal when only behind too).
+//
+// Otherwise a local branch of that name is re-attached, as #62 wants for a
+// worktree whose directory went away, but first checked against origin/<branch>
+// exactly as `wt adopt` checks it (#167): equal is attached, only ahead
+// (unpushed commits) is attached with a note naming them, only behind is
+// fast-forwarded when no worktree has it, and diverged or not comparable is
+// refused with both tips, the local-only commits and the ways on. With no
+// origin/<branch> to compare against (never pushed, or never fetched and
+// offline) it is attached as it is and labelled unverified. Before #198 every
+// one of those was attached silently: a branch left by an earlier attempt that
+// reused the name, or one behind or diverged from what was pushed, was resumed,
+// and a claim then committed on it, failed to push, and its rollback deleted
+// the branch. With no local branch, a new one is cut from the base, as before.
+func PlanNew(c *config.Config, branch string, f NewFor) (*NewPlan, error) {
 	slug := strings.ReplaceAll(branch, "/", "-")
-	wtDir := filepath.Join(c.WorktreeRoot, slug)
+	dir := filepath.Join(c.WorktreeRoot, slug)
+	p := &NewPlan{c: c, branch: branch, dir: dir, who: f.attachFor(branch, dir)}
 
 	// Short-circuit only when it's a LIVE worktree (#62) — not a stale/empty dir
 	// left by another window's clean or an out-of-band `git worktree remove`.
-	if isValidWorktree(wtDir) {
-		ui.OK("worktree already exists at %s", wtDir)
-		ui.Step("cd %s", wtDir)
-		return wtDir, nil
+	if isValidWorktree(dir) {
+		if err := checkExistingWorktree(dir, branch, fetchBranchTarget(branch, c.WorktreeRoot), p.who); err != nil {
+			return nil, err
+		}
+		p.existing = true
+		return p, nil
 	}
-	if err := reconcileWorktreeDir(wtDir); err != nil {
-		return "", err
+	// Before the in-use check: a worktree whose directory is already gone must
+	// not count as having the branch checked out (#167).
+	if err := reconcileWorktreeDir(dir); err != nil {
+		return nil, err
 	}
 
 	ui.Step("fetching origin/%s", c.Base)
@@ -169,20 +242,81 @@ func New(c *config.Config, branch string) (string, error) {
 		ui.Warn("git fetch failed (continuing with local refs): %v", err)
 	}
 
-	if err := os.MkdirAll(c.WorktreeRoot, 0o755); err != nil {
-		return "", fmt.Errorf("mkdir worktree root: %w", err)
+	fold := gitx.IgnoreCase()
+	if fold {
+		if err := refuseCaseTwin(branch, p.who); err != nil {
+			return nil, err
+		}
+	}
+	local := gitx.BranchTip(branch)
+	var target adoptTarget
+	if local != "" {
+		target = fetchBranchTarget(branch, c.WorktreeRoot)
+	}
+	a, err := planAttach(branch, local, target, fold, p.who)
+	if err != nil {
+		return nil, err
+	}
+	p.attach = a
+	return p, nil
+}
+
+// fetchBranchTarget fetches origin/<branch> and returns what a local branch, or
+// wt's existing worktree, is checked against (#198): the target `wt adopt
+// <branch>` uses (#167). Offline-tolerant: when the fetch fails, origin/<branch>
+// as last fetched is the target, labelled so, and with no origin/<branch> in the
+// clone there is nothing to compare against. The fetch failing for a branch
+// this clone never fetched is what a never-pushed branch (#62) looks like, so
+// it is not warned about.
+func fetchBranchTarget(branch, root string) adoptTarget {
+	ui.Step("fetching origin/%s", branch)
+	err := gitx.Fetch("origin", branch)
+	if err != nil && gitx.RemoteTrackingTip(branch) != "" {
+		ui.Warn("git fetch origin %s failed (comparing with origin/%s as last fetched): %v", branch, branch, err)
+	}
+	t, _ := resolveAdoptTarget(branch, AdoptWant{}, err == nil, root) // by branch name: never refuses
+	return t
+}
+
+// Create carries out the plan (#198): hands back the existing worktree, or
+// fast-forwards a local branch that is only behind, attaches it (or cuts a new
+// branch from the base), and checks where the new worktree landed. A local
+// branch that changed after PlanNew looked is refused (apply).
+func (p *NewPlan) Create() (Created, error) {
+	if p.existing {
+		ui.OK("worktree already exists at %s", p.dir)
+		ui.Step("cd %s", p.dir)
+		return Created{Dir: p.dir}, nil
+	}
+	intended, err := p.attach.apply(p.who)
+	if err != nil {
+		return Created{}, err
+	}
+	if err := os.MkdirAll(p.c.WorktreeRoot, 0o755); err != nil {
+		return Created{}, fmt.Errorf("mkdir worktree root: %w", err)
+	}
+	made := Created{Dir: p.dir, NewWorktree: true}
+	if p.attach.action == AdoptCreate {
+		base := resolveBaseRef(p.c.Base)
+		ui.Step("creating worktree at %s on a new branch %s (from %s)", p.dir, p.branch, base)
+		if err := gitx.WorktreeAddNewBranch(p.dir, p.branch, base); err != nil {
+			return Created{}, fmt.Errorf("git worktree add: %w", err)
+		}
+		made.NewBranch = true
+	} else {
+		ui.Step("attaching worktree at %s to existing local branch %s", p.dir, p.branch)
+		if err := gitx.WorktreeAdopt(p.dir, p.branch); err != nil {
+			return Created{}, fmt.Errorf("could not attach a worktree to local branch %q (it may be checked out in another worktree): %w", p.branch, err)
+		}
+		if err := verifyAdopted(p.dir, p.branch, intended, p.who); err != nil {
+			return Created{}, err
+		}
 	}
 
-	base := resolveBaseRef(c.Base)
-	ui.Step("creating worktree at %s on %s (from %s)", wtDir, branch, base)
-	if err := gitx.WorktreeAdd(wtDir, branch, base); err != nil {
-		return "", fmt.Errorf("git worktree add: %w", err)
-	}
-
-	linkSharedFiles(c, wtDir)
+	linkSharedFiles(p.c, p.dir)
 	ui.OK("worktree ready")
-	ui.Step("cd %s", wtDir)
-	return wtDir, nil
+	ui.Step("cd %s", p.dir)
+	return made, nil
 }
 
 // Adopt attaches a worktree to an EXISTING branch — a colleague's or a previous
@@ -223,7 +357,7 @@ func Adopt(c *config.Config, branch string, want AdoptWant) (string, error) {
 	}
 
 	if isValidWorktree(wtDir) {
-		if err := checkExistingWorktree(wtDir, branch, want, target); err != nil {
+		if err := checkExistingWorktree(wtDir, branch, target, adoptFor(branch, want)); err != nil {
 			return "", err
 		}
 		ui.OK("worktree already exists at %s", wtDir)
@@ -251,7 +385,7 @@ func Adopt(c *config.Config, branch string, want AdoptWant) (string, error) {
 		// error already carries git's own stderr with the real reason. (#134)
 		return "", fmt.Errorf("could not attach a worktree to branch %q — it may be checked out in another worktree, or absent locally and on origin: %w", branch, err)
 	}
-	if err := verifyAdopted(wtDir, branch, intended); err != nil {
+	if err := verifyAdopted(wtDir, branch, intended, adoptFor(branch, want)); err != nil {
 		return "", err
 	}
 

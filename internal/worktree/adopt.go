@@ -120,11 +120,12 @@ func GatePRHead(remote, head string, headInRemote, known, fetched bool) HeadGate
 }
 
 // AdoptAction is what `wt adopt` does with the local branch it is about to
-// attach a new worktree to (#167).
+// attach a new worktree to (#167). `wt new` and `wt claim` decide the same way
+// (#198), against origin/<branch>.
 type AdoptAction int
 
 const (
-	AdoptCreate      AdoptAction = iota // no local branch: worktree-add creates it from origin/<branch>, as before #167
+	AdoptCreate      AdoptAction = iota // no local branch: worktree-add creates it (adopt: from origin/<branch>, as before #167; new and claim: from the base)
 	AdoptAsIs                           // the local branch is the target: attach it unchanged
 	AdoptAhead                          // the local branch is the target plus commits not on it (unpushed): attach it unchanged, and say so
 	AdoptUnverified                     // nothing to compare against: attach the local branch as it is, and say so
@@ -136,6 +137,13 @@ const (
 // DecideAdopt picks what `wt adopt` does with an existing local branch of the
 // target's name before it worktree-adds it (#167). inUse says a worktree has the
 // branch checked out, or that this could not be ruled out. Pure.
+//
+// `wt new` and `wt claim` re-attach a local branch of the name they want (#62),
+// and decide with this too, against origin/<branch> (#198): they resumed a
+// branch left by an earlier attempt that reused the name, or one behind or
+// diverged from what was pushed, without looking. With no origin/<branch> the
+// branch is attached unverified, which is the #62 case (a branch never pushed,
+// with work on it).
 //
 // The #167 bug was this check missing. worktree-add takes refs/heads/<branch>
 // whenever it exists, so a stale branch left by an earlier PR that reused the
@@ -174,14 +182,16 @@ func DecideAdopt(localExists bool, rel TipRelation, inUse bool) AdoptAction {
 }
 
 // ExistingAction is what `wt adopt` does when wt's worktree for the branch
-// already exists, which is the re-run case (#167).
+// already exists, which is the re-run case (#167). `wt new` and `wt claim` check
+// it the same way (#198).
 type ExistingAction int
 
 const (
-	ExistingReuse       ExistingAction = iota // it matches, or there is nothing to compare: hand it back, as before #167
-	ExistingReuseBehind                       // only behind the target: hand it back, and say how to update it there
-	ExistingReuseAhead                        // only ahead (unpushed commits): hand it back, and say so
-	ExistingRefuse                            // diverged, or could not be compared: it may be left over from an earlier PR
+	ExistingReuse        ExistingAction = iota // it matches, or there is nothing to compare: hand it back, as before #167
+	ExistingReuseBehind                        // only behind the target: hand it back, and say how to update it there
+	ExistingReuseAhead                         // only ahead (unpushed commits): hand it back, and say so
+	ExistingRefuse                             // diverged, or could not be compared: it may be left over from an earlier PR
+	ExistingRefuseBehind                       // only behind, for a command that commits on it and pushes (claim): refused, not moved
 )
 
 // DecideExisting picks what `wt adopt` does with wt's existing worktree for the
@@ -202,6 +212,19 @@ func DecideExisting(rel TipRelation) ExistingAction {
 	default: // TipNoTarget, TipEqual
 		return ExistingReuse
 	}
+}
+
+// DecideExistingFor is DecideExisting for a command that may push the branch
+// right after (#198). `wt claim` commits its placeholder on the existing
+// worktree's HEAD and pushes it: on a HEAD only behind origin/<branch> that
+// commit diverges from origin, which rejects the push, and the claim then rolls
+// back. wt does not move the worktree's branch, so only-behind is refused there,
+// with the fast-forward to run in that worktree. Pure.
+func DecideExistingFor(rel TipRelation, pushes bool) ExistingAction {
+	if pushes && rel == TipBehind {
+		return ExistingRefuseBehind
+	}
+	return DecideExisting(rel)
 }
 
 // CheckedOutIn returns the path of the worktree that has branch checked out, or
@@ -256,6 +279,67 @@ func AdoptedOnTarget(gotRef, gotHead, branch, intended string) bool {
 // listWorktrees is gitx.WorktreeList, as a variable so a test can make the
 // listing fail (#167).
 var listWorktrees = gitx.WorktreeList
+
+// attachKind is the command an attach check runs for (#198).
+type attachKind int
+
+const (
+	forAdopt attachKind = iota // wt adopt
+	forNew                     // wt new
+	forClaim                   // wt claim, which commits a placeholder on the branch and pushes it
+)
+
+// attachFor is the command an attach check runs for (#198). `wt new` and `wt
+// claim` check a local branch, or wt's existing worktree, against
+// origin/<branch> exactly as `wt adopt` does (#167); only their notes and the
+// remediation a refusal prints differ. A missing branch is created from the
+// base by new and claim, so their advice for taking what was pushed is `wt
+// adopt`, not a re-run.
+type attachFor struct {
+	kind  attachKind
+	rerun string // the command line that re-runs it: "wt adopt 1079", "wt new feat/x", "wt claim 42"
+	dir   string // new and claim: the worktree directory wt would use
+}
+
+// adoptFor is the attachFor of `wt adopt` (#167).
+func adoptFor(branch string, want AdoptWant) attachFor {
+	if want.PR != "" {
+		return attachFor{kind: forAdopt, rerun: "wt adopt " + want.PR}
+	}
+	return attachFor{kind: forAdopt, rerun: "wt adopt " + branch}
+}
+
+// pushes reports whether the command pushes the branch right after (claim).
+func (a attachFor) pushes() bool { return a.kind == forClaim }
+
+// tag is the issue a message cites: the guard is #167's, applied to new and
+// claim by #198.
+func (a attachFor) tag() string {
+	if a.kind == forAdopt {
+		return "#167"
+	}
+	return "#198"
+}
+
+// didNot ends a refusal: what wt did not do.
+func (a attachFor) didNot() string {
+	switch a.kind {
+	case forNew:
+		return "wt did not create the worktree"
+	case forClaim:
+		return "wt did not claim it"
+	}
+	return "wt did not adopt it"
+}
+
+// didNotReuse ends the refusal of wt's existing worktree for the branch, which
+// `wt new` does not create but hands back.
+func (a attachFor) didNotReuse() string {
+	if a.kind == forNew {
+		return "wt did not hand it back"
+	}
+	return a.didNot()
+}
 
 // adoptTarget is the commit `wt adopt` lands on, and how messages name it
 // (#167). tip is "" when there is nothing to compare against: adopting by
@@ -340,20 +424,32 @@ func relate(local, target string) TipRelation {
 // refuseCaseTwin refuses a branch that has a case-only twin on a filesystem that
 // ignores case (#167): there the two share one loose ref file, so moving or
 // attaching one moves or attaches the other, and git's checked-out check, which
-// compares names exactly, does not see a worktree that has the twin.
-func refuseCaseTwin(branch string) error {
+// compares names exactly, does not see a worktree that has the twin. Creating
+// the branch is refused too (#198): its new loose ref would be the twin's file.
+func refuseCaseTwin(branch string, who attachFor) error {
 	names, err := gitx.LocalBranches()
 	if err != nil {
-		return refuse(ErrCaseTwin, "could not list the local branches to rule out one that differs from %q only in case (core.ignorecase is set): %v; wt did not adopt it", branch, err)
+		return refuse(ErrCaseTwin, "could not list the local branches to rule out one that differs from %q only in case (core.ignorecase is set): %v; %s", branch, err, who.didNot())
 	}
 	twin := CaseTwin(names, branch)
 	if twin == "" {
 		return nil
 	}
-	ui.Warn("local branch %s differs from %s only in letter case, and this filesystem ignores case (core.ignorecase), so the two are one ref: wt will not check out, create or move either (#167)", twin, branch)
+	ui.Warn("local branch %s differs from %s only in letter case, and this filesystem ignores case (core.ignorecase), so the two are one ref: wt will not check out, create or move either (%s)", twin, branch, who.tag())
 	ui.Info("rename the local one, then re-run:")
 	fmt.Printf("  git branch -m %s %s-local\n", twin, twin)
-	return refuse(ErrCaseTwin, "local branch %q differs from %q only in letter case, and this filesystem ignores case, so they are one ref; wt did not adopt it", twin, branch)
+	return refuse(ErrCaseTwin, "local branch %q differs from %q only in letter case, and this filesystem ignores case, so they are one ref; %s", twin, branch, who.didNot())
+}
+
+// attachPlan is what an attach check decided for the local branch a new
+// worktree is about to take (#167, #198). planAttach decides it before anything
+// is checked out, created or moved; apply carries it out right before
+// worktree-add. `wt claim` asks gh, and may prompt, in between.
+type attachPlan struct {
+	branch string
+	local  string // the local branch's tip when checked, "" when there is none
+	target adoptTarget
+	action AdoptAction
 }
 
 // prepareLocalBranch checks the local branch worktree-add is about to take
@@ -364,77 +460,138 @@ func refuseCaseTwin(branch string) error {
 // else is refused. With no local branch, worktree-add creates it from
 // origin/<branch>, as before.
 func prepareLocalBranch(branch string, want AdoptWant, target adoptTarget) (string, error) {
+	who := adoptFor(branch, want)
 	fold := gitx.IgnoreCase()
 	if fold {
-		if err := refuseCaseTwin(branch); err != nil {
+		if err := refuseCaseTwin(branch, who); err != nil {
 			return "", err
 		}
 	}
-	local := gitx.BranchTip(branch)
+	p, err := planAttach(branch, gitx.BranchTip(branch), target, fold, who)
+	if err != nil {
+		return "", err
+	}
+	return p.apply(who)
+}
+
+// planAttach decides what happens to the local branch (tip local, "" when there
+// is none) before anything is checked out, created or moved (#167, #198), and
+// says so: a note for what is attached as it is, a refusal, with both tips and
+// the remediation, for what must not be. A fast-forward is announced when apply
+// makes it.
+func planAttach(branch, local string, target adoptTarget, fold bool, who attachFor) (attachPlan, error) {
 	rel := relate(local, target.tip)
 	inUseAt, inUse := "", false
 	if local != "" {
 		refs, listErr := listWorktrees()
 		inUseAt, inUse = BranchInUse(refs, listErr, branch, fold)
 	}
-	rerun := "wt adopt " + branch
-	if want.PR != "" {
-		rerun = "wt adopt " + want.PR
-	}
+	p := attachPlan{branch: branch, local: local, target: target, action: DecideAdopt(local != "", rel, inUse)}
 
-	switch DecideAdopt(local != "", rel, inUse) {
-	case AdoptCreate:
-		return target.tip, nil
+	switch p.action {
+	case AdoptCreate, AdoptFastForward:
+		return p, nil
 	case AdoptAsIs:
 		ui.OK("local branch %s matches %s (%s)", branch, target.label, short(local))
-		return local, nil
+		return p, nil
 	case AdoptAhead:
 		ahead, _, _ := gitx.AheadBehind(local, target.tip)
 		ui.Info("local branch %s is %s plus %d commit(s) not on it (not pushed yet?); attaching it as it is:", branch, target.label, ahead)
 		printOnlyIn("local "+branch, local, target.tip, ahead)
-		return local, nil
+		if who.pushes() {
+			ui.Info("`%s` pushes them, with its placeholder commit on top", who.rerun)
+		}
+		return p, nil
 	case AdoptUnverified:
 		ui.Info("no origin/%s to compare the local branch with, so it is attached as it is (%s), unverified", branch, short(local))
-		return local, nil
-	case AdoptFastForward:
-		_, behind, _ := gitx.AheadBehind(local, target.tip)
-		ui.Step("local branch %s is %d commit(s) behind %s: fast-forwarding it %s → %s", branch, behind, target.label, short(local), short(target.tip))
-		if err := gitx.FastForwardBranch(branch, local, target.tip); err != nil {
-			return "", fmt.Errorf("fast-forward local branch %q to %s: %w", branch, target.label, err)
-		}
-		return target.tip, nil
+		return p, nil
 	case AdoptRefuseInUse:
 		where := "in a worktree wt could not identify (git worktree list failed)"
 		if inUseAt != "" {
 			where = "at " + inUseAt
 		}
-		ui.Warn("local branch %s is behind %s (%s → %s), but it is checked out %s, and wt does not move a branch a worktree has checked out (#167)", branch, target.label, short(local), short(target.tip), where)
+		ui.Warn("local branch %s is behind %s (%s → %s), but it is checked out %s, and wt does not move a branch a worktree has checked out (%s)", branch, target.label, short(local), short(target.tip), where, who.tag())
 		if inUseAt != "" {
 			ui.Info("work in that worktree instead, after fast-forwarding it there:")
 			fmt.Printf("  git -C %s merge --ff-only %s\n", inUseAt, target.tip)
 		}
-		return "", refuse(ErrBranchInUse, "local branch %q is behind %s but checked out %s; wt did not move it", branch, target.label, where)
+		return p, refuse(ErrBranchInUse, "local branch %q is behind %s but checked out %s; wt did not move it", branch, target.label, where)
 	}
 
 	// AdoptRefuse: the local branch diverged from the target, or the two could
-	// not be compared. Never check it out silently (#167).
-	ui.Warn("local branch %s does not match %s, so wt will not check it out (#167):", branch, target.label)
+	// not be compared. Never check it out silently (#167, #198).
+	ui.Warn("local branch %s does not match %s, so wt will not check it out (%s):", branch, target.label, who.tag())
 	printTips("local "+branch, local, target.label, target.tip, rel)
 	if inUseAt != "" {
 		ui.Info("it is checked out at %s", inUseAt)
 	}
-	ui.Info("it is most likely left over from an earlier PR that reused the name. Inspect it, then set it aside (or delete it), and re-run:")
-	fmt.Printf("  git log --oneline %s..%s\n", target.tip, local)
-	fmt.Printf("  git branch -m %s %s-old-%s     # or: git branch -D %s\n", branch, branch, short(local), branch)
-	fmt.Printf("  %s\n", rerun)
-	return "", fmt.Errorf("local branch %q (%s) does not match %s (%s): %s; wt did not check it out", branch, short(local), target.label, short(target.tip), relationPhrase(rel))
+	if who.kind == forAdopt {
+		ui.Info("it is most likely left over from an earlier PR that reused the name. Inspect it, then set it aside (or delete it), and re-run:")
+		fmt.Printf("  git log --oneline %s..%s\n", target.tip, local)
+		fmt.Printf("  git branch -m %s %s-old-%s     # or: git branch -D %s\n", branch, branch, short(local), branch)
+		fmt.Printf("  %s\n", who.rerun)
+	} else {
+		adviseDiverged(branch, local, target, who)
+	}
+	return p, fmt.Errorf("local branch %q (%s) does not match %s (%s): %s; wt did not check it out", branch, short(local), target.label, short(target.tip), relationPhrase(rel))
 }
 
-// verifyAdopted checks the worktree Adopt just added (#167). worktree-add
-// resolves <branch> itself, and a tag of the same name, for one, wins over
+// adviseDiverged prints the ways on for `wt new` / `wt claim` when the local
+// branch diverged from origin/<branch> (#198). Setting the branch aside and
+// re-running would create a new branch from the base, not take what was pushed,
+// so that path is `wt adopt`. Keeping the local branch is the operator's call:
+// new names the plain worktree-add, and claim, which pushes the branch, needs it
+// reconciled with origin first.
+func adviseDiverged(branch, local string, target adoptTarget, who attachFor) {
+	ui.Info("it may be left over from an earlier attempt that reused the name, or hold your own commits, rebased or not pushed yet. Inspect it:")
+	fmt.Printf("  git log --oneline %s..%s\n", target.tip, local)
+	ui.Info("to work on what was pushed, set the local branch aside and adopt origin/%s:", branch)
+	fmt.Printf("  git branch -m %s %s-old-%s\n", branch, branch, short(local))
+	fmt.Printf("  wt adopt %s\n", branch)
+	if who.kind == forClaim {
+		ui.Info("to claim with the local branch, reconcile it with origin/%s first (claim pushes the branch, and origin rejects one that diverged), then re-run:", branch)
+		fmt.Printf("  git worktree add %s %s\n", who.dir, branch)
+		fmt.Printf("  git -C %s rebase origin/%s     # or merge it\n", who.dir, branch)
+		fmt.Printf("  %s\n", who.rerun)
+		return
+	}
+	ui.Info("to keep the local branch as it is, attach it yourself:")
+	fmt.Printf("  git worktree add %s %s\n", who.dir, branch)
+}
+
+// apply carries out the plan right before worktree-add (#167, #198), and returns
+// the commit the new worktree must then be on ("" when there is none to check).
+// A branch that changed since planAttach looked is refused, not attached: the
+// check was of that tip.
+func (p attachPlan) apply(who attachFor) (string, error) {
+	cur := gitx.BranchTip(p.branch)
+	switch p.action {
+	case AdoptCreate:
+		if cur != "" {
+			return "", fmt.Errorf("local branch %q appeared (at %s) after wt checked for it; %s. Re-run: %s", p.branch, short(cur), who.didNot(), who.rerun)
+		}
+		return p.target.tip, nil
+	case AdoptFastForward:
+		_, behind, _ := gitx.AheadBehind(p.local, p.target.tip)
+		ui.Step("local branch %s is %d commit(s) behind %s: fast-forwarding it %s → %s", p.branch, behind, p.target.label, short(p.local), short(p.target.tip))
+		if err := gitx.FastForwardBranch(p.branch, p.local, p.target.tip); err != nil {
+			return "", fmt.Errorf("fast-forward local branch %q to %s: %w", p.branch, p.target.label, err)
+		}
+		return p.target.tip, nil
+	}
+	// AdoptAsIs, AdoptAhead, AdoptUnverified: attached as checked.
+	if cur != p.local {
+		return "", fmt.Errorf("local branch %q moved after wt checked it (%s → %s); %s. Re-run: %s", p.branch, short(p.local), short(cur), who.didNot(), who.rerun)
+	}
+	return p.local, nil
+}
+
+// verifyAdopted checks the worktree Adopt just added (#167), or the one new and
+// claim attached to an existing local branch (#198). worktree-add resolves
+// <branch> itself, and a tag of the same name, for one, wins over
 // origin/<branch> and leaves a detached HEAD at the tag. On a mismatch it
 // removes that worktree, and only it, and refuses.
-func verifyAdopted(wtDir, branch, intended string) error {
+func verifyAdopted(wtDir, branch, intended string, who attachFor) error {
 	ref, head := gitx.SymbolicHead(wtDir), gitx.HeadCommit(wtDir)
 	if AdoptedOnTarget(ref, head, branch, intended) {
 		return nil
@@ -447,7 +604,7 @@ func verifyAdopted(wtDir, branch, intended string) error {
 	if intended != "" {
 		want += " at " + short(intended)
 	}
-	ui.Warn("the new worktree is on %s at %s, not on %s: git worktree add resolved %q to something else, such as a tag of that name (#167)", got, short(head), want, branch)
+	ui.Warn("the new worktree is on %s at %s, not on %s: git worktree add resolved %q to something else, such as a tag of that name, or the branch moved meanwhile (%s)", got, short(head), want, branch, who.tag())
 	removed := "removed it again"
 	if err := gitx.WorktreeRemove(wtDir, false); err != nil {
 		removed = "could not remove it (" + err.Error() + "); remove it with: git worktree remove " + wtDir
@@ -462,17 +619,22 @@ func verifyAdopted(wtDir, branch, intended string) error {
 			fmt.Printf("  git worktree add --track -b %s %s origin/%s\n", branch, wtDir, branch)
 		}
 	}
+	if who.kind != forAdopt {
+		return refuse(ErrLandedElsewhere, "the new worktree for %q landed on %s at %s, not on %s; wt %s", branch, got, short(head), want, removed)
+	}
 	return refuse(ErrLandedElsewhere, "the new worktree for %q landed on %s at %s, not on %s; wt %s and did not adopt it", branch, got, short(head), want, removed)
 }
 
 // checkExistingWorktree checks wt's existing worktree for the branch against the
 // target before handing it back on a re-run (#167). It never moves the
 // worktree's branch: a note when it is only behind or only ahead, a refusal when
-// it diverged or could not be compared.
-func checkExistingWorktree(wtDir, branch string, want AdoptWant, target adoptTarget) error {
+// it diverged or could not be compared. `wt new` and `wt claim` check theirs the
+// same way (#198), and for claim, which commits on that HEAD and pushes, only
+// behind is refused too (DecideExistingFor).
+func checkExistingWorktree(wtDir, branch string, target adoptTarget, who attachFor) error {
 	head := gitx.HeadCommit(wtDir)
 	rel := relate(head, target.tip)
-	action := DecideExisting(rel)
+	action := DecideExistingFor(rel, who.pushes())
 	if action == ExistingReuse {
 		return nil
 	}
@@ -494,16 +656,33 @@ func checkExistingWorktree(wtDir, branch string, want AdoptWant, target adoptTar
 	case ExistingReuseAhead:
 		ahead, _, _ := gitx.AheadBehind(head, target.tip)
 		ui.Info("the existing worktree%s has %d commit(s) that %s does not (not pushed yet?)", other, ahead, target.label)
+		if who.pushes() {
+			printOnlyIn("the worktree", head, target.tip, ahead)
+			ui.Info("`%s` pushes them, with its placeholder commit on top", who.rerun)
+		}
 		return nil
+	case ExistingRefuseBehind:
+		_, behind, _ := gitx.AheadBehind(head, target.tip)
+		ui.Warn("wt's worktree for %s already exists at %s%s, %d commit(s) behind %s (%s → %s). A claim commits on its HEAD and pushes, which origin would reject, and wt does not move a checked-out branch (%s). Update it there, then re-run:", branch, wtDir, other, behind, target.label, short(head), short(target.tip), who.tag())
+		fmt.Printf("  git -C %s merge --ff-only %s\n", wtDir, target.tip)
+		fmt.Printf("  %s\n", who.rerun)
+		return refuse(ErrBranchInUse, "wt's worktree for %q (HEAD %s) is behind %s (%s), and wt does not move a checked-out branch; %s", branch, short(head), target.label, short(target.tip), who.didNotReuse())
 	}
 
-	rerun := "wt adopt " + branch
-	if want.PR != "" {
-		rerun = "wt adopt " + want.PR
-	}
-	ui.Warn("wt's worktree for %s already exists at %s%s, but its HEAD does not match %s (#167):", branch, wtDir, other, target.label)
+	ui.Warn("wt's worktree for %s already exists at %s%s, but its HEAD does not match %s (%s):", branch, wtDir, other, target.label, who.tag())
 	printTips("the worktree", head, target.label, target.tip, rel)
-	ui.Info("if it is left over from an earlier PR that reused the name, keep what it holds, remove it, set the branch aside, and re-run:")
+	if who.kind != forAdopt {
+		// new and claim: setting the branch aside and re-running would create a
+		// new branch from the base, so taking what was pushed is `wt adopt`.
+		if who.kind == forClaim {
+			ui.Info("if it is your own work and origin moved on underneath it, reconcile it there (rebase or merge onto %s, then push), and re-run: %s", short(target.tip), who.rerun)
+		} else {
+			ui.Info("if it is your own work and origin moved on underneath it, reconcile it there (rebase or merge onto %s)", short(target.tip))
+		}
+		ui.Info("if it is left over from an earlier attempt that reused the name, keep what it holds, remove it, set the branch aside, and adopt what was pushed:")
+	} else {
+		ui.Info("if it is left over from an earlier PR that reused the name, keep what it holds, remove it, set the branch aside, and re-run:")
+	}
 	if detached {
 		// git worktree remove keeps nothing that only a detached HEAD has.
 		fmt.Printf("  git -C %s branch %s-wip-%s     # its detached HEAD: removing the worktree would orphan these commits\n", wtDir, branch, short(head))
@@ -512,9 +691,13 @@ func checkExistingWorktree(wtDir, branch string, want AdoptWant, target adoptTar
 	if tip := gitx.BranchTip(branch); tip != "" {
 		fmt.Printf("  git branch -m %s %s-old-%s\n", branch, branch, short(tip))
 	}
-	fmt.Printf("  %s\n", rerun)
-	ui.Info("if it is your own work and the target moved on underneath it, reconcile it there instead (rebase or merge onto %s)", short(target.tip))
-	return fmt.Errorf("wt's worktree for %q (HEAD %s) does not match %s (%s): %s; wt did not adopt it", branch, short(head), target.label, short(target.tip), relationPhrase(rel))
+	if who.kind != forAdopt {
+		fmt.Printf("  wt adopt %s\n", branch)
+	} else {
+		fmt.Printf("  %s\n", who.rerun)
+		ui.Info("if it is your own work and the target moved on underneath it, reconcile it there instead (rebase or merge onto %s)", short(target.tip))
+	}
+	return fmt.Errorf("wt's worktree for %q (HEAD %s) does not match %s (%s): %s; %s", branch, short(head), target.label, short(target.tip), relationPhrase(rel), who.didNotReuse())
 }
 
 // maxShownCommits caps the commit lists printed below.

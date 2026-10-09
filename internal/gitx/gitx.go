@@ -216,23 +216,27 @@ func Fetch(remote, branch string) error {
 	return err
 }
 
-// WorktreeAdd creates a new worktree at path on a new branch from base.
-func WorktreeAdd(path, branch, base string) error {
-	// If the branch already exists (its previous worktree was removed out-of-band
-	// but the branch — and its commits — survived), re-attach it to a fresh
-	// worktree instead of `-b` (which errors "branch already exists") (#62).
-	if LocalBranchExists(branch) {
-		_, err := Run("worktree", "add", path, branch)
+// WorktreeAddNewBranch creates a new worktree at path on a NEW branch cut from
+// base. git refuses when the branch already exists, so it can never re-attach
+// one: `wt new` decides that itself, after checking the branch against
+// origin/<branch> (#198), and attaches with WorktreeAdopt. The error carries
+// git's own stderr.
+func WorktreeAddNewBranch(path, branch, base string) error {
+	cmd := exec.Command("git", "worktree", "add", "-b", branch, path, base)
+	cmd.Env = scopedEnv()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		if msg := strings.TrimSpace(string(out)); msg != "" {
+			return fmt.Errorf("%w: %s", err, msg)
+		}
 		return err
 	}
-	_, err := Run("worktree", "add", path, "-b", branch, base)
-	return err
+	return nil
 }
 
 // WorktreeAdopt attaches a worktree at path to an EXISTING branch — a local
 // refs/heads/<branch> or, via git worktree-add's DWIM, a lone remote
 // origin/<branch> (which materializes a local tracking branch). Unlike
-// WorktreeAdd it NEVER creates a branch from base: adopting someone else's or a
+// WorktreeAddNewBranch it NEVER creates a branch from base: adopting someone else's or a
 // previous session's PR branch must land on that exact branch, not a fresh fork
 // of it. On failure — the branch is absent, OR (common for adopt) already
 // checked out in another worktree — the error carries git's own stderr so the
@@ -247,12 +251,6 @@ func WorktreeAdopt(path, branch string) error {
 		return err
 	}
 	return nil
-}
-
-// LocalBranchExists reports whether refs/heads/<branch> exists.
-func LocalBranchExists(branch string) bool {
-	_, err := Run("rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
-	return err == nil
 }
 
 // RemoteTrackingTip returns the commit refs/remotes/origin/<branch> points at, as
@@ -1345,6 +1343,25 @@ func IsClean(dir string) bool {
 // CommitEmpty makes an empty commit in dir with the given message.
 func CommitEmpty(dir, msg string) error {
 	_, err := RunDir(dir, "commit", "--allow-empty", "-m", msg)
+	return err
+}
+
+// UndoCommit moves the worktree at dir's HEAD, and so its branch, from commit
+// back to parent with `git reset --soft`: the index and the files stay as they
+// are. It acts only when HEAD is still commit and parent is commit's first
+// parent. `wt claim` uses it to take its placeholder commit back off a branch it
+// did not create when the push fails (#198), instead of deleting the branch.
+func UndoCommit(dir, commit, parent string) error {
+	if commit == "" || parent == "" {
+		return fmt.Errorf("undo needs a commit and its parent, got %q %q", commit, parent)
+	}
+	if cur := HeadCommit(dir); cur != commit {
+		return fmt.Errorf("HEAD is at %s now, not %s", cur, commit)
+	}
+	if got, err := RunDir(dir, "rev-parse", "--verify", "--quiet", commit+"^1"); err != nil || got != parent {
+		return fmt.Errorf("%s's parent is %q, not %s", commit, got, parent)
+	}
+	_, err := RunDir(dir, "reset", "--soft", parent)
 	return err
 }
 
