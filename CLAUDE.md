@@ -17,7 +17,7 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   the hook drivers (`runHook`, `claude_hook.go`).
 - **gitx** / **ghx** — thin `git` / `gh` shell-outs.
 - **hooks** — git hook shims + `HookPrePush`/`HookPreCommit`.
-- **worktree** — `wt new`/`clean` (data-loss-critical; see below).
+- **worktree** — `wt new`/`clean`/`discard` (data-loss-critical; see below).
 - **merge** — `merge-pr` guard + closing-keyword lint. **doctor**, **coord**,
   **activework**, **todos**, **config**, **section**, **ui**, **selfupdate**,
   **lock**.
@@ -255,6 +255,39 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   must pick out exactly ONE worktree (`CheckNames`): none is a typo, two is a
   directory name that is also another worktree's branch. Either stops the run
   with nothing cleaned, so a bad `-y` list never removes "the rest" of it.
+- **`wt discard` is the ONLY command that drops unpushed commits (#177), and only
+  for an exact name with `--drop-commits`.** It removes ONE worktree its owner
+  declared throwaway (a canary pushed, used and deleted on origin), its local
+  branch and the claim sections recorded ON THAT BRANCH
+  (`activework.RemoveBranchSections`; auto-clean's removal by issue would also
+  drop another worktree's claim on the same issue). Never a sweep: one name,
+  resolved by `DiscardTarget` (clean's `MatchedName` + `CheckNames` wording, with
+  the main checkout a candidate, so a name that also picks it out is ambiguous).
+  `DecideDiscard` is pure; no flag unlocks anything but its own guard (an
+  exhaustive test pins it): the main checkout, a detached HEAD (mid-rebase), the
+  base branch, the window it runs in, a dirty tree, a locked worktree are refused
+  whatever the flags; out-of-root needs `--all-roots`, which keeps discard's
+  reach equal to clean's (#101). ⚠ **"Unique" is read from origin itself**
+  (`ls-remote --heads`), never `rev-list --not --remotes`: a branch deleted on
+  origin from the web or another clone leaves a stale `origin/<branch>` here that
+  hid the canary's own commit, and a later prune drops it. Offline, the tracking
+  refs stand in, minus `origin/<branch>` itself. The fetch is `--no-prune`: a
+  prune deletes other branches' stale refs, which can be the only copy of
+  someone's commits. ⚠ `CommitsOnlyOn` verifies the tip first: under
+  `--ignore-missing` a missing tip read as "no commits". ⚠ Measured on git 2.39:
+  `git worktree remove` deletes a worktree nested (ignored) inside the one
+  removed, so a worktree with another inside is refused; and
+  `status.showUntrackedFiles=no` blinds a plain porcelain status AND worktree
+  remove's own check, which deleted the untracked files, so `StatusEntries`
+  passes `--untracked-files=normal` and `RemoveCleanWorktree` `-c
+  status.showUntrackedFiles=normal`. ⚠ With `core.ignorecase` a case twin is one
+  loose ref file and git's in-use check compares names exactly (#167), so the
+  base and branch-in-use checks fold case (`sameBranch`): `git branch -D Main`
+  deletes main. A worktree whose directory is gone has nothing on disk to lose
+  (git removes just its record, measured); one that is no longer a work tree's
+  top (replaced since git recorded it, #198 review), or any other unreadable
+  status, counts as dirty. The branch is deleted only at the tip that was listed
+  (`DeleteBranchAt`), never forced, and origin is never touched.
 - **`wt adopt` never checks out, creates or moves a branch onto anything but the
   target (#167).** `git worktree add <path> <branch>` takes `refs/heads/<branch>`
   whenever it exists, so a stale branch left by an earlier PR that reused the

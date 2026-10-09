@@ -631,6 +631,12 @@ func MatchedName(names, resolved []string, wtPath, branch string) string {
 // Either way nothing is cleaned, so a mistyped or ambiguous `-y` list never removes
 // "the rest" of what it named. The review round found both. Pure.
 func CheckNames(names []string, hits map[string][]string) error {
+	return checkNames(names, hits, "cleaned")
+}
+
+// checkNames is CheckNames for a command whose refusal ends "nothing was
+// <done>": `wt discard` resolves its one name the same way (#177).
+func checkNames(names []string, hits map[string][]string, done string) error {
 	var missing, ambiguous []string
 	seen := map[string]bool{}
 	for _, n := range names {
@@ -656,7 +662,7 @@ func CheckNames(names []string, hits map[string][]string) error {
 	if len(msgs) == 0 {
 		return nil
 	}
-	return fmt.Errorf("%s; nothing was cleaned", strings.Join(msgs, "; "))
+	return fmt.Errorf("%s; nothing was %s", strings.Join(msgs, "; "), done)
 }
 
 // RerunHint is the line a listing-only clean ends with, or "" when it listed

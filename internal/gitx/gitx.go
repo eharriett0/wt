@@ -610,6 +610,7 @@ func WorktreeBranchesUnder(root string) ([]string, error) {
 type WorktreeRef struct {
 	Path   string
 	Branch string
+	Locked bool // `git worktree lock`ed: git refuses to remove it (#177)
 }
 
 // WorktreeList returns every worktree of this repo with its checked-out branch.
@@ -636,6 +637,8 @@ func WorktreeList() ([]WorktreeRef, error) {
 			cur.Path = strings.TrimSpace(strings.TrimPrefix(ln, "worktree "))
 		case strings.HasPrefix(ln, "branch "):
 			cur.Branch = strings.TrimPrefix(strings.TrimSpace(strings.TrimPrefix(ln, "branch ")), "refs/heads/")
+		case ln == "locked" || strings.HasPrefix(ln, "locked "):
+			cur.Locked = true
 		}
 	}
 	flush()
@@ -1620,6 +1623,175 @@ func pickLsRemote(out, ref string) string {
 		}
 	}
 	return ""
+}
+
+// FetchRemote fetches what remote's configured refspec covers, and never prunes
+// (#177). `wt discard` fetches before it lists the commits it would drop. A
+// prune deletes the remote-tracking refs of branches the remote has since
+// deleted, and such a ref can be the only copy of someone's commits in this
+// clone: --no-prune overrides fetch.prune / remote.<name>.prune, so discard
+// never touches a ref it was not asked about. The error carries git's stderr.
+func FetchRemote(remote string) error {
+	_, err := runReporting("", "fetch", "--no-prune", remote)
+	return err
+}
+
+// RemoteHeads returns every branch remote has right now, name → tip commit, via
+// `git ls-remote --heads` (#177). An error means the remote could not be asked.
+// Unlike the remote-tracking refs, the answer cannot hold a branch the remote
+// has since deleted.
+func RemoteHeads(remote string) (map[string]string, error) {
+	out, err := runReporting("", "ls-remote", "--heads", remote)
+	if err != nil {
+		return nil, err
+	}
+	return parseRemoteHeads(out), nil
+}
+
+// parseRemoteHeads reads `ls-remote --heads` output, "<sha>\trefs/heads/<name>"
+// per line, into name → sha. Anything else is skipped. Pure.
+func parseRemoteHeads(out string) map[string]string {
+	heads := map[string]string{}
+	for _, ln := range strings.Split(out, "\n") {
+		sha, ref, ok := strings.Cut(strings.TrimSpace(ln), "\t")
+		if !ok || sha == "" || !strings.HasPrefix(ref, "refs/heads/") {
+			continue
+		}
+		if name := strings.TrimPrefix(ref, "refs/heads/"); name != "" {
+			heads[name] = sha
+		}
+	}
+	return heads
+}
+
+// RemoteTrackingTips returns the commit of every remote-tracking ref
+// (refs/remotes/...) as last fetched, except the ref named exactly except
+// (#177). `wt discard` falls back on them when origin cannot be asked.
+func RemoteTrackingTips(except string) ([]string, error) {
+	out, err := Run("for-each-ref", "--format=%(objectname) %(refname)", "refs/remotes")
+	if err != nil {
+		return nil, err
+	}
+	return pickTrackingTips(out, except), nil
+}
+
+// pickTrackingTips reads `for-each-ref --format='%(objectname) %(refname)'`
+// output and returns every commit but the one of the ref named exactly except.
+// Pure.
+func pickTrackingTips(out, except string) []string {
+	var tips []string
+	for _, ln := range strings.Split(out, "\n") {
+		sha, ref, ok := strings.Cut(strings.TrimSpace(ln), " ")
+		if !ok || sha == "" || ref == except {
+			continue
+		}
+		tips = append(tips, sha)
+	}
+	return tips
+}
+
+// Commit is one commit: its full id and its subject line.
+type Commit struct {
+	SHA, Subject string
+}
+
+// CommitsOnlyOn lists the commits reachable from tip and from none of exclude,
+// newest first: `git log <tip> --not <exclude>...` (#177). The excluded commits
+// go in on stdin, so any number of them fit. One this clone does not have is
+// skipped (--ignore-missing): a commit missing here is no ancestor of tip, so
+// skipping it can only list more commits, never fewer.
+//
+// ⚠ tip must exist, and is checked first: under --ignore-missing a tip this
+// clone lacks is skipped too, and the empty answer read as "no commits only
+// on the branch" (measured, git 2.39), which is what lets `wt discard` drop
+// them without --drop-commits.
+func CommitsOnlyOn(tip string, exclude []string) ([]Commit, error) {
+	if tip == "" {
+		return nil, fmt.Errorf("no commit to list from")
+	}
+	if _, err := Run("rev-parse", "--verify", "--quiet", tip+"^{commit}"); err != nil {
+		return nil, fmt.Errorf("%s is not a commit in this clone", tip)
+	}
+	var in strings.Builder
+	for _, sha := range exclude {
+		if sha = strings.TrimSpace(sha); sha != "" {
+			in.WriteString("^" + sha + "\n")
+		}
+	}
+	cmd := exec.Command("git", "log", "--no-decorate", "--format=%H%x09%s", "--ignore-missing", "--stdin", tip)
+	cmd.Env = scopedEnv()
+	cmd.Stdin = strings.NewReader(in.String())
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		if msg := gitStderr(stderr.String()); msg != "" {
+			err = fmt.Errorf("%w: %s", err, msg)
+		}
+		return nil, err
+	}
+	return parseCommitLines(string(out)), nil
+}
+
+// parseCommitLines reads "<sha>\t<subject>" lines. Pure.
+func parseCommitLines(out string) []Commit {
+	var commits []Commit
+	for _, ln := range strings.Split(out, "\n") {
+		if ln = strings.TrimRight(ln, "\r"); strings.TrimSpace(ln) == "" {
+			continue
+		}
+		sha, subject, _ := strings.Cut(ln, "\t")
+		commits = append(commits, Commit{SHA: strings.TrimSpace(sha), Subject: subject})
+	}
+	return commits
+}
+
+// StatusEntries returns the worktree at dir's `git status --porcelain` lines:
+// one per uncommitted change, untracked-but-not-ignored files included (#177).
+// --untracked-files=normal overrides a status.showUntrackedFiles=no, which
+// hides untracked files from a plain porcelain status, and from `git worktree
+// remove`'s own check too: it deleted them with the worktree (measured, git
+// 2.39). Submodule changes are listed (--ignore-submodules=none). Read-only:
+// discard reads another window's worktree, and must not take its index.lock.
+func StatusEntries(dir string) ([]string, error) {
+	out, err := runRawReadOnly(dir, "status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none")
+	if err != nil {
+		return nil, err
+	}
+	var lines []string
+	for _, ln := range strings.Split(out, "\n") {
+		if ln = strings.TrimRight(ln, "\r"); strings.TrimSpace(ln) != "" {
+			lines = append(lines, ln)
+		}
+	}
+	return lines, nil
+}
+
+// RemoveCleanWorktree removes the worktree at path and never forces (#177): git
+// refuses one with uncommitted or untracked changes, a locked one, and one with
+// submodules. status.showUntrackedFiles is set to normal for git's own check,
+// which a repo's `no` blinds: the untracked files went with the worktree
+// (measured, git 2.39). git hands -c settings to the status it runs. The error
+// carries git's stderr.
+func RemoveCleanWorktree(path string) error {
+	_, err := runReporting("", "-c", "status.showUntrackedFiles=normal", "worktree", "remove", path)
+	return err
+}
+
+// DeleteBranchAt deletes local branch, and only while it still points at tip
+// (#177): `wt discard` read the branch's commits at tip, and a commit made
+// since is not one the operator was shown. Checked as late as possible, like
+// FastForwardBranch's. `git branch -D` also refuses a branch a worktree has
+// checked out. The error carries git's stderr.
+func DeleteBranchAt(branch, tip string) error {
+	if branch == "" || tip == "" {
+		return fmt.Errorf("delete needs a branch and its tip, got %q %q", branch, tip)
+	}
+	if cur := BranchTip(branch); cur != tip {
+		return fmt.Errorf("%s is at %s now, not %s", branch, cur, tip)
+	}
+	_, err := runReporting("", "branch", "-D", branch)
+	return err
 }
 
 // Abs resolves a possibly-relative path against the repo root.
