@@ -533,8 +533,9 @@ func contiguousRuns(offsets []int) [][2]int {
 // hunks (no removed lines) modify no existing line, so they contribute no range
 // (an insertion adjacent to another window's edit isn't a conflict). ok=false
 // when a hunk can't be uniquely located, or nothing is a real modification — the
-// caller then falls back to a file-level advisory. Frame-safety (content ==
-// base) is the caller's job (the #108 lesson). Reuses locateRange.
+// caller then falls back to a file-level advisory. The ranges are on-disk line
+// numbers; moving them into base numbers is the caller's job (pendingPatchRanges
+// → gitx.LinesToBase, the #108 lesson). Reuses locateRange.
 func patchRangesInFile(f codexPatchFile, content string) ([]gitx.LineRange, bool) {
 	var ranges []gitx.LineRange
 	for _, h := range f.hunks {
@@ -560,10 +561,10 @@ func patchRangesInFile(f codexPatchFile, content string) ([]gitx.LineRange, bool
 
 // hookCodexEdit implements `wt _hook codex-edit` — a Codex PreToolUse hook on
 // apply_patch. It grades the patch's target files with the SAME engine as
-// `wt check`, re-graded against the patch's actual hunks when frame-safe (the
-// #108 lesson), and emits additionalContext on a HIGH overlap — or, under
-// WT_CODEX_HOOK_BLOCK=1, a `deny` for a CONFIRMED HIGH only. Always exits 0
-// (fail-open); disjoint / no-overlap / ≤1-worktree stay silent.
+// `wt check`, re-graded against the patch's actual hunks in base line numbers
+// (regradePending, the #108/#184 lesson), and emits additionalContext on a HIGH
+// overlap — or, under WT_CODEX_HOOK_BLOCK=1, a `deny` for a CONFIRMED HIGH only.
+// Always exits 0 (fail-open); disjoint / no-overlap / ≤1-worktree stay silent.
 func hookCodexEdit(r io.Reader) int {
 	if os.Getenv("WT_SKIP_COLLISION") == "1" || os.Getenv("HOOK_DISABLE_MULTIWINDOW_CHECK") == "1" {
 		return 0
@@ -610,24 +611,31 @@ func hookCodexEdit(r io.Reader) int {
 	}
 
 	entries := buildCheckReport(c, ws, root, paths, false)
+	// Re-grade each path's entries against the patch's ACTUAL hunks the way `wt
+	// check` will grade the file once the patch is applied (regradePending, the
+	// same rule as the Claude hook): this window's own ranges plus the patch's,
+	// moved into base line numbers through this worktree's own diff (#108/#184).
+	byLabel := windowByLabel(ws)
+	byEntryPath := map[string][]CheckEntry{}
+	var order []string
+	for _, e := range entries {
+		if _, seen := byEntryPath[e.Path]; !seen {
+			order = append(order, e.Path)
+		}
+		byEntryPath[e.Path] = append(byEntryPath[e.Path], e)
+	}
 	var high []codexGradedEntry
 	anyConfirmed := false
-	for _, e := range entries {
-		if e.Category != CatBlocking {
-			continue
+	for _, path := range order {
+		cur, curOK := ownRanges(root, c.Base, path)
+		pending, pendingOK := pendingPatchRanges(byPath, path, root, c.Base)
+		graded := regradePending(byEntryPath[path], cur, curOK, pending, pendingOK, func(e CheckEntry) bool {
+			return subsumedByBase(byLabel[e.Window].Worktree, c.Base, path)
+		})
+		for _, g := range graded {
+			high = append(high, codexGradedEntry{entry: g.entry, confirmed: g.confirmed})
+			anyConfirmed = anyConfirmed || g.confirmed
 		}
-		// Re-grade against the patch's ACTUAL hunks, but only when frame-safe: the
-		// hunk line numbers (located in the on-disk file) match e.OtherRanges'
-		// base frame only when this worktree's file is unchanged vs base (#108).
-		conf := false
-		if pending, ok := pendingPatchRanges(byPath, e.Path, root, c.Base); ok && len(e.OtherRanges) > 0 {
-			if collide.ConflictSeverity(pending, e.OtherRanges, false) != collide.SevHigh {
-				continue // patch hunks are disjoint from the other window — no overlap
-			}
-			conf = true // frame-safe, real overlapping hunks
-			anyConfirmed = true
-		}
-		high = append(high, codexGradedEntry{entry: e, confirmed: conf})
 	}
 	if out, has := codexEditDecision(high, os.Getenv("WT_CODEX_HOOK_BLOCK") == "1" && anyConfirmed); has {
 		fmt.Println(out)
@@ -636,35 +644,39 @@ func hookCodexEdit(r io.Reader) int {
 }
 
 // codexGradedEntry pairs a blocking CheckEntry with whether its overlap was
-// frame-safe hunk-CONFIRMED (vs a file-level heads-up), so a multi-file patch
+// hunk-CONFIRMED in base line numbers (vs a file-level heads-up), so a multi-file patch
 // can word each line accurately (#117 review).
 type codexGradedEntry struct {
 	entry     CheckEntry
 	confirmed bool
 }
 
-// pendingPatchRanges returns the patch's edited ranges for relPath, but ONLY when
-// this worktree's file is unchanged vs base (frame-safe) — otherwise the located
-// line numbers don't share e.OtherRanges' base frame. ok=false → the caller keeps
-// the entry as a file-level advisory rather than risk a wrong grade.
+// pendingPatchRanges returns the patch's edited ranges for relPath in BASE line
+// numbers: located in the on-disk file, then moved through this worktree's own
+// diff against base (gitx.LinesToBase), so they share e.OtherRanges' frame even
+// when this worktree already differs from base, by its own edits or by base's it
+// is behind on (#108/#184). ok=false (unlocatable hunks, an add/delete, a git
+// error) → the caller keeps the entry as a file-level advisory rather than risk a
+// wrong grade.
 func pendingPatchRanges(byPath map[string]codexPatchFile, relPath, root, base string) ([]gitx.LineRange, bool) {
 	f, ok := byPath[relPath]
 	if !ok || len(f.hunks) == 0 {
 		return nil, false
 	}
-	if len(gitx.ChangedRanges(root, base, relPath)) != 0 {
-		return nil, false // this worktree already diverged for the path — not frame-safe
-	}
 	data, err := os.ReadFile(filepath.Join(root, relPath))
 	if err != nil {
 		return nil, false
 	}
-	return patchRangesInFile(f, string(data))
+	onDisk, ok := patchRangesInFile(f, string(data))
+	if !ok {
+		return nil, false
+	}
+	return gitx.LinesToBase(root, base, relPath, onDisk)
 }
 
 // codexEditDecision shapes the PreToolUse stdout JSON. deny=true → permissionDecision
 // "deny" (only ever passed when the batch has ≥1 CONFIRMED HIGH); else
-// additionalContext. Each file is tagged per-entry — "overlapping hunks" (frame-safe
+// additionalContext. Each file is tagged per-entry — "overlapping hunks" (computed
 // confirmed) vs "hunk overlap not computed" (file-level heads-up) — so a mixed
 // multi-file patch never overstates hunk overlap on an unverified file (#117 review).
 // Pure.
@@ -692,7 +704,7 @@ func codexEditDecision(high []codexGradedEntry, deny bool) (string, bool) {
 	}
 	header := "wt: your apply_patch touches file(s) another live window is editing:"
 	if anyConfirmed && !anyFileLevel {
-		header = "wt collision: your apply_patch OVERLAPS hunks another live window is editing:"
+		header = "wt collision: with this apply_patch, your version OVERLAPS hunks another live window is editing (`wt check` will grade it HIGH):"
 	}
 	msg := header + "\n" + strings.Join(lines, "\n") +
 		"\nCoordinate before applying to avoid a merge conflict / duplicate PR. (Set WT_SKIP_COLLISION=1 to silence.)"
