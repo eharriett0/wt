@@ -255,7 +255,13 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   that 0 as a merge removed the lane and `git branch -D`'d unpushed commits.
   `merge.ConfirmMerged` re-reads the state (2.5s at most, for API lag); anything
   but MERGED (OPEN, CLOSED, no answer) keeps the worktree, branch and claim for
-  `wt clean` to reap once the PR ships. ⚠ **Even then, only a lane whose local
+  `wt clean` to reap once the PR ships. ⚠ **The converse holds too (#196): a
+  non-zero exit is not "not merged".** `-- -d` merges, then fails to delete a
+  local branch a wt worktree has checked out, and exits 1, so the close verify
+  and the auto-clean were skipped for a merged PR. `merge.Run` wraps gh's own
+  failure in `ErrMergeCommand` (a guard's refusal is not), and only that error
+  reads the state (`mergedDespiteFailure`, the same `ConfirmMerged`): MERGED
+  goes on to verify + auto-clean, anything else exits 1. ⚠ **Even then, only a lane whose local
   tip shipped (#187):** a squash leaves the branch unmerged in git's eyes, so the
   auto-clean's `git branch -D` would drop commits made after the push.
   `merge.LocalTipVerdict` needs the tip to BE the PR's `headRefOid` or an
@@ -424,8 +430,8 @@ The formula supports `head "…", branch: "main"` for `--HEAD` builds.
   the PR body only, NOT the squash commit body (the `merge-pr` close-lint scans
   commit messages too — #77).
   ⚠ **A body forwarded after `--` replaces the commit bodies in the squash (#180)**,
-  so the lint judges it instead (headlines stay: `--body` doesn't replace the
-  subject). `merge.ParseForwardedBody` reads the passthrough the way gh's pflag
+  so the lint judges it instead (the subject stays, and is judged as #196 below
+  says). `merge.ParseForwardedBody` reads the passthrough the way gh's pflag
   does — last flag wins, a value flag eats a `-`-led next token, `--body` with
   `--body-file` is gh's own error. A file or `-F -` body is read ONCE and handed
   to gh on stdin with the flag re-pointed at `-`: `-F <(…)` is a pipe, and gh
@@ -438,6 +444,30 @@ The formula supports `head "…", branch: "main"` for `--HEAD` builds.
   and gh merged the subject "--admin" with no admin; in front, gh fails on the
   dangling flag, and an operator's own `--subject` beats the WIP strip (gh keeps
   the last one).
+  ⚠ **The gate judges the squash commit GitHub will WRITE, subject included
+  (#196).** The subject was never read, so a PR title "Fixes #N" on a two-commit
+  PR closed #N silently, and a closing headline that a forwarded `--subject`
+  and `--body` kept out still refused. `merge.ShippedSquash` (pure) models it:
+  subject = a forwarded `--subject`/`-t` (`SubjectOverride`: the operator's, the
+  last one, else the WIP strip's; `--subject ""` makes gh send none), else
+  `squash_merge_commit_title` (PR_TITLE → title; COMMIT_OR_PR_TITLE → the one
+  commit's headline, else the title); body = a forwarded body, else
+  `squash_merge_commit_message` (PR_BODY / BLANK / COMMIT_MESSAGES: every
+  message, but ONE commit gives its body alone unless its headline differs from
+  the default subject, i.e. PR_TITLE with another title). The gate is the PR
+  body + that subject + body; the verify watches the title and every commit
+  message too. Measured against GitHub's own default text, GraphQL
+  `viewerMergeHeadlineText`/`viewerMergeBodyText(mergeType:SQUASH)`, on 785
+  merged PRs across all four setting pairs: subject, body (up to bullets,
+  wrapping and gathered trailers) and close set all matched. Merge commits are
+  neither counted nor listed; a headline is the WHOLE first line, while GraphQL
+  `messageHeadline` cuts it at 69 chars with "…" (rest into `messageBody`), so
+  `ghx.PRCommits` reads `message` + `parents{totalCount}`; gh sends no subject
+  unless `--subject` is non-empty. ⚠ **The settings come from GraphQL**
+  (`ghx.RepoSquashSettings`): REST `gh api repos/{owner}/{repo}` returns them as
+  null to a non-admin viewer. Unreadable → **over-scan** (the title AND the one
+  commit's headline; every commit message): a missed close is the #77 trap, a
+  false refusal costs a `--close-ok`.
 - macOS is the dev floor: bash 3.2 (no `mapfile`/`declare -A`), BSD `sed`/`stat`,
   `/var`→`/private/var` symlinks (resolve with `EvalSymlinks` before path
   compares).

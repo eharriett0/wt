@@ -401,6 +401,92 @@ func TestParseForwardedBody(t *testing.T) {
 	}
 }
 
+// TestParseForwardedSubject pins the gh-faithful reading of a forwarded squash
+// SUBJECT (#196), through the same scanner as the body: the last --subject/-t
+// wins, a value flag swallows the next token, and an empty value is still given
+// (gh then sends none, so GitHub writes the repo's default).
+func TestParseForwardedSubject(t *testing.T) {
+	type want struct {
+		given bool
+		value string
+		flag  string
+	}
+	none := want{}
+	cases := []struct {
+		name string
+		args []string
+		want want
+	}{
+		{"no passthrough", nil, none},
+		{"unrelated flags only", []string{"--delete-branch", "--admin", "-d"}, none},
+		{"a body is not a subject", []string{"-b", "Fixes #5"}, none},
+
+		{"--subject x", []string{"--subject", "x"}, want{true, "x", "--subject"}},
+		{"--subject=x", []string{"--subject=x"}, want{true, "x", "--subject"}},
+		{"-t x", []string{"-t", "x"}, want{true, "x", "-t"}},
+		{"-tx attached", []string{"-tx"}, want{true, "x", "-t"}},
+		{"-t=x", []string{"-t=x"}, want{true, "x", "-t"}},
+		{"-dt x: -d is a bool", []string{"-dt", "x"}, want{true, "x", "-t"}},
+		{"value with a close keyword", []string{"-t", "Fixes #8 via subject"}, want{true, "Fixes #8 via subject", "-t"}},
+
+		// the last one wins, an empty one included
+		{"twice: the last wins", []string{"--subject", "Fixes #5", "-t", "clean"}, want{true, "clean", "-t"}},
+		{"--subject '' is given and empty", []string{"--subject", ""}, want{true, "", "--subject"}},
+		{"--subject= after a real one", []string{"-t", "Fixes #5", "--subject="}, want{true, "", "--subject"}},
+		{"the WIP strip's subject, then the operator's", []string{"--subject", "Strip", "--admin", "--subject", "Mine"}, want{true, "Mine", "--subject"}},
+
+		// a value flag takes the next token, whatever it looks like
+		{"-b -t: -t is the body", []string{"-b", "-t", "x"}, none},
+		{"--body --subject: the body is the text --subject", []string{"--body", "--subject"}, none},
+		{"-F -t: -t is the file", []string{"-F", "-t"}, none},
+		{"-t -b: -b is the subject", []string{"-t", "-b"}, want{true, "-b", "-t"}},
+		{"-R o/r then -t", []string{"-R", "o/r", "-t", "x"}, want{true, "x", "-t"}},
+
+		// `--` ends the flags
+		{"-- before the subject flag", []string{"--", "--subject", "x"}, none},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ParseForwardedSubject(tc.args)
+			if err != nil {
+				t.Fatalf("ParseForwardedSubject(%q) error: %v", tc.args, err)
+			}
+			if got.Given != tc.want.given || got.Value != tc.want.value || got.Flag != tc.want.flag {
+				t.Fatalf("ParseForwardedSubject(%q) = {%v %q %q}, want {%v %q %q}",
+					tc.args, got.Given, got.Value, got.Flag, tc.want.given, tc.want.value, tc.want.flag)
+			}
+		})
+	}
+	// A value flag left without a value is gh's own failure: an error, as for
+	// the body, never a guessed subject.
+	for _, args := range [][]string{{"--subject"}, {"-t"}, {"-dt"}, {"-t", "x", "-b"}} {
+		if got, err := ParseForwardedSubject(args); err == nil {
+			t.Errorf("ParseForwardedSubject(%q) = %+v, want an error", args, got)
+		}
+	}
+}
+
+func TestWIPSubject(t *testing.T) {
+	cases := []struct {
+		title string
+		want  string
+		ok    bool
+	}{
+		{"WIP: Fixes #5 the thing", "Fixes #5 the thing", true},
+		{"WIP: #196 — title", "#196 — title", true},
+		{"WIP:", "", false},    // nothing after the prefix: Run leaves the title
+		{"WIP:   ", "", false}, // the same, padded
+		{"Fixes #5", "Fixes #5", false},
+		{"", "", false},
+	}
+	for _, c := range cases {
+		got, ok := WIPSubject(c.title)
+		if ok != c.ok || (ok && got != c.want) {
+			t.Errorf("WIPSubject(%q) = (%q, %v), want (%q, %v)", c.title, got, ok, c.want, c.ok)
+		}
+	}
+}
+
 // No single body can be named → an error, never a guess: gh refuses --body with
 // --body-file, and a body flag with no value would make gh take whatever wt
 // appends next (--admin, --subject …) as its value.
