@@ -169,7 +169,7 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 | `wt claim <issue>` | Assign a GitHub issue, make a worktree, open a draft PR, record the claim `[--force] [--no-pr] [--epic <id>]`. **Refuses (won't duplicate) when an open PR already references the issue** — including a plain `Refs #N` (which GitHub never treats as a linked/closing reference, so it's invisible to `closingIssuesReferences`); it names that PR and points at `wt adopt`. `--force` opens another anyway. Before it assigns anything, a local branch (or worktree) of the claim's name is checked against `origin/<branch>` exactly as `wt new` checks it, and a diverged one is refused; so is a worktree already there that is only behind, since a placeholder on it could not be pushed, a branch origin has deleted since it was pushed (the claim would push it back), and, with no local branch, a branch origin already has (pointing at `wt adopt`). The placeholder commit never takes work staged in a worktree it reuses, and refuses one in the middle of a merge. If anything fails after the assign, the claim rolls back only what it did: the issue is unassigned (unless it was yours before), and a branch it re-attached, or a worktree it reused, keeps its commits, minus the placeholder |
 | `wt adopt <branch\|pr>` | Put a worktree on an **existing** branch (a colleague's or a previous session's PR branch) instead of forking a new one, and record it like `claim` — resolves a PR number to its head branch. This is the actionable half of `claim`'s refusal above, and the only command that lands a registered worktree on a branch you didn't just create `[--epic <id>]`. **Adopting by PR, `origin/<branch>` must carry the PR head first:** a PR from a fork (its head is on another repository, out of `git fetch origin`'s reach) or a failed fetch is refused before anything is checked out, created or moved, with a `gh pr checkout` recipe for the fork case. A local branch of that name is then compared with `origin/<branch>`: one that is only behind is fast-forwarded, one with unpushed commits on top is attached as it is with a note, and one that diverged (typically left over from an earlier PR that reused the name) is refused with both SHAs, never silently checked out. A re-run that finds the worktree already there is compared the same way but never moved: behind or ahead is handed back with a note, diverged is refused |
 | `wt release <issue>` | Drop the claim. `[--clean]` also removes the worktree when the branch is abandoned (clean tree, no live PR, WIP-only commits) |
-| `wt merge-pr <pr>` | Guarded squash-merge (PR-state precheck, refuses while the PR's checks are pending, failed or never ran — `--checks-ok` proceeds, see [Merging](#merging-auto-cleanup-and-merge--deploy) — strips a `WIP:` subject unless you forward `-- --subject`, refuses an empty/placeholder-only PR), then auto-removes the worktree + claim (also when `gh pr merge` fails after merging, as `-- -d` does when a worktree has the branch checked out). Lints the closing keywords the squash will fire: the PR body, plus the squash commit's **subject and body as GitHub will write them** (see [Merging](#merging-auto-cleanup-and-merge--deploy)), and verifies issue state after (skip both with `--no-close-check` for a PR that closes nothing) `[--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok] [--checks-ok] [--no-close-check]` |
+| `wt merge-pr <pr>` | Guarded squash-merge (PR-state precheck, refuses while the PR's checks are pending or failed, or a check or workflow its branch requires never ran — `--checks-ok` proceeds, see [Merging](#merging-auto-cleanup-and-merge--deploy) — strips a `WIP:` subject unless you forward `-- --subject`, refuses an empty/placeholder-only PR), then auto-removes the worktree + claim (also when `gh pr merge` fails after merging, as `-- -d` does when a worktree has the branch checked out). Lints the closing keywords the squash will fire: the PR body, plus the squash commit's **subject and body as GitHub will write them** (see [Merging](#merging-auto-cleanup-and-merge--deploy)), and verifies issue state after (skip both with `--no-close-check` for a PR that closes nothing) `[--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok] [--checks-ok] [--no-close-check]` |
 | `wt todos` | What every window is working on (mirrors each window's TODO list) |
 | **— cross-window coordination —** | |
 | `wt announce "<msg>"` | Tell other windows a change is starting `[--hold "merge-main,…"] [--issue N]` |
@@ -241,9 +241,10 @@ when a worktree has the branch checked out), merge-pr sees the PR is MERGED and
 finishes the job: the close verify and the auto-clean still run.
 
 Right after its PR-state precheck, merge-pr reads the checks on the PR's head
-commit and the ones its base branch requires (branch protection and rulesets),
-and prints a summary line, `--dry-run` included, so a clean dry run means the
-checks were read and were green:
+commit and what its base branch requires (branch protection and rulesets, read
+from the PR's own base repository), and prints a summary line, `--dry-run`
+included, so a clean dry run means the checks were read: `checks=green`, or
+`checks=none` when no check ran:
 
 ```
 merge-pr: PR #60 checks=green on 1a2b3c4d5e6f: 12 passed, 2 skipped; required: 3, all reported
@@ -253,15 +254,24 @@ It refuses (asks, at a terminal; a dry run says what a real merge would do)
 when a check is pending; when one failed, errored, was cancelled, timed out or
 needs action (`--admin` bypasses GitHub's required checks too, so nothing else
 would stop a red one); when a required check never reported on the head (CI
-never started); when fewer checks ran than `merge_min_checks`; and when the
-checks, or the required ones, can't be read. `--checks-ok` merges anyway, and
-says so; `--bypass` and `--admin` never get past it. A PR on which no check ran,
-in a repo that requires none and sets no floor, merges with a "no check ran"
-note: whether a workflow should run on a PR is in its triggers (paths, labels,
-`if:`), which wt can't evaluate, so a required check or `merge_min_checks` is
-what makes "CI never started" refuse. The merge is pinned to the commit whose
-checks were read (`--match-head-commit`): push after the read and GitHub
-refuses it rather than ship a head nobody checked.
+never started), or, required from one app, only another app reported it; when
+a workflow a ruleset requires never ran; when fewer checks ran than
+`merge_min_checks`; and when the checks, or the required ones, can't be read.
+A failure stays a failure until a later run of that check passes: a run a label
+event started that skipped the job, or one that was cancelled, does not clear
+it. `--checks-ok` merges anyway, and says so; `--bypass` and `--admin` never get
+past it. A PR on which no check ran, in a repo that requires none and sets no
+floor, merges with a "no check ran" note: whether a workflow should run on a PR
+is in its triggers (paths, labels, `if:`), which wt can't evaluate, so a
+required check or `merge_min_checks` is what makes "CI never started" refuse.
+The merge is pinned to the commit whose checks were read
+(`--match-head-commit`): push after the read and GitHub refuses it rather than
+ship a head nobody checked. A forwarded `-R`/`--repo` names the PR's
+repository, so that PR is the one read and pinned. A forwarded flag that merges
+nothing (`--disable-auto`, `--help`) skips the gate. `--auto` gets no
+exemption: when the only checks pending or failing are ones no branch rule
+requires, gh merges at once instead of waiting for them. A dry run's verdict
+line carries the result too (`verdict=ok checks=blocked`).
 
 The gates run in this order: the PR-state precheck, the checks, the
 merge==deploy confirm (below), another window's `merge-main` hold, the close

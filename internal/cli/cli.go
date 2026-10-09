@@ -416,12 +416,21 @@ func cmdMergePR(args []string) int {
 	// pending or red stops before anyone types "deploy". --admin bypasses
 	// GitHub's required checks, so nothing after this would stop it; --checks-ok
 	// is the only way past (not --bypass). Read on --dry-run too: a clean dry
-	// run means the checks were read, and green. The merge is pinned to the
-	// commit whose checks it read (WithMatchHead, below).
-	pin, ok := checksGate(pr, checksOpts{dryRun: *dryRun, checksOK: *checksOK, admin: *admin, bypass: *bypass,
-		minChecks: c.MergeMinChecks, minChecksBad: c.MergeMinChecksBad}, os.Stdin, stdinIsTTY(), liveChecksReads)
-	if !ok {
-		return 1
+	// run means the checks were read. The merge is pinned to the commit whose
+	// checks it read (WithMatchHead, below). A forwarded -R/--repo is the PR's
+	// repository, so the gate reads that PR; a passthrough that merges nothing
+	// (--disable-auto, --help) skips the gate and the pin.
+	pin, checksLabel := "", "skipped"
+	if flag := merge.NonMerging(ghArgs); flag != "" {
+		fmt.Println(skippedChecksLine(pr, flag))
+	} else {
+		var ok bool
+		pin, checksLabel, ok = checksGate(pr, checksOpts{dryRun: *dryRun, checksOK: *checksOK, admin: *admin, bypass: *bypass,
+			auto: merge.ForwardsAuto(ghArgs), repo: merge.ParseForwardedRepo(ghArgs),
+			minChecks: c.MergeMinChecks, minChecksBad: c.MergeMinChecksBad}, os.Stdin, stdinIsTTY(), liveChecksReads)
+		if !ok {
+			return 1
+		}
 	}
 	// ⚠ The deploy gate is EVALUATED on --dry-run too (#170), for the reason the close-set
 	// preview below gives (#164): deployGateApplies and the draft read are
@@ -476,7 +485,7 @@ func cmdMergePR(args []string) int {
 	if !ok {
 		return 1
 	}
-	if err := merge.Run(pr, *dryRun, *bypass, *mergeForeign, wtBranches, merge.WithMatchHead(pin, merge.WithAdmin(*admin, prep.args)), prep.stdin); err != nil {
+	if err := merge.Run(pr, *dryRun, *bypass, *mergeForeign, wtBranches, merge.WithMatchHead(pin, merge.WithAdmin(*admin, prep.args)), prep.stdin, checksLabel); err != nil {
 		// ⚠ gh can fail AFTER merging (#196): `-- -d` merges, then cannot delete a
 		// local branch that a wt worktree has checked out, and exits non-zero. So a
 		// failed `gh pr merge` reads the PR state too, and only MERGED goes on to
@@ -722,7 +731,9 @@ func deployGate(pr string, confirmed bool) int {
 // with no stdin (Go also opens it in place of a closed fd 0), so it is not a
 // terminal: read as one, a `-F -` with nothing piped in printed "end it with
 // Ctrl-D" and skipped the empty-body warning (#180).
-func stdinIsTTY() bool {
+//
+// A variable so a test can drive merge-pr's terminal prompts (#179).
+var stdinIsTTY = func() bool {
 	fi, err := os.Stdin.Stat()
 	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
 		return false

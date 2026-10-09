@@ -174,6 +174,11 @@ var (
 	ghMergeValueShort = map[byte]string{
 		'A': "author-email", 'b': "body", 'F': "body-file", 'R': "repo", 't': "subject",
 	}
+	// ghMergeBoolShort are its bool shorthands, by long name (#179: -h asks for
+	// help, which merges nothing).
+	ghMergeBoolShort = map[byte]string{
+		'd': "delete-branch", 'h': "help", 'm': "merge", 'r': "rebase", 's': "squash",
+	}
 )
 
 // flagOcc is the occurrence of a `gh pr merge` value flag that gh uses: the
@@ -208,7 +213,7 @@ type flagOcc struct {
 // front of the passthrough (WithAdmin, WithSubject), so nothing follows it and
 // gh fails with "flag needs an argument" — said here, before a body is read.
 func ParseForwardedBody(args []string) (ForwardedBody, error) {
-	last, dangling := scanMergeFlags(args)
+	last, _, dangling := scanMergeFlags(args)
 	if dangling != "" {
 		return ForwardedBody{}, danglingFlagError(dangling)
 	}
@@ -244,7 +249,7 @@ type ForwardedSubject struct {
 // writes the repo's default. Pure. Errors on a value flag left without a value,
 // as ParseForwardedBody does.
 func ParseForwardedSubject(args []string) (ForwardedSubject, error) {
-	last, dangling := scanMergeFlags(args)
+	last, _, dangling := scanMergeFlags(args)
 	if dangling != "" {
 		return ForwardedSubject{}, danglingFlagError(dangling)
 	}
@@ -258,9 +263,11 @@ func danglingFlagError(flag string) error {
 
 // scanMergeFlags reads a `gh pr merge` passthrough the way gh's parser (pflag
 // v1.0.6) does and returns the occurrence gh uses (the last) of each value flag,
-// by long name, and the first value flag left without a value ("" = none). Pure.
-func scanMergeFlags(args []string) (last map[string]flagOcc, dangling string) {
-	last = map[string]flagOcc{}
+// by long name; what each bool flag given ends up as, by long name (`--x=false`
+// sets it false); and the first value flag left without a value ("" = none).
+// Pure.
+func scanMergeFlags(args []string) (last map[string]flagOcc, bools map[string]bool, dangling string) {
+	last, bools = map[string]flagOcc{}, map[string]bool{}
 	take := func(name, flag, value string, at argPos) {
 		last[name] = flagOcc{value: value, flag: flag, at: at}
 	}
@@ -276,7 +283,8 @@ scan:
 		if s[1] == '-' { // --name, --name=value
 			name, value, inline := strings.Cut(s[2:], "=")
 			if !ghMergeValueLong[name] {
-				continue // a bool flag, or one gh rejects
+				bools[name] = boolValue(value, inline) // a bool flag, or one gh rejects
+				continue
 			}
 			at := argPos{index: i, prefix: "--" + name + "="}
 			if !inline {
@@ -298,10 +306,17 @@ scan:
 			eq := len(cluster)-j > 2 && cluster[j+1] == '='
 			name, valued := ghMergeValueShort[cluster[j]]
 			if !valued {
+				if b, ok := ghMergeBoolShort[cluster[j]]; ok {
+					value := ""
+					if eq {
+						value = cluster[j+2:]
+					}
+					bools[b] = boolValue(value, eq)
+				}
 				if eq {
 					break // `-d=false`: the rest is this bool's value
 				}
-				continue // a bool (-d -m -r -s), or one gh rejects
+				continue // a bool (-d -h -m -r -s), or one gh rejects
 			}
 			flag := "-" + string(cluster[j])
 			var value string
@@ -322,7 +337,49 @@ scan:
 			break // a value flag ends the cluster
 		}
 	}
-	return last, dangling
+	return last, bools, dangling
+}
+
+// boolValue is what a bool flag is set to: true, or its `=value` read the way
+// pflag reads it (strconv.ParseBool; anything else is gh's error, and gh then
+// merges nothing, so it counts as set). Pure.
+func boolValue(value string, given bool) bool {
+	if !given {
+		return true
+	}
+	b, err := strconv.ParseBool(value)
+	return err != nil || b
+}
+
+// ParseForwardedRepo is the -R/--repo the args forwarded after `wt merge-pr
+// <pr> --` hand `gh pr merge` (the last one, read as gh reads it), or "" (#179):
+// gh then merges that repository's PR, so the checks gate reads that one. Pure.
+func ParseForwardedRepo(args []string) string {
+	last, _, _ := scanMergeFlags(args)
+	return strings.TrimSpace(last["repo"].value)
+}
+
+// NonMerging is the forwarded flag that makes `gh pr merge` merge nothing
+// (#179): --disable-auto (it only disarms auto-merge) or --help/-h, as gh
+// reads the passthrough; "" when gh will merge, queue or arm the PR. The
+// checks gate skips such a run: refusing to disarm auto-merge while checks are
+// pending blocked the one thing an operator wants then. Pure.
+func NonMerging(args []string) string {
+	_, bools, _ := scanMergeFlags(args)
+	switch {
+	case bools["help"]:
+		return "--help"
+	case bools["disable-auto"]:
+		return "--disable-auto"
+	}
+	return ""
+}
+
+// ForwardsAuto reports whether the args forwarded after `wt merge-pr <pr> --`
+// ask gh to arm auto-merge (--auto), as gh reads them (#179). Pure.
+func ForwardsAuto(args []string) bool {
+	_, bools, _ := scanMergeFlags(args)
+	return bools["auto"]
 }
 
 // RedirectToStdin returns a copy of args (the slice that was parsed) with the
@@ -346,9 +403,12 @@ func (b ForwardedBody) RedirectToStdin(args []string) []string {
 // (the foreign-branch guard, wt#15). worktreeBranches is the set of wt-managed
 // worktree branches for this repo. extraArgs pass through to `gh pr merge`;
 // ghStdin is what gh reads as its stdin (nil = wt's own), which carries a
-// forwarded body wt already read (#180). An error from gh itself wraps
-// ErrMergeCommand (#196); a guard's refusal does not.
-func Run(pr string, dryRun, bypass, mergeForeign bool, worktreeBranches []string, extraArgs []string, ghStdin io.Reader) error {
+// forwarded body wt already read (#180). checks is the checks gate's verdict
+// (#179), which the dry-run line carries beside the guard's, so a dry run the
+// checks would refuse never reads as a bare verdict=ok ("" leaves it out). An
+// error from gh itself wraps ErrMergeCommand (#196); a guard's refusal does
+// not.
+func Run(pr string, dryRun, bypass, mergeForeign bool, worktreeBranches []string, extraArgs []string, ghStdin io.Reader, checks string) error {
 	fileCount := ghx.PRChangedFileCount(pr)
 	subjects := ghx.PRCommitSubjects(pr)
 	v := GuardVerdict(fileCount, subjects)
@@ -392,7 +452,7 @@ func Run(pr string, dryRun, bypass, mergeForeign bool, worktreeBranches []string
 		if foreign {
 			note = " [FOREIGN: head has no wt worktree here — a real merge needs --merge-foreign]"
 		}
-		fmt.Printf("merge-pr: %s verdict=%s file_count=%s%s (dry-run, not merging)\n", label, v, fileCount, note)
+		fmt.Printf("merge-pr: %s %s file_count=%s%s (dry-run, not merging)\n", label, VerdictField(v, checks), fileCount, note)
 		return nil
 	}
 
@@ -425,6 +485,16 @@ func Run(pr string, dryRun, bypass, mergeForeign bool, worktreeBranches []string
 		return fmt.Errorf("%w: %w", ErrMergeCommand, err)
 	}
 	return nil
+}
+
+// VerdictField is the dry-run line's verdict: `verdict=ok`, with the checks
+// gate's `checks=blocked` (green, none, unread, skipped) beside it when it
+// read them (#179). Pure.
+func VerdictField(v Verdict, checks string) string {
+	if checks == "" {
+		return fmt.Sprintf("verdict=%s", v)
+	}
+	return fmt.Sprintf("verdict=%s checks=%s", v, checks)
 }
 
 // ErrMergeCommand marks a Run error that `gh pr merge` itself returned, as

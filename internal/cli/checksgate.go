@@ -9,7 +9,6 @@
 package cli
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -25,9 +24,10 @@ import (
 // checksReads are the gh reads the checks gate makes, as fields so a test can
 // drive it without gh. liveChecksReads is the real thing.
 type checksReads struct {
-	checks     func(pr string) (ghx.PRChecksRead, error)
-	protection func(base string) ([]string, error)
-	rulesets   func(base string) ([]string, error)
+	checks     func(pr, repo string) (ghx.PRChecksRead, error)
+	protection func(host, repo, base string) (ghx.Required, error)
+	rulesets   func(host, repo, base string) (ghx.Required, error)
+	repoName   func(host string, id int64) (string, error)
 	sleep      func(time.Duration)
 }
 
@@ -35,6 +35,7 @@ var liveChecksReads = checksReads{
 	checks:     ghx.PRChecks,
 	protection: ghx.BranchProtectionChecks,
 	rulesets:   ghx.RulesetChecks,
+	repoName:   ghx.RepoName,
 	sleep:      time.Sleep,
 }
 
@@ -47,6 +48,8 @@ type checksOpts struct {
 	checksOK     bool   // --checks-ok: merge past it, loudly
 	admin        bool   // --admin: GitHub's required checks are bypassed as well
 	bypass       bool   // --bypass, which does NOT cover this gate: the refusal says so
+	auto         bool   // the passthrough arms auto-merge (--auto): the refusal says why that is not exempt
+	repo         string // the passthrough's -R/--repo: gh merges that repository's PR, so that is the one read
 	minChecks    int    // merge_min_checks
 	minChecksBad string // merge_min_checks that is not a count
 }
@@ -85,23 +88,25 @@ func checksAction(s merge.ChecksStatus, dryRun, checksOK, tty bool) gateAction {
 // checksGate is merge-pr's checks gate (#179). It reads the checks on PR pr's
 // head commit and what the base branch requires, decides (merge.DecideChecks),
 // prints the summary, and returns the commit to pin the merge to (the one it
-// read; "" when the checks could not be read) and whether to go on. stdin and
+// read; "" when the checks could not be read), the verdict's label for the
+// dry-run line (green, none, blocked, unread) and whether to go on. stdin and
 // tty are where a terminal's answer comes from.
 //
 // ⚠ --admin never gets past it: --admin bypasses GitHub's required checks, so
 // this is the one check left. --bypass does not either (it is for wt's
 // empty-diff, placeholder, foreign-lane and hold guards); --checks-ok does.
-func checksGate(pr string, o checksOpts, stdin io.Reader, tty bool, r checksReads) (string, bool) {
+func checksGate(pr string, o checksOpts, stdin io.Reader, tty bool, r checksReads) (pin, label string, ok bool) {
 	read, in := readChecks(pr, o, r)
 	v := merge.DecideChecks(in)
+	label = v.Label()
 	fmt.Println(checksLine(pr, read.Head, v))
 	act := checksAction(v.Status, o.dryRun, o.checksOK, tty)
 	switch act {
 	case gateProceed:
-		return read.Head, true
+		return read.Head, label, true
 	case gateNote:
 		ui.Warn("%s", noChecksNote(pr, v))
-		return read.Head, true
+		return read.Head, label, true
 	}
 	for _, l := range checksDetail(v, read.Head) {
 		ui.Warn("%s", l)
@@ -111,65 +116,120 @@ func checksGate(pr string, o checksOpts, stdin io.Reader, tty bool, r checksRead
 	case gatePreview:
 		if o.checksOK {
 			ui.Warn("--dry-run: %s; --checks-ok is set, so a real merge would merge anyway.", why)
-			return read.Head, true
+			return read.Head, label, true
 		}
 		ui.Warn("--dry-run: a real merge would REFUSE here (or ask at a terminal): %s.", why)
 		for _, h := range refuseHints(pr, v, o) {
 			ui.Info("%s", h)
 		}
-		return read.Head, true
+		return read.Head, label, true
 	case gateOverride:
 		ui.Warn("--checks-ok set — merging PR #%s anyway: %s.%s", pr, why, adminTail(o.admin))
-		return read.Head, true
+		return read.Head, label, true
 	case gateAsk:
 		fmt.Fprintf(os.Stderr, "%s PR #%s: %s.%s Type %s to merge anyway (anything else aborts): ",
 			ui.Yellow("→"), pr, why, adminTail(o.admin), ui.Bold("merge"))
-		line, _ := bufio.NewReader(stdin).ReadString('\n')
-		if strings.TrimSpace(line) == "merge" {
-			return read.Head, true
+		if strings.TrimSpace(readLine(stdin)) == "merge" {
+			return read.Head, label, true
 		}
 		ui.Err("aborted — PR #%s not merged.", pr)
-		return "", false
+		return "", label, false
 	}
 	ui.Err("refusing to merge PR #%s — %s.", pr, why)
 	for _, h := range refuseHints(pr, v, o) {
 		ui.Info("%s", h)
 	}
-	return "", false
+	return "", label, false
 }
 
-// readChecks reads the head commit's checks and, from its base branch, the
-// required ones, each read retried once (a failed read stays a failed read:
-// the verdict blocks on it). ghx.ErrRulesetsUnavailable is an answer, so it is
-// not retried.
+// readChecks reads the head commit's checks and, from its base branch in its
+// base repository, what is required, each read retried once (a failed read
+// stays a failed read: the verdict blocks on it). ghx.ErrRulesetsUnavailable
+// is an answer, so it is not retried.
 func readChecks(pr string, o checksOpts, r checksReads) (ghx.PRChecksRead, merge.ChecksInput) {
 	in := merge.ChecksInput{MinChecks: o.minChecks, MinChecksBad: o.minChecksBad}
-	read, err := r.checks(pr)
+	read, err := r.checks(pr, o.repo)
 	if err != nil {
 		r.sleep(checksRetryWait)
-		read, err = r.checks(pr)
+		read, err = r.checks(pr, o.repo)
 	}
 	if err != nil {
 		in.ReadErr = err.Error()
 		return ghx.PRChecksRead{}, in
 	}
 	in.Checks = read.Checks
-	required := func(f func(string) ([]string, error)) ([]string, error) {
-		names, err := f(read.Base)
+	required := func(f func(host, repo, base string) (ghx.Required, error)) (ghx.Required, error) {
+		req, err := f(read.Host, read.Repo, read.Base)
 		if err != nil && !errors.Is(err, ghx.ErrRulesetsUnavailable) {
 			r.sleep(checksRetryWait)
-			names, err = f(read.Base)
+			req, err = f(read.Host, read.Repo, read.Base)
 		}
-		return names, err
+		return req, err
 	}
 	prot, perr := required(r.protection)
 	rules, rerr := required(r.rulesets)
-	in.Required, in.RequiredUnread = merge.RequiredChecks(prot, perr, rules, rerr)
+	req, unread := merge.RequiredChecks(prot, perr, rules, rerr)
+	workflows, wunread := resolveWorkflows(read, req.Workflows, r)
+	in.Required, in.Workflows, in.RequiredUnread = req.Checks, workflows, append(unread, wunread...)
 	return read, in
 }
 
+// resolveWorkflows names the repository each required workflow lives in, so
+// the gate can match runs to it (#179): the PR's base repository when the rule
+// names its id, else as gh resolves the id (retried once). A workflow whose
+// repository gh cannot name is left out and reported as unread, which blocks.
+func resolveWorkflows(read ghx.PRChecksRead, ws []ghx.RequiredWorkflow, r checksReads) (out []ghx.RequiredWorkflow, unread []string) {
+	names := map[int64]string{read.RepoID: read.Repo}
+	failed := map[int64]error{}
+	for _, w := range ws {
+		name, known := names[w.RepoID]
+		if !known && failed[w.RepoID] == nil {
+			n, err := r.repoName(read.Host, w.RepoID)
+			if err != nil {
+				r.sleep(checksRetryWait)
+				n, err = r.repoName(read.Host, w.RepoID)
+			}
+			if err != nil {
+				failed[w.RepoID] = err
+			} else {
+				name, known, names[w.RepoID] = n, true, n
+			}
+		}
+		if !known {
+			unread = append(unread, fmt.Sprintf("the repository (id %d) of required workflow %s: %v", w.RepoID, w.Path, failed[w.RepoID]))
+			continue
+		}
+		w.Repo = name
+		out = append(out, w)
+	}
+	return out, unread
+}
+
+// readLine reads one line from r, a byte at a time, so it never consumes what
+// comes after: a `-F -` body read from the same stdin is next (#180). Buffered,
+// the answer's read took the body with it whenever stdin is not a line-at-a-
+// time terminal. The line is returned without its newline; at EOF, what there
+// was.
+func readLine(r io.Reader) string {
+	var line []byte
+	b := make([]byte, 1)
+	for {
+		n, err := r.Read(b)
+		if n == 1 {
+			if b[0] == '\n' {
+				return string(line)
+			}
+			line = append(line, b[0])
+		}
+		if err != nil {
+			return string(line)
+		}
+	}
+}
+
 // checksLine is the gate's summary, printed on every merge-pr run, dry or not:
-// a clean dry run therefore says the checks were read, and green. Pure.
+// a clean dry run therefore says the checks were read: green, or none when no
+// check ran. Pure.
 //
 //	merge-pr: PR #7 checks=green on 1a2b3c4d5e6f: 12 passed, 2 skipped; required: 3, all reported
 func checksLine(pr, head string, v merge.ChecksVerdict) string {
@@ -177,17 +237,24 @@ func checksLine(pr, head string, v merge.ChecksVerdict) string {
 		return fmt.Sprintf("merge-pr: PR #%s checks=unread: %s", pr, v.ReadErr)
 	}
 	var req string
+	notReported := len(v.Missing) + len(v.OtherApp) + len(v.MissingWorkflows) + len(v.Unverifiable)
 	switch {
 	case len(v.RequiredUnread) > 0:
 		req = "required: could not be read"
 	case v.Required == 0:
 		req = "no required checks"
-	case len(v.Missing) == 0:
+	case notReported == 0:
 		req = fmt.Sprintf("required: %d, all reported", v.Required)
 	default:
-		req = fmt.Sprintf("required: %d, %d never reported", v.Required, len(v.Missing))
+		req = fmt.Sprintf("required: %d, %d never reported", v.Required, notReported)
 	}
-	return fmt.Sprintf("merge-pr: PR #%s checks=%s on %.12s: %s; %s", pr, v.Status, head, v.CountsText(), req)
+	return fmt.Sprintf("merge-pr: PR #%s checks=%s on %.12s: %s; %s", pr, v.Label(), head, v.CountsText(), req)
+}
+
+// skippedChecksLine is the gate's line when the passthrough merges nothing
+// (merge.NonMerging): no checks are read, and nothing is pinned. Pure.
+func skippedChecksLine(pr, flag string) string {
+	return fmt.Sprintf("merge-pr: PR #%s checks=skipped: the forwarded %s merges nothing, so the checks gate does not apply", pr, flag)
 }
 
 // checksDetail lists what blocks a verdict, one line per kind, for the lines
@@ -208,6 +275,15 @@ func checksDetail(v merge.ChecksVerdict, head string) []string {
 	}
 	if len(v.Missing) > 0 {
 		out = append(out, fmt.Sprintf("required, but never reported on %.12s: %s (CI may not have started)", head, nameList(v.Missing)))
+	}
+	if len(v.OtherApp) > 0 {
+		out = append(out, fmt.Sprintf("required from one app, but reported on %.12s only by another: %s", head, nameList(v.OtherApp)))
+	}
+	if len(v.MissingWorkflows) > 0 {
+		out = append(out, fmt.Sprintf("required workflow never ran on %.12s: %s (CI may not have started)", head, nameList(v.MissingWorkflows)))
+	}
+	if len(v.Unverifiable) > 0 {
+		out = append(out, fmt.Sprintf("required workflow wt cannot verify on %.12s: %s (GitHub did not say which workflow file some runs came from)", head, nameList(v.Unverifiable)))
 	}
 	if v.Floor > 0 {
 		out = append(out, fmt.Sprintf("only %d check(s) ran, fewer than merge_min_checks = %d (CI may not have started)", v.Ran, v.Floor))
@@ -236,6 +312,9 @@ func refuseHints(pr string, v merge.ChecksVerdict, o checksOpts) []string {
 		out = append(out, "re-run once gh can read them, or pass --checks-ok to merge without them")
 	} else {
 		out = append(out, fmt.Sprintf("wait for CI (gh pr checks %s --watch) and re-run, or pass --checks-ok to merge anyway", pr))
+	}
+	if o.auto {
+		out = append(out, "--auto is not exempt: when the only checks pending or failing are ones no branch rule requires, gh merges at once instead of waiting for them")
 	}
 	if o.admin {
 		out = append(out, "--admin bypasses GitHub's required checks too, so nothing after wt would stop this merge")
