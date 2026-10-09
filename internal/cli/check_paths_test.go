@@ -28,6 +28,7 @@ import (
 // internal/foo.go. Nothing touches the root README.md.
 func pathsRepo(t *testing.T) (root, wa, wb string) {
 	t.Helper()
+	hermeticGitT(t) // the fixture's git and the code under test's (#167)
 	offlineGH(t)
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("WT_SKIP_COLLISION", "")
