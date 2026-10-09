@@ -351,7 +351,7 @@ func TestChecksGateReads(t *testing.T) {
 // "rollup.fail" exists), whose base branch answer is "branch" and whose
 // rulesets answer is "rules" (gh exits 1 after printing it when "rules.fail"
 // exists). Every call is appended to "calls", and every `pr merge` argv
-// recorded, one per line, in "argv".
+// recorded, one per line, in "argv", with its stdin in "stdin".
 const checksGh = `#!/bin/sh
 d=$(dirname "$0")
 printf '%s\n' "$*" >> "$d/calls"
@@ -380,7 +380,7 @@ case "$1 $2" in
 	*parents*) echo '{"message":"Fix the widget","parents":1}' ;;
 	esac ;;
 "issue view") echo OPEN ;;
-"pr merge") printf '%s\n' "$@" > "$d/argv" ;;
+"pr merge") printf '%s\n' "$@" > "$d/argv"; cat > "$d/stdin" ;;
 esac
 exit 0
 `
@@ -495,6 +495,7 @@ func TestCmdMergePR_checksGate(t *testing.T) {
 		stdin    string
 		code     int
 		merged   []string // gh's argv after `pr merge 99999 --squash`; nil = gh never merged
+		ghStdin  string   // what gh pr merge read on its stdin, when the case says
 		stdout   []string
 		stderr   []string
 		notOut   []string // in neither stream
@@ -548,7 +549,8 @@ func TestCmdMergePR_checksGate(t *testing.T) {
 		{name: "a terminal that types anything else: aborted", args: []string{"99999", "--keep"}, rollup: pending, tty: true, stdin: "yes\n",
 			code: 1, stderr: []string{"aborted — PR #99999 not merged."}},
 		{name: "a terminal, then a -F - body typed after the answer", args: []string{"99999", "--keep", "--", "-F", "-"}, rollup: pending, tty: true,
-			stdin: "merge\nTyped body, refs #3.\n", code: 0, merged: append(append([]string{}, pinned...), "-F", "-")},
+			stdin: "merge\nTyped body, refs #3.\n", code: 0, merged: append(append([]string{}, pinned...), "-F", "-"),
+			ghStdin: "Typed body, refs #3.\n"},
 		{name: "--dry-run: the verdict line carries checks=blocked", args: []string{"99999", "--dry-run"}, rollup: pending, code: 0,
 			stdout: []string{"checks=blocked on 0123456789ab: 1 passed, 1 pending", `verdict=ok checks=blocked file_count=1 (dry-run, not merging)`},
 			stderr: []string{"--dry-run: a real merge would REFUSE here"}},
@@ -591,7 +593,7 @@ func TestCmdMergePR_checksGate(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			for name, on := range map[string]bool{"rollup.fail": tc.rollup == "", "rules.fail": tc.rulesErr, "argv": false, "calls": false} {
+			for name, on := range map[string]bool{"rollup.fail": tc.rollup == "", "rules.fail": tc.rulesErr, "argv": false, "calls": false, "stdin": false} {
 				_ = os.Remove(filepath.Join(ghDir, name))
 				if on {
 					if err := os.WriteFile(filepath.Join(ghDir, name), nil, 0o644); err != nil {
@@ -656,6 +658,31 @@ func TestCmdMergePR_checksGate(t *testing.T) {
 					t.Errorf("gh argv = %q, want %q", got, want)
 				}
 			}
+			if tc.ghStdin != "" {
+				if got, _ := os.ReadFile(filepath.Join(ghDir, "stdin")); string(got) != tc.ghStdin {
+					t.Errorf("gh stdin = %q, want %q: the prompt must leave the body after its answer", got, tc.ghStdin)
+				}
+			}
 		})
+	}
+}
+
+// TestReadLine: the prompt's answer is read up to its newline and no further,
+// so a `-F -` body after it is still there for the squash (#180).
+func TestReadLine(t *testing.T) {
+	for _, c := range []struct{ in, line, rest string }{
+		{"merge\nThe body.\n", "merge", "The body.\n"},
+		{"merge\n", "merge", ""},
+		{"merge", "merge", ""},
+		{"", "", ""},
+		{"\nmerge\n", "", "merge\n"},
+	} {
+		r := strings.NewReader(c.in)
+		line := readLine(r)
+		rest := make([]byte, r.Len())
+		_, _ = r.Read(rest)
+		if line != c.line || string(rest) != c.rest {
+			t.Errorf("readLine(%q) = %q, leaving %q; want %q, leaving %q", c.in, line, rest, c.line, c.rest)
+		}
 	}
 }
