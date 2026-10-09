@@ -1,7 +1,10 @@
 package ghx
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -139,5 +142,52 @@ old.example.com
 		if !reflect.DeepEqual(got, c.want) || parsed != c.parsed {
 			t.Errorf("%s:\n parseAuthStatus = (%+v, %v)\n want             (%+v, %v)", c.name, got, parsed, c.want, c.parsed)
 		}
+	}
+}
+
+// TestAuthStatusForReadsBothStreams pins the gh plumbing under the parser: once
+// any account fails, gh writes EVERY host section to stderr and exits 1, so a
+// stdout-only capture would read the #183 two-host case as "could not be
+// verified". It also pins #172's single check: the boolean and the per-host
+// breakdown come from one memoized gh run.
+func TestAuthStatusForReadsBothStreams(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script gh shim")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "out.txt"), []byte(ghTwoHosts), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	calls := filepath.Join(dir, "calls")
+	shim := "#!/bin/sh\necho run >> '" + calls + "'\ncat '" + filepath.Join(dir, "out.txt") + "' >&2\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(shim), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+"/usr/bin"+string(os.PathListSeparator)+"/bin")
+
+	authMu.Lock()
+	saved := authMemo
+	authMemo = map[string]authAnswer{}
+	authMu.Unlock()
+	t.Cleanup(func() {
+		authMu.Lock()
+		authMemo = saved
+		authMu.Unlock()
+	})
+
+	if AuthedFor("") {
+		t.Fatal("AuthedFor(\"\") = true for a gh that exited 1")
+	}
+	got := AuthStatusFor("")
+	want := []HostAuth{{Host: "github.com", State: HostAuthOK}, {Host: "ghe.example.com", State: HostAuthTimeout}}
+	if got.OK || !got.Parsed || !reflect.DeepEqual(got.Hosts, want) {
+		t.Errorf("AuthStatusFor(\"\") = %+v, want OK=false Parsed=true Hosts=%+v (the sections are on stderr)", got, want)
+	}
+	b, err := os.ReadFile(calls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(b), "run"); n != 1 {
+		t.Errorf("gh ran %d times for AuthedFor + AuthStatusFor, want 1 (one memoized check, #172)", n)
 	}
 }
