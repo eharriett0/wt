@@ -44,6 +44,36 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   worktree is NEVER suppressed — even a far-behind base checkout stays HIGH and
   is only *labelled* "likely stale" (#87). Uncomputable/offline → surfaced, not
   hidden.
+- **A window's ranges are its OWN edits, in BASE line numbers (#29/#142/#184).**
+  Diffed straight from base, a branch BEHIND base reads every line base inserted
+  or modified after it forked as its own edit (it still holds the old text), so
+  any window editing those lines "overlapped" it: a false HIGH that blocked
+  pushes. `ChangedRanges` therefore diffs a behind branch from its merge base and
+  moves its hunks into base numbering through base's own hunks
+  (`mapHunksToBase`). ⚠ A base hunk that CONFLICTS with a branch hunk by git's
+  3-way rule (`hunksConflict`: they overlap, or touch with no unchanged line
+  between; checked against `git merge-file` on every 1-2 line shape) adds its
+  replacement to the branch's range: git merges the two as ONE conflict region,
+  so a window editing base's text there collides even on lines the branch never
+  had (branch edits l11, base rewrites l12-13, another window edits l13: merge-tree
+  conflicts). Mapping only the branch's own lines dropped exactly that case, and a
+  push main had blocked went through. An edit identical to one base also made
+  (a cherry-pick) stays the branch's: if the other window lands first, git
+  conflicts. `ChangedRangesNew` diffs from the merge base too.
+  ⚠ **A failed measurement never reads as "no edits":** the merge-base diffs
+  failing fall back to the plain base diff (over-reports); git failing outright
+  → `ChangedRangesChecked` ok=false, `ChangedRanges` nil (graders: indeterminate
+  = HIGH), `ChangedRangesNew` the whole file. `gitOutput` is the test seam.
+- **The pre-edit hooks grade what `wt check` will say once the edit is made
+  (#108/#184).** `regradePending`: every hunk-graded entry (HIGH *or* FYI: a
+  window whose earlier edits were disjoint can be about to overlap) is HIGH iff
+  this window's own ranges ∪ the pending edit overlap the other window's. The
+  pending edit is located in the on-disk file and moved into base numbering
+  through this worktree's own diff (`gitx.LinesToBase`, the same mapping with the
+  sides swapped), so a window that is behind base or already edited the file is
+  graded exactly, not file-level. Only when that can't be computed (a Write, a
+  non-unique `old_string`, a binary file, a git error) does an entry stay as a
+  file-level heads-up, and then it is never dropped.
 - **Coordination ownership is ONE predicate, and it includes the session (#163).**
   Two agent sessions started in one checkout resolve to the same window id, so
   each treated the other's announcements as its own: `inbox clear`, `wt holds`
@@ -97,6 +127,28 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   `collide.SharedSectionsAcross` — the hooks used to stop at the blanket
   shared-doc advisory, so the one case `structured_doc` exists to catch (two
   windows in the same lane) blocked in `check` and sailed through pre-push.
+  Inside `cli`, the per-entry decision is ONE function, `gradeEntry` (#182):
+  `wt check`/wt_check/both edit hooks AND `wt status`/wt_status/the per-turn
+  banner grade through it. The banner used to run its own all-windows grade, so
+  merged/dormant/closed windows rode along and it said HIGH where `check` said
+  low. For a file the current window edits, the banner lists what `check` lists
+  and is **HIGH ⇒ `check` blocks** (`TestAgentOverlaps_MatchesCheck`). ⚠ NOT ⟺,
+  on purpose: when this window's own copy is already on base (#109) or its change
+  already landed (#122), `check` still blocks (its pre-edit heads-up: empty or
+  phantom ranges can't be proven disjoint) but the banner reads "same file".
+  Re-tighten it and a session left open after its PR merged is told HIGH on
+  every turn, the #182 noise. An untracked copy (#113) stays HIGH in both.
+  Window-neutral (`wt status`, banner lines for files this window isn't
+  editing), a file is HIGH iff some pair blocks in BOTH directions: a window
+  whose claim is already merged, landed or untracked contests nothing. ⇒ Two
+  windows creating the same new file read advisory in status and in other
+  windows' banners until one commits it (consistent with #113), while `check`
+  from the untracked side still blocks. **A label is not an identity**: two
+  worktrees that claimed one issue are both `#N`, and detached worktrees are
+  named by their directory. Overlaps carry worktrees (`Overlap.Worktrees`,
+  `collide.Self`) and pairs grade by worktree; `ClassifyWindows` keeps a shared
+  label's least-suppressed answer. Grading by label compared one window with
+  itself and dropped a real pair.
 - **`wt clean` is data-loss-critical.** `ReapVerdict` only reaps a *provably
   shipped* worktree (grace window, upstream, merged PR / cherry). Never
   force-remove a dirty worktree automatically — `--stale-index` is
@@ -133,6 +185,18 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   must pick out exactly ONE worktree (`CheckNames`): none is a typo, two is a
   directory name that is also another worktree's branch. Either stops the run
   with nothing cleaned, so a bad `-y` list never removes "the rest" of it.
+- **`merge-pr` auto-cleans only a PR that reads MERGED afterwards (#185).** `gh
+  pr merge` exits 0 WITHOUT merging for `--help`/`-h`, `--auto` (armed),
+  `--disable-auto`, a merge queue (queued) and `-R` (another repo's PR). Taking
+  that 0 as a merge removed the lane and `git branch -D`'d unpushed commits.
+  `merge.ConfirmMerged` re-reads the state (2.5s at most, for API lag); anything
+  but MERGED (OPEN, CLOSED, no answer) keeps the worktree, branch and claim for
+  `wt clean` to reap once the PR ships. ⚠ **Even then, only a lane whose local
+  tip shipped (#187):** a squash leaves the branch unmerged in git's eyes, so the
+  auto-clean's `git branch -D` would drop commits made after the push.
+  `merge.LocalTipVerdict` needs the tip to BE the PR's `headRefOid` or an
+  ancestor of it; otherwise, or when it can't tell (no head, not fetched here),
+  the worktree and branch stay and the warning counts the commits not in the PR.
 - **"No PR" must be an `ok=false`, never a parsed placeholder (#168).**
   `PRForBranch`'s old `.[0] | …` query printed `null null` for a branch with
   no PR, which parsed as a PR in state `null`. Every caller then matched no
@@ -175,17 +239,20 @@ exit 0** (advisory / fail-open; a coordination nicety must never break the sessi
 `PreToolUse` fires on `apply_patch` and supports both `additionalContext` and
 `permissionDecision:"deny"` — so `wt install-codex-hook` wires two hooks:
 - `wt _hook codex-context` (**UserPromptSubmit**): each turn emits the cross-window
-  overlap summary from the SAME `collide.Overlaps` + `gradeStatusOverlaps` machinery
-  `wt status` uses, excluding the current window (`collide.LabelForWorktree`).
+  overlap summary (`agentOverlaps`: `collide.PartitionOverlapsFor` + `gradeOverlaps`)
+  from the CURRENT window's side, so a file this window edits lists the windows
+  `wt check <file>` would there and reads HIGH only where it blocks (#182); the
+  current window, identified by worktree (`collide.SelfFor`), is excluded. Same
+  builder as `claude-context`.
 - `wt _hook codex-edit` (**PreToolUse**, matcher `apply_patch`): parses the patch's
   `*** {Update|Add|Delete|Move} File:` targets, grades them via `buildCheckReport`
-  (the same grader as `wt check`), then RE-grades each `CatBlocking` entry against
-  the patch's actual hunks — localized in the current file via `locateRange`
-  (`parseCodexPatch` → per-hunk pre-image of context+removed lines) — but **only
-  when frame-safe** (this worktree's file is unchanged vs base, i.e.
-  `ChangedRanges(root,base,path)` empty; the #108 lesson). A disjoint patch to a
-  shared file therefore stays silent. Emits `additionalContext` on overlap;
-  `WT_CODEX_HOOK_BLOCK=1` upgrades a **confirmed** HIGH (frame-safe hunk overlap) to
+  (the same grader as `wt check`), then RE-grades each hunk-graded entry (HIGH or
+  FYI) against this window's own ranges plus the patch's actual hunks — localized
+  in the current file via `locateRange` (`parseCodexPatch` → per-hunk pre-image of
+  context+removed lines) and moved into base numbering by `gitx.LinesToBase` —
+  with the same `regradePending` as the Claude hook (#108/#184). A disjoint patch
+  to a shared file therefore stays silent. Emits `additionalContext` on overlap;
+  `WT_CODEX_HOOK_BLOCK=1` upgrades a **confirmed** HIGH (a computed hunk overlap) to
   `deny` — a file-level-only match never denies.
 
 Key facts: `.codex/hooks.json` uses the **same nested shape** as Claude's
@@ -257,6 +324,15 @@ The formula supports `head "…", branch: "main"` for `--HEAD` builds.
   is a bare `gh auth status`, deliberately (#100), and that validates EVERY
   configured host: about 6 s with two. Uncached, it ran once per PR lookup and
   made a two-worktree `wt clean` take 18 s instead of 6.
+  ⚠ **That bare check's exit code is an aggregate (#183):** one unreachable
+  Enterprise host fails it for a github.com login that is fine, and outside a
+  repo there is never a host to scope to. So `doctor` reads it per host
+  (`AuthStatusFor` → pure `parseAuthStatus`, from the SAME memoized run; the
+  active account decides a host). gh writes every host section to **stderr**
+  once any account fails, so `authCheck` captures BOTH streams; stdout alone
+  reads as unparseable. A timeout or unreadable output proves nothing about the
+  login → "could not be verified", never "NOT authenticated". `Authed()` stays
+  the exit code: it only gates gh calls that need the repo's host anyway.
 - **A backtick code span DOES suppress GitHub's linked-issue parser — measured, #164.**
   One PR, one already-closed issue, body varied and `closingIssuesReferences` sampled:
 
@@ -283,6 +359,21 @@ The formula supports `head "…", branch: "main"` for `--HEAD` builds.
   — query via `gh api graphql … resource(url:){… on PullRequest{…}}`. It reads
   the PR body only, NOT the squash commit body (the `merge-pr` close-lint scans
   commit messages too — #77).
+  ⚠ **A body forwarded after `--` replaces the commit bodies in the squash (#180)**,
+  so the lint judges it instead (headlines stay: `--body` doesn't replace the
+  subject). `merge.ParseForwardedBody` reads the passthrough the way gh's pflag
+  does — last flag wins, a value flag eats a `-`-led next token, `--body` with
+  `--body-file` is gh's own error. A file or `-F -` body is read ONCE and handed
+  to gh on stdin with the flag re-pointed at `-`: `-F <(…)` is a pipe, and gh
+  re-opening it after wt read it would merge an EMPTY body. That handoff is
+  pinned by fake-`gh`-on-PATH tests (`ghx.MergePRSquash`, `merge.Run`), which put
+  the shim alone on PATH and refuse to run unless `gh` resolves to it.
+  ⚠ **wt's own gh flags go IN FRONT of the passthrough** (`--admin`, the WIP
+  `--subject`: `gh pr merge N --squash [wt flags] <passthrough>`). Appended, a
+  passthrough ending in a value flag (`-- --subject`) took `--admin` as its value
+  and gh merged the subject "--admin" with no admin; in front, gh fails on the
+  dangling flag, and an operator's own `--subject` beats the WIP strip (gh keeps
+  the last one).
 - macOS is the dev floor: bash 3.2 (no `mapfile`/`declare -A`), BSD `sed`/`stat`,
   `/var`→`/private/var` symlinks (resolve with `EvalSymlinks` before path
   compares).

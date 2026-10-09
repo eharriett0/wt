@@ -4,6 +4,7 @@ package gitx
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -46,15 +47,24 @@ func scopedEnv() []string {
 	return out
 }
 
-// run executes git with args in dir ("" = current dir) and returns trimmed
-// stdout. stderr is discarded; callers branch on err.
-func run(dir string, args ...string) (string, error) {
+// gitOutput runs git with args in dir ("" = current dir), the repo-pinning env
+// stripped (scopedEnv), and returns its stdout. It is a var for exactly one
+// reason: the fail-safe tests inject a git failure (a lost object, a crash) that
+// a scratch repo can't produce on demand, to pin that a failed measurement never
+// reads as "no edits" or "frame-safe" (#184). Production never reassigns it.
+var gitOutput = func(dir string, args ...string) ([]byte, error) {
 	cmd := exec.Command("git", args...)
 	if dir != "" {
 		cmd.Dir = dir
 	}
 	cmd.Env = scopedEnv()
-	out, err := cmd.Output()
+	return cmd.Output()
+}
+
+// run executes git with args in dir ("" = current dir) and returns trimmed
+// stdout. stderr is discarded; callers branch on err.
+func run(dir string, args ...string) (string, error) {
+	out, err := gitOutput(dir, args...)
 	return strings.TrimSpace(string(out)), err
 }
 
@@ -91,13 +101,31 @@ func RunDir(dir string, args ...string) (string, error) { return run(dir, args..
 // whose leading status-column space is load-bearing (trimming the blob shifts
 // the first line's path by one byte).
 func runRaw(dir string, args ...string) (string, error) {
+	out, err := gitOutput(dir, args...)
+	return string(out), err
+}
+
+// runRawReadOnly is runRaw for a read-only query in ANOTHER window's worktree,
+// with readOnlyEnv. Use it only for a command that must not write there.
+func runRawReadOnly(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
 	if dir != "" {
 		cmd.Dir = dir
 	}
-	cmd.Env = scopedEnv()
+	cmd.Env = readOnlyEnv(scopedEnv())
 	out, err := cmd.Output()
 	return string(out), err
+}
+
+// readOnlyEnv adds GIT_OPTIONAL_LOCKS=0 to env: without it `git status`
+// opportunistically refreshes the worktree's index, which takes index.lock, so a
+// probe of another window can make that window's own `git add` or `git commit`
+// fail with "index.lock: File exists". The per-turn banner asks once per
+// overlapping window on every prompt (#182). Set on the one command, never
+// process-wide: the #92 lesson is that git env leaking into the wrong call breaks
+// it. Pure.
+func readOnlyEnv(env []string) []string {
+	return append(env[:len(env):len(env)], "GIT_OPTIONAL_LOCKS=0")
 }
 
 // Present reports whether the git binary is on PATH.
@@ -441,7 +469,9 @@ func IsUntracked(worktree, path string) bool {
 	if worktree == "" {
 		return false
 	}
-	out, err := runRaw(worktree, "status", "--porcelain", "--untracked-files=all", "--", path)
+	// Read-only: this asks about ANOTHER window's worktree, once per prompt from
+	// the agent banner, so it must not take that window's index.lock (#182).
+	out, err := runRawReadOnly(worktree, "status", "--porcelain", "--untracked-files=all", "--", path)
 	if err != nil {
 		return false
 	}
@@ -647,8 +677,8 @@ func TouchedFiles(dir, base string) []string {
 }
 
 // LineRange is a 1-based inclusive span of changed lines. ChangedRanges emits
-// these in BASE coordinates (the OLD side of a base-vs-worktree diff, #29) so
-// two windows that fork from the same base can be compared in one frame. A pure
+// these in BASE coordinates (the base ref's line numbers, #29) so two windows
+// that fork from the same base can be compared in one frame. A pure
 // insertion/deletion (count 0) is recorded spanning the gap boundary (the
 // surviving line before + after) so it still overlaps an edit of the same region
 // in another window — biasing toward flagging (a missed conflict is worse than
@@ -704,121 +734,73 @@ func parseHunkRangesWith(diff string, re *regexp.Regexp) []LineRange {
 }
 
 // ChangedRanges returns the line ranges file was changed on in the worktree at
-// dir, expressed in BASE coordinates (#29). It runs ONE `git diff -U0 <base> --
-// <file>` — base commit vs the working tree, which folds committed + staged +
-// unstaged changes into a single diff — and parses the OLD (base) side of each
-// hunk. Because every window diffs against the SAME base ref, their ranges live
-// in one shared frame, so OverlappingSpans compares like-for-like even after one
-// window has inserts/deletes before a shared edit region (the pre-#29 latent
-// false-negative: NEW-side numbers from three separate diffs in three frames).
+// dir, expressed in BASE coordinates (#29): line numbers of the base ref's copy
+// of the file. Every window is reported in that one shared frame, so
+// OverlappingSpans compares like-for-like even after one window has
+// inserts/deletes before a shared edit region (the pre-#29 latent false
+// negative: NEW-side numbers from separate diffs, in separate frames).
+//
+// The ranges are the window's OWN edits (committed + staged + unstaged), never
+// the base's. For a branch up to date with base that is the old side of one
+// `git diff -U0 <base> -- <file>` (base commit vs the working tree). A branch
+// BEHIND base still holds the old text of everything base changed after it
+// forked, so that same diff reads base's later edits as the branch's: a block
+// base inserted (#142), a line base modified (#184). Another window editing
+// those lines then "overlapped" a branch that never touched them, a false HIGH
+// that blocked the pre-push hook. So a behind branch is measured from its merge
+// base instead: `git diff -U0 <merge-base> -- <file>` holds only the branch's
+// own edits, in merge-base line numbers, and they are moved into base line
+// numbers through base's own hunks since that merge base (mapHunksToBase).
+// Where a branch edit and a base edit meet (they overlap, or touch with no
+// unchanged line between: git's 3-way conflict rule), the branch's range also
+// covers base's replacement text there, so a window editing that text still
+// overlaps it: a real conflict is never mapped away. A file absent at the merge
+// base (each side added its own: an add/add) keeps the plain base diff, which
+// compares the two versions directly (#142 review).
+//
+// nil when git could not measure the file at all (ChangedRangesChecked has the
+// explicit ok): the graders read an empty side as indeterminate, so that grades
+// HIGH, never disjoint.
 //
 // Fallback: when neither origin/<base> nor <base> resolves (a base-less repo,
 // where cross-window base comparison is meaningless anyway), degrade to the
 // NEW-side uncommitted hunks so a single window still self-reports.
 func ChangedRanges(dir, base, file string) []LineRange {
-	r := changedRangesWith(dir, base, file, parseHunkRangesOld)
-	// #142: subtract content the branch merely LACKS — the base's PURE insertions
-	// since this branch's merge-base. In the base-frame `base..worktree` diff a
-	// stale branch's absence of base-gained content reads as phantom DELETION
-	// hunks, so an unrelated edit inside that region (by another window) would
-	// falsely grade as an overlap. Those insertions sit at base-frame positions
-	// the branch never had, so they can't coincide with the branch's own edits —
-	// dropping them keeps the base-frame comparability (#29/#108) AND real
-	// deletions (a delete/modify IS contested), fixing only the false positive.
-	if g := baseInsertedRanges(dir, base, file); len(g) > 0 {
-		r = subtractRanges(r, g)
-	}
+	r, _ := ChangedRangesChecked(dir, base, file)
 	return r
 }
 
-// insertHunkRe matches a -U0 PURE-insertion hunk (old count 0), capturing the
-// NEW-side start + optional count — the lines the new side gained with no
-// old-side counterpart. A modify (`-a,M` with M>0) does NOT match. (#142)
-var insertHunkRe = regexp.MustCompile(`^@@ -\d+,0 \+(\d+)(?:,(\d+))? @@`)
-
-// baseInsertedRanges returns the base-frame line ranges the base has PURELY
-// INSERTED since the branch at dir diverged (merge-base(base, HEAD)..base) — the
-// content a stale branch lacks. Empty when the branch is up to date with base
-// (merge-base == base) or the base ref can't be resolved. (#142)
-func baseInsertedRanges(dir, base, file string) []LineRange {
-	for _, ref := range []string{"origin/" + base, base} {
-		sha, err := RunDir(dir, "rev-parse", "--verify", "--quiet", ref+"^{commit}")
-		if err != nil {
-			continue
-		}
-		mb, err := RunDir(dir, "merge-base", ref, "HEAD")
-		if err != nil || mb == "" {
-			return nil
-		}
-		if mb == sha {
-			return nil // branch is up to date with base — nothing gained since
-		}
-		// Only subtract when the file EXISTED at the merge-base. If it didn't,
-		// base "inserting" the whole file isn't phantom-the-branch-lacks — the
-		// branch may have independently ADDED its own file (a real add/add
-		// conflict), and subtracting would suppress it (#142 review).
-		if _, err := RunDir(dir, "cat-file", "-e", mb+":"+file); err != nil {
-			return nil
-		}
-		out, err := runRaw(dir, "diff", "-U0", mb, ref, "--", file)
-		if err != nil {
-			return nil
-		}
-		return parseInsertedRangesNew(out)
+// ChangedRangesChecked is ChangedRanges with a failed measurement made explicit:
+// ok=false when git could not diff the file at all. A caller that UNIONS these
+// ranges with others (the pre-edit hooks add an agent's pending edit to them)
+// must then fall back to a conservative grade: there an empty set would read as
+// "no edits", where the graders read it as indeterminate.
+func ChangedRangesChecked(dir, base, file string) (ranges []LineRange, ok bool) {
+	ref, sha, hasBase := resolveBaseRef(dir, base)
+	if !hasBase {
+		return uncommittedRangesNew(dir, file)
 	}
-	return nil
+	if mb := behindMergeBase(dir, ref, sha, file); mb != "" {
+		own, ownErr := runRaw(dir, "diff", "-U0", mb, "--", file)
+		moved, movedErr := runRaw(dir, "diff", "-U0", mb, ref, "--", file)
+		if ownErr == nil && movedErr == nil {
+			return mapHunksToBase(parseHunks(own), parseHunks(moved)), true
+		}
+		// Can't measure from the merge base: fall through to the plain base diff,
+		// which over-reports (base's own edits read as the branch's). A noisy
+		// grade, never a hidden one.
+	}
+	out, err := runRaw(dir, "diff", "-U0", ref, "--", file)
+	if err != nil {
+		return nil, false
+	}
+	return parseHunkRangesOld(out), true
 }
 
-// parseInsertedRangesNew emits the NEW-side ranges of PURE-insertion hunks from a
-// -U0 diff (see insertHunkRe). (#142)
-func parseInsertedRangesNew(diff string) []LineRange {
-	var out []LineRange
-	for _, ln := range strings.Split(diff, "\n") {
-		m := insertHunkRe.FindStringSubmatch(ln)
-		if m == nil {
-			continue
-		}
-		start, _ := strconv.Atoi(m[1])
-		count := 1
-		if m[2] != "" {
-			count, _ = strconv.Atoi(m[2])
-		}
-		out = append(out, LineRange{start, start + count - 1})
-	}
-	return out
-}
-
-// subtractRanges removes the g spans from the r spans by true INTERVAL
-// subtraction — an r span that straddles a g span is SPLIT, not dropped whole.
-// `git diff -U0` folds a phantom base-block deletion together with a real branch
-// edit into ONE hunk when the edit is directly adjacent to the block (no
-// unchanged line between), so dropping the whole span would discard the real
-// edit — a false negative in the exact shared-manifest scenario (#142 review).
-// Splitting keeps the real edit and removes only the phantom part.
-func subtractRanges(r, g []LineRange) []LineRange {
-	var out []LineRange
-	for _, rr := range r {
-		segs := []LineRange{rr}
-		for _, gg := range g {
-			var next []LineRange
-			for _, s := range segs {
-				if !s.Overlaps(gg) {
-					next = append(next, s)
-					continue
-				}
-				if s.Start < gg.Start {
-					next = append(next, LineRange{s.Start, gg.Start - 1})
-				}
-				if s.End > gg.End {
-					next = append(next, LineRange{gg.End + 1, s.End})
-				}
-			}
-			segs = next
-		}
-		out = append(out, segs...)
-	}
-	return out
-}
+// wholeFile is what ChangedRangesNew reports when git can't measure the file: a
+// span over every line, so a failed measurement grades as "edited every section"
+// (HIGH against any window editing the doc), never as "edited nothing".
+var wholeFile = []LineRange{{1, math.MaxInt32}}
 
 // ChangedRangesNew is ChangedRanges but NEW-frame (current/`+` side). Use it to
 // attribute a window's diff to its OWN current-content sections (#22 structured
@@ -827,8 +809,242 @@ func subtractRanges(r, g []LineRange) []LineRange {
 // earlier edit shifts line counts (#123). NOT for cross-window line grading:
 // that needs the base frame (ChangedRanges) so two windows' ranges are comparable
 // (#108).
+//
+// It too reports only the window's OWN edits: a branch behind base is diffed from
+// its merge base (#184), whose new side already IS the current file, so no
+// mapping is needed. Diffed from base, the old text a behind branch still holds
+// wherever base changed after it forked was attributed to the branch, so a
+// section only base had touched graded "same section" HIGH against any window
+// editing it (in both the #142 insert and the #184 modify shape). If that diff
+// fails it falls back to the base diff (over-reports), and if git can't diff the
+// file at all it reports wholeFile.
 func ChangedRangesNew(dir, base, file string) []LineRange {
-	return changedRangesWith(dir, base, file, parseHunkRanges)
+	ref, sha, hasBase := resolveBaseRef(dir, base)
+	if !hasBase {
+		if r, ok := uncommittedRangesNew(dir, file); ok {
+			return r
+		}
+		return wholeFile
+	}
+	if mb := behindMergeBase(dir, ref, sha, file); mb != "" {
+		if out, err := runRaw(dir, "diff", "-U0", mb, "--", file); err == nil {
+			return parseHunkRanges(out)
+		}
+	}
+	out, err := runRaw(dir, "diff", "-U0", ref, "--", file)
+	if err != nil {
+		return wholeFile
+	}
+	return parseHunkRanges(out)
+}
+
+// LinesToBase moves line spans of the worktree's CURRENT copy of file (an agent's
+// pending edit, located in the on-disk file) into base line numbers, the frame
+// every window's ChangedRanges are reported in. It maps through the worktree's
+// own diff against base with the sides swapped (worktree → base), by the same
+// rule as ChangedRanges: a span on a line the worktree holds differently from
+// base (its own edit, or a base edit it is behind on) lands on base's text there,
+// and a span touching such a region claims it too. So the result is where
+// ChangedRanges will report the edit once it is made, whether the branch is up
+// to date, behind, or already edited (#184; the #108 frame lesson without giving
+// up on a worktree that differs from base). ok=false when that can't be measured
+// (a git error, a binary file, or a base-less repo with uncommitted changes); the
+// caller must then fall back to a conservative grade, never treat on-disk line
+// numbers as base's. Pure mapping over one git call.
+func LinesToBase(dir, base, file string, spans []LineRange) ([]LineRange, bool) {
+	ref, _, hasBase := resolveBaseRef(dir, base)
+	if !hasBase {
+		// Base-less: every window self-reports its uncommitted NEW side, which is
+		// the on-disk frame only while nothing uncommitted (not even a binary
+		// change, which has no hunks) shifts it.
+		for _, args := range [][]string{{"diff", "--", file}, {"diff", "--cached", "--", file}} {
+			if out, err := runRaw(dir, args...); err != nil || out != "" {
+				return nil, false
+			}
+		}
+		return spans, true
+	}
+	out, err := runRaw(dir, "diff", "-U0", ref, "--", file)
+	if err != nil {
+		return nil, false
+	}
+	hunks := parseHunks(out)
+	if len(hunks) == 0 && strings.Contains("\n"+out, "\nBinary files ") {
+		return nil, false // differs from base, but not line by line
+	}
+	toBase := make([]diffHunk, len(hunks))
+	for i, h := range hunks {
+		toBase[i] = diffHunk{oldStart: h.newStart, oldCount: h.newCount, newStart: h.oldStart, newCount: h.oldCount}
+	}
+	own := make([]diffHunk, len(spans))
+	for i, sp := range spans {
+		own[i] = diffHunk{oldStart: sp.Start, oldCount: sp.End - sp.Start + 1}
+	}
+	return mapHunksToBase(own, toBase), true
+}
+
+// resolveBaseRef returns the ref every window's ranges are measured against —
+// origin/<base>, else <base>, whichever first resolves to a commit in dir — and
+// that commit's sha. ok=false when neither resolves (a base-less repo). One
+// resolution for every caller keeps all windows in the same frame (#29/#108).
+func resolveBaseRef(dir, base string) (ref, sha string, ok bool) {
+	for _, r := range []string{"origin/" + base, base} {
+		if s, err := RunDir(dir, "rev-parse", "--verify", "--quiet", r+"^{commit}"); err == nil && s != "" {
+			return r, s, true
+		}
+	}
+	return "", "", false
+}
+
+// behindMergeBase returns the merge base of ref (at sha) and the worktree's HEAD
+// when the branch is BEHIND ref (the merge base is not ref itself) and file
+// existed at that merge base. "" otherwise: up to date with base, no merge base
+// (unrelated history, unborn HEAD), or a file new since the merge base, where
+// "lines base changed under the branch" means nothing (each side added its own
+// file, an add/add the plain base diff must keep seeing, #142 review).
+func behindMergeBase(dir, ref, sha, file string) string {
+	mb, err := RunDir(dir, "merge-base", ref, "HEAD")
+	if err != nil || mb == "" || mb == sha {
+		return ""
+	}
+	if _, err := RunDir(dir, "cat-file", "-e", mb+":"+file); err != nil {
+		return ""
+	}
+	return mb
+}
+
+// diffHunk is one `git diff -U0` hunk header: the OLD side's start + line count
+// and the NEW side's. A side with count 0 holds no lines (a pure insertion on the
+// old side, a pure deletion on the new), and its start is then the line BEFORE
+// the gap (0 = above line 1), as git reports it.
+type diffHunk struct{ oldStart, oldCount, newStart, newCount int }
+
+// fullHunkRe captures both sides of a -U0 hunk header (#184).
+var fullHunkRe = regexp.MustCompile(`^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@`)
+
+// parseHunks extracts every hunk header from -U0 output, in file order. A count
+// git omits is 1. Pure (#184).
+func parseHunks(diff string) []diffHunk {
+	count := func(s string) int {
+		if s == "" {
+			return 1
+		}
+		n, _ := strconv.Atoi(s)
+		return n
+	}
+	var out []diffHunk
+	for _, ln := range strings.Split(diff, "\n") {
+		m := fullHunkRe.FindStringSubmatch(ln)
+		if m == nil {
+			continue
+		}
+		oldStart, _ := strconv.Atoi(m[1])
+		newStart, _ := strconv.Atoi(m[3])
+		out = append(out, diffHunk{oldStart, count(m[2]), newStart, count(m[4])})
+	}
+	return out
+}
+
+// sideRange is one side of a hunk as a LineRange: [start, start+count-1], or for a
+// zero-count side the gap's two neighbours [start, start+1] (parseHunkRangesWith's
+// convention). Pure.
+func sideRange(start, count int) LineRange {
+	if count == 0 {
+		return LineRange{start, start + 1}
+	}
+	return LineRange{start, start + count - 1}
+}
+
+// mapHunksToBase moves a branch's OWN hunks from MERGE-BASE line numbers (the old
+// side of `git diff -U0 <merge-base> -- <file>` in its worktree) into BASE line
+// numbers, given base's hunks since that merge base (old side = merge-base frame,
+// new side = base frame), and returns them as LineRanges in parseHunkRangesWith's
+// convention. Pure (#184).
+//
+// Each end of a hunk's range is mapped on its own (mapLine), so the range keeps
+// covering everything between its ends. And every base hunk that CONFLICTS with
+// the branch hunk by git's 3-way rule (hunksConflict: they overlap, or touch with
+// no unchanged line between) adds its whole replacement to the range: in a merge
+// the two are one conflict region, so a window editing base's text anywhere in it
+// collides with this branch even on lines the branch never had. The chain shape:
+// a stale branch edits line 11, base rewrites lines 12-13, another window edits
+// line 13 — git merge-tree conflicts, so this must overlap.
+func mapHunksToBase(own, base []diffHunk) []LineRange {
+	out := make([]LineRange, 0, len(own))
+	for _, o := range own {
+		r := sideRange(o.oldStart, o.oldCount)
+		m := LineRange{mapLine(r.Start, base).Start, mapLine(r.End, base).End}
+		for _, h := range base {
+			if !hunksConflict(o, h) {
+				continue
+			}
+			n := sideRange(h.newStart, h.newCount)
+			if n.Start < m.Start {
+				m.Start = n.Start
+			}
+			if n.End > m.End {
+				m.End = n.End
+			}
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// hunksConflict reports whether two hunks against the SAME old file are one
+// conflict region in a 3-way merge. git (xdl_merge) keeps two changes apart only
+// when an unchanged line separates them, so changed spans that overlap or are
+// adjacent conflict, an insertion conflicts with a change that includes the line
+// before or after its gap, and two insertions conflict at the same gap. (git
+// also lets two IDENTICAL changes through; content isn't compared here, which
+// only ever errs toward flagging.) Pure (#184).
+func hunksConflict(a, b diffHunk) bool {
+	switch {
+	case a.oldCount == 0 && b.oldCount == 0:
+		return a.oldStart == b.oldStart
+	case a.oldCount == 0:
+		return insertTouches(a.oldStart, b)
+	case b.oldCount == 0:
+		return insertTouches(b.oldStart, a)
+	}
+	return a.oldStart <= b.oldStart+b.oldCount && b.oldStart <= a.oldStart+a.oldCount
+}
+
+// insertTouches: an insertion after old line p sits in the gap between lines p
+// and p+1, so it meets a change of old lines [start, start+count-1] that includes
+// either of them. Pure.
+func insertTouches(p int, h diffHunk) bool {
+	return h.oldStart <= p+1 && p <= h.oldStart+h.oldCount-1
+}
+
+// mapLine maps ONE merge-base line into base line numbers (#184). Pure.
+//
+//   - A line base left alone moves by the net size change (newCount-oldCount)
+//     of every base hunk above it. A pure insertion (oldCount 0) sits AFTER old
+//     line oldStart, so it moves only the lines below that point.
+//   - A line base modified or deleted lands on that hunk's whole new side. A
+//     deletion has no new side, so it maps to the gap's two neighbours
+//     [newStart, newStart+1], the same zero-count convention as
+//     parseHunkRangesWith.
+func mapLine(line int, hunks []diffHunk) LineRange {
+	shift := 0
+	for _, h := range hunks {
+		if h.oldCount == 0 { // pure insertion below old line h.oldStart
+			if line <= h.oldStart {
+				break
+			}
+			shift += h.newCount
+			continue
+		}
+		if line < h.oldStart {
+			break
+		}
+		if line < h.oldStart+h.oldCount { // base modified or deleted this line
+			return sideRange(h.newStart, h.newCount)
+		}
+		shift += h.newCount - h.oldCount
+	}
+	return LineRange{line + shift, line + shift}
 }
 
 // FileChangeSubsumed reports whether the worktree's branch contributes NOTHING
@@ -902,29 +1118,21 @@ func FileChangeSubsumed(worktree, base, path string) (subsumed, known bool) {
 	return merged == ours, true
 }
 
-// changedRangesWith is the shared body of ChangedRanges / ChangedRangesNew;
-// `parse` selects which side of each hunk (old vs new) the base-diff case reads.
-// The base-less fallback is always NEW-side (there is no base to be old-relative
-// to) so a single window still self-reports.
-func changedRangesWith(dir, base, file string, parse func(string) []LineRange) []LineRange {
-	for _, ref := range []string{"origin/" + base, base} {
-		if _, err := RunDir(dir, "rev-parse", "--verify", "--quiet", ref+"^{commit}"); err != nil {
+// uncommittedRangesNew is the base-less fallback of ChangedRanges,
+// ChangedRangesNew and LinesToBase: the NEW-side hunks of the unstaged and the
+// staged diff (index frame). With no base to be old-relative to, a single window
+// still self-reports. ok=false when either diff fails.
+func uncommittedRangesNew(dir, file string) (ranges []LineRange, ok bool) {
+	ok = true
+	for _, args := range [][]string{{"diff", "-U0", "--", file}, {"diff", "-U0", "--cached", "--", file}} {
+		out, err := runRaw(dir, args...)
+		if err != nil {
+			ok = false
 			continue
 		}
-		if out, err := runRaw(dir, "diff", "-U0", ref, "--", file); err == nil {
-			return parse(out)
-		}
-		return nil
-	}
-	// No base ref — degraded NEW-side self-report (index frame).
-	var ranges []LineRange
-	if out, err := runRaw(dir, "diff", "-U0", "--", file); err == nil {
 		ranges = append(ranges, parseHunkRanges(out)...)
 	}
-	if out, err := runRaw(dir, "diff", "-U0", "--cached", "--", file); err == nil {
-		ranges = append(ranges, parseHunkRanges(out)...)
-	}
-	return ranges
+	return ranges, ok
 }
 
 // LastCommitUnix returns the committer timestamp (unix seconds) of HEAD in dir.

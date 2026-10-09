@@ -57,7 +57,8 @@ Append-heavy files — an image-inventory YAML, a kustomize `resources:` list, a
 changelog — get edited by many windows at once where every edit is a disjoint
 append; the real conflict risk is ~zero, yet a file-level check lights up a `💥`
 wall on exactly the files touched most. `wt` diffs the **pending hunks** of each
-window (`git diff -U0`, uncommitted ∪ committed-vs-base) and grades the overlap:
+window (`git diff -U0`, uncommitted ∪ committed since its merge base with
+base) and grades the overlap:
 
 ```
 config.yaml   — overlapping L88-95  → HIGH   (exit 3, blocks)
@@ -66,7 +67,11 @@ inventory.yaml — 6 windows, 0 overlapping hunks → low (FYI, exit 0)
 
 Only **overlapping line ranges** (or an indeterminate case where your side has
 no edits yet — kept blocking, to be safe) count as HIGH and drive exit 3.
-Provably-disjoint hunks are downgraded to a non-blocking FYI. Two escape hatches
+Provably-disjoint hunks are downgraded to a non-blocking FYI. A branch that has
+fallen behind base is graded on its own edits only: a line base added or changed
+after it forked is never counted as that branch's edit, unless the branch's own
+edit touches it (no unchanged line between), where git would conflict. Two
+escape hatches
 make files always-advisory regardless of hunks: `shared_docs` (basename match,
 default `CLAUDE.md,MEMORY.md`) and `append_only_paths` (globs — changelogs,
 inventory lists).
@@ -141,7 +146,7 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 
 | Command | What it does |
 |---|---|
-| `wt status [--json]` | All windows + files each touches + severity-graded overlaps. `[--blocking]` = only HIGH, exit 3 (a gate). `[--max-age D]` |
+| `wt status [--json]` | All windows + files each touches + severity-graded overlaps. An overlap lists only live windows: merged, closed-PR and (with `max_age`) dormant ones are left out of its `windows`, and one left with fewer than two counts in `benign_count`. A file is HIGH when some pair of its windows would each block in `wt check`; a window whose copy is already on base, whose change already landed, or whose copy is untracked contests nothing, so two windows creating the same new file read advisory until one commits it. `[--blocking]` = only HIGH, exit 3 (a gate): it exits 0 when those were the only HIGHs. `[--max-age D]` |
 | `wt status --epic <id>` | Aggregate an epic's claims + live PR states across sibling repos |
 | `wt check <paths…>` | Is another window touching these paths? `[--show-diff] [--json] [--blocking] [--include-stale] [--allow-missing] [--max-age D]` (exit 3 = HIGH). `--blocking` prints only HIGH (a scriptable gate). Refuses a path that doesn't exist, isn't tracked, and no window is touching — a typo must never falsely report "clear" (`--allow-missing` opts into a deleted/other-branch/about-to-create path) |
 | `wt where <issue\|branch>` | Print that window's worktree path — `cd $(wt where 42)` |
@@ -150,7 +155,7 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 | `wt claim <issue>` | Assign a GitHub issue, make a worktree, open a draft PR, record the claim `[--force] [--no-pr] [--epic <id>]`. **Refuses (won't duplicate) when an open PR already references the issue** — including a plain `Refs #N` (which GitHub never treats as a linked/closing reference, so it's invisible to `closingIssuesReferences`); it names that PR and points at `wt adopt`. `--force` opens another anyway |
 | `wt adopt <branch\|pr>` | Put a worktree on an **existing** branch (a colleague's or a previous session's PR branch) instead of forking a new one, and record it like `claim` — resolves a PR number to its head branch. This is the actionable half of `claim`'s refusal above, and the only command that lands a registered worktree on a branch you didn't just create `[--epic <id>]` |
 | `wt release <issue>` | Drop the claim. `[--clean]` also removes the worktree when the branch is abandoned (clean tree, no live PR, WIP-only commits) |
-| `wt merge-pr <pr>` | Guarded squash-merge (PR-state precheck, strips a `WIP:` subject, refuses an empty/placeholder-only PR), then auto-removes the worktree + claim. Lints the closing keywords the squash will fire (PR body **and** commit bodies) and verifies issue state after (skip both with `--no-close-check` for a PR that closes nothing) `[--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok] [--no-close-check]` |
+| `wt merge-pr <pr>` | Guarded squash-merge (PR-state precheck, strips a `WIP:` subject unless you forward `-- --subject`, refuses an empty/placeholder-only PR), then auto-removes the worktree + claim. Lints the closing keywords the squash will fire (PR body **and** commit bodies; a body forwarded with `-- --body/--body-file/-F -` is linted in place of the commit bodies) and verifies issue state after (skip both with `--no-close-check` for a PR that closes nothing) `[--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok] [--no-close-check]` |
 | `wt todos` | What every window is working on (mirrors each window's TODO list) |
 | **— cross-window coordination —** | |
 | `wt announce "<msg>"` | Tell other windows a change is starting `[--hold "merge-main,…"] [--issue N]` |
@@ -292,6 +297,15 @@ usual failure mode is that the *agents doing the editing* never run `wt check`.
   snapshot of what other live windows are doing: cross-window file overlaps
   **plus** un-acked coordination signals — a `merge-main` hold another window
   placed, or an announcement you haven't acked (each with a `wt ack <id>`).
+  A file you are editing lists the windows `wt check <file>` would (merged,
+  closed-PR and, with `max_age`, dormant branches are left out) and reads HIGH
+  only where `wt check` would block. One difference is deliberate: when your own
+  copy of the file is already on base, or your change to it already landed, it
+  reads "same file" while `wt check` still flags it as a pre-edit heads-up,
+  because you hold nothing that can collide. A new file another window has not
+  committed yet shows as advisory (untracked there) until it is committed, in
+  `wt status` and every other window's banner; `wt check` and the banner in the
+  window holding the untracked copy still flag it.
 
 ```
 wt install-claude-hook            # prints the .claude/settings.json snippet (both hooks)
@@ -348,8 +362,9 @@ hooks = false
 - Both hooks are injected **only when** another live window overlaps a file
   (silent otherwise), with the current window excluded and a `wt check <file>`
   reminder.
-- The edit hook re-grades against the patch's actual hunks when it's frame-safe
-  (this worktree's file is unchanged vs base), so a **disjoint** patch to a shared
+- The edit hook re-grades against the patch's actual hunks, moved into base line
+  numbers through this worktree's own diff (so it stays exact when the worktree is
+  behind base or already edited the file), so a **disjoint** patch to a shared
   file stays silent — no crying wolf on parallel appends.
 - Advisory by default. Set `WT_CODEX_HOOK_BLOCK=1` to have the edit hook `deny`
   a **confirmed** HIGH overlap (a heads-up-only file-level match never denies).

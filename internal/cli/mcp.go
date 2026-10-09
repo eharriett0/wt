@@ -139,7 +139,9 @@ func mcpToolDescriptors() []map[string]any {
 		{
 			"name": "wt_status",
 			"description": "Every active window in this repo (worktree, branch, claimed issue, files touched) " +
-				"plus graded cross-window overlaps (HIGH = overlapping hunks). Read-only.",
+				"plus graded cross-window overlaps. An overlap lists only live windows (merged, closed-PR and dormant ones are left out) " +
+				"and is HIGH when some pair of them would each block in wt_check (overlapping hunks, or the same section of a structured doc); " +
+				"a window whose copy is already on base, already landed, or untracked contests nothing. Read-only.",
 			"inputSchema": obj(map[string]any{
 				"blocking": map[string]any{"type": "boolean", "description": "return only HIGH-risk overlaps"},
 			}),

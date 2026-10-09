@@ -5,6 +5,7 @@ package ghx
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strconv"
@@ -89,8 +90,9 @@ var (
 )
 
 type authAnswer struct {
-	ok bool
-	at time.Time
+	ok  bool
+	out string // what gh printed, both streams: AuthStatusFor reads it per host (#183)
+	at  time.Time
 }
 
 // authFresh reports whether an answer taken at `at` may be reused at now: not in
@@ -101,20 +103,27 @@ func authFresh(at, now time.Time) bool {
 	return age >= 0 && age < authTTL
 }
 
-// AuthedFor reports whether gh has an authenticated account FOR host. The answer
-// is memoized per host for authTTL; the lock is held across the gh call so that
-// concurrent first callers (ClassifyWindows runs 8) share one check (#172).
-func AuthedFor(host string) bool {
+// authCheck runs `gh auth status` for host, or reuses an answer younger than
+// authTTL. The lock is held across the gh call so that concurrent first callers
+// (ClassifyWindows runs 8) share one check (#172).
+func authCheck(host string) authAnswer {
 	authMu.Lock()
 	defer authMu.Unlock()
 	now := time.Now()
 	if a, ok := authMemo[host]; ok && authFresh(a.at, now) {
-		return a.ok
+		return a
 	}
-	ok := exec.Command("gh", authStatusArgs(host)...).Run() == nil
-	authMemo[host] = authAnswer{ok: ok, at: now}
-	return ok
+	// BOTH streams (#183): once any account fails, gh writes every host section to
+	// stderr, and that is exactly the output AuthStatusFor needs to read.
+	out, err := exec.Command("gh", authStatusArgs(host)...).CombinedOutput()
+	a := authAnswer{ok: err == nil, out: string(out), at: now}
+	authMemo[host] = a
+	return a
 }
+
+// AuthedFor reports whether gh has an authenticated account FOR host: gh's exit
+// code. The answer is memoized per host for authTTL (#172).
+func AuthedFor(host string) bool { return authCheck(host).ok }
 
 // Authed reports whether gh is authenticated for the host THIS repo uses.
 //
@@ -131,7 +140,9 @@ func AuthedFor(host string) bool {
 //
 // With no forge host (a local-path origin) the check stays bare, as #100 chose,
 // and a bare check validates every configured host: about 6 s with two (#172).
-// AuthedFor's memo is what keeps that to once per command.
+// AuthedFor's memo is what keeps that to once per command. Its exit code is then
+// an aggregate, which is why doctor reads it per host instead (RepoAuthStatus,
+// #183); this boolean only gates gh calls that need the repo's host anyway.
 func Authed() bool { return AuthedFor(RepoHost()) }
 
 // CurrentUser returns the authenticated login.
@@ -659,12 +670,17 @@ func PRIsDraft(pr string) (bool, error) {
 	return strings.TrimSpace(out) == "true", nil
 }
 
-// MergePRSquash runs `gh pr merge <pr> --squash <extra...>`, inheriting stdio.
-func MergePRSquash(pr string, extra []string) error {
+// MergePRSquash runs `gh pr merge <pr> --squash <extra...>`, inheriting stdout
+// and stderr. gh reads stdin from the given reader, or wt's own stdin when it is
+// nil — merge-pr passes the forwarded squash body it already read (#180).
+func MergePRSquash(pr string, extra []string, stdin io.Reader) error {
 	args := append([]string{"pr", "merge", pr, "--squash"}, extra...)
 	cmd := exec.Command("gh", args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
+	if stdin != nil {
+		cmd.Stdin = stdin
+	}
 	return cmd.Run()
 }

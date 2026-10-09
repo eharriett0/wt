@@ -7,6 +7,7 @@ package merge
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"sort"
@@ -75,33 +76,228 @@ func BranchIsForeign(head string, worktreeBranches []string) bool {
 	return true
 }
 
-// WithAdmin returns extraArgs with "--admin" appended when admin is set, so the
-// squash forwards --admin to `gh pr merge` — the maintainer bypass for a branch
-// whose protection REQUIRES a PR review (own low-risk CI-green PRs on a
-// required-review repo; wt#20). Deduplicated so an explicit `-- --admin`
-// passthrough doesn't double it. This bypasses GitHub branch protection, NOT
+// WithAdmin returns extraArgs with "--admin" in front of them when admin is set,
+// so the squash forwards --admin to `gh pr merge` — the maintainer bypass for a
+// branch whose protection REQUIRES a PR review (own low-risk CI-green PRs on a
+// required-review repo; wt#20). This bypasses GitHub branch protection, NOT
 // wt's own safety checks: the CLI runs the merge_is_deploy deploy-gate + the
 // empty-diff/placeholder + foreign-branch guards BEFORE the merge, so the value
 // of wt merge-pr (the deploy gate the raw `gh` fallback loses) is preserved.
+//
+// ⚠ wt's own gh flags go IN FRONT of the operator's passthrough (#180). When
+// they were appended, a passthrough ending in a value flag (`-- --subject`)
+// took "--admin" as that flag's value: gh merged with the subject "--admin" and
+// no admin. In front, a dangling flag fails inside gh instead. There is no
+// dedupe: gh's parser takes a repeated bool fine, while the old token match
+// read a VALUE (`-b --admin` is the body "--admin") as the flag and dropped it.
 func WithAdmin(admin bool, extraArgs []string) []string {
 	if !admin {
 		return extraArgs
 	}
-	for _, a := range extraArgs {
-		if strings.TrimSpace(a) == "--admin" {
-			return extraArgs // already present via `-- --admin` passthrough
+	return append([]string{"--admin"}, extraArgs...)
+}
+
+// WithSubject returns args with `--subject subject` in front of them, for the
+// WIP strip (#38). In front for the same reason as WithAdmin (#180), and so an
+// operator's own forwarded --subject still wins: gh's parser keeps the last
+// one. Pure; args is not mutated.
+func WithSubject(subject string, args []string) []string {
+	return append([]string{"--subject", subject}, args...)
+}
+
+// BodySource is where `gh pr merge` takes the squash commit BODY from (#180).
+type BodySource int
+
+const (
+	BodyDefault BodySource = iota // no body flag: GitHub composes it from the commits
+	BodyText                      // -b / --body <text>
+	BodyFile                      // -F / --body-file <path>
+	BodyStdin                     // -F - / --body-file -
+)
+
+// ForwardedBody is the squash-body override in a merge-pr passthrough (#180).
+type ForwardedBody struct {
+	Source BodySource
+	Value  string // BodyText: the text. BodyFile: the path. BodyStdin: "-".
+	Flag   string // the flag as written ("-F", "--body-file", "-b", …), for messages
+
+	// fileAt locates the value of the --body-file occurrence gh will use, so
+	// RedirectToStdin can re-point it.
+	fileAt argPos
+}
+
+// argPos is where a flag's value sits in argv: args[index], after prefix.
+// prefix is "" when the value is its own token (`-F path`), else the part of the
+// token before it (`--body-file=` / `-F=` / `-F` / `-dF` for `-dFpath`).
+type argPos struct {
+	index  int
+	prefix string
+}
+
+// Describe renders the source for a message: `--body-file body.txt`, `-F -
+// (stdin)`, `--body`.
+func (b ForwardedBody) Describe() string {
+	switch b.Source {
+	case BodyFile:
+		return b.Flag + " " + b.Value
+	case BodyStdin:
+		return b.Flag + " - (stdin)"
+	case BodyText:
+		return b.Flag
+	}
+	return "the commit messages"
+}
+
+// The `gh pr merge` flags that take a value (gh v2.68.1, including the
+// inherited -R/--repo). Every other flag it accepts is a bool. Only needed to
+// know which tokens are values, so `--subject -b` is not misread as a body flag.
+var (
+	ghMergeValueLong = map[string]bool{
+		"author-email": true, "body": true, "body-file": true,
+		"match-head-commit": true, "repo": true, "subject": true,
+	}
+	ghMergeValueShort = map[byte]string{
+		'A': "author-email", 'b': "body", 'F': "body-file", 'R': "repo", 't': "subject",
+	}
+)
+
+// ParseForwardedBody reports which squash body the args forwarded after
+// `wt merge-pr <pr> --` make `gh pr merge` use. Pure.
+//
+// It reads them the way gh's parser (pflag v1.0.6) does, because the close check
+// has to judge the body that will actually SHIP, not the one a simpler reading
+// finds:
+//
+//   - `--body x`, `--body=x`, `-b x`, `-bx`, `-b=x`; the same for `--body-file`/`-F`.
+//     Shorthands cluster (`-dF path`: -d is a bool), and a value flag ends the
+//     cluster (`-Fd` is the file "d").
+//   - A value flag takes the next token even when it starts with `-`, so the `-b`
+//     in `--subject -b` is a subject, not a body flag.
+//   - A repeated flag: the last one wins.
+//   - `--body` counts as set whenever it appears, even empty (`--body=` ships an
+//     empty body), but `--body-file` only when its final value is non-empty —
+//     gh's own test is `bodyFile != ""`.
+//   - A standalone `--` ends the flags.
+//
+// Errors where gh would not merge at all, so no body can be named: gh refuses
+// `--body` together with `--body-file`; and a value flag (a body flag or any
+// other) at the very end of the passthrough has no value. wt's own flags go in
+// front of the passthrough (WithAdmin, WithSubject), so nothing follows it and
+// gh fails with "flag needs an argument" — said here, before a body is read.
+func ParseForwardedBody(args []string) (ForwardedBody, error) {
+	var (
+		bodySet        bool
+		body, bodyFlag string
+		file, fileFlag string
+		fileAt         argPos
+		dangling       string
+	)
+	take := func(name, flag, value string, at argPos) {
+		switch name {
+		case "body":
+			bodySet, body, bodyFlag = true, value, flag
+		case "body-file":
+			file, fileFlag, fileAt = value, flag, at
 		}
 	}
-	out := append([]string(nil), extraArgs...)
-	return append(out, "--admin")
+scan:
+	for i := 0; i < len(args); i++ {
+		s := args[i]
+		if len(s) < 2 || s[0] != '-' {
+			continue // a positional ("-" alone is one too)
+		}
+		if s == "--" {
+			break // pflag stops reading flags here
+		}
+		if s[1] == '-' { // --name, --name=value
+			name, value, inline := strings.Cut(s[2:], "=")
+			if !ghMergeValueLong[name] {
+				continue // a bool flag, or one gh rejects
+			}
+			at := argPos{index: i, prefix: "--" + name + "="}
+			if !inline {
+				if i+1 >= len(args) {
+					dangling = "--" + name
+					break scan
+				}
+				i++
+				value, at = args[i], argPos{index: i}
+			}
+			take(name, "--"+name, value, at)
+			continue
+		}
+		cluster := s[1:] // -x, -xyz, -xVALUE, -x=VALUE
+		if strings.HasPrefix(cluster, "test.") {
+			continue // pflag skips go-test style flags entirely
+		}
+		for j := 0; j < len(cluster); j++ {
+			eq := len(cluster)-j > 2 && cluster[j+1] == '='
+			name, valued := ghMergeValueShort[cluster[j]]
+			if !valued {
+				if eq {
+					break // `-d=false`: the rest is this bool's value
+				}
+				continue // a bool (-d -m -r -s), or one gh rejects
+			}
+			flag := "-" + string(cluster[j])
+			var value string
+			var at argPos
+			switch {
+			case eq: // -F=path
+				value, at = cluster[j+2:], argPos{index: i, prefix: "-" + cluster[:j+2]}
+			case len(cluster)-j > 1: // -Fpath (and `-F=` alone is the file "=")
+				value, at = cluster[j+1:], argPos{index: i, prefix: "-" + cluster[:j+1]}
+			case i+1 < len(args): // -F path
+				i++
+				value, at = args[i], argPos{index: i}
+			default:
+				dangling = flag
+				break scan
+			}
+			take(name, flag, value, at)
+			break // a value flag ends the cluster
+		}
+	}
+	if dangling != "" {
+		return ForwardedBody{}, fmt.Errorf("%s is the last forwarded gh arg and has no value, so gh pr merge would fail on it (flag needs an argument)", dangling)
+	}
+	fileSet := file != ""
+	switch {
+	case bodySet && fileSet:
+		return ForwardedBody{}, fmt.Errorf("both %s and %s are forwarded, and gh pr merge refuses that (specify only one of --body or --body-file)", bodyFlag, fileFlag)
+	case fileSet && file == "-":
+		return ForwardedBody{Source: BodyStdin, Value: file, Flag: fileFlag, fileAt: fileAt}, nil
+	case fileSet:
+		return ForwardedBody{Source: BodyFile, Value: file, Flag: fileFlag, fileAt: fileAt}, nil
+	case bodySet:
+		return ForwardedBody{Source: BodyText, Value: body, Flag: bodyFlag}, nil
+	}
+	return ForwardedBody{}, nil
+}
+
+// RedirectToStdin returns a copy of args (the slice that was parsed) with the
+// --body-file value gh will use re-pointed at "-", for a caller that has already
+// read the body and hands gh those same bytes on its stdin. A pipe or a process
+// substitution (`-F <(…)`) can be read only once, so gh re-reading the path
+// would merge an EMPTY body; and this way gh merges exactly the bytes that were
+// checked. Unchanged for any other source. Pure; args is not mutated.
+func (b ForwardedBody) RedirectToStdin(args []string) []string {
+	if (b.Source != BodyFile && b.Source != BodyStdin) || b.fileAt.index >= len(args) {
+		return args
+	}
+	out := append([]string(nil), args...)
+	out[b.fileAt.index] = b.fileAt.prefix + "-"
+	return out
 }
 
 // Run executes the guarded merge for PR number pr. dryRun prints the verdict
 // without merging; bypass proceeds past a block verdict (loud warning).
 // mergeForeign permits merging a PR whose head branch has no wt worktree here
 // (the foreign-branch guard, wt#15). worktreeBranches is the set of wt-managed
-// worktree branches for this repo. extraArgs pass through to `gh pr merge`.
-func Run(pr string, dryRun, bypass, mergeForeign bool, worktreeBranches []string, extraArgs []string) error {
+// worktree branches for this repo. extraArgs pass through to `gh pr merge`;
+// ghStdin is what gh reads as its stdin (nil = wt's own), which carries a
+// forwarded body wt already read (#180).
+func Run(pr string, dryRun, bypass, mergeForeign bool, worktreeBranches []string, extraArgs []string, ghStdin io.Reader) error {
 	fileCount := ghx.PRChangedFileCount(pr)
 	subjects := ghx.PRCommitSubjects(pr)
 	v := GuardVerdict(fileCount, subjects)
@@ -163,17 +359,18 @@ func Run(pr string, dryRun, bypass, mergeForeign bool, worktreeBranches []string
 	// #38: strip a "WIP:" prefix (the wt-claim placeholder title) from the squash
 	// SUBJECT so it doesn't land on base history. gh's --squash defaults the
 	// subject to the PR title; --subject overrides it. Best-effort — a failed
-	// title lookup just leaves the default behavior.
+	// title lookup just leaves the default behavior. It goes in FRONT of the
+	// passthrough (WithSubject, #180), so a --subject the operator forwards wins.
 	mergeArgs := extraArgs
 	if title, err := ghx.PRTitle(pr); err == nil {
 		if stripped, wasWIP := DeWIPTitle(title); wasWIP && stripped != "" {
-			mergeArgs = append(append([]string{}, extraArgs...), "--subject", stripped)
-			fmt.Fprintf(os.Stderr, "note: stripping 'WIP:' from the squash subject → %q\n", stripped)
+			mergeArgs = WithSubject(stripped, extraArgs)
+			fmt.Fprintf(os.Stderr, "note: stripping 'WIP:' from the squash subject → %q (a --subject forwarded after -- still wins)\n", stripped)
 		}
 	}
 
 	fmt.Printf("merge-pr: %s — %s changed file(s) — merging (squash).\n", label, fileCount)
-	return ghx.MergePRSquash(pr, mergeArgs)
+	return ghx.MergePRSquash(pr, mergeArgs, ghStdin)
 }
 
 // PreVerdict is the merge-pr PR-state precheck outcome (#39).
