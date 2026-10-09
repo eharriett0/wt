@@ -4,6 +4,7 @@ package cli
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -443,10 +444,11 @@ func cmdMergePR(args []string) int {
 	// wt's own safety checks (which is exactly the value the raw `gh` fallback
 	// lost).
 	// Close-keyword lint (#77): merge-pr is the only place that sees BOTH the PR
-	// body and the squash commit body it forwards — the two texts that decide
-	// what auto-closes. Print the resolved close set; refuse only when the squash
-	// closes something the PR's own closing references don't (trap 2), unless
-	// --close-ok. Best-effort — a gh failure yields an empty plan (never blocks).
+	// body and the squash commit it forwards — subject and body (#196) — the
+	// texts that decide what auto-closes. Print the resolved close set; refuse
+	// only when the squash closes something the PR's own closing references don't
+	// (trap 2), unless --close-ok. Best-effort — a gh failure yields an empty plan
+	// (never blocks).
 	// ⚠ This runs on --dry-run TOO (#164). It used to be skipped there, which
 	// made the one command you would reach for to preview a merge the one that
 	// could not tell you what the merge closes — you had to perform the merge to
@@ -463,13 +465,19 @@ func cmdMergePR(args []string) int {
 		return 1
 	}
 	if err := merge.Run(pr, *dryRun, *bypass, *mergeForeign, wtBranches, merge.WithAdmin(*admin, prep.args), prep.stdin); err != nil {
-		return 1
-	}
-	// ⚠ gh exits 0 WITHOUT merging for --help, --auto, --disable-auto, a merge
-	// queue or -R, so only a PR that now reads MERGED is verified and auto-cleaned
-	// (#185). Still exit 0: gh did what it was asked (printed help, armed
-	// auto-merge, queued the PR), and keeping the worktree loses nothing.
-	if !*dryRun && !mergeConfirmed(pr) {
+		// ⚠ gh can fail AFTER merging (#196): `-- -d` merges, then cannot delete a
+		// local branch that a wt worktree has checked out, and exits non-zero. So a
+		// failed `gh pr merge` reads the PR state too, and only MERGED goes on to
+		// the verify and the auto-clean (#187's shipped-tip guard included); a
+		// guard's refusal, or any other state, exits 1 as before.
+		if !errors.Is(err, merge.ErrMergeCommand) || !mergedDespiteFailure(pr) {
+			return 1
+		}
+	} else if !*dryRun && !mergeConfirmed(pr) {
+		// ⚠ gh exits 0 WITHOUT merging for --help, --auto, --disable-auto, a merge
+		// queue or -R, so only a PR that now reads MERGED is verified and
+		// auto-cleaned (#185). Still exit 0: gh did what it was asked (printed help,
+		// armed auto-merge, queued the PR), and keeping the worktree loses nothing.
 		return 0
 	}
 	// Post-merge verification (#77): re-check the referenced issues + report any

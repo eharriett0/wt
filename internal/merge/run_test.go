@@ -1,6 +1,7 @@
 package merge
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -80,6 +81,56 @@ func TestRunPutsWtFlagsBeforeThePassthrough(t *testing.T) {
 		}
 		if got := read("stdin"); got != "Forwarded body." {
 			t.Errorf("%q: gh stdin = %q, want the forwarded body", tc.passthrough, got)
+		}
+	}
+}
+
+// TestRunMarksGhFailures: an error from `gh pr merge` itself wraps
+// ErrMergeCommand, so merge-pr reads the PR state before calling it "not
+// merged" (gh can fail AFTER merging: `-d` cannot delete a local branch a wt
+// worktree has checked out, #196); a guard's refusal never does, so it exits 1
+// without a state read.
+func TestRunMarksGhFailures(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake gh is a shell script")
+	}
+	dir := t.TempDir()
+	const failingGh = `#!/bin/sh
+d=$(dirname "$0")
+case "$1 $2" in
+"pr diff") cat "$d/files" ;;
+"pr view")
+	case "$*" in
+	*messageHeadline*) echo "Fix the widget" ;;
+	*headRefName*) echo feat-x ;;
+	*title*) echo "Fix the widget" ;;
+	esac ;;
+"pr merge") echo "failed to delete local branch feat-x" >&2; exit 1 ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(failingGh), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+"/usr/bin"+string(os.PathListSeparator)+"/bin")
+	if got, err := exec.LookPath("gh"); err != nil || got != filepath.Join(dir, "gh") {
+		t.Fatalf("gh resolves to %q (%v), not the fake", got, err)
+	}
+	for _, tc := range []struct {
+		files  string
+		ghFail bool
+	}{
+		{"a.txt\n", true}, // gh ran and failed
+		{"", false},       // the empty-diff guard refused: gh never ran
+	} {
+		if err := os.WriteFile(filepath.Join(dir, "files"), []byte(tc.files), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		err := Run("99999", false, false, false, []string{"feat-x"}, nil, nil)
+		if err == nil {
+			t.Fatalf("files %q: Run succeeded, want an error", tc.files)
+		}
+		if got := errors.Is(err, ErrMergeCommand); got != tc.ghFail {
+			t.Errorf("files %q: errors.Is(%v, ErrMergeCommand) = %v, want %v", tc.files, err, got, tc.ghFail)
 		}
 	}
 }

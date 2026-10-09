@@ -543,20 +543,6 @@ func PRBody(pr string) (string, error) {
 	return run("pr", "view", pr, "--json", "body", "--jq", ".body")
 }
 
-// PRCommitText returns all commits' FULL messages (headline + body) joined into
-// one blob. The squash body gh composes is built from these, so the closing-
-// keyword scan must see them — a `Fixes #N` in a commit body fires on merge even
-// when the PR body (and thus closingIssuesReferences) never mentions it (#77
-// trap 2). Best-effort: "" on error / gh unavailable.
-func PRCommitText(pr string) string {
-	out, err := run("pr", "view", pr, "--json", "commits", "--jq",
-		`[.commits[] | .messageHeadline + "\n" + .messageBody] | join("\n\n")`)
-	if err != nil {
-		return ""
-	}
-	return out
-}
-
 // PRClosingIssueNumbers returns the numbers in the PR's GraphQL
 // closingIssuesReferences — what GitHub itself reports the PR will close (from
 // the PR title/body ONLY; blind to the squash commit body). This is GraphQL-only
