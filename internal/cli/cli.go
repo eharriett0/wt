@@ -364,7 +364,7 @@ func cmdRelease(args []string) int {
 }
 
 func cmdMergePR(args []string) int {
-	if code, done := guardHelp(args, "usage: wt merge-pr <pr> [--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok] [--no-close-check] [-- extra gh args]"); done {
+	if code, done := guardHelp(args, "usage: wt merge-pr <pr> [--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok] [--checks-ok] [--no-close-check] [-- extra gh args]"); done {
 		return code
 	}
 	fs := flag.NewFlagSet("merge-pr", flag.ContinueOnError)
@@ -375,13 +375,14 @@ func cmdMergePR(args []string) int {
 	confirmDeploy := fs.Bool("confirm-deploy", false, "acknowledge merge auto-applies to prod (merge_is_deploy repos)")
 	admin := fs.Bool("admin", false, "forward --admin to gh pr merge — maintainer bypass of a required-review branch (wt#20)")
 	closeOK := fs.Bool("close-ok", false, "proceed even when the squash closes issues the PR's own closing references don't (#77)")
+	checksOK := fs.Bool("checks-ok", false, "merge even when the PR's checks are pending, failed, missing or unreadable (#179); --bypass does not imply it")
 	noCloseCheck := fs.Bool("no-close-check", false, "skip the close-keyword lint + post-merge issue-state verify (#77)")
 	pos, ghArgs, err := parseInterspersed(fs, args)
 	if err != nil {
 		return 64
 	}
 	if len(pos) < 1 {
-		ui.Err("usage: wt merge-pr <pr> [--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok] [--no-close-check] [-- extra gh args]")
+		ui.Err("usage: wt merge-pr <pr> [--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok] [--checks-ok] [--no-close-check] [-- extra gh args]")
 		return 64
 	}
 	pr := pos[0]
@@ -411,7 +412,18 @@ func cmdMergePR(args []string) int {
 			return 1
 		}
 	}
-	// ⚠ The gate is EVALUATED on --dry-run too (#170), for the reason the close-set
+	// #179: the checks gate. Before the deploy confirm, so a merge whose CI is
+	// pending or red stops before anyone types "deploy". --admin bypasses
+	// GitHub's required checks, so nothing after this would stop it; --checks-ok
+	// is the only way past (not --bypass). Read on --dry-run too: a clean dry
+	// run means the checks were read, and green. The merge is pinned to the
+	// commit whose checks it read (WithMatchHead, below).
+	pin, ok := checksGate(pr, checksOpts{dryRun: *dryRun, checksOK: *checksOK, admin: *admin, bypass: *bypass,
+		minChecks: c.MergeMinChecks, minChecksBad: c.MergeMinChecksBad}, os.Stdin, stdinIsTTY(), liveChecksReads)
+	if !ok {
+		return 1
+	}
+	// ⚠ The deploy gate is EVALUATED on --dry-run too (#170), for the reason the close-set
 	// preview below gives (#164): deployGateApplies and the draft read are
 	// read-only, and a dry run that stayed silent here printed `verdict=ok` for a
 	// PR the real merge then stopped at. A dry run never prompts.
@@ -439,10 +451,10 @@ func cmdMergePR(args []string) int {
 		wtBranches, _ = gitx.WorktreeBranchesUnder(c.WorktreeRoot)
 	}
 	// --admin forwards through to `gh pr merge` for the required-review-branch
-	// maintainer bypass (wt#20). Added only here — AFTER the deploy-gate +
-	// coord + guard checks above — so it bypasses GitHub branch protection, not
-	// wt's own safety checks (which is exactly the value the raw `gh` fallback
-	// lost).
+	// maintainer bypass (wt#20). Added only here — AFTER the checks gate (#179),
+	// the deploy gate and the coord + guard checks above — so it bypasses GitHub
+	// branch protection, not wt's own safety checks (which is exactly the value
+	// the raw `gh` fallback lost).
 	// Close-keyword lint (#77): merge-pr is the only place that sees BOTH the PR
 	// body and the squash commit it forwards — subject and body (#196) — the
 	// texts that decide what auto-closes. Print the resolved close set; refuse
@@ -464,7 +476,7 @@ func cmdMergePR(args []string) int {
 	if !ok {
 		return 1
 	}
-	if err := merge.Run(pr, *dryRun, *bypass, *mergeForeign, wtBranches, merge.WithAdmin(*admin, prep.args), prep.stdin); err != nil {
+	if err := merge.Run(pr, *dryRun, *bypass, *mergeForeign, wtBranches, merge.WithMatchHead(pin, merge.WithAdmin(*admin, prep.args)), prep.stdin); err != nil {
 		// ⚠ gh can fail AFTER merging (#196): `-- -d` merges, then cannot delete a
 		// local branch that a wt worktree has checked out, and exits non-zero. So a
 		// failed `gh pr merge` reads the PR state too, and only MERGED goes on to

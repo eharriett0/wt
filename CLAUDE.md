@@ -267,6 +267,37 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   `merge.LocalTipVerdict` needs the tip to BE the PR's `headRefOid` or an
   ancestor of it; otherwise, or when it can't tell (no head, not fetched here),
   the worktree and branch stay and the warning counts the commits not in the PR.
+- **merge-pr's checks gate never reads a failed read, or `--admin`, as green
+  (#179).** It reads the head commit's statusCheckRollup (one GraphQL query,
+  paged: `ghx.PRChecks`) and the base branch's required checks from REST
+  `branches/{base}` (`protection.required_status_checks`, which any reader
+  gets, unlike the protection endpoint) and `rules/branches/{base}`, then
+  decides in pure `merge.DecideChecks`: pending, failed (CANCELLED and STALE
+  included), a state wt does not know, a required check with no run on the
+  head, fewer non-SKIPPED checks than `merge_min_checks` (or a value that is not
+  a count), and an unreadable read of either half all block; no check that ran,
+  nothing required and no floor is `none`: merge, with a note. ⚠ **Not `gh pr
+  checks`:** it exits 1 with a stderr sentence for "no checks" (a failure's exit
+  code), and the raw rollup keeps every re-run (cli/cli#14044: 21 runs, 9
+  checks), so `latestChecks` keeps the newest per name/workflow/event by
+  `databaseId` (a status per context by `createdAt`). ⚠
+  `{"data":{"resource":null}}` (no such PR) and `{"resource":{}}` (an issue's
+  URL) come back with exit 0; `parsePRChecks` requires the head commit, so they
+  are errors, never "no checks" (#168). ⚠ A 404 or the "Upgrade to GitHub Pro"
+  403 from the rules endpoint means the server has no rulesets for the repo
+  (`ErrRulesetsUnavailable`): an answer, not a failed read. A rate-limit or SSO
+  403 is a failed read. ⚠ **Order:** precheck → checks → deploy confirm → coord
+  hold → close check → Run's guards. Before the deploy confirm, so nobody types
+  "deploy" for a red PR. ⚠ **Only `--checks-ok` gets past it:** `--bypass` is
+  for wt's structural guards, and `--admin` bypasses GitHub's own checks, which
+  is why the gate exists. ⚠ The merge is pinned with `--match-head-commit <the
+  head it read>` (`merge.WithMatchHead`, in front of the passthrough like
+  `--admin`), so a push after the read fails the merge instead of shipping an
+  unchecked head. ⚠ Zero checks in a repo WITH workflows still merges, with the
+  note: a workflow's triggers decide whether it runs on a PR (awesome-o's one
+  workflow is path-filtered, so its PRs legitimately carry none), so the
+  deterministic "CI never started" signals are a required check and
+  `merge_min_checks`.
 - **"No PR" must be an `ok=false`, never a parsed placeholder (#168).**
   `PRForBranch`'s old `.[0] | …` query printed `null null` for a branch with
   no PR, which parsed as a PR in state `null`. Every caller then matched no

@@ -44,7 +44,9 @@ func printHelp() {
 	fmt.Println()
 
 	fmt.Println(b(g("  ✦ MERGE")) + d("  — guarded squash that refuses empty/placeholder-only PRs"))
-	fmt.Printf("    %s     %s\n", c("wt merge-pr <pr>"), "guarded squash (surfaces head branch) + auto-remove worktree  "+d("[--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok] [--no-close-check]"))
+	fmt.Printf("    %s     %s\n", c("wt merge-pr <pr>"), "guarded squash (surfaces head branch) + auto-remove worktree  "+d("[--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok] [--checks-ok] [--no-close-check]"))
+	fmt.Println("    " + d("refuses (asks, at a terminal) while the PR's checks are pending, failed, unreadable, or a required one never ran;"))
+	fmt.Println("    " + d("set ") + c("merge_min_checks") + d(" to refuse when fewer ran. ") + c("--checks-ok") + d(" merges anyway; --bypass and --admin don't."))
 	fmt.Println("    " + d("set ") + c("merge_is_deploy") + d(" for GitOps repos (merge auto-applies to prod): refuses"))
 	fmt.Println("    " + d("a draft PR, banners the deploy, and requires a typed confirm / --confirm-deploy."))
 	fmt.Println("    " + d("scope it with ") + c("merge_is_deploy_paths") + d(" (globs, ** ok) so the gate skips docs/CI/scripts-only PRs."))

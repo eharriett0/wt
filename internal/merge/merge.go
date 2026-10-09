@@ -98,6 +98,20 @@ func WithAdmin(admin bool, extraArgs []string) []string {
 	return append([]string{"--admin"}, extraArgs...)
 }
 
+// WithMatchHead returns args with `--match-head-commit head` in front of them
+// (#179), so gh merges only the commit whose checks the checks gate read: a
+// push after the read makes GitHub refuse the merge ("Head branch was
+// modified"), and merge-pr exits 1 instead of shipping a head nothing checked.
+// In front for the same reason as WithAdmin (#180); an operator's own
+// forwarded --match-head-commit comes later and wins (gh keeps the last). ""
+// (the checks were not read) leaves args alone. Pure; args is not mutated.
+func WithMatchHead(head string, args []string) []string {
+	if head == "" {
+		return args
+	}
+	return append([]string{"--match-head-commit", head}, args...)
+}
+
 // WithSubject returns args with `--subject subject` in front of them, for the
 // WIP strip (#38). In front for the same reason as WithAdmin (#180), and so an
 // operator's own forwarded --subject still wins: gh's parser keeps the last
