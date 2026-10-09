@@ -210,6 +210,8 @@ func TestScopedEnv(t *testing.T) {
 	t.Setenv("GIT_DIR", "/some/.git")
 	t.Setenv("GIT_INDEX_FILE", "/some/.git/index")
 	t.Setenv("GIT_WORK_TREE", "/some")
+	t.Setenv("GIT_LITERAL_PATHSPECS", "1") // #204: it would turn literalPath's magic into part of the name
+	t.Setenv("GIT_ICASE_PATHSPECS", "1")
 	t.Setenv("WT_KEEP_ME", "yes")
 	env := scopedEnv()
 	has := func(prefix string) bool {
@@ -220,7 +222,7 @@ func TestScopedEnv(t *testing.T) {
 		}
 		return false
 	}
-	for _, dropped := range []string{"GIT_DIR=", "GIT_INDEX_FILE=", "GIT_WORK_TREE="} {
+	for _, dropped := range []string{"GIT_DIR=", "GIT_INDEX_FILE=", "GIT_WORK_TREE=", "GIT_LITERAL_PATHSPECS=", "GIT_ICASE_PATHSPECS="} {
 		if has(dropped) {
 			t.Errorf("scopedEnv did not strip %s", dropped)
 		}

@@ -57,7 +57,8 @@ that exact repo path: `wt check README.md` at the root asks about the root
 repo is a search instead: `wt check foo.go` matches a touched file of that name
 in any directory. A file another window moved counts by both its old and its
 new path. Names are matched exactly as git stores them, non-ASCII ones
-(`café.md`) and names with spaces, quotes or newlines included.
+(`café.md`) and names with spaces, quotes, newlines or glob characters
+(`a[1].md`) included.
 
 In `wt check --json`, each entry's `path` is the repo-relative path that
 collides, not the argument as you typed it: `wt check ./svc/README.md` run in

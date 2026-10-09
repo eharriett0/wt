@@ -27,17 +27,30 @@ var gitScopeEnvVars = []string{
 	"GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_NAMESPACE",
 }
 
+// gitPathspecEnvVars are git's global pathspec switches. git exports them to
+// the hooks of a `git --literal-pathspecs …` run (or --glob/--noglob/--icase).
+// Every path wt hands to git carries its own ":(literal)" magic (literalPath,
+// #204), and under GIT_LITERAL_PATHSPECS git reads that magic as part of the
+// file name, so the path matches nothing; icase would match a file whose name
+// differs only in case. Stripped like the scope vars, so a path means exactly
+// that file whatever the caller's git was told.
+var gitPathspecEnvVars = []string{
+	"GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS",
+}
+
 // scopedEnv returns the current environment with the repo/worktree-pinning git
-// vars removed, so a git subprocess discovers its repo from cwd / -C dir.
+// vars and the global pathspec switches removed, so a git subprocess discovers
+// its repo from cwd / -C dir and reads a path as that file.
 func scopedEnv() []string {
 	env := os.Environ()
 	out := env[:0:0]
 	for _, kv := range env {
 		drop := false
-		for _, v := range gitScopeEnvVars {
-			if strings.HasPrefix(kv, v+"=") {
-				drop = true
-				break
+		for _, vars := range [][]string{gitScopeEnvVars, gitPathspecEnvVars} {
+			for _, v := range vars {
+				if strings.HasPrefix(kv, v+"=") {
+					drop = true
+				}
 			}
 		}
 		if !drop {
@@ -46,6 +59,16 @@ func scopedEnv() []string {
 	}
 	return out
 }
+
+// literalPath is how a file's path is passed to git after "--" (#204). There
+// git reads it as a pathspec: "a[1].md" is a glob that also matches a1.md,
+// "*.md" every .md file and "?x" ax, and a leading ':' starts pathspec magic,
+// so ":colon.md" asked about colon.md. The ":(literal)" magic makes it match
+// that one file. A relative (../ included) or absolute path resolves as before.
+// Prefixing the path, rather than passing git-wide --literal-pathspecs, keeps
+// the subcommand at args[0], where the gitOutput failure-injection tests match
+// it. Pure.
+func literalPath(p string) string { return ":(literal)" + p }
 
 // gitOutput runs git with args in dir ("" = current dir), the repo-pinning env
 // stripped (scopedEnv), and returns its stdout. It is a var for exactly one
@@ -617,9 +640,12 @@ func IsInsideWorktree(dir string) bool {
 
 // IsTracked reports whether path is known to git — tracked in the index (so a
 // path deleted in the working tree but still in git returns true). Used by
-// `wt check` to distinguish a deleted/renamed path from a typo (#93).
+// `wt check` to distinguish a deleted/renamed path from a typo (#93). The path
+// is that one file (literalPath, #204): read as a pattern, `sub/[y].md` was
+// "tracked" because sub/y.md is, and `wt check` cleared a path that names
+// nothing.
 func IsTracked(path string) bool {
-	_, err := Run("ls-files", "--error-unmatch", "--", path)
+	_, err := Run("ls-files", "--error-unmatch", "--", literalPath(path))
 	return err == nil
 }
 
@@ -627,7 +653,7 @@ func IsTracked(path string) bool {
 // current directory. MCP wt_check reads its paths from the repo root, whatever
 // directory the server was started in (#181 review).
 func IsTrackedIn(dir, path string) bool {
-	_, err := RunDir(dir, "ls-files", "--error-unmatch", "--", path)
+	_, err := RunDir(dir, "ls-files", "--error-unmatch", "--", literalPath(path))
 	return err == nil
 }
 
@@ -692,7 +718,10 @@ func IsUntracked(worktree, path string) bool {
 	}
 	// Read-only: this asks about ANOTHER window's worktree, once per prompt from
 	// the agent banner, so it must not take that window's index.lock (#182).
-	out, err := runRawReadOnly(worktree, "status", "--porcelain", "--untracked-files=all", "--", path)
+	// literalPath (#204): as a pattern, "a[1].md" also listed an untracked a1.md
+	// there, every line read "?? ", and a real collision on a committed a[1].md
+	// was downgraded to advisory.
+	out, err := runRawReadOnly(worktree, "status", "--porcelain", "--untracked-files=all", "--", literalPath(path))
 	if err != nil {
 		return false
 	}
@@ -721,6 +750,7 @@ func IsUntracked(worktree, path string) bool {
 // WorktreeBlob returns the git blob hash of the WORKING-TREE file at path inside
 // worktree (`git hash-object`), and whether it could be hashed. Lets a caller
 // compare a window's on-disk content against a ref without a diff (#109).
+// hash-object takes a file, not a pathspec, so path is already literal.
 func WorktreeBlob(worktree, path string) (string, bool) {
 	out, err := RunDir(worktree, "hash-object", "--", path)
 	if err != nil || out == "" {
@@ -730,9 +760,15 @@ func WorktreeBlob(worktree, path string) (string, bool) {
 }
 
 // RefBlob returns the git blob hash of path at ref inside worktree (`ref:path`),
-// and whether it resolved. ref "" reads the STAGED blob (`:path`). Absent ref or
-// path → ("", false) via --verify --quiet, so the caller fails safe (#109).
+// and whether it resolved. ref "" reads the STAGED blob, as `:0:path`: in the
+// short `:path` form a name like "1:x.md" reads as stage 1 of x.md (#204).
+// Absent ref or path → ("", false) via --verify --quiet, so the caller fails
+// safe (#109). The path after a ref's colon is read literally, never as a
+// pattern.
 func RefBlob(worktree, ref, path string) (string, bool) {
+	if ref == "" {
+		ref = ":0"
+	}
 	out, err := RunDir(worktree, "rev-parse", "--verify", "--quiet", ref+":"+path)
 	if err != nil || out == "" {
 		return "", false
@@ -978,14 +1014,18 @@ func ChangedRanges(dir, base, file string) []LineRange {
 // ranges with others (the pre-edit hooks add an agent's pending edit to them)
 // must then fall back to a conservative grade: there an empty set would read as
 // "no edits", where the graders read it as indeterminate.
+//
+// Every diff names file as that one file (literalPath, #204). Read as a
+// pattern, "*.md" folded every .md file's hunks into this one's, and
+// ":colon.md" measured colon.md instead, so its own edits never counted.
 func ChangedRangesChecked(dir, base, file string) (ranges []LineRange, ok bool) {
 	ref, sha, hasBase := resolveBaseRef(dir, base)
 	if !hasBase {
 		return uncommittedRangesNew(dir, file)
 	}
 	if mb := behindMergeBase(dir, ref, sha, file); mb != "" {
-		own, ownErr := runRaw(dir, "diff", "-U0", mb, "--", file)
-		moved, movedErr := runRaw(dir, "diff", "-U0", mb, ref, "--", file)
+		own, ownErr := runRaw(dir, "diff", "-U0", mb, "--", literalPath(file))
+		moved, movedErr := runRaw(dir, "diff", "-U0", mb, ref, "--", literalPath(file))
 		if ownErr == nil && movedErr == nil {
 			return mapHunksToBase(parseHunks(own), parseHunks(moved)), true
 		}
@@ -993,7 +1033,7 @@ func ChangedRangesChecked(dir, base, file string) (ranges []LineRange, ok bool) 
 		// which over-reports (base's own edits read as the branch's). A noisy
 		// grade, never a hidden one.
 	}
-	out, err := runRaw(dir, "diff", "-U0", ref, "--", file)
+	out, err := runRaw(dir, "diff", "-U0", ref, "--", literalPath(file))
 	if err != nil {
 		return nil, false
 	}
@@ -1030,11 +1070,11 @@ func ChangedRangesNew(dir, base, file string) []LineRange {
 		return wholeFile
 	}
 	if mb := behindMergeBase(dir, ref, sha, file); mb != "" {
-		if out, err := runRaw(dir, "diff", "-U0", mb, "--", file); err == nil {
+		if out, err := runRaw(dir, "diff", "-U0", mb, "--", literalPath(file)); err == nil {
 			return parseHunkRanges(out)
 		}
 	}
-	out, err := runRaw(dir, "diff", "-U0", ref, "--", file)
+	out, err := runRaw(dir, "diff", "-U0", ref, "--", literalPath(file))
 	if err != nil {
 		return wholeFile
 	}
@@ -1060,14 +1100,14 @@ func LinesToBase(dir, base, file string, spans []LineRange) ([]LineRange, bool) 
 		// Base-less: every window self-reports its uncommitted NEW side, which is
 		// the on-disk frame only while nothing uncommitted (not even a binary
 		// change, which has no hunks) shifts it.
-		for _, args := range [][]string{{"diff", "--", file}, {"diff", "--cached", "--", file}} {
+		for _, args := range [][]string{{"diff", "--", literalPath(file)}, {"diff", "--cached", "--", literalPath(file)}} {
 			if out, err := runRaw(dir, args...); err != nil || out != "" {
 				return nil, false
 			}
 		}
 		return spans, true
 	}
-	out, err := runRaw(dir, "diff", "-U0", ref, "--", file)
+	out, err := runRaw(dir, "diff", "-U0", ref, "--", literalPath(file))
 	if err != nil {
 		return nil, false
 	}
@@ -1327,7 +1367,7 @@ func FileChangeSubsumed(worktree, base, path string) (subsumed, known bool) {
 // still self-reports. ok=false when either diff fails.
 func uncommittedRangesNew(dir, file string) (ranges []LineRange, ok bool) {
 	ok = true
-	for _, args := range [][]string{{"diff", "-U0", "--", file}, {"diff", "-U0", "--cached", "--", file}} {
+	for _, args := range [][]string{{"diff", "-U0", "--", literalPath(file)}, {"diff", "-U0", "--cached", "--", literalPath(file)}} {
 		out, err := runRaw(dir, args...)
 		if err != nil {
 			ok = false

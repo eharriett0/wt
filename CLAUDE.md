@@ -203,6 +203,22 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   (its `-z` needs git 2.36; Ubuntu 22.04 ships 2.34). gh has no `-z`: `gh pr
   diff --name-only` relays GitHub's quoted names, so `ghx.PRChangedFiles`
   unquotes them (`unquoteGitPath`) before the deploy-path globs see them.
+- **A path handed to git means that one file, never a pattern (#204).** After
+  `--` git reads a path as a pathspec: `a[1].md` also matched an untracked
+  `a1.md`, so `IsUntracked` read a committed `a[1].md` as untracked and #113
+  downgraded a real collision; `*.md` folded every .md file's hunks into one
+  file's ranges; a leading `:` is magic (`:colon.md` measured `colon.md`). Every
+  `-- <path>` call passes `gitx.literalPath(p)` (`:(literal)<p>`): IsTracked*,
+  IsUntracked, ChangedRangesChecked/ChangedRangesNew, LinesToBase,
+  uncommittedRangesNew. Prefixing the path, not `git --literal-pathspecs`, keeps
+  the subcommand at `args[0]`, where the `gitOutput` failure-injection tests
+  match it (a per-call env var would need the seam itself changed). ⚠
+  `scopedEnv` strips `GIT_LITERAL_PATHSPECS` (and the glob/noglob/icase
+  switches): git exports it to the hooks of `git --literal-pathspecs …`, and
+  under it git reads `:(literal)` as part of the name, which then matches
+  nothing. Already literal, not pathspecs: `hash-object -- <file>` and
+  `<rev>:<path>` lookups. But `RefBlob`'s staged form is `:0:<path>`: in the
+  short `:<path>` form, `1:x.md` reads as stage 1 of `x.md`.
 - **`wt clean` is data-loss-critical.** `ReapVerdict` only reaps a *provably
   shipped* worktree (grace window, upstream, merged PR / cherry). Never
   force-remove a dirty worktree automatically — `--stale-index` is
