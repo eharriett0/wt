@@ -158,10 +158,24 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   nothing. A root file has no `/` to anchor a suffix on, so fuzzy-matching every
   path made the root `README.md` collide with another branch's
   `pkg/svc/README.md` and blocked the push. The zero `MatchMode` is exact, so a
-  query whose mode was never decided can't invent a collision. Relative paths
-  resolve against `git rev-parse --show-prefix` (not root); absolute ones via
-  `resolveExisting`, which handles `/var`→`/private/var` even for a file that
-  doesn't exist yet.
+  query whose mode was never decided can't invent a collision. A `wt check`
+  argument is read from the cwd (`git rev-parse --show-prefix`, `cwdArgBase`),
+  a `wt_check` one from the repo ROOT (`rootArgBase`: its schema says
+  repo-relative, and the server may run in a subdirectory); absolute ones go
+  through `resolveExisting`, which handles `/var`→`/private/var` even for a file
+  that doesn't exist yet. ⚠ So the #92 equality holds for every path that
+  names something; for a name that names nothing yet (not on disk, not
+  tracked, not touched at that path), `wt check` runs a fuzzy SEARCH and is a
+  superset of the edit hooks, which ask about the exact file being created and
+  stay silent about namesakes. That direction is safe; don't "fix" it by making
+  the hooks fuzzy. CheckPaths lets an exact query claim a file before a fuzzy
+  one (`exactFirst`), so an entry names the real path whatever the argument
+  order. ⚠ **Every `git diff --name-only` feeding the engine passes
+  `--no-renames`** (TouchedFiles, RangeChangedPaths, StagedFiles): with rename
+  detection a COMMITTED move listed only its new path, so an edit of the old
+  path in another window went unmatched. The fuzzy suffix tier used to hide that
+  (README.md is a suffix of pkg/README.md); exact matching needs the old path
+  listed, as the porcelain read already does for a staged move (#28).
 - **`wt clean` is data-loss-critical.** `ReapVerdict` only reaps a *provably
   shipped* worktree (grace window, upstream, merged PR / cherry). Never
   force-remove a dirty worktree automatically — `--stale-index` is

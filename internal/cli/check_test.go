@@ -2,6 +2,7 @@ package cli
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/eharriett0/wt/internal/collide"
@@ -22,7 +23,7 @@ func argFor(arg, rel string, exists, tracked bool, ws []collide.Window) checkArg
 func TestUnknownCheckPaths(t *testing.T) {
 	ws := []collide.Window{
 		{Branch: "feat-b", Worktree: "/w/b", Touched: []string{
-			"pkg/svc/README.md", "envs/landru/configs/kiali/netpol.yaml", "docs/NEW.md",
+			"pkg/svc/README.md", "envs/landru/configs/kiali/netpol.yaml", "docs/NEW.md", "TOP.md",
 		}},
 	}
 	cases := []struct {
@@ -37,6 +38,9 @@ func TestUnknownCheckPaths(t *testing.T) {
 		{"bare name is a fuzzy query, never flagged", argFor("nothing.go", "nothing.go", false, false, ws), false},
 		{"a typo with a directory component is refused", argFor("pkg/svc/READNE.md", "pkg/svc/READNE.md", false, false, ws), true},
 		{"a zsh non-word-split pair is refused", argFor("a.go b.go", "a.go b.go", false, false, ws), true},
+		// typed in a subdirectory, the argument and the path it names differ: the
+		// guard must ask about the path (#181 review), not the text typed
+		{"../ to a path that exists only on another branch", argFor("../TOP.md", "TOP.md", false, false, ws), false},
 	}
 	for _, tc := range cases {
 		got := unknownCheckPaths([]checkArg{tc.a}, ws)
@@ -103,5 +107,66 @@ func TestRepoRelativePatch(t *testing.T) {
 	}
 	if files[0].path != "svc/README.md" {
 		t.Error("repoRelativePatch must not mutate its input")
+	}
+}
+
+// fakeBase is an argBase answering from fixed sets of arguments as typed.
+func fakeBase(prefix string, exists, tracked []string) argBase {
+	in := func(set []string) func(string) bool {
+		return func(a string) bool {
+			for _, s := range set {
+				if s == a {
+					return true
+				}
+			}
+			return false
+		}
+	}
+	return argBase{prefix: prefix, exists: in(exists), tracked: in(tracked)}
+}
+
+// TestResolveCheckArgs pins how an argument becomes a query, given where it is
+// read from (#181): the cwd's prefix for `wt check`, the root for wt_check.
+func TestResolveCheckArgs(t *testing.T) {
+	ws := []collide.Window{
+		{Branch: "feat-b", Worktree: "/repo-b", Touched: []string{
+			"pkg/svc/README.md", "internal/foo.go", "TOP.md", "envs/landru/configs/kiali/netpol.yaml",
+		}},
+	}
+	exact := func(p string) collide.Query { return collide.Query{Path: p, Mode: collide.MatchExact} }
+	fuzzy := func(p string) collide.Query { return collide.Query{Path: p, Mode: collide.MatchFuzzy} }
+	cases := []struct {
+		name string
+		base argBase
+		arg  string
+		want collide.Query
+	}{
+		{"root file at the root", fakeBase("", []string{"README.md"}, nil), "README.md", exact("README.md")},
+		{"same name in pkg/svc/ is pkg/svc/README.md", fakeBase("pkg/svc/", []string{"README.md"}, nil), "README.md", exact("pkg/svc/README.md")},
+		{"subdirectory-relative path", fakeBase("pkg/", []string{"svc/README.md"}, nil), "svc/README.md", exact("pkg/svc/README.md")},
+		{"../ out of a subdirectory", fakeBase("pkg/svc/", []string{"../../README.md"}, nil), "../../README.md", exact("README.md")},
+		{"./ prefix is cleaned", fakeBase("", []string{"./README.md"}, nil), "./README.md", exact("README.md")},
+		{"deleted but tracked", fakeBase("", nil, []string{"gone.go"}), "gone.go", exact("gone.go")},
+		{"exists only on another branch, exactly there", fakeBase("", nil, nil), "TOP.md", exact("TOP.md")},
+		{"../ to a path that exists only on another branch", fakeBase("docs/", nil, nil), "../TOP.md", exact("TOP.md")},
+		{"bare name that is nothing here: a search, as typed", fakeBase("", nil, nil), "foo.go", fuzzy("foo.go")},
+		{"bare name in a subdirectory: a search, as typed", fakeBase("pkg/", nil, nil), "foo.go", fuzzy("foo.go")},
+		{"partial directory that names nothing: a search (#154)", fakeBase("", nil, nil), "configs/kiali/", fuzzy("configs/kiali/")},
+		{"absolute path inside the repo", fakeBase("pkg/", []string{"/repo/README.md"}, nil), "/repo/README.md", exact("README.md")},
+		{"surrounding whitespace", fakeBase("", []string{"README.md"}, nil), "  README.md ", exact("README.md")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveCheckArgs([]string{tc.arg}, "/repo", tc.base, ws)
+			if len(got) != 1 || got[0].query != tc.want {
+				t.Fatalf("resolveCheckArgs(%q, prefix %q) = %+v, want query %+v", tc.arg, tc.base.prefix, got, tc.want)
+			}
+			if got[0].arg != strings.TrimSpace(tc.arg) {
+				t.Errorf("arg = %q, want it as typed (trimmed)", got[0].arg)
+			}
+		})
+	}
+	if got := resolveCheckArgs([]string{"", "  "}, "/repo", fakeBase("", nil, nil), ws); len(got) != 0 {
+		t.Errorf("blank arguments must be skipped, got %+v", got)
 	}
 }

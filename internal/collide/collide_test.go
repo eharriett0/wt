@@ -170,6 +170,27 @@ func TestCheckPaths_NamesTheFileThatActuallyCollides(t *testing.T) {
 	}
 }
 
+func TestCheckPaths_ExactQueryNamesTheEntry(t *testing.T) {
+	// #181 review: when a fuzzy search and an exact path reach the same file, the
+	// entry carries the exact path whatever the argument order. Its Path is what
+	// gets reported and what the shared-doc / append-only globs match.
+	ws := []Window{
+		{Branch: "feat-b", Worktree: "/w/b", Touched: []string{"pkg/svc/NEW.md"}},
+		{Branch: "feat-a", Worktree: "/w/a"},
+	}
+	fz, ex := Query{Path: "NEW.md", Mode: MatchFuzzy}, Query{Path: "pkg/svc/NEW.md"}
+	for _, qs := range [][]Query{{fz, ex}, {ex, fz}} {
+		got := CheckPaths(ws, "/w/a", qs)
+		want := []Conflict{{Path: "pkg/svc/NEW.md", Window: "feat-b", MatchedFile: "pkg/svc/NEW.md"}}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("CheckPaths(%+v) =\n%#v\nwant\n%#v", qs, got, want)
+		}
+	}
+	if got := exactFirst([]Query{fz, ex, {Path: "a"}}); !reflect.DeepEqual(got, []Query{ex, {Path: "a"}, fz}) {
+		t.Errorf("exactFirst = %+v, want exact ones in order, then fuzzy", got)
+	}
+}
+
 func TestQueryFor(t *testing.T) {
 	ws := []Window{
 		{Branch: "feat-b", Worktree: "/w/b", Touched: []string{

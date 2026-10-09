@@ -251,8 +251,11 @@ func QueryFor(arg, rel string, onDisk bool, ws []Window) Query {
 // carry the matched file in Path as well, because a report that printed the
 // requested directory three times would not tell you which files to look at.
 // Entries are deduped by (window, file): passing both a directory and a file
-// under it is a natural thing to do and must not double-report.
+// under it is a natural thing to do and must not double-report. Exact queries
+// claim a file before fuzzy ones (exactFirst), so when both reach it the entry
+// carries the path that names it, whatever order the arguments came in.
 func CheckPaths(ws []Window, currentWorktree string, qs []Query) []Conflict {
+	qs = exactFirst(qs)
 	var out []Conflict
 	for _, w := range ws {
 		if sameWorktree(w.Worktree, currentWorktree) {
@@ -292,6 +295,27 @@ func CheckPaths(ws []Window, currentWorktree string, qs []Query) []Conflict {
 		}
 		return out[i].Window < out[j].Window
 	})
+	return out
+}
+
+// exactFirst returns qs with every MatchExact query ahead of every MatchFuzzy
+// one, each group in its original order (#181 review). CheckPaths keeps the
+// first query to reach a file, and its Path is what the entry reports and what
+// the shared-doc / append-only globs match: `wt check NEW.md pkg/svc/NEW.md`
+// used to report the fuzzy "NEW.md" for pkg/svc/NEW.md, and the reverse order
+// the real path. Pure.
+func exactFirst(qs []Query) []Query {
+	out := make([]Query, 0, len(qs))
+	for _, q := range qs {
+		if q.Mode != MatchFuzzy {
+			out = append(out, q)
+		}
+	}
+	for _, q := range qs {
+		if q.Mode == MatchFuzzy {
+			out = append(out, q)
+		}
+	}
 	return out
 }
 

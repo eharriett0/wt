@@ -1035,27 +1035,66 @@ type checkArg struct {
 	tracked bool          // known to git (a deleted-but-tracked path counts)
 }
 
-// resolveCheckArgs gathers each argument's facts and lets collide.QueryFor
-// decide its match mode: exact at the repo-relative path it names when it names
-// a real one, fuzzy as typed when it doesn't (#181). Everything is read
-// cwd-relative (NOT root-relative): the operator types paths relative to where
-// they are, and IsTracked (git ls-files) is cwd-relative too, so all of them
-// agree from a subdir (#92 review). root is the repo's top level (for an
-// absolute argument). Shared by `wt check` and MCP wt_check so the two can't
-// diverge. I/O: stat, git ls-files, git rev-parse.
-func resolveCheckArgs(args []string, root string, ws []collide.Window) []checkArg {
+// argBase is the place a check's arguments are read from: prefix is its path
+// relative to the repo root (`git rev-parse --show-prefix`, "" = the root
+// itself), exists and tracked answer for an argument as typed. Injected so the
+// resolution is table-testable without a repo (resolveCheckArgs).
+type argBase struct {
+	prefix  string
+	exists  func(arg string) bool // present in the working tree
+	tracked func(arg string) bool // known to git (a deleted-but-tracked path counts)
+}
+
+// cwdArgBase is `wt check`'s: arguments are read relative to the current
+// directory, the way the operator typed them (README.md typed in pkg/svc/ is
+// pkg/svc/README.md). Asking git for the prefix avoids comparing os.Getwd, which
+// can return the logical /var/… path on macOS, with git's physical root.
+// IsTracked (git ls-files) is cwd-relative too, so the facts agree from a subdir
+// (#92 review). I/O.
+func cwdArgBase() argBase {
 	prefix, _ := gitx.ShowPrefix()
+	return argBase{
+		prefix:  prefix,
+		exists:  func(a string) bool { _, err := os.Stat(a); return err == nil },
+		tracked: gitx.IsTracked,
+	}
+}
+
+// rootArgBase is MCP wt_check's: arguments are read relative to the repo root,
+// whatever directory the client started `wt mcp` in (#181 review). Its schema
+// promises repo-relative paths, and a model has no way to know the server's cwd;
+// read from a subdirectory, README.md named that subdirectory's README.md and
+// missed a collision on the root one. I/O.
+func rootArgBase(root string) argBase {
+	at := func(a string) string {
+		if filepath.IsAbs(a) {
+			return a
+		}
+		return filepath.Join(root, a)
+	}
+	return argBase{
+		exists:  func(a string) bool { _, err := os.Stat(at(a)); return err == nil },
+		tracked: func(a string) bool { return gitx.IsTrackedIn(root, a) },
+	}
+}
+
+// resolveCheckArgs gathers each argument's facts from base and lets
+// collide.QueryFor decide its match mode: exact at the repo-relative path it
+// names when it names a real one, fuzzy as typed when it doesn't (#181). root is
+// the repo's top level, for an absolute argument. Shared by `wt check`
+// (cwdArgBase) and MCP wt_check (rootArgBase), so the two differ only in where a
+// relative path starts. Pure given base (an absolute argument also resolves
+// symlinks: repoRelativePath).
+func resolveCheckArgs(args []string, root string, base argBase, ws []collide.Window) []checkArg {
 	var out []checkArg
 	for _, a := range args {
 		a = strings.TrimSpace(a)
 		if a == "" {
 			continue
 		}
-		ca := checkArg{arg: a}
-		_, err := os.Stat(a)
-		ca.exists = err == nil
-		ca.tracked = !ca.exists && gitx.IsTracked(a)
-		ca.query = collide.QueryFor(a, repoRelativePath(root, prefix, a), ca.exists || ca.tracked, ws)
+		ca := checkArg{arg: a, exists: base.exists(a)}
+		ca.tracked = !ca.exists && base.tracked(a)
+		ca.query = collide.QueryFor(a, repoRelativePath(root, base.prefix, a), ca.exists || ca.tracked, ws)
 		out = append(out, ca)
 	}
 	return out
@@ -1124,7 +1163,7 @@ func cmdCheck(args []string) int {
 		// #181: a path that names a real location (here, tracked, or touched at
 		// that exact path by a window) matches EXACTLY; only one that names
 		// nothing in the repo is a fuzzy basename/suffix search.
-		args := resolveCheckArgs(paths, root, ws)
+		args := resolveCheckArgs(paths, root, cwdArgBase(), ws)
 		// #93: refuse a path that doesn't exist in the working tree, isn't tracked
 		// by git, and isn't touched by any window — a typo (or a zsh non-word-split
 		// single arg) that would otherwise falsely report '✓ clear'. Bare basenames

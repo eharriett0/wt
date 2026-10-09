@@ -281,9 +281,11 @@ func mcpCheck(c *config.Config, paths []string, includeStale, allowMissing bool)
 	}
 	// #181: same exact-vs-fuzzy resolution as `wt check`, so an existing path
 	// (e.g. the root README.md) matches exactly and only a name that is no path in
-	// the repo is a fuzzy basename search.
+	// the repo is a fuzzy basename search. Unlike `wt check`, a relative path is
+	// read from the repo ROOT, as the schema promises, not from wherever the
+	// client started the server.
 	root, _ := gitx.RepoRoot()
-	args := resolveCheckArgs(paths, root, ws)
+	args := resolveCheckArgs(paths, root, rootArgBase(root), ws)
 	// #93: refuse to report "clear" for a path that doesn't exist, isn't tracked,
 	// and no window touches — a typo must NOT read as a false all-clear (the exact
 	// failure this tool exists to prevent). Mirrors `wt check`'s guard so the MCP
