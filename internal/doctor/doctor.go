@@ -361,6 +361,7 @@ func resolvedConfig(c *config.Config) map[string]string {
 		"max_age":           ageStr(c.MaxAge, "off"),
 		"hold_max_age":      ageStr(c.HoldMaxAge, "never"),
 		"merge_is_deploy":   boolStr(c.MergeIsDeploy),
+		"merge_min_checks":  config.MinChecksString(c.MergeMinChecks, c.MergeMinChecksBad),
 		"coord_issue":       coordIssueStr(c.CoordIssue),
 	}
 }

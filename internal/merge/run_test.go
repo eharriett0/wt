@@ -72,7 +72,7 @@ func TestRunPutsWtFlagsBeforeThePassthrough(t *testing.T) {
 			t.Fatal(err)
 		}
 		args := WithAdmin(true, tc.passthrough)
-		if err := Run("99999", false, false, false, []string{"feat-x"}, args, strings.NewReader("Forwarded body.")); err != nil {
+		if err := Run("99999", false, false, false, []string{"feat-x"}, args, strings.NewReader("Forwarded body."), ""); err != nil {
 			t.Fatalf("%q: Run: %v", tc.passthrough, err)
 		}
 		got := strings.Split(strings.TrimSuffix(read("argv"), "\n"), "\n")
@@ -125,7 +125,7 @@ esac
 		if err := os.WriteFile(filepath.Join(dir, "files"), []byte(tc.files), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		err := Run("99999", false, false, false, []string{"feat-x"}, nil, nil)
+		err := Run("99999", false, false, false, []string{"feat-x"}, nil, nil, "")
 		if err == nil {
 			t.Fatalf("files %q: Run succeeded, want an error", tc.files)
 		}

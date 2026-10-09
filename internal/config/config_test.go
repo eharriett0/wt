@@ -259,3 +259,62 @@ func TestApplyConf_CoordIssue(t *testing.T) {
 		t.Fatal("coord_issue flagged unknown")
 	}
 }
+
+// TestMergeMinChecks: merge_min_checks is a whole number, "off"/"none" for 0
+// (#179). Anything else is kept as MergeMinChecksBad, so merge-pr's checks gate
+// refuses rather than run without the floor someone asked for; a valid value
+// later (the env over the file) clears it, and a blank one changes nothing.
+func TestMergeMinChecks(t *testing.T) {
+	cases := []struct {
+		v  string
+		n  int
+		ok bool
+	}{
+		{"3", 3, true}, {" 12 ", 12, true}, {"0", 0, true}, {"off", 0, true}, {"None", 0, true},
+		{"five", 0, false}, {"-1", 0, false}, {"2.5", 0, false}, {"3x", 0, false},
+	}
+	for _, c := range cases {
+		if n, ok := ParseMinChecks(c.v); n != c.n || ok != c.ok {
+			t.Errorf("ParseMinChecks(%q) = (%d, %v), want (%d, %v)", c.v, n, ok, c.n, c.ok)
+		}
+	}
+
+	c := &Config{}
+	ApplyConf(c, ParseConf("merge_min_checks = 4\n"))
+	if c.MergeMinChecks != 4 || c.MergeMinChecksBad != "" {
+		t.Fatalf("merge_min_checks = 4 → (%d, %q)", c.MergeMinChecks, c.MergeMinChecksBad)
+	}
+	ApplyConf(c, ParseConf("merge_min_checks = four\n"))
+	if c.MergeMinChecks != 0 || c.MergeMinChecksBad != "four" {
+		t.Fatalf("merge_min_checks = four → (%d, %q), want (0, \"four\")", c.MergeMinChecks, c.MergeMinChecksBad)
+	}
+	ApplyConf(c, ParseConf("merge_min_checks =\n"))
+	if c.MergeMinChecksBad != "four" {
+		t.Fatalf("a blank merge_min_checks changed it: (%d, %q)", c.MergeMinChecks, c.MergeMinChecksBad)
+	}
+	t.Setenv("WT_MERGE_MIN_CHECKS", "2")
+	applyEnv(c)
+	if c.MergeMinChecks != 2 || c.MergeMinChecksBad != "" {
+		t.Fatalf("WT_MERGE_MIN_CHECKS=2 over a bad file value → (%d, %q)", c.MergeMinChecks, c.MergeMinChecksBad)
+	}
+	t.Setenv("WT_MERGE_MIN_CHECKS", "lots")
+	applyEnv(c)
+	if c.MergeMinChecks != 0 || c.MergeMinChecksBad != "lots" {
+		t.Fatalf("WT_MERGE_MIN_CHECKS=lots → (%d, %q)", c.MergeMinChecks, c.MergeMinChecksBad)
+	}
+	if len(UnknownKeys(ParseConf("merge_min_checks = 3\n"))) != 0 {
+		t.Fatal("merge_min_checks flagged unknown")
+	}
+	for _, c := range []struct {
+		n    int
+		bad  string
+		want string
+	}{{0, "", "off"}, {3, "", "3"}, {0, "x", `"x" (not a count: merge-pr refuses until it is fixed)`}} {
+		if got := MinChecksString(c.n, c.bad); got != c.want {
+			t.Errorf("MinChecksString(%d, %q) = %q, want %q", c.n, c.bad, got, c.want)
+		}
+	}
+	if out := ScaffoldConf(&Config{}); !strings.Contains(out, "# resolved: off\n# merge_min_checks = 3") {
+		t.Errorf("ScaffoldConf has no merge_min_checks entry:\n%s", out)
+	}
+}
