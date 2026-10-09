@@ -233,6 +233,150 @@ func LocalBranchExists(branch string) bool {
 	return err == nil
 }
 
+// RemoteTrackingTip returns the commit refs/remotes/origin/<branch> points at, as
+// last fetched, or "" when there is no such ref. No network. `wt adopt <branch>`
+// checks a local branch of the same name against it (#167).
+func RemoteTrackingTip(branch string) string {
+	if branch == "" {
+		return ""
+	}
+	out, err := Run("rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+branch+"^{commit}")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+// HeadCommit returns the commit HEAD points at in the worktree at dir, or "" when
+// it does not resolve (#167).
+func HeadCommit(dir string) string {
+	out, err := RunDir(dir, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+// SymbolicHead returns the full ref HEAD points at in the worktree at dir
+// ("refs/heads/<branch>"), or "" when HEAD is detached or unreadable (#167).
+// Unlike CurrentBranchIn it never abbreviates, so a tag of the same name cannot
+// turn the answer into "heads/<branch>".
+func SymbolicHead(dir string) string {
+	out, err := RunDir(dir, "symbolic-ref", "-q", "HEAD")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+// IgnoreCase reports core.ignorecase: git sets it when it creates a repo on a
+// case-insensitive filesystem (macOS by default), where two branch names that
+// differ only in case are one loose ref file. Unset or unreadable is false, as
+// git itself reads it (#167).
+func IgnoreCase() bool {
+	out, err := Run("config", "--type=bool", "--get", "core.ignorecase")
+	return err == nil && strings.TrimSpace(out) == "true"
+}
+
+// LocalBranches lists every local branch name (refs/heads/*, without the
+// prefix) (#167).
+func LocalBranches() ([]string, error) {
+	out, err := Run("for-each-ref", "--format=%(refname)", "refs/heads")
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, ln := range strings.Split(out, "\n") {
+		if ln = strings.TrimSpace(ln); strings.HasPrefix(ln, "refs/heads/") {
+			names = append(names, strings.TrimPrefix(ln, "refs/heads/"))
+		}
+	}
+	return names, nil
+}
+
+// AheadBehind counts the commits a has that b lacks (ahead) and the commits b
+// has that a lacks (behind): `git rev-list --left-right --count a...b` (#167).
+func AheadBehind(a, b string) (ahead, behind int, err error) {
+	out, err := Run("rev-list", "--left-right", "--count", a+"..."+b)
+	if err != nil {
+		return 0, 0, err
+	}
+	return parseLeftRight(out)
+}
+
+// parseLeftRight reads `rev-list --left-right --count`'s "<left>\t<right>". Pure.
+func parseLeftRight(out string) (left, right int, err error) {
+	f := strings.Fields(out)
+	if len(f) != 2 {
+		return 0, 0, fmt.Errorf("unexpected rev-list --left-right --count output %q", out)
+	}
+	if left, err = strconv.Atoi(f[0]); err != nil {
+		return 0, 0, err
+	}
+	if right, err = strconv.Atoi(f[1]); err != nil {
+		return 0, 0, err
+	}
+	return left, right, nil
+}
+
+// OnelineLog returns up to max "<short sha> <subject>" lines for the commits in
+// to that are not in from (`git log from..to`), newest first (#167).
+func OnelineLog(from, to string, max int) ([]string, error) {
+	out, err := Run("log", "--no-decorate", "--format=%h %s", "-n", strconv.Itoa(max), from+".."+to)
+	if err != nil {
+		return nil, err
+	}
+	var lines []string
+	for _, ln := range strings.Split(out, "\n") {
+		if ln = strings.TrimSpace(ln); ln != "" {
+			lines = append(lines, ln)
+		}
+	}
+	return lines, nil
+}
+
+// FastForwardBranch moves refs/heads/<branch> from `from` to `to`, and only as a
+// fast-forward: it refuses unless from is an ancestor of to and the branch still
+// points at from (#167).
+//
+// It moves the ref with `git branch -f`, not `update-ref`, for git's own in-use
+// check: branch -f refuses a branch that any worktree has checked out OR is in
+// the middle of rebasing or bisecting. Moving such a branch leaves that
+// worktree's files at the old commit (its next commit reverts the move) or
+// breaks the rebase's final ref update. A worktree mid-rebase has a detached
+// HEAD, so `git worktree list` does not report the branch, and update-ref moved
+// it anyway (measured, git 2.39). Callers should still rule out a checked-out
+// branch first, for a clearer message.
+func FastForwardBranch(branch, from, to string) error {
+	if branch == "" || from == "" || to == "" {
+		return fmt.Errorf("fast-forward needs a branch and two commits, got %q %q %q", branch, from, to)
+	}
+	ok, err := IsAncestor(from, to)
+	if err != nil {
+		return fmt.Errorf("fast-forward %s: %w", branch, err)
+	}
+	if !ok {
+		return fmt.Errorf("fast-forward %s: %s is not an ancestor of %s", branch, from, to)
+	}
+	// branch -f has no old-value check, so confirm the branch has not moved since
+	// the caller read it, as late as possible.
+	if cur := BranchTip(branch); cur != from {
+		return fmt.Errorf("fast-forward %s: it is at %s now, not %s", branch, cur, from)
+	}
+	cmd := exec.Command("git", "branch", "-f", branch, to)
+	cmd.Env = scopedEnv()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		if msg := strings.TrimSpace(string(out)); msg != "" {
+			return fmt.Errorf("%w: %s", err, msg)
+		}
+		return err
+	}
+	if cur := BranchTip(branch); cur != to {
+		return fmt.Errorf("fast-forward %s: it is at %s after the move, not %s", branch, cur, to)
+	}
+	return nil
+}
+
 // WorktreePaths lists every worktree path (primary first), via porcelain.
 func WorktreePaths() ([]string, error) {
 	out, err := Run("worktree", "list", "--porcelain")

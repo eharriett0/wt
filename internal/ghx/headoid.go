@@ -36,3 +36,35 @@ func parseHeadOid(out string) (string, bool) {
 	}
 	return s, true
 }
+
+// PRHead returns PR pr's head branch (headRefName) and head commit (headRefOid),
+// in one gh call, so the two cannot come from different pushes. `wt adopt <pr#>`
+// lands on that branch, and only once origin/<branch> carries that commit
+// (#167). An error when gh fails or does not return both.
+func PRHead(pr string) (branch, oid string, err error) {
+	out, err := run("pr", "view", pr, "--json", "headRefName,headRefOid",
+		"--jq", `"\(.headRefName // empty) \(.headRefOid // empty)"`)
+	if err != nil {
+		return "", "", err
+	}
+	branch, oid, ok := parsePRHead(out)
+	if !ok {
+		return "", "", fmt.Errorf("gh returned no head branch and commit for PR #%s (got %q)", pr, out)
+	}
+	return branch, oid, nil
+}
+
+// parsePRHead reads PRHead's `<headRefName> <headRefOid>` line: a branch name,
+// then a full object id as parseHeadOid reads one. Anything else is ok=false,
+// never a parsed placeholder (the #168 rule); the `// empty` query prints
+// nothing when either field is missing. Pure.
+func parsePRHead(out string) (branch, oid string, ok bool) {
+	f := strings.Fields(out)
+	if len(f) != 2 {
+		return "", "", false
+	}
+	if oid, ok = parseHeadOid(f[1]); !ok {
+		return "", "", false
+	}
+	return f[0], oid, true
+}

@@ -53,6 +53,7 @@ func TestCmdMergePR_forwardedBodyReachesGh(t *testing.T) {
 	if err != nil {
 		t.Skip("no git")
 	}
+	hermeticGitT(t)
 	repo := t.TempDir()
 	for _, args := range [][]string{
 		{"init", "-q", "-b", "main"},
