@@ -185,23 +185,37 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   must pick out exactly ONE worktree (`CheckNames`): none is a typo, two is a
   directory name that is also another worktree's branch. Either stops the run
   with nothing cleaned, so a bad `-y` list never removes "the rest" of it.
-- **`wt adopt` never checks out a local branch that is not the target (#167).**
-  `git worktree add <path> <branch>` takes `refs/heads/<branch>` whenever it
-  exists, so a stale branch left by an earlier PR that reused the name was
-  adopted in place of the PR head (ahead 6, behind 285). After the fetch,
-  `prepareLocalBranch` compares it to the PR's `headRefOid` (`ghx.PRHead`), else
-  `origin/<branch>`, through the pure `ClassifyTips`/`DecideAdopt`: equal is
-  attached, only-behind is fast-forwarded (`gitx.FastForwardBranch`), and
-  anything with commits the target lacks, or that cannot be compared, is refused
-  with both SHAs. ⚠ Only a branch NO worktree is using is moved: moving one
-  underneath its worktree leaves its files at the old commit, and its next
-  commit reverts the move. ⚠ `git worktree list` cannot see a worktree that is
-  mid-rebase of the branch (its HEAD is detached), so the move goes through
-  `git branch -f`, whose own in-use check refuses it; `update-ref` moved it
-  (measured). ⚠ The fetch runs
-  BEFORE the existing-worktree short-circuit, so a re-run is checked too
-  (`DecideExisting`: behind or ahead is handed back with a note, diverged is
-  refused, and wt never moves an existing worktree's branch).
+- **`wt adopt` never checks out, creates or moves a branch onto anything but the
+  target (#167).** `git worktree add <path> <branch>` takes `refs/heads/<branch>`
+  whenever it exists, so a stale branch left by an earlier PR that reused the
+  name was adopted in place of the PR head (ahead 6, behind 285). The target is
+  `origin/<branch>` as just fetched. ⚠ **Adopting by PR it must first carry
+  gh's `headRefOid`** (`GatePRHead`: equal, or contains it after a SUCCESSFUL
+  fetch, since gh can lag a push): a fork PR's head is not on origin, so
+  `origin/<branch>` is another branch that shares the name (and DWIM checked it
+  out), or the PR head is in the clone via `gh pr checkout` and the local branch
+  of that name (base `main`, for a PR from a contributor's main) got
+  fast-forwarded onto the fork's commits. A failed fetch leaves an old copy.
+  Gate first, before the existing-worktree short-circuit; don't key on
+  `isCrossRepository` (an origin that IS the user's fork is legitimate). Then
+  `prepareLocalBranch` (pure `ClassifyTips`/`DecideAdopt`): equal or only ahead
+  (unpushed) is attached as is, only-behind is fast-forwarded
+  (`gitx.FastForwardBranch`), diverged is refused with both SHAs. ⚠ Only a
+  branch NO worktree is using is moved (`BranchInUse`; a failed `git worktree
+  list` counts as in use): moving one underneath its worktree leaves its files at
+  the old commit, and its next commit reverts the move. `git worktree list`
+  cannot see a worktree mid-rebase of the branch (detached HEAD), so the move
+  goes through `git branch -f`, whose own in-use check refuses it (`update-ref`
+  moved it, measured). ⚠ **With `core.ignorecase` a branch differing only in
+  case is the same loose ref file**, and git's in-use check compares names
+  exactly (it moved `Feat` under its worktree for `wt adopt` of `feat`), so a
+  case-only twin is refused outright. ⚠ After the add, the worktree must be on
+  `refs/heads/<branch>` at the intended commit (`AdoptedOnTarget`, read with
+  `symbolic-ref`, not `--abbrev-ref`): a tag of the same name wins over
+  `origin/<branch>` in worktree-add's DWIM and leaves a detached HEAD; that
+  worktree, and only it, is removed. A re-run is checked too (`DecideExisting`:
+  behind or ahead is handed back with a note, diverged is refused, and wt never
+  moves an existing worktree's branch).
 - **`merge-pr` auto-cleans only a PR that reads MERGED afterwards (#185).** `gh
   pr merge` exits 0 WITHOUT merging for `--help`/`-h`, `--auto` (armed),
   `--disable-auto`, a merge queue (queued) and `-R` (another repo's PR). Taking

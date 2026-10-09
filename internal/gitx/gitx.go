@@ -257,6 +257,43 @@ func HeadCommit(dir string) string {
 	return strings.TrimSpace(out)
 }
 
+// SymbolicHead returns the full ref HEAD points at in the worktree at dir
+// ("refs/heads/<branch>"), or "" when HEAD is detached or unreadable (#167).
+// Unlike CurrentBranchIn it never abbreviates, so a tag of the same name cannot
+// turn the answer into "heads/<branch>".
+func SymbolicHead(dir string) string {
+	out, err := RunDir(dir, "symbolic-ref", "-q", "HEAD")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+// IgnoreCase reports core.ignorecase: git sets it when it creates a repo on a
+// case-insensitive filesystem (macOS by default), where two branch names that
+// differ only in case are one loose ref file. Unset or unreadable is false, as
+// git itself reads it (#167).
+func IgnoreCase() bool {
+	out, err := Run("config", "--type=bool", "--get", "core.ignorecase")
+	return err == nil && strings.TrimSpace(out) == "true"
+}
+
+// LocalBranches lists every local branch name (refs/heads/*, without the
+// prefix) (#167).
+func LocalBranches() ([]string, error) {
+	out, err := Run("for-each-ref", "--format=%(refname)", "refs/heads")
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, ln := range strings.Split(out, "\n") {
+		if ln = strings.TrimSpace(ln); strings.HasPrefix(ln, "refs/heads/") {
+			names = append(names, strings.TrimPrefix(ln, "refs/heads/"))
+		}
+	}
+	return names, nil
+}
+
 // AheadBehind counts the commits a has that b lacks (ahead) and the commits b
 // has that a lacks (behind): `git rev-list --left-right --count a...b` (#167).
 func AheadBehind(a, b string) (ahead, behind int, err error) {

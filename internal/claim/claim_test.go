@@ -1,10 +1,12 @@
 package claim
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/eharriett0/wt/internal/config"
+	"github.com/eharriett0/wt/internal/worktree"
 )
 
 // #157 (+review): non-interactive ALWAYS proceeds (agents never hang); the
@@ -101,5 +103,37 @@ func TestIssueFromBranch(t *testing.T) {
 		if got := issueFromBranch(c.prefix, c.branch); got != c.want {
 			t.Errorf("issueFromBranch(%q, %q) = %q, want %q", c.prefix, c.branch, got, c.want)
 		}
+	}
+}
+
+// #167: `wt adopt <pr#>` resolves the PR's head branch AND head commit in one gh
+// call, and the commit reaches worktree.Adopt, which requires origin/<branch>
+// to carry it; a branch name never asks gh, and a gh failure stops the adopt.
+func TestResolveAdopt(t *testing.T) {
+	oid := strings.Repeat("ab", 20)
+	var asked []string
+	prHead := func(pr string) (string, string, error) {
+		asked = append(asked, pr)
+		if pr != "1079" {
+			return "", "", errors.New("no such PR")
+		}
+		return "bot/image", oid, nil
+	}
+
+	branch, want, err := resolveAdopt("1079", prHead)
+	if err != nil || branch != "bot/image" || want != (worktree.AdoptWant{PR: "1079", PRHead: oid}) {
+		t.Errorf(`resolveAdopt("1079") = (%q, %+v, %v), want ("bot/image", {PR:1079 PRHead:%s}, nil)`, branch, want, err, oid)
+	}
+
+	branch, want, err = resolveAdopt("feat/x", prHead)
+	if err != nil || branch != "feat/x" || want != (worktree.AdoptWant{}) {
+		t.Errorf(`resolveAdopt("feat/x") = (%q, %+v, %v), want ("feat/x", {}, nil)`, branch, want, err)
+	}
+	if len(asked) != 1 {
+		t.Errorf("gh was asked about %q; a branch name must not ask it", asked)
+	}
+
+	if _, _, err := resolveAdopt("404", prHead); err == nil {
+		t.Error(`resolveAdopt("404") succeeded although gh failed`)
 	}
 }

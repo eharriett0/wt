@@ -57,6 +57,7 @@ func TestCmdMergePR_keepsTheLaneUnlessMerged(t *testing.T) {
 	if err != nil {
 		t.Skip("no git")
 	}
+	hermeticGitT(t)
 	ghDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(ghDir, "gh"), []byte(postMergeGh), 0o755); err != nil {
 		t.Fatal(err)

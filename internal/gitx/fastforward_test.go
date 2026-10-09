@@ -162,3 +162,57 @@ func TestRemoteTrackingTip(t *testing.T) {
 		t.Errorf("RemoteTrackingTip(\"\") = %q, want empty", got)
 	}
 }
+
+// SymbolicHead reads the full ref HEAD names, which a tag sharing the branch's
+// name cannot abbreviate into "heads/<branch>" the way --abbrev-ref does, and
+// is "" on a detached HEAD (#167).
+func TestSymbolicHead(t *testing.T) {
+	dir := gitRepo(t)
+	runGit(t, dir, "tag", "main") // a tag with the branch's name
+	if got := SymbolicHead(dir); got != "refs/heads/main" {
+		t.Errorf("SymbolicHead = %q, want refs/heads/main", got)
+	}
+	runGit(t, dir, "checkout", "-q", "--detach")
+	if got := SymbolicHead(dir); got != "" {
+		t.Errorf("SymbolicHead on a detached HEAD = %q, want empty", got)
+	}
+	if got := SymbolicHead(t.TempDir()); got != "" {
+		t.Errorf("SymbolicHead outside a repo = %q, want empty", got)
+	}
+}
+
+// IgnoreCase reads core.ignorecase as git does: unset is false (#167).
+func TestIgnoreCase(t *testing.T) {
+	dir := gitRepo(t)
+	t.Chdir(dir)
+	for _, c := range []struct {
+		set  []string
+		want bool
+	}{
+		{[]string{"config", "core.ignorecase", "true"}, true},
+		{[]string{"config", "core.ignorecase", "false"}, false},
+		{[]string{"config", "--unset", "core.ignorecase"}, false},
+	} {
+		runGit(t, dir, c.set...)
+		if got := IgnoreCase(); got != c.want {
+			t.Errorf("after git %v: IgnoreCase = %v, want %v", c.set, got, c.want)
+		}
+	}
+}
+
+// LocalBranches lists refs/heads only, without the prefix: not tags, not
+// remote-tracking refs (#167).
+func TestLocalBranches(t *testing.T) {
+	dir := gitRepo(t)
+	t.Chdir(dir)
+	runGit(t, dir, "branch", "bot/image")
+	runGit(t, dir, "branch", "Feat")
+	runGit(t, dir, "tag", "v1")
+	got, err := LocalBranches()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"Feat", "bot/image", "main"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("LocalBranches = %q, want %q", got, want)
+	}
+}

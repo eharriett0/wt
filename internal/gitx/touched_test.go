@@ -8,8 +8,19 @@ import (
 	"testing"
 )
 
+// hermeticGit points every git the test runs, the fixture's and the code
+// under test's, at an empty global config and no system config, so the
+// runner's ~/.gitconfig (commit.gpgsign with a key it cannot use, hooksPath,
+// init.defaultBranch, ...) never reaches a fixture (#167).
+func hermeticGit(t *testing.T) {
+	t.Helper()
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+}
+
 func runGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
+	hermeticGit(t)
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	if out, err := cmd.CombinedOutput(); err != nil {

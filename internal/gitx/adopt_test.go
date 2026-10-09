@@ -11,6 +11,7 @@ import (
 // gitOut runs git in dir and returns its output (fatal on error).
 func gitOut(t *testing.T, dir string, args ...string) string {
 	t.Helper()
+	hermeticGit(t)
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
