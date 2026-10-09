@@ -334,6 +334,63 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   `merge.LocalTipVerdict` needs the tip to BE the PR's `headRefOid` or an
   ancestor of it; otherwise, or when it can't tell (no head, not fetched here),
   the worktree and branch stay and the warning counts the commits not in the PR.
+- **merge-pr's checks gate never reads a failed read, or `--admin`, as green
+  (#179).** It reads the head commit's statusCheckRollup (one GraphQL query,
+  paged: `ghx.PRChecks`) and what the base branch requires, from the PR's own
+  `baseRepository` on the PR URL's host (never the cwd's `{owner}/{repo}`: a PR
+  URL or a forwarded `-R` names another repo): REST `branches/{base}`
+  (`protection.required_status_checks`, which any reader gets, unlike the
+  protection endpoint) and `rules/branches/{base}`. It decides in pure
+  `merge.DecideChecks`: pending, failed (CANCELLED and STALE included), a state
+  wt does not know, a required check with no run on the head, a required check
+  pinned to an app (`app_id`/`integration_id`) that only another app reported,
+  a ruleset `workflows` rule with no run of that file in that repository
+  (`workflowRun.file`; unverifiable when a run's file is unknown), fewer
+  non-SKIPPED checks than `merge_min_checks` (or a value that is not a count),
+  and an unreadable read of either half all block; no check that ran, nothing
+  required and no floor is `none`: merge, with a note. GitHub's own per-context
+  `isRequired(pullRequestNumber:)` decides an app-pinned check (it is the only
+  way to verify a pinned commit STATUS) and costs nothing measurable (1
+  rate-limit point a page either way). ⚠ **Not `gh pr checks`:** it exits 1
+  with a stderr sentence for "no checks" (a failure's exit code), and the
+  rollup keeps every workflow run a later event started on the same head
+  (cli/cli#14044: label events, 21 runs of 9 checks), though it already drops a
+  re-run job's earlier attempt (measured: same check suite, only attempt 2
+  listed). ⚠⚠ **What still counts is `ghx.latestChecks` (#179 review), and
+  newest-wins was a fail-open:** a label event's run that SKIPPED a job an
+  earlier run FAILED read green. Runs group by app + workflow (name and file) +
+  event + name (two apps posting one name are two checks); within ONE workflow
+  run every run counts (two jobs of one name, pytorch); across workflow runs the
+  newest decides, except a failure stands until a later run PASSES (a skip,
+  neutral or cancelled run never clears it), a skip never replaces a pass, a
+  running run or an unknown state, and CANCELLED/STALE are replaced by anything
+  later. One state reading (`ghx.StateKind`) feeds both that and
+  `merge.BucketOf`. ⚠ `{"data":{"resource":null}}` (no such PR) and
+  `{"resource":{}}` (an issue's URL) come back with exit 0; `parsePRChecks`
+  requires the head commit and the base repository, so they are errors, never
+  "no checks" (#168). ⚠ A 404 or the "Upgrade to GitHub Pro" 403 from the rules
+  endpoint means the server has no rulesets for the repo
+  (`ErrRulesetsUnavailable`): an answer, not a failed read. A rate-limit or SSO
+  403 is a failed read. ⚠ **Order:** precheck → checks → deploy confirm → coord
+  hold → close check → Run's guards. Before the deploy confirm, so nobody types
+  "deploy" for a red PR. ⚠ **Only `--checks-ok` gets past it:** `--bypass` is
+  for wt's structural guards, and `--admin` bypasses GitHub's own checks, which
+  is why the gate exists. `--auto` is not exempt either: gh merges at once when
+  only checks no rule requires are pending or failing (UNSTABLE). A passthrough
+  that merges nothing (`merge.NonMerging`: `--disable-auto`, `--help`/`-h`, read
+  as gh's pflag reads it) skips the gate and the pin (`checks=skipped`). ⚠ The
+  merge is pinned with `--match-head-commit <the head it read>`
+  (`merge.WithMatchHead`, in front of the passthrough like `--admin`), so a push
+  after the read fails the merge instead of shipping an unchecked head. ⚠ The
+  terminal prompt reads its answer a byte at a time (`readLine`): a `-F -` body
+  is read from the same stdin next (#180), and a buffered read took it along. ⚠
+  A dry run's verdict line carries the gate's result (`verdict=ok
+  checks=blocked`), never a bare `verdict=ok` for a merge the checks would
+  stop; it still exits 0. ⚠ Zero checks in a repo WITH workflows still merges,
+  with the note: a workflow's triggers decide whether it runs on a PR
+  (awesome-o's one workflow is path-filtered, so its PRs legitimately carry
+  none), so the deterministic "CI never started" signals are a required check
+  and `merge_min_checks`.
 - **"No PR" must be an `ok=false`, never a parsed placeholder (#168).**
   `PRForBranch`'s old `.[0] | …` query printed `null null` for a branch with
   no PR, which parsed as a PR in state `null`. Every caller then matched no

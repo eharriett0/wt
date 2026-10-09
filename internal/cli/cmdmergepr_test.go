@@ -13,10 +13,11 @@ import (
 
 // mergePRGh is a fake gh for cmdMergePR: an open PR 99999 whose one commit's
 // body says "Closes #7" while the PR body only says "Refs #7", answered from
-// argv, with every `pr merge` argv (one per line) and stdin recorded.
+// argv, with every `pr merge` argv (one per line) and stdin recorded. Its
+// checks are green (greenChecksGh), so the merge is pinned to fakeHead (#179).
 const mergePRGh = `#!/bin/sh
 d=$(dirname "$0")
-case "$1 $2" in
+` + greenChecksGh + `case "$1 $2" in
 "pr view")
 	case "$*" in
 	*" state "*) echo OPEN ;;
@@ -84,7 +85,7 @@ func TestCmdMergePR_forwardedBodyReachesGh(t *testing.T) {
 		name     string
 		args     []string
 		stdin    string
-		wantArgv []string // after `pr merge 99999 --squash`
+		wantArgv []string // after `pr merge 99999 --squash --match-head-commit <head>`
 		wantBody string
 	}{
 		{"-F - from stdin", []string{"99999", "--keep", "--", "-F", "-"}, "Piped body, refs #7.\n",
@@ -115,7 +116,7 @@ func TestCmdMergePR_forwardedBodyReachesGh(t *testing.T) {
 			if err != nil {
 				t.Fatalf("gh pr merge never ran: %v", err)
 			}
-			want := append([]string{"pr", "merge", "99999", "--squash"}, tc.wantArgv...)
+			want := append([]string{"pr", "merge", "99999", "--squash", "--match-head-commit", fakeHead}, tc.wantArgv...)
 			if got := strings.Split(strings.TrimSuffix(string(argv), "\n"), "\n"); !reflect.DeepEqual(got, want) {
 				t.Errorf("gh argv = %q, want %q", got, want)
 			}
@@ -129,11 +130,12 @@ func TestCmdMergePR_forwardedBodyReachesGh(t *testing.T) {
 // subjectGh is a fake gh for cmdMergePR's #196 cases: open PR 99999 whose
 // title, body and commits (one JSON object each, as wt's --jq prints them) are
 // the files "title", "body" and "commits" in its directory, in a repo squashing
-// with GitHub's default message. closingIssuesReferences is empty. Every `pr
-// merge` argv is recorded, one per line, in "argv".
+// with GitHub's default message. closingIssuesReferences is empty, and the
+// checks are green (greenChecksGh, #179). Every `pr merge` argv is recorded,
+// one per line, in "argv".
 const subjectGh = `#!/bin/sh
 d=$(dirname "$0")
-case "$1 $2" in
+` + greenChecksGh + `case "$1 $2" in
 "pr view")
 	case "$*" in
 	*" state "*) echo OPEN ;;
@@ -208,7 +210,7 @@ func TestCmdMergePR_judgesTheShippedSubject(t *testing.T) {
 		commits  string
 		args     []string
 		code     int
-		merged   []string // gh's argv after `pr merge 99999 --squash`; nil = gh never merged
+		merged   []string // gh's argv after `pr merge 99999 --squash --match-head-commit <head>`; nil = gh never merged
 		stderrIs string
 	}{
 		{"a closing PR title on two commits is refused", "Fixes #5 the thing", two,
@@ -257,7 +259,7 @@ func TestCmdMergePR_judgesTheShippedSubject(t *testing.T) {
 			case tc.merged != nil && err != nil:
 				t.Errorf("gh pr merge never ran: %v", err)
 			case tc.merged != nil:
-				want := append([]string{"pr", "merge", "99999", "--squash"}, tc.merged...)
+				want := append([]string{"pr", "merge", "99999", "--squash", "--match-head-commit", fakeHead}, tc.merged...)
 				if got := strings.Split(strings.TrimSuffix(string(argv), "\n"), "\n"); !reflect.DeepEqual(got, want) {
 					t.Errorf("gh argv = %q, want %q", got, want)
 				}
