@@ -290,8 +290,10 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   check (#198).** #62 re-attaches an existing local branch so a worktree whose
   directory went away keeps its work; unchecked, that resumed a branch left by an
   earlier attempt that reused the name, or one behind or diverged from what was
-  pushed. `PlanNew` fetches `origin/<branch>` (failed: as last fetched; none: attach
-  unverified, the #62 never-pushed case) and decides through adopt's own
+  pushed. `PlanNew` fetches `origin/<branch>` with an explicit refspec (so a
+  single-branch or shallow clone still gets the tracking ref, read back exactly
+  with `for-each-ref`, never a case-only twin's loose ref; none: attach unverified,
+  the #62 never-pushed case) and decides through adopt's own
   `DecideAdopt`/`planAttach`: equal or only-ahead attached (ahead names the unpushed
   commits), only-behind fast-forwarded with #167's guards (in use, case twin,
   `branch -f`), diverged or uncomparable refused. An existing worktree is checked
@@ -303,6 +305,17 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   used to `git branch -D` a branch the claim had merely re-attached, never-pushed
   work and all. Now that branch, or a worktree claim was handed back, gets the
   placeholder undone (`gitx.UndoCommit`) and stays.
+  ⚠ **Edge cases closed in review (#198):** `isValidWorktree` requires the dir to
+  be its work tree's TOP (a leftover dir under a worktree_root inside the repo is
+  not a worktree), and new/claim refuse an existing worktree that is off the
+  branch, never printing `git -C <dir>` advice for one. `DecideNew` refuses a
+  branch checked out in another worktree for EVERY relation, before claim's
+  assign. A failed fetch asks `ls-remote`: a branch gone from origin that was
+  pushed under its name (`PushedUnderItsName`) was deleted, not offline (new
+  warns, claim refuses). The placeholder is `commit --allow-empty --only`, so
+  staged work stays staged and a mid-merge claim fails instead of concluding the
+  merge; `UndoCommit` resets only an empty single-parent commit. Any failure
+  after the assign unassigns, but only an assignment this claim made.
 - **`merge-pr` auto-cleans only a PR that reads MERGED afterwards (#185).** `gh
   pr merge` exits 0 WITHOUT merging for `--help`/`-h`, `--auto` (armed),
   `--disable-auto`, a merge queue (queued) and `-R` (another repo's PR). Taking
