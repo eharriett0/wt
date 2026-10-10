@@ -455,12 +455,12 @@ func cmdMergePR(args []string) int {
 	// checks it read (WithMatchHead, below). A forwarded -R/--repo is the PR's
 	// repository, so the gate reads that PR; a passthrough that merges nothing
 	// (--disable-auto, --help) skips the gate and the pin.
-	pin, checksLabel := "", "skipped"
+	pin, checksLabel, prHost := "", "skipped", ""
 	if flag := merge.NonMerging(ghArgs); flag != "" {
 		fmt.Println(skippedChecksLine(pr, flag))
 	} else {
 		var ok bool
-		pin, checksLabel, ok = checksGate(pr, checksOpts{dryRun: *dryRun, checksOK: *checksOK, admin: *admin, bypass: *bypass,
+		pin, checksLabel, prHost, ok = checksGate(pr, checksOpts{dryRun: *dryRun, checksOK: *checksOK, admin: *admin, bypass: *bypass,
 			auto: merge.ForwardsAuto(ghArgs), repo: merge.ParseForwardedRepo(ghArgs),
 			minChecks: c.MergeMinChecks, minChecksBad: c.MergeMinChecksBad}, os.Stdin, stdinIsTTY(), liveChecksReads)
 		if !ok {
@@ -471,11 +471,19 @@ func cmdMergePR(args []string) int {
 	// preview below gives (#164): deployGateApplies and the draft read are
 	// read-only, and a dry run that stayed silent here printed `verdict=ok` for a
 	// PR the real merge then stopped at. A dry run never prompts.
+	// #178: right before the confirm, GitHub's status page is read (github.com
+	// only) and an Actions incident is warned about; a dry run prints the same
+	// lines, and like the real gate reads nothing for a draft it would refuse.
 	if c.MergeIsDeploy && deployGateApplies(c, pr) {
+		statusHost := deployStatusHost(prHost)
 		if *dryRun {
 			draft, derr := ghx.PRIsDraft(pr)
-			ui.Warn("%s", deployDryRunNote(pr, draft && derr == nil, *confirmDeploy))
-		} else if code := deployGate(pr, *confirmDeploy); code != 0 {
+			isDraft := draft && derr == nil
+			ui.Warn("%s", deployDryRunNote(pr, isDraft, *confirmDeploy))
+			if !isDraft {
+				warnActionsStatus(statusHost)
+			}
+		} else if code := deployGate(pr, *confirmDeploy, statusHost); code != 0 {
 			return code
 		}
 	}
@@ -626,9 +634,6 @@ func cwdUnder(dir string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-// deployGate enforces the merge==deploy prod safety check. Returns 0 to proceed,
-// non-zero to abort. Refuses a draft PR outright, prints a prod banner, and
-// requires either --confirm-deploy or a typed "deploy" at an interactive prompt.
 // deployGateApplies reports whether the merge==deploy prod gate should fire for
 // this PR. With merge_is_deploy_paths UNSET, every merge is a deploy (legacy: the
 // whole repo is a deploy surface). With it SET, the gate fires only when the PR
@@ -729,13 +734,20 @@ func deployDryRunNote(pr string, draft, confirmed bool) string {
 	}
 }
 
-func deployGate(pr string, confirmed bool) int {
+// deployGate enforces the merge==deploy prod safety check. Returns 0 to proceed,
+// non-zero to abort. Refuses a draft PR outright, prints a prod banner, warns
+// when GitHub's status page reports an Actions incident (statusHost is the PR's
+// host; github.com only, #178), and requires either --confirm-deploy or a typed
+// "deploy" at an interactive prompt. The warning sits right before the
+// confirm, so whoever confirms has just read it; it never blocks.
+func deployGate(pr string, confirmed bool, statusHost string) int {
 	if draft, err := ghx.PRIsDraft(pr); err == nil && draft {
 		ui.Err("PR #%s is a DRAFT — refusing to merge in a merge==deploy repo (would auto-apply to prod).", pr)
 		ui.Info("mark it ready first: gh pr ready %s", pr)
 		return 1
 	}
 	ui.Banner("⚠ merge_is_deploy — merging PR #" + pr + " AUTO-APPLIES to prod")
+	warnActionsStatus(statusHost)
 	if confirmed {
 		ui.Info("--confirm-deploy set — proceeding with the prod deploy.")
 		return 0

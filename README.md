@@ -303,13 +303,25 @@ reconcile on push), that squash is far higher-stakes than normal. Set
 
 - refuses to merge a **draft** PR,
 - prints a `⚠ merging … AUTO-APPLIES to prod` banner,
+- for a PR on github.com, reads [GitHub's status page](https://www.githubstatus.com)
+  and, right before the confirm, **warns** when the Actions component is not
+  operational or an unresolved incident names Actions: each incident's name,
+  status and last update, and the component's status. A deploy job started
+  during an Actions incident can wait for a runner and be cancelled without
+  running a step. It only warns: the confirm below is still the gate. The read
+  gives up after 3 seconds, and a page it can't read (down, slow, not the
+  expected JSON) costs one `could not check GitHub's status` line, never the
+  merge. GitHub Enterprise hosts aren't on that page, so nothing is read for
+  them. (`WT_GITHUB_STATUS_URL` points the read at another URL, for testing and
+  diagnosis only.)
 - requires a deliberate confirm — a typed `deploy` at an interactive prompt, or
   `--confirm-deploy` for non-interactive/agent use (never a silent default).
 
 `wt merge-pr <pr> --dry-run` evaluates the same gate without prompting and says
 what a real merge would do: refuse a draft, stop for the confirm, or proceed
-because `--confirm-deploy` was passed. With `merge_is_deploy_paths` set, a PR
-that touches no deploy path says it would skip the gate.
+because `--confirm-deploy` was passed; it prints the same status-page lines.
+With `merge_is_deploy_paths` set, a PR that touches no deploy path says it
+would skip the gate.
 
 ## Cross-repo epics
 
