@@ -626,14 +626,19 @@ func WorktreeBranchesUnder(root string) ([]string, error) {
 type WorktreeRef struct {
 	Path   string
 	Branch string
+	Head   string // the commit HEAD is at, "" for a worktree whose HEAD is unborn (#177 review)
+	Locked bool   // `git worktree lock`ed: git refuses to remove it (#177)
 }
 
 // WorktreeList returns every worktree of this repo with its checked-out branch.
 // Detached worktrees have Branch == "". (Companion to WorktreePaths /
 // WorktreeBranchesUnder — this one pairs path↔branch, which `wt doctor`'s
 // upstream check needs per-worktree, #76.)
-func WorktreeList() ([]WorktreeRef, error) {
-	out, err := Run("worktree", "list", "--porcelain")
+func WorktreeList() ([]WorktreeRef, error) { return WorktreeListIn("") }
+
+// WorktreeListIn is WorktreeList with git run in dir ("" = the current directory).
+func WorktreeListIn(dir string) ([]WorktreeRef, error) {
+	out, err := RunDir(dir, "worktree", "list", "--porcelain")
 	if err != nil {
 		return nil, err
 	}
@@ -652,6 +657,12 @@ func WorktreeList() ([]WorktreeRef, error) {
 			cur.Path = strings.TrimSpace(strings.TrimPrefix(ln, "worktree "))
 		case strings.HasPrefix(ln, "branch "):
 			cur.Branch = strings.TrimPrefix(strings.TrimSpace(strings.TrimPrefix(ln, "branch ")), "refs/heads/")
+		case strings.HasPrefix(ln, "HEAD "):
+			if h := strings.TrimSpace(strings.TrimPrefix(ln, "HEAD ")); !AllZeroSHA(h) {
+				cur.Head = h
+			}
+		case ln == "locked" || strings.HasPrefix(ln, "locked "):
+			cur.Locked = true
 		}
 	}
 	flush()
@@ -670,15 +681,23 @@ func pathUnder(path, root string) bool {
 }
 
 // WorktreeRemove removes the worktree at path. force discards untracked/dirty
-// files (git refuses otherwise).
-func WorktreeRemove(path string, force bool) error {
-	args := []string{"worktree", "remove"}
-	if force {
-		args = append(args, "--force")
-	}
-	args = append(args, path)
-	_, err := Run(args...)
-	return err
+// files (git refuses otherwise). Ignored files go with the worktree either way,
+// as git has always removed them.
+//
+// git's own refusal reads a status that honours status.showUntrackedFiles, so a
+// repo set to `no` let a non-force remove delete untracked files (#208,
+// measured on git 2.39): `wt clean -y`, merge-pr's auto-clean and `release
+// --clean` all reach here after wt's own check (IsClean). The command therefore
+// carries a scoped `-c status.showUntrackedFiles=normal`, which git hands to the
+// status it runs: one command's setting, never the process environment (the #92
+// env-scoping lesson). The error carries git's stderr.
+func WorktreeRemove(path string, force bool) error { return WorktreeRemoveIn("", path, force) }
+
+// withUntrackedShown prefixes a git command with `-c
+// status.showUntrackedFiles=normal`, so any status it runs lists untracked files
+// whatever the repo's config says (#208). Pure.
+func withUntrackedShown(args ...string) []string {
+	return append([]string{"-c", "status.showUntrackedFiles=normal"}, args...)
 }
 
 // BranchDelete force-deletes local branch (git branch -D). Safe to call after a
@@ -1644,16 +1663,21 @@ func LastCommitAge(dir string, now time.Time) (time.Duration, error) {
 }
 
 // IsClean reports whether the worktree at dir has NO uncommitted changes
-// (staged, unstaged, or untracked). A dirty worktree means the window is
-// actively editing, which keeps it out of the "stale" collision bucket even
-// when its branch has no open PR. On error (dir gone, not a worktree) it
+// (staged, unstaged, or untracked-but-not-ignored). A dirty worktree means the
+// window is actively editing, which keeps it out of the "stale" collision bucket
+// even when its branch has no open PR. On error (dir gone, not a worktree) it
 // returns false — i.e. treat an unknowable worktree as potentially active.
+//
+// It reads StatusEntries, so untracked files count whatever
+// status.showUntrackedFiles says (#208). A plain porcelain status honours a
+// `no` there: a worktree holding only untracked work read as clean, and `wt
+// clean -y`, merge-pr's auto-clean and `release --clean`, which remove only a
+// clean worktree, removed it, untracked files and all. An edit to a tracked file
+// that git status skips (assume-unchanged, skip-worktree, core.ignoreStat)
+// counts too (#210). Ignored files never counted, and still don't.
 func IsClean(dir string) bool {
-	out, err := runRaw(dir, "status", "--porcelain")
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(out) == ""
+	entries, err := StatusEntries(dir)
+	return err == nil && len(entries) == 0
 }
 
 // CommitEmpty makes an empty commit in dir with the given message, and only
@@ -1775,6 +1799,135 @@ func pickLsRemote(out, ref string) string {
 		}
 	}
 	return ""
+}
+
+// FetchRemote fetches what remote's configured refspec covers, and never prunes
+// (#177). `wt discard` fetches before it lists the commits it would drop. A
+// prune deletes the remote-tracking refs of branches the remote has since
+// deleted, and such a ref can be the only copy of someone's commits in this
+// clone: --no-prune overrides fetch.prune / remote.<name>.prune, so discard
+// never touches a ref it was not asked about. The error carries git's stderr.
+func FetchRemote(remote string) error {
+	_, err := runReporting("", "fetch", "--no-prune", remote)
+	return err
+}
+
+// RemoteHeads returns every branch remote has right now, name → tip commit, via
+// `git ls-remote --heads` (#177). An error means the remote could not be asked.
+// Unlike the remote-tracking refs, the answer cannot hold a branch the remote
+// has since deleted.
+func RemoteHeads(remote string) (map[string]string, error) {
+	out, err := runReporting("", "ls-remote", "--heads", remote)
+	if err != nil {
+		return nil, err
+	}
+	return parseRemoteHeads(out), nil
+}
+
+// parseRemoteHeads reads `ls-remote --heads` output, "<sha>\trefs/heads/<name>"
+// per line, into name → sha. Anything else is skipped. Pure.
+func parseRemoteHeads(out string) map[string]string {
+	heads := map[string]string{}
+	for _, ln := range strings.Split(out, "\n") {
+		sha, ref, ok := strings.Cut(strings.TrimSpace(ln), "\t")
+		if !ok || sha == "" || !strings.HasPrefix(ref, "refs/heads/") {
+			continue
+		}
+		if name := strings.TrimPrefix(ref, "refs/heads/"); name != "" {
+			heads[name] = sha
+		}
+	}
+	return heads
+}
+
+// Commit is one commit: its full id and its subject line.
+type Commit struct {
+	SHA, Subject string
+}
+
+// CommitsOnlyOn lists the commits reachable from tip and from none of exclude,
+// newest first: `git log <tip> --not <exclude>...` (#177). The excluded commits
+// go in on stdin, so any number of them fit. One this clone does not have is
+// skipped (--ignore-missing): a commit missing here is no ancestor of tip, so
+// skipping it can only list more commits, never fewer.
+//
+// ⚠ tip must exist, and is checked first: under --ignore-missing a tip this
+// clone lacks is skipped too, and the empty answer read as "no commits only
+// on the branch" (measured, git 2.39), which is what lets `wt discard` drop
+// them without --drop-commits.
+func CommitsOnlyOn(tip string, exclude []string) ([]Commit, error) {
+	if tip == "" {
+		return nil, fmt.Errorf("no commit to list from")
+	}
+	if _, err := Run("rev-parse", "--verify", "--quiet", tip+"^{commit}"); err != nil {
+		return nil, fmt.Errorf("%s is not a commit in this clone", tip)
+	}
+	var in strings.Builder
+	for _, sha := range exclude {
+		if sha = strings.TrimSpace(sha); sha != "" {
+			in.WriteString("^" + sha + "\n")
+		}
+	}
+	cmd := exec.Command("git", "log", "--no-decorate", "--format=%H%x09%s", "--ignore-missing", "--stdin", tip)
+	cmd.Env = scopedEnv()
+	cmd.Stdin = strings.NewReader(in.String())
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		if msg := gitStderr(stderr.String()); msg != "" {
+			err = fmt.Errorf("%w: %s", err, msg)
+		}
+		return nil, err
+	}
+	return parseCommitLines(string(out)), nil
+}
+
+// parseCommitLines reads "<sha>\t<subject>" lines. Pure.
+func parseCommitLines(out string) []Commit {
+	var commits []Commit
+	for _, ln := range strings.Split(out, "\n") {
+		if ln = strings.TrimRight(ln, "\r"); strings.TrimSpace(ln) == "" {
+			continue
+		}
+		sha, subject, _ := strings.Cut(ln, "\t")
+		commits = append(commits, Commit{SHA: strings.TrimSpace(sha), Subject: subject})
+	}
+	return commits
+}
+
+// StatusEntries returns the worktree at dir's `git status --porcelain` lines:
+// one per uncommitted change, untracked-but-not-ignored files included (#177,
+// #208). It is wt's one read of "what would a removal lose": IsClean and the
+// dirty counts go through it. --untracked-files=normal overrides a
+// status.showUntrackedFiles=no, which hides untracked files from a plain
+// porcelain status, and from `git worktree remove`'s own check too: it deleted
+// them with the worktree (measured, git 2.39). Ignored files are not listed.
+// Submodule changes are (--ignore-submodules=none, as `git worktree remove`'s
+// own check reads them), whatever submodule.<name>.ignore says.
+//
+// An edit git status never looks at is listed too (#210): a tracked file
+// flagged assume-unchanged (core.ignoreStat=true flags every file it checks
+// out) or skip-worktree whose content is not the index's (hiddenEdits). git
+// status hid such an edit, and `git worktree remove` deleted it. Unreadable
+// either way is an error, which IsClean reads as dirty. Read-only: it reads
+// other windows' worktrees, and must not take their index.lock.
+func StatusEntries(dir string) ([]string, error) {
+	out, err := runRawReadOnly(dir, "status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none")
+	if err != nil {
+		return nil, err
+	}
+	var lines []string
+	for _, ln := range strings.Split(out, "\n") {
+		if ln = strings.TrimRight(ln, "\r"); strings.TrimSpace(ln) != "" {
+			lines = append(lines, ln)
+		}
+	}
+	hidden, err := hiddenEdits(dir)
+	if err != nil {
+		return nil, err
+	}
+	return append(lines, hidden...), nil
 }
 
 // Abs resolves a possibly-relative path against the repo root.

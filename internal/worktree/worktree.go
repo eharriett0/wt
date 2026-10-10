@@ -90,20 +90,15 @@ func PushedUpstream(hasUpstream bool, mergeRef, base string) bool {
 	return hasUpstream && mergeRef != "" && mergeRef != "refs/heads/"+base
 }
 
-// dirtyCount counts uncommitted changes in the worktree at wt (porcelain lines),
-// for the --stale-index preview message; 0 on any error.
+// dirtyCount counts uncommitted changes in the worktree at wt for clean's
+// messages, untracked files included as IsClean counts them (#208); 0 on any
+// error.
 func dirtyCount(wt string) int {
-	out, err := gitx.RunDir(wt, "status", "--porcelain")
+	entries, err := gitx.StatusEntries(wt)
 	if err != nil {
 		return 0
 	}
-	n := 0
-	for _, ln := range strings.Split(out, "\n") {
-		if strings.TrimSpace(ln) != "" {
-			n++
-		}
-	}
-	return n
+	return len(entries)
 }
 
 // StaleIndexReportable decides whether `wt clean --stale-index` should REPORT a
@@ -631,6 +626,12 @@ func MatchedName(names, resolved []string, wtPath, branch string) string {
 // Either way nothing is cleaned, so a mistyped or ambiguous `-y` list never removes
 // "the rest" of what it named. The review round found both. Pure.
 func CheckNames(names []string, hits map[string][]string) error {
+	return checkNames(names, hits, "cleaned")
+}
+
+// checkNames is CheckNames for a command whose refusal ends "nothing was
+// <done>": `wt discard` resolves its one name the same way (#177).
+func checkNames(names []string, hits map[string][]string, done string) error {
 	var missing, ambiguous []string
 	seen := map[string]bool{}
 	for _, n := range names {
@@ -656,7 +657,7 @@ func CheckNames(names []string, hits map[string][]string) error {
 	if len(msgs) == 0 {
 		return nil
 	}
-	return fmt.Errorf("%s; nothing was cleaned", strings.Join(msgs, "; "))
+	return fmt.Errorf("%s; nothing was %s", strings.Join(msgs, "; "), done)
 }
 
 // RerunHint is the line a listing-only clean ends with, or "" when it listed
@@ -803,6 +804,13 @@ func Clean(c *config.Config, apply, staleIndex, allRoots bool, names []string) e
 			}
 			continue
 		}
+		// What git status does not show but the removal would delete (a git
+		// repository in the ignored files) or git would refuse (a checked-out
+		// submodule) keeps it too, so the listing agrees with remove() (#174).
+		if why := removalBlocked(wt); why != "" {
+			ui.Info("%s — shipped, but %s, leave alone", br, why)
+			continue
+		}
 		reason := fmt.Sprintf("patch-equivalent on %s", c.Base)
 		if prMerged {
 			reason = "PR merged"
@@ -849,6 +857,8 @@ func Clean(c *config.Config, apply, staleIndex, allRoots bool, names []string) e
 //   - refuses a worktree with uncommitted changes unless force (so we never
 //     silently discard in-flight work; force is for known-junk like a stray
 //     extracted binary),
+//   - unless force, refuses one holding a git repository in its ignored files
+//     or a checked-out submodule (removalBlocked: git status shows neither),
 //   - a failed branch delete is a warning, not an error (the worktree is
 //     already gone; a lingering local branch is harmless).
 func Remove(c *config.Config, wtPath, branch string, force bool) error {
@@ -866,6 +876,11 @@ func remove(c *config.Config, wtPath, branch string, force, allowOutsideRoot boo
 	}
 	if !force && !gitx.IsClean(wtPath) {
 		return fmt.Errorf("has uncommitted changes (commit/stash, or force to discard)")
+	}
+	if !force {
+		if why := removalBlocked(wtPath); why != "" {
+			return fmt.Errorf("%s", why)
+		}
 	}
 	if err := gitx.WorktreeRemove(wtPath, force); err != nil {
 		return fmt.Errorf("git worktree remove: %w", err)
@@ -886,6 +901,29 @@ func remove(c *config.Config, wtPath, branch string, force, allowOutsideRoot boo
 		}
 	}
 	return nil
+}
+
+// removalBlocked says what keeps a worktree with no uncommitted changes from
+// being removed safely (#177 review), "" when nothing does. git status never
+// looks inside an ignored directory, and `git worktree remove` deletes it
+// whole: a git repository in there (a clone, another repository's worktree)
+// went with it, unpushed commits and all (gitx.NestedRepos). And git refuses
+// to remove a worktree with a checked-out submodule (gitx.PopulatedSubmodules),
+// which clean's listing called safe to remove. A check that fails is a reason
+// too: fail closed.
+func removalBlocked(wt string) string {
+	var why []string
+	if nested, err := gitx.NestedRepos(wt); err != nil {
+		why = append(why, fmt.Sprintf("its ignored files could not be checked for a git repository (%v)", err))
+	} else if len(nested) > 0 {
+		why = append(why, fmt.Sprintf("it holds a git repository in its ignored files (%s), which removing the worktree would delete with all its commits", strings.Join(nested, ", ")))
+	}
+	if subs, err := gitx.PopulatedSubmodules(wt); err != nil {
+		why = append(why, fmt.Sprintf("it could not be checked for checked-out submodules (%v)", err))
+	} else if len(subs) > 0 {
+		why = append(why, fmt.Sprintf("it has checked-out submodules (%s), which git refuses to remove with the worktree", strings.Join(subs, ", ")))
+	}
+	return strings.Join(why, "; ")
 }
 
 // resolveBaseRef prefers origin/<base>, falls back to local <base>, then HEAD.

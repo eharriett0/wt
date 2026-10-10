@@ -141,3 +141,53 @@ func TestUpsertSection_AppendsWhenAbsent(t *testing.T) {
 		t.Fatalf("expected one #99 section:\n%s", got)
 	}
 }
+
+// IssueForBranch finds the claim recorded on a branch, the first one when two
+// share it, as merge-pr's auto-clean and `wt discard` drop it (#40, #177).
+func TestIssueForBranch(t *testing.T) {
+	entries := []Entry{
+		{Issue: "7", Branch: "canary"},
+		{Issue: "8", Branch: "feat/other"},
+		{Issue: "9", Branch: "canary"},
+		{Issue: "10", Branch: ""},
+	}
+	for branch, want := range map[string]string{"canary": "7", "feat/other": "8", "nope": "", "": ""} {
+		if got := IssueForBranch(entries, branch); got != want {
+			t.Errorf("IssueForBranch(%q) = %q, want %q", branch, got, want)
+		}
+	}
+}
+
+// RemoveBranchSections drops exactly the claims recorded on the branch (#177):
+// not another worktree's claim on the same issue, and nothing else in the file.
+func TestRemoveBranchSections(t *testing.T) {
+	t0 := fixedTime()
+	content := AppendSection("", Entry{Issue: "7", Title: "canary", Branch: "canary", Worktree: "/w/canary", Window: "a", When: t0})
+	content = AppendSection(content, Entry{Issue: "7", Title: "same issue, other worktree", Branch: "feat/7", Worktree: "/w/feat-7", Window: "b", When: t0})
+	content = AppendSection(content, Entry{Issue: "9", Title: "canary again", Branch: "canary", Worktree: "/w/canary", Window: "a", When: t0})
+	content = AppendSection(content, Entry{Issue: "8", Title: "other", Branch: "canary-2", Worktree: "/w/canary-2", Window: "c", When: t0})
+
+	got, removed := RemoveBranchSections(content, "canary")
+	if strings.Join(removed, ",") != "7,9" {
+		t.Errorf("removed %v, want [7 9]", removed)
+	}
+	left := Parse(got)
+	if len(left) != 2 || left[0].Branch != "feat/7" || left[0].Issue != "7" || left[1].Branch != "canary-2" {
+		t.Fatalf("left %+v, want #7 on feat/7 and #8 on canary-2", left)
+	}
+	if !strings.HasPrefix(got, header) {
+		t.Errorf("the file header went:\n%s", got)
+	}
+	// One section on the branch: the same bytes RemoveSection leaves.
+	single := AppendSection(AppendSection("", Entry{Issue: "1", Branch: "a", When: t0}), Entry{Issue: "2", Branch: "b", When: t0})
+	byBranch, _ := RemoveBranchSections(single, "a")
+	byIssue, _ := RemoveSection(single, "1")
+	if byBranch != byIssue {
+		t.Errorf("RemoveBranchSections = %q, want RemoveSection's %q", byBranch, byIssue)
+	}
+	for _, b := range []string{"nope", ""} {
+		if got, removed := RemoveBranchSections(content, b); got != content || removed != nil {
+			t.Errorf("RemoveBranchSections(%q) changed the file or removed %v", b, removed)
+		}
+	}
+}

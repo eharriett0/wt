@@ -18,10 +18,11 @@ import (
 // and -R (#185) — and exits 1 when the file "fails" exists, after the merge or
 // instead of it, as `-d` does when it cannot delete a branch a worktree has
 // checked out (#196). Its head commit (headRefOid) is the file "head", empty
-// when gh does not know it (#187).
+// when gh does not know it (#187). The checks gate's reads (#179) are answered
+// green by greenChecksGh, a separate read from that headRefOid.
 const postMergeGh = `#!/bin/sh
 d=$(dirname "$0")
-case "$1 $2" in
+` + greenChecksGh + `case "$1 $2" in
 "pr view")
 	case "$*" in
 	*" state "*) cat "$d/state" ;;

@@ -17,7 +17,7 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   the hook drivers (`runHook`, `claude_hook.go`).
 - **gitx** / **ghx** — thin `git` / `gh` shell-outs.
 - **hooks** — git hook shims + `HookPrePush`/`HookPreCommit`.
-- **worktree** — `wt new`/`clean` (data-loss-critical; see below).
+- **worktree** — `wt new`/`clean`/`discard` (data-loss-critical; see below).
 - **merge** — `merge-pr` guard + closing-keyword lint. **doctor**, **coord**,
   **activework**, **todos**, **config**, **section**, **ui**, **selfupdate**,
   **lock**.
@@ -284,6 +284,43 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   on the BASE branch** (`ReapableBranch`): "patch-equivalent on base" is
   trivially true for the base itself, so every downstream verdict says shipped
   and the printed command becomes `git branch -D main` (#101).
+  ⚠ **Untracked files count whatever `status.showUntrackedFiles` says (#208).**
+  A repo set to `no` hid them from a plain porcelain status AND from `git
+  worktree remove`'s own check, so `clean -y`, merge-pr's auto-clean and
+  `release --clean` deleted a worktree's untracked work (measured, git 2.39).
+  `IsClean` and every dirty count read `gitx.StatusEntries`
+  (`--untracked-files=normal`); `WorktreeRemove` carries a scoped `-c
+  status.showUntrackedFiles=normal`, one command's argument, never the process
+  env (#92). Ignored files are unchanged: never dirty, deleted with the worktree.
+  ⚠ **So does an edit git status never looks at (#210).** A tracked file
+  flagged `--assume-unchanged` or `--skip-worktree`, or every file a checkout
+  writes under `core.ignoreStat=true`, is skipped by git status and by `git
+  worktree remove`'s check, which deleted the edit. `StatusEntries` reads the
+  flags from `git ls-files -z -s -v` (lower-case tag = assume-unchanged, `S`/`s`
+  = skip-worktree) and lists each flagged file that exists and differs from its
+  index blob: regular files hashed by git (`hash-object --stdin-paths`, so clean
+  and eol filters apply as for `git add`), symlinks by their target. A file the
+  entry no longer has on disk loses nothing and is skipped; anything that can't
+  be compared counts as changed (fail closed).
+  ⚠ **Liveness reads the same `StatusEntries`** (`IsClean` → `LiveFacts.Dirty`,
+  doctor's counts): untracked files a `showUntrackedFiles=no` config hides,
+  hidden tracked edits, and submodule changes (`--ignore-submodules=none`, as
+  git's own removal check reads them, overriding `submodule.<name>.ignore`) now
+  make a window dirty, and **dirty is never suppressed** (#87). A merged-by-
+  ancestry, tip-merged or dormant window holding such junk therefore stays
+  surfaced: exactly what the same window reads in a default-config repo, and
+  untracked files were already its touched paths (`TouchedFiles` lists them
+  with `-uall`). Silence junk with ignore rules, not by hiding it from status.
+  ⚠ **What git status never shows but the removal deletes or git refuses
+  blocks a clean worktree too** (`removalBlocked`, in `remove()` and in clean's
+  listing, #174): a git repository below an ignored path (`gitx.NestedRepos`:
+  `ls-files -o -i --exclude-standard --directory`, then a walk for `.git`
+  entries, symlinks not followed; `git worktree remove` deleted it, unpushed
+  commits and all) and a checked-out submodule (`gitx.PopulatedSubmodules`, git's
+  `validate_no_submodules`). Not part of `IsClean`: the walk is too slow for
+  liveness, and a nested clone is no collision. Any read error blocks.
+  `release --clean` keeps origin's placeholder too when the removal is refused
+  (it used to delete it and keep the worktree).
   ⚠ **An upstream is not a push (#175).** `wt new` branches from
   `origin/<base>`, and git's default `branch.autoSetupMerge` records that as the
   new branch's upstream, so `HasUpstream` is true from birth. The "never pushed"
@@ -312,6 +349,66 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   must pick out exactly ONE worktree (`CheckNames`): none is a typo, two is a
   directory name that is also another worktree's branch. Either stops the run
   with nothing cleaned, so a bad `-y` list never removes "the rest" of it.
+- **`wt discard` is the ONLY command that drops unpushed commits (#177), and only
+  for an exact name with `--drop-commits`.** It removes ONE worktree its owner
+  declared throwaway (a canary pushed, used and deleted on origin), its local
+  branch and the claim sections recorded ON THAT BRANCH
+  (`activework.RemoveBranchSections`; auto-clean's removal by issue would also
+  drop another worktree's claim on the same issue). Never a sweep: one name,
+  resolved by `DiscardTarget` (clean's `MatchedName` + `CheckNames` wording, with
+  the main checkout a candidate, so a name that also picks it out is ambiguous).
+  `DecideDiscard` is pure; no flag unlocks anything but its own guard (an
+  exhaustive test pins it): the main checkout, a detached HEAD (mid-rebase), the
+  base branch, the window it runs in, a dirty tree, a locked worktree, a git
+  repository in its ignored files and a checked-out submodule are refused
+  whatever the flags; out-of-root needs `--all-roots`, which keeps discard's
+  reach equal to clean's (#101). ⚠ **"Unique" is read from origin itself**
+  (`ls-remote --heads`), never `rev-list --not --remotes`: a branch deleted on
+  origin from the web or another clone leaves a stale `origin/<branch>` here that
+  hid the canary's own commit, and a later prune drops it. ⚠ **Offline, only
+  `origin/<base>` as last fetched is trusted** (every other commit counts, and
+  the plan says origin couldn't be asked): trusting the tracking refs minus
+  `origin/<branch>` let a canary pushed under ANOTHER name, or to another remote,
+  and deleted there, go without `--drop-commits` (#177 review). The plan also
+  says which listed commits another ref here keeps (`gitx.RefTipsExcept`: other
+  refs, the stash, other worktrees' HEADs) and which become unreachable. The
+  fetch is `--no-prune`: a
+  prune deletes other branches' stale refs, which can be the only copy of
+  someone's commits. ⚠ `CommitsOnlyOn` verifies the tip first: under
+  `--ignore-missing` a missing tip read as "no commits". ⚠ Measured on git 2.39:
+  `git worktree remove` deletes a worktree nested (ignored) inside the one
+  removed, so a worktree with another inside is refused; and
+  `status.showUntrackedFiles=no` blinds a plain porcelain status AND worktree
+  remove's own check, which deleted the untracked files, so `StatusEntries`
+  passes `--untracked-files=normal` and `WorktreeRemove` a scoped `-c
+  status.showUntrackedFiles=normal` (every removal, #208). ⚠ With
+  `core.ignorecase` a case twin is one loose ref file and git's in-use check
+  compares names exactly (#167), so the
+  base and branch-in-use checks fold case (`sameBranch`): `git branch -D Main`
+  deletes main. A worktree whose directory is gone has nothing on disk to lose
+  (git removes just its record, measured); one that is no longer a work tree's
+  top (replaced since git recorded it, #198 review), or any other unreadable
+  status, counts as dirty. ⚠ **"The window it runs in" compares directories,
+  not path text** (`holdsCwd`: walk up from "." via ".." with `os.SameFile`): a
+  cwd reached by a differently-cased path (macOS) or a symlink was not "under"
+  the worktree, which was removed from under the command; an unreadable cwd
+  counts as held. Once it removes, discard's git runs in the main checkout
+  (`WorktreeRemoveIn`, `DeleteBranchAt(dir, …)`), never in the deleted
+  worktree. ⚠ **The branch is deleted only at the tip that was listed, in ONE
+  step**: `git update-ref -d refs/heads/<b> <tip>` (`git branch -D` deletes
+  whatever is there by then, so a commit landing between a separate check and it
+  was dropped), after `branchBusy` makes `branch -D`'s own in-use check
+  (checked out, case twins folded, or being rebased/bisected: the
+  `rebase-*/head-name` and `BISECT_START` files of every worktree's git dir), and
+  then its `branch.<b>` config section goes. Never forced; origin is never
+  touched. `wt release <issue>` is suggested only when no other claim on the
+  issue is left (`claimNotes`): release removes claims by issue.
+  Known gaps, left as follow-ups: a commit only a reflog reaches (the removed
+  worktree's HEAD reflog, the branch's own) is neither listed nor kept;
+  `--drop-commits` drops what the run lists, with no pin to a tip reviewed
+  earlier; another session working in the target is seen only through a dirty
+  tree; a directory on an unmounted volume that is not `git worktree lock`ed
+  reads as gone.
 - **`wt adopt` never checks out, creates or moves a branch onto anything but the
   target (#167).** `git worktree add <path> <branch>` takes `refs/heads/<branch>`
   whenever it exists, so a stale branch left by an earlier PR that reused the
@@ -391,6 +488,78 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   `merge.LocalTipVerdict` needs the tip to BE the PR's `headRefOid` or an
   ancestor of it; otherwise, or when it can't tell (no head, not fetched here),
   the worktree and branch stay and the warning counts the commits not in the PR.
+- **merge-pr's checks gate never reads a failed read, or `--admin`, as green
+  (#179).** It reads the head commit's statusCheckRollup (one GraphQL query,
+  paged: `ghx.PRChecks`) and what the base branch requires, from the PR's own
+  `baseRepository` on the PR URL's host (never the cwd's `{owner}/{repo}`: a PR
+  URL or a forwarded `-R` names another repo): REST `branches/{base}`
+  (`protection.required_status_checks`, which any reader gets, unlike the
+  protection endpoint) and `rules/branches/{base}`. It decides in pure
+  `merge.DecideChecks`: pending, failed (CANCELLED and STALE included), a state
+  wt does not know, a required check with no run on the head, a required check
+  pinned to an app (`app_id`/`integration_id`) that only another app reported,
+  a ruleset `workflows` rule with no run of that file in that repository
+  (`workflowRun.file`; unverifiable when a run's file is unknown), fewer
+  non-SKIPPED checks than `merge_min_checks` (or a value that is not a count),
+  and an unreadable read of either half all block; no check that ran, nothing
+  required and no floor is `none`: merge, with a note. GitHub's own per-context
+  `isRequired(pullRequestNumber:)` decides an app-pinned check (it is the only
+  way to verify a pinned commit STATUS) and costs nothing measurable (1
+  rate-limit point a page either way). ⚠ **Not `gh pr checks`:** it exits 1
+  with a stderr sentence for "no checks" (a failure's exit code), and the
+  rollup keeps every workflow run a later event started on the same head
+  (cli/cli#14044: label events, 21 runs of 9 checks), though it already drops a
+  re-run job's earlier attempt (measured: same check suite, only attempt 2
+  listed). ⚠⚠ **What still counts is `ghx.latestChecks` (#179 review), and
+  newest-wins was a fail-open:** a label event's run that SKIPPED a job an
+  earlier run FAILED read green. Runs group by app + workflow (name and file) +
+  event + name (two apps posting one name are two checks); within ONE workflow
+  run every run counts (two jobs of one name, pytorch); across workflow runs the
+  newest decides, except a failure stands until a later run PASSES (a skip,
+  neutral or cancelled run never clears it), a skip never replaces a pass, a
+  running run or an unknown state, and CANCELLED/STALE are replaced by anything
+  later. One state reading (`ghx.StateKind`) feeds both that and
+  `merge.BucketOf`. ⚠ `{"data":{"resource":null}}` (no such PR) and
+  `{"resource":{}}` (an issue's URL) come back with exit 0; `parsePRChecks`
+  requires the head commit and the base repository, so they are errors, never
+  "no checks" (#168). ⚠ A 404 or the "Upgrade to GitHub Pro" 403 from the rules
+  endpoint means the server has no rulesets for the repo
+  (`ErrRulesetsUnavailable`): an answer, not a failed read. A rate-limit or SSO
+  403 is a failed read. ⚠ **Order:** precheck → checks → deploy confirm → coord
+  hold → close check → Run's guards. Before the deploy confirm, so nobody types
+  "deploy" for a red PR. ⚠ **Only `--checks-ok` gets past it:** `--bypass` is
+  for wt's structural guards, and `--admin` bypasses GitHub's own checks, which
+  is why the gate exists. `--auto` is not exempt either: gh merges at once when
+  only checks no rule requires are pending or failing (UNSTABLE). A passthrough
+  that merges nothing (`merge.NonMerging`: `--disable-auto`, `--help`/`-h`, read
+  as gh's pflag reads it) skips the gate and the pin (`checks=skipped`). ⚠ The
+  merge is pinned with `--match-head-commit <the head it read>`
+  (`merge.WithMatchHead`, in front of the passthrough like `--admin`), so a push
+  after the read fails the merge instead of shipping an unchecked head. ⚠ The
+  terminal prompt reads its answer a byte at a time (`readLine`): a `-F -` body
+  is read from the same stdin next (#180), and a buffered read took it along. ⚠
+  A dry run's verdict line carries the gate's result (`verdict=ok
+  checks=blocked`), never a bare `verdict=ok` for a merge the checks would
+  stop; it still exits 0. ⚠ Zero checks in a repo WITH workflows still merges,
+  with the note: a workflow's triggers decide whether it runs on a PR
+  (awesome-o's one workflow is path-filtered, so its PRs legitimately carry
+  none), so the deterministic "CI never started" signals are a required check
+  and `merge_min_checks`.
+- **The deploy gate's GitHub status read only WARNS, and fails open (#178).**
+  Inside the deploy confirm (draft refusal → prod banner → status → confirm),
+  for a PR on github.com (`merge.GitHubStatusCovers`; the host is the checks
+  gate's PR-URL read, so an ssh alias or a forwarded `-R` resolves, else
+  origin's), merge-pr GETs githubstatus.com's `summary.json` (net/http, 3s for
+  the whole read: wt's one direct network call) and warns when a component
+  naming Actions is not `operational` or an unresolved incident names Actions
+  (whole word, in its name, components or updates' affected components). Pure
+  `merge.DecideActionsStatus`: a degraded signal outranks unknown, and a page
+  that does not SAY operational (no Actions component, no incident list, not
+  JSON, unreachable) is unknown: one "could not check" line, never silence.
+  Never a refusal, `--confirm-deploy` still merges; a dry run prints the same
+  lines; a draft, a non-deploy PR and a non-github.com host read nothing.
+  ⚠ `WT_GITHUB_STATUS_URL` is the test seam, and the cli package's `TestMain`
+  points it at a scheme that fails offline, so no test reaches the real page.
 - **"No PR" must be an `ok=false`, never a parsed placeholder (#168).**
   `PRForBranch`'s old `.[0] | …` query printed `null null` for a branch with
   no PR, which parsed as a PR in state `null`. Every caller then matched no

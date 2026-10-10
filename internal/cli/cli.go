@@ -93,6 +93,8 @@ func Main(args []string) int {
 		return cmdInit(rest)
 	case "clean":
 		return cmdClean(rest)
+	case "discard":
+		return cmdDiscard(rest)
 	case "claim":
 		return cmdClaim(rest)
 	case "adopt":
@@ -191,6 +193,39 @@ func cmdClean(args []string) int {
 	}
 	return withConfig(func(c *config.Config) int {
 		if err := worktree.Clean(c, *apply, *staleIndex, *allRoots, names); err != nil {
+			ui.Err("%v", err)
+			return 1
+		}
+		return 0
+	})
+}
+
+// discardUsage is `wt discard`'s usage line (#177).
+const discardUsage = "usage: wt discard <name> [--drop-commits] [--dry-run] [--all-roots]"
+
+// cmdDiscard is `wt discard <name>` (#177): drop ONE throwaway worktree, its
+// local branch and its claim. Exactly one name, never a list: discard is never a
+// sweep, and each run lists what that one worktree holds. The guards are
+// worktree.DecideDiscard; exit 64 for usage, 1 for any refusal (a --dry-run that
+// a real run would refuse included) or failure.
+func cmdDiscard(args []string) int {
+	if code, done := guardHelp(args, discardUsage); done {
+		return code
+	}
+	fs := flag.NewFlagSet("discard", flag.ContinueOnError)
+	dropCommits := fs.Bool("drop-commits", false, "also drop commits that no branch on origin has (they are listed first)")
+	dryRun := fs.Bool("dry-run", false, "print what would happen and change nothing (origin is still fetched, as a real run fetches it)")
+	allRoots := fs.Bool("all-roots", false, "allow a worktree outside worktree_root, as wt clean --all-roots evaluates them (#101)")
+	pos, passthrough, err := parseInterspersed(fs, args)
+	if err != nil {
+		return 64
+	}
+	if len(pos) != 1 || pos[0] == "" || len(passthrough) > 0 {
+		ui.Err("%s — exactly one worktree (a directory, a branch, or a path): discard is never a sweep", discardUsage)
+		return 64
+	}
+	return withConfig(func(c *config.Config) int {
+		if _, err := worktree.Discard(c, pos[0], worktree.DiscardOpts{DropCommits: *dropCommits, DryRun: *dryRun, AllRoots: *allRoots}); err != nil {
 			ui.Err("%v", err)
 			return 1
 		}
@@ -364,7 +399,7 @@ func cmdRelease(args []string) int {
 }
 
 func cmdMergePR(args []string) int {
-	if code, done := guardHelp(args, "usage: wt merge-pr <pr> [--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok] [--no-close-check] [-- extra gh args]"); done {
+	if code, done := guardHelp(args, "usage: wt merge-pr <pr> [--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok] [--checks-ok] [--no-close-check] [-- extra gh args]"); done {
 		return code
 	}
 	fs := flag.NewFlagSet("merge-pr", flag.ContinueOnError)
@@ -375,13 +410,14 @@ func cmdMergePR(args []string) int {
 	confirmDeploy := fs.Bool("confirm-deploy", false, "acknowledge merge auto-applies to prod (merge_is_deploy repos)")
 	admin := fs.Bool("admin", false, "forward --admin to gh pr merge — maintainer bypass of a required-review branch (wt#20)")
 	closeOK := fs.Bool("close-ok", false, "proceed even when the squash closes issues the PR's own closing references don't (#77)")
+	checksOK := fs.Bool("checks-ok", false, "merge even when the PR's checks are pending, failed, missing or unreadable (#179); --bypass does not imply it")
 	noCloseCheck := fs.Bool("no-close-check", false, "skip the close-keyword lint + post-merge issue-state verify (#77)")
 	pos, ghArgs, err := parseInterspersed(fs, args)
 	if err != nil {
 		return 64
 	}
 	if len(pos) < 1 {
-		ui.Err("usage: wt merge-pr <pr> [--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok] [--no-close-check] [-- extra gh args]")
+		ui.Err("usage: wt merge-pr <pr> [--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok] [--checks-ok] [--no-close-check] [-- extra gh args]")
 		return 64
 	}
 	pr := pos[0]
@@ -411,15 +447,43 @@ func cmdMergePR(args []string) int {
 			return 1
 		}
 	}
-	// ⚠ The gate is EVALUATED on --dry-run too (#170), for the reason the close-set
+	// #179: the checks gate. Before the deploy confirm, so a merge whose CI is
+	// pending or red stops before anyone types "deploy". --admin bypasses
+	// GitHub's required checks, so nothing after this would stop it; --checks-ok
+	// is the only way past (not --bypass). Read on --dry-run too: a clean dry
+	// run means the checks were read. The merge is pinned to the commit whose
+	// checks it read (WithMatchHead, below). A forwarded -R/--repo is the PR's
+	// repository, so the gate reads that PR; a passthrough that merges nothing
+	// (--disable-auto, --help) skips the gate and the pin.
+	pin, checksLabel, prHost := "", "skipped", ""
+	if flag := merge.NonMerging(ghArgs); flag != "" {
+		fmt.Println(skippedChecksLine(pr, flag))
+	} else {
+		var ok bool
+		pin, checksLabel, prHost, ok = checksGate(pr, checksOpts{dryRun: *dryRun, checksOK: *checksOK, admin: *admin, bypass: *bypass,
+			auto: merge.ForwardsAuto(ghArgs), repo: merge.ParseForwardedRepo(ghArgs),
+			minChecks: c.MergeMinChecks, minChecksBad: c.MergeMinChecksBad}, os.Stdin, stdinIsTTY(), liveChecksReads)
+		if !ok {
+			return 1
+		}
+	}
+	// ⚠ The deploy gate is EVALUATED on --dry-run too (#170), for the reason the close-set
 	// preview below gives (#164): deployGateApplies and the draft read are
 	// read-only, and a dry run that stayed silent here printed `verdict=ok` for a
 	// PR the real merge then stopped at. A dry run never prompts.
+	// #178: right before the confirm, GitHub's status page is read (github.com
+	// only) and an Actions incident is warned about; a dry run prints the same
+	// lines, and like the real gate reads nothing for a draft it would refuse.
 	if c.MergeIsDeploy && deployGateApplies(c, pr) {
+		statusHost := deployStatusHost(prHost)
 		if *dryRun {
 			draft, derr := ghx.PRIsDraft(pr)
-			ui.Warn("%s", deployDryRunNote(pr, draft && derr == nil, *confirmDeploy))
-		} else if code := deployGate(pr, *confirmDeploy); code != 0 {
+			isDraft := draft && derr == nil
+			ui.Warn("%s", deployDryRunNote(pr, isDraft, *confirmDeploy))
+			if !isDraft {
+				warnActionsStatus(statusHost)
+			}
+		} else if code := deployGate(pr, *confirmDeploy, statusHost); code != 0 {
 			return code
 		}
 	}
@@ -439,10 +503,10 @@ func cmdMergePR(args []string) int {
 		wtBranches, _ = gitx.WorktreeBranchesUnder(c.WorktreeRoot)
 	}
 	// --admin forwards through to `gh pr merge` for the required-review-branch
-	// maintainer bypass (wt#20). Added only here — AFTER the deploy-gate +
-	// coord + guard checks above — so it bypasses GitHub branch protection, not
-	// wt's own safety checks (which is exactly the value the raw `gh` fallback
-	// lost).
+	// maintainer bypass (wt#20). Added only here — AFTER the checks gate (#179),
+	// the deploy gate and the coord + guard checks above — so it bypasses GitHub
+	// branch protection, not wt's own safety checks (which is exactly the value
+	// the raw `gh` fallback lost).
 	// Close-keyword lint (#77): merge-pr is the only place that sees BOTH the PR
 	// body and the squash commit it forwards — subject and body (#196) — the
 	// texts that decide what auto-closes. Print the resolved close set; refuse
@@ -464,7 +528,7 @@ func cmdMergePR(args []string) int {
 	if !ok {
 		return 1
 	}
-	if err := merge.Run(pr, *dryRun, *bypass, *mergeForeign, wtBranches, merge.WithAdmin(*admin, prep.args), prep.stdin); err != nil {
+	if err := merge.Run(pr, *dryRun, *bypass, *mergeForeign, wtBranches, merge.WithMatchHead(pin, merge.WithAdmin(*admin, prep.args)), prep.stdin, checksLabel); err != nil {
 		// ⚠ gh can fail AFTER merging (#196): `-- -d` merges, then cannot delete a
 		// local branch that a wt worktree has checked out, and exits non-zero. So a
 		// failed `gh pr merge` reads the PR state too, and only MERGED goes on to
@@ -548,13 +612,7 @@ func removeActiveWorkForBranch(c *config.Config, branch string) {
 	if content == "" {
 		return
 	}
-	var issue string
-	for _, e := range activework.Parse(content) {
-		if e.Branch == branch {
-			issue = e.Issue
-			break
-		}
-	}
+	issue := activework.IssueForBranch(activework.Parse(content), branch)
 	if issue == "" {
 		return
 	}
@@ -576,9 +634,6 @@ func cwdUnder(dir string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-// deployGate enforces the merge==deploy prod safety check. Returns 0 to proceed,
-// non-zero to abort. Refuses a draft PR outright, prints a prod banner, and
-// requires either --confirm-deploy or a typed "deploy" at an interactive prompt.
 // deployGateApplies reports whether the merge==deploy prod gate should fire for
 // this PR. With merge_is_deploy_paths UNSET, every merge is a deploy (legacy: the
 // whole repo is a deploy surface). With it SET, the gate fires only when the PR
@@ -679,13 +734,20 @@ func deployDryRunNote(pr string, draft, confirmed bool) string {
 	}
 }
 
-func deployGate(pr string, confirmed bool) int {
+// deployGate enforces the merge==deploy prod safety check. Returns 0 to proceed,
+// non-zero to abort. Refuses a draft PR outright, prints a prod banner, warns
+// when GitHub's status page reports an Actions incident (statusHost is the PR's
+// host; github.com only, #178), and requires either --confirm-deploy or a typed
+// "deploy" at an interactive prompt. The warning sits right before the
+// confirm, so whoever confirms has just read it; it never blocks.
+func deployGate(pr string, confirmed bool, statusHost string) int {
 	if draft, err := ghx.PRIsDraft(pr); err == nil && draft {
 		ui.Err("PR #%s is a DRAFT — refusing to merge in a merge==deploy repo (would auto-apply to prod).", pr)
 		ui.Info("mark it ready first: gh pr ready %s", pr)
 		return 1
 	}
 	ui.Banner("⚠ merge_is_deploy — merging PR #" + pr + " AUTO-APPLIES to prod")
+	warnActionsStatus(statusHost)
 	if confirmed {
 		ui.Info("--confirm-deploy set — proceeding with the prod deploy.")
 		return 0
@@ -710,7 +772,9 @@ func deployGate(pr string, confirmed bool) int {
 // with no stdin (Go also opens it in place of a closed fd 0), so it is not a
 // terminal: read as one, a `-F -` with nothing piped in printed "end it with
 // Ctrl-D" and skipped the empty-body warning (#180).
-func stdinIsTTY() bool {
+//
+// A variable so a test can drive merge-pr's terminal prompts (#179).
+var stdinIsTTY = func() bool {
 	fi, err := os.Stdin.Stat()
 	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
 		return false

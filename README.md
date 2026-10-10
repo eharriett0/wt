@@ -174,11 +174,12 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 | `wt check <paths…>` | Is another window touching these paths? `[--show-diff] [--json] [--blocking] [--include-stale] [--allow-missing] [--max-age D]` (exit 3 = HIGH). `--blocking` prints only HIGH (a scriptable gate). Refuses a path that doesn't exist, isn't tracked, and no window is touching — a typo must never falsely report "clear" (`--allow-missing` opts into a deleted/other-branch/about-to-create path) |
 | `wt where <issue\|branch>` | Print that window's worktree path — `cd $(wt where 42)` |
 | `wt new <branch>` | Create a worktree on a new branch from the base branch. A local branch of that name (say, one whose worktree directory went away) is re-attached instead, but only after it is compared with `origin/<branch>` as just fetched: equal is attached, one with unpushed commits on top is attached with a note naming them, one only behind is fast-forwarded (never while a worktree has it checked out), and one that diverged (typically left over from an earlier attempt that reused the name) is refused with both SHAs and the commits only it has, never silently resumed. A branch checked out in another worktree is refused, whatever its state. With no `origin/<branch>` (never pushed) it is attached as it is; one that was pushed before and that origin has since deleted (typically after its PR merged) is attached as it is with a warning, not compared with the stale `origin/<branch>`. A worktree already there for the branch is compared the same way but never moved: behind or ahead is handed back with a note, diverged is refused, and so is one that is not on the branch (another branch, or a detached HEAD). A directory at that path that is not a worktree of its own (say, a leftover one under a `worktree_root` inside the repo) is never taken for one |
-| `wt clean [-y] [<name>...]` | List worktrees whose branch already shipped (incl. squash-merged PRs); `-y` removes them. Name worktrees (a directory, a branch, or a path) to limit the run to those, so one session can remove its own without touching the others the list shows. Every name must pick out exactly one worktree: one that matches nothing (a typo) or more than one (a directory name that is also another worktree's branch; use the path) stops the run with nothing cleaned. A branch whose commits were pushed under **another** name (e.g. onto an automation's PR branch) is recognised by its tip commit: shipped when that commit is in a merged PR's final commits. Never reaps, or lists as removable, a just-created worktree (grace window), a never-pushed branch (no upstream of its own: the `origin/<base>` upstream a `wt new` branch starts with is where it was cut from, not a push), or one with uncommitted changes, which it names with a file count. `[--stale-index]` also **reports** (never auto-removes) a merged-PR worktree holding a leftover uncommitted index a plain clean can't touch, and prints the manual remove command. `[--all-roots]` additionally evaluates worktrees **outside** `worktree_root` — the collision engine scans those, so a legacy worktree root can hard-block pushes that a default clean never clears (all the data-loss guards still apply) |
+| `wt clean [-y] [<name>...]` | List worktrees whose branch already shipped (incl. squash-merged PRs); `-y` removes them. Name worktrees (a directory, a branch, or a path) to limit the run to those, so one session can remove its own without touching the others the list shows. Every name must pick out exactly one worktree: one that matches nothing (a typo) or more than one (a directory name that is also another worktree's branch; use the path) stops the run with nothing cleaned. A branch whose commits were pushed under **another** name (e.g. onto an automation's PR branch) is recognised by its tip commit: shipped when that commit is in a merged PR's final commits. Never reaps, or lists as removable, a just-created worktree (grace window), a never-pushed branch (no upstream of its own: the `origin/<base>` upstream a `wt new` branch starts with is where it was cut from, not a push), or one with uncommitted changes, which it names with a file count (untracked files count, also in a repo set to `status.showUntrackedFiles=no`, and so does an edit git status skips: a file flagged `--assume-unchanged` or `--skip-worktree`, or checked out under `core.ignoreStat=true`), nor one whose ignored files hold a git repository (the removal would delete it, commits and all) or with a checked-out submodule (git refuses). `[--stale-index]` also **reports** (never auto-removes) a merged-PR worktree holding a leftover uncommitted index a plain clean can't touch, and prints the manual remove command. `[--all-roots]` additionally evaluates worktrees **outside** `worktree_root` — the collision engine scans those, so a legacy worktree root can hard-block pushes that a default clean never clears (all the data-loss guards still apply) |
+| `wt discard <name> [--drop-commits] [--dry-run] [--all-roots]` | Drop **one** worktree you decided is throwaway (say a canary branch you pushed, used, then deleted on origin on purpose), with its local branch and the active-work claims recorded on that branch (only those): the exit `wt clean` rightly never takes for a branch whose work is on no branch origin has. Never a sweep: the name must pick out exactly one worktree, as for `wt clean <name>` (the main checkout counts too, so a name that also matches it is ambiguous). Refuses a dirty tree (uncommitted or untracked-but-not-ignored changes, an edit git status hides included, which it names), a git repository in its ignored files (git status never looks there, and the removal would delete it with all its commits), a checked-out submodule (git refuses to remove the worktree), the base branch, the main checkout, the window it runs in (by any path to it, a symlink or a differently-cased one), a detached or locked worktree, one with another worktree inside it, and one whose branch another worktree has checked out. A worktree whose directory is already gone (removed by hand) has nothing on disk to lose and goes through the same commit check. It fetches origin (never pruning) and lists the commits on the branch that no branch on origin has, asking origin itself, so an `origin/<branch>` left behind by a deletion on the web hides nothing; any such commit is dropped only with `--drop-commits`, and the plan says which of them another ref here (a local branch, a tag, the stash) still keeps and which become unreachable (the restore command is printed). When origin can't be asked, only `origin/<base>` as last fetched is trusted, so every other commit counts. The branch is deleted only at the tip that was listed, in one step (`git update-ref -d`). Never deletes the branch on origin: when origin still has it, it says so and prints `git push origin --delete <branch>`. `--dry-run` prints the plan and changes nothing but the fetch; `--all-roots` allows a worktree outside `worktree_root`, as for `wt clean`. Exit 64 on a usage error, 1 on a refusal (a dry run that a real run would refuse included) |
 | `wt claim <issue>` | Assign a GitHub issue, make a worktree, open a draft PR, record the claim `[--force] [--no-pr] [--epic <id>]`. **Refuses (won't duplicate) when an open PR already references the issue** — including a plain `Refs #N` (which GitHub never treats as a linked/closing reference, so it's invisible to `closingIssuesReferences`); it names that PR and points at `wt adopt`. `--force` opens another anyway. Before it assigns anything, a local branch (or worktree) of the claim's name is checked against `origin/<branch>` exactly as `wt new` checks it, and a diverged one is refused; so is a worktree already there that is only behind, since a placeholder on it could not be pushed, a branch origin has deleted since it was pushed (the claim would push it back), and, with no local branch, a branch origin already has (pointing at `wt adopt`). The placeholder commit never takes work staged in a worktree it reuses, and refuses one in the middle of a merge. If anything fails after the assign, the claim rolls back only what it did: the issue is unassigned (unless it was yours before), and a branch it re-attached, or a worktree it reused, keeps its commits, minus the placeholder |
 | `wt adopt <branch\|pr>` | Put a worktree on an **existing** branch (a colleague's or a previous session's PR branch) instead of forking a new one, and record it like `claim` — resolves a PR number to its head branch. This is the actionable half of `claim`'s refusal above, and the only command that lands a registered worktree on a branch you didn't just create `[--epic <id>]`. **Adopting by PR, `origin/<branch>` must carry the PR head first:** a PR from a fork (its head is on another repository, out of `git fetch origin`'s reach) or a failed fetch is refused before anything is checked out, created or moved, with a `gh pr checkout` recipe for the fork case. A local branch of that name is then compared with `origin/<branch>`: one that is only behind is fast-forwarded, one with unpushed commits on top is attached as it is with a note, and one that diverged (typically left over from an earlier PR that reused the name) is refused with both SHAs, never silently checked out. A re-run that finds the worktree already there is compared the same way but never moved: behind or ahead is handed back with a note, diverged is refused |
 | `wt release <issue>` | Drop the claim. `[--clean]` also removes the worktree when the branch is abandoned (clean tree, no live PR, WIP-only commits) |
-| `wt merge-pr <pr>` | Guarded squash-merge (PR-state precheck, strips a `WIP:` subject unless you forward `-- --subject`, refuses an empty/placeholder-only PR), then auto-removes the worktree + claim (also when `gh pr merge` fails after merging, as `-- -d` does when a worktree has the branch checked out). Lints the closing keywords the squash will fire: the PR body, plus the squash commit's **subject and body as GitHub will write them** (see [Merging](#merging-auto-cleanup-and-merge--deploy)), and verifies issue state after (skip both with `--no-close-check` for a PR that closes nothing) `[--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok] [--no-close-check]` |
+| `wt merge-pr <pr>` | Guarded squash-merge (PR-state precheck, refuses while the PR's checks are pending or failed, or a check or workflow its branch requires never ran — `--checks-ok` proceeds, see [Merging](#merging-auto-cleanup-and-merge--deploy) — strips a `WIP:` subject unless you forward `-- --subject`, refuses an empty/placeholder-only PR), then auto-removes the worktree + claim (also when `gh pr merge` fails after merging, as `-- -d` does when a worktree has the branch checked out). Lints the closing keywords the squash will fire: the PR body, plus the squash commit's **subject and body as GitHub will write them** (see [Merging](#merging-auto-cleanup-and-merge--deploy)), and verifies issue state after (skip both with `--no-close-check` for a PR that closes nothing) `[--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok] [--checks-ok] [--no-close-check]` |
 | `wt todos` | What every window is working on (mirrors each window's TODO list) |
 | **— cross-window coordination —** | |
 | `wt announce "<msg>"` | Tell other windows a change is starting `[--hold "merge-main,…"] [--issue N]` |
@@ -243,11 +244,50 @@ external service, no Claude Code dependency.
 placeholder-only PR) and then, since the work has shipped, **auto-removes that
 PR's worktree and local branch**. Guarded: it only removes a worktree under the
 configured root (never your primary or a foreign checkout) and never one with
-uncommitted changes. `--keep` opts out; if you were sitting inside the removed
+uncommitted changes, or with a git repository in its ignored files. `--keep` opts out; if you were sitting inside the removed
 worktree it prints a `cd` hint back. `wt clean -y` sweeps any already-shipped
-worktrees the same way. If `gh pr merge` fails *after* merging (`-- -d` does
+worktrees the same way. A worktree that never ships because you threw it away
+(a canary, a spike) is yours to drop by name with `wt discard <name>`, which
+lists any commits that would go and drops them only with `--drop-commits`. If `gh pr merge` fails *after* merging (`-- -d` does
 when a worktree has the branch checked out), merge-pr sees the PR is MERGED and
 finishes the job: the close verify and the auto-clean still run.
+
+Right after its PR-state precheck, merge-pr reads the checks on the PR's head
+commit and what its base branch requires (branch protection and rulesets, read
+from the PR's own base repository), and prints a summary line, `--dry-run`
+included, so a clean dry run means the checks were read: `checks=green`, or
+`checks=none` when no check ran:
+
+```
+merge-pr: PR #60 checks=green on 1a2b3c4d5e6f: 12 passed, 2 skipped; required: 3, all reported
+```
+
+It refuses (asks, at a terminal; a dry run says what a real merge would do)
+when a check is pending; when one failed, errored, was cancelled, timed out or
+needs action (`--admin` bypasses GitHub's required checks too, so nothing else
+would stop a red one); when a required check never reported on the head (CI
+never started), or, required from one app, only another app reported it; when
+a workflow a ruleset requires never ran; when fewer checks ran than
+`merge_min_checks`; and when the checks, or the required ones, can't be read.
+A failure stays a failure until a later run of that check passes: a run a label
+event started that skipped the job, or one that was cancelled, does not clear
+it. `--checks-ok` merges anyway, and says so; `--bypass` and `--admin` never get
+past it. A PR on which no check ran, in a repo that requires none and sets no
+floor, merges with a "no check ran" note: whether a workflow should run on a PR
+is in its triggers (paths, labels, `if:`), which wt can't evaluate, so a
+required check or `merge_min_checks` is what makes "CI never started" refuse.
+The merge is pinned to the commit whose checks were read
+(`--match-head-commit`): push after the read and GitHub refuses it rather than
+ship a head nobody checked. A forwarded `-R`/`--repo` names the PR's
+repository, so that PR is the one read and pinned. A forwarded flag that merges
+nothing (`--disable-auto`, `--help`) skips the gate. `--auto` gets no
+exemption: when the only checks pending or failing are ones no branch rule
+requires, gh merges at once instead of waiting for them. A dry run's verdict
+line carries the result too (`verdict=ok checks=blocked`).
+
+The gates run in this order: the PR-state precheck, the checks, the
+merge==deploy confirm (below), another window's `merge-main` hold, the close
+check, then the empty-diff, placeholder and foreign-lane guards.
 
 Before the squash, merge-pr lists every issue the merge will close and refuses
 (`--close-ok` proceeds) when one is closed by text the PR's own closing
@@ -272,13 +312,25 @@ reconcile on push), that squash is far higher-stakes than normal. Set
 
 - refuses to merge a **draft** PR,
 - prints a `⚠ merging … AUTO-APPLIES to prod` banner,
+- for a PR on github.com, reads [GitHub's status page](https://www.githubstatus.com)
+  and, right before the confirm, **warns** when the Actions component is not
+  operational or an unresolved incident names Actions: each incident's name,
+  status and last update, and the component's status. A deploy job started
+  during an Actions incident can wait for a runner and be cancelled without
+  running a step. It only warns: the confirm below is still the gate. The read
+  gives up after 3 seconds, and a page it can't read (down, slow, not the
+  expected JSON) costs one `could not check GitHub's status` line, never the
+  merge. GitHub Enterprise hosts aren't on that page, so nothing is read for
+  them. (`WT_GITHUB_STATUS_URL` points the read at another URL, for testing and
+  diagnosis only.)
 - requires a deliberate confirm — a typed `deploy` at an interactive prompt, or
   `--confirm-deploy` for non-interactive/agent use (never a silent default).
 
 `wt merge-pr <pr> --dry-run` evaluates the same gate without prompting and says
 what a real merge would do: refuse a draft, stop for the confirm, or proceed
-because `--confirm-deploy` was passed. With `merge_is_deploy_paths` set, a PR
-that touches no deploy path says it would skip the gate.
+because `--confirm-deploy` was passed; it prints the same status-page lines.
+With `merge_is_deploy_paths` set, a PR that touches no deploy path says it
+would skip the gate.
 
 ## Cross-repo epics
 
@@ -466,6 +518,7 @@ Zero-config works by derivation. Override via a repo-root `.wt.conf`
 | `hold_max_age` | `WT_HOLD_MAX_AGE` | `24h` — a `--hold` older than this stops hard-blocking `merge-pr` (warns instead); `0`/`off` = never expire |
 | `coord_issue` | `WT_COORD_ISSUE` | *(off)* — a pinned GitHub issue as the **cross-machine** mirror: announce/ack/all-clear auto-mirror to it, and `inbox` + the `merge-pr` gate read it back, so a hold on one machine blocks/warns on another |
 | `merge_is_deploy` | `WT_MERGE_IS_DEPLOY` | `false` — enable the prod-deploy gate on `merge-pr` |
+| `merge_min_checks` | `WT_MERGE_MIN_CHECKS` | *(off)* — `merge-pr` refuses when fewer checks ran on the PR's head (skipped ones don't count): the "CI never started" floor for a repo that requires no check. A value that isn't a count makes `merge-pr` refuse until it's fixed |
 
 Color is auto-disabled when stdout isn't a TTY; force off with `NO_COLOR=1`.
 

@@ -286,20 +286,15 @@ func classifyStaleCheckout(behind int) (issue, severity string) {
 	return "", ""
 }
 
-// dirtyFileCount counts uncommitted changes in the worktree at path (porcelain
-// lines) for the report message; 0 on any error.
+// dirtyFileCount counts uncommitted changes in the worktree at path for the
+// report message, untracked files included as IsClean counts them (#208); 0 on
+// any error.
 func dirtyFileCount(path string) int {
-	out, err := gitx.RunDir(path, "status", "--porcelain")
+	entries, err := gitx.StatusEntries(path)
 	if err != nil {
 		return 0
 	}
-	n := 0
-	for _, ln := range strings.Split(out, "\n") {
-		if strings.TrimSpace(ln) != "" {
-			n++
-		}
-	}
-	return n
+	return len(entries)
 }
 
 // classifyUpstream decides a worktree branch's upstream finding from its git
@@ -366,6 +361,7 @@ func resolvedConfig(c *config.Config) map[string]string {
 		"max_age":           ageStr(c.MaxAge, "off"),
 		"hold_max_age":      ageStr(c.HoldMaxAge, "never"),
 		"merge_is_deploy":   boolStr(c.MergeIsDeploy),
+		"merge_min_checks":  config.MinChecksString(c.MergeMinChecks, c.MergeMinChecksBad),
 		"coord_issue":       coordIssueStr(c.CoordIssue),
 	}
 }

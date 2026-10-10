@@ -31,6 +31,9 @@ func printHelp() {
 	fmt.Printf("    %s        %s\n", c("wt new <branch>"), "create a worktree on a new branch from the base")
 	fmt.Printf("    %s              %s\n", c("wt init"), "scaffold a commented .wt.conf for this repo (derived defaults)  "+d("[--force]"))
 	fmt.Printf("    %s              %s\n", c("wt clean"), "list worktrees whose branch already shipped  "+d("(-y to remove; name worktrees to limit it to them: `wt clean -y <name>...`, each must match exactly one; --stale-index reports merged leftover-index ones; --all-roots also evaluates worktrees outside worktree_root, which still block pushes)"))
+	fmt.Printf("    %s   %s\n", c("wt discard <name>"), "drop ONE throwaway worktree + its local branch + its claim, which clean keeps as never pushed  "+d("[--drop-commits] [--dry-run] [--all-roots]"))
+	fmt.Println("    " + d("exact name only, never a sweep; refuses a dirty tree, a git repository in its ignored files, the base branch, the main checkout and the window it runs in;"))
+	fmt.Println("    " + d("lists the commits no branch on origin has and drops them only with ") + c("--drop-commits") + d("; never deletes the branch on origin."))
 	fmt.Println()
 
 	fmt.Println(b(g("  ✦ CLAIM A UNIT OF WORK")) + d("  — assign issue + worktree + draft PR + record"))
@@ -44,9 +47,12 @@ func printHelp() {
 	fmt.Println()
 
 	fmt.Println(b(g("  ✦ MERGE")) + d("  — guarded squash that refuses empty/placeholder-only PRs"))
-	fmt.Printf("    %s     %s\n", c("wt merge-pr <pr>"), "guarded squash (surfaces head branch) + auto-remove worktree  "+d("[--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok] [--no-close-check]"))
+	fmt.Printf("    %s     %s\n", c("wt merge-pr <pr>"), "guarded squash (surfaces head branch) + auto-remove worktree  "+d("[--dry-run] [--bypass] [--merge-foreign] [--keep] [--confirm-deploy] [--admin] [--close-ok] [--checks-ok] [--no-close-check]"))
+	fmt.Println("    " + d("refuses (asks, at a terminal) while the PR's checks are pending, failed, unreadable, or a required one never ran;"))
+	fmt.Println("    " + d("set ") + c("merge_min_checks") + d(" to refuse when fewer ran. ") + c("--checks-ok") + d(" merges anyway; --bypass and --admin don't."))
 	fmt.Println("    " + d("set ") + c("merge_is_deploy") + d(" for GitOps repos (merge auto-applies to prod): refuses"))
 	fmt.Println("    " + d("a draft PR, banners the deploy, and requires a typed confirm / --confirm-deploy."))
+	fmt.Println("    " + d("on github.com it first warns (never blocks) when githubstatus.com reports an Actions incident."))
 	fmt.Println("    " + d("scope it with ") + c("merge_is_deploy_paths") + d(" (globs, ** ok) so the gate skips docs/CI/scripts-only PRs."))
 	fmt.Println("    " + d("prefix a glob with ") + c("!") + d(" to carve out a class that can't deploy inside one that can (e.g. a README beside the code it documents)."))
 	fmt.Println("    " + d("--admin forwards to gh pr merge to bypass a required-review branch (keeps the guard)."))

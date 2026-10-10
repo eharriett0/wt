@@ -39,6 +39,8 @@ type Config struct {
 	HoldMaxAge         time.Duration     // a coordination --hold older than this stops HARD-blocking merge-pr and downgrades to a loud warn (a crashed window can't wedge everyone forever); 0 = never expire. Default DefaultHoldMaxAge (#32)
 	MergeIsDeploy      bool              // this repo auto-deploys on merge to base — merge-pr adds a prod-safety gate (refuse draft, banner, confirm)
 	MergeIsDeployPaths []string          // globs (** via collide.MatchDoubleStar) scoping the deploy gate: when set, merge-pr fires the prod gate ONLY if the PR changes a matching file — docs/CI/scripts-only PRs skip it. Unset → whole repo is a deploy surface (legacy). Prefix a glob with `!` to EXCLUDE a class that cannot deploy but sits inside one that can, e.g. "infrastructure/**,modules/**,!modules/**/*.md" (#119). Exclusions-only fails CLOSED (gates everything), so a typo can't disable the gate.
+	MergeMinChecks     int               // merge-pr's checks gate refuses when fewer checks ran on the PR's head commit than this (#179): the deterministic "CI never started" signal for a repo with no required checks. SKIPPED checks don't count; pending and failed ones refuse on their own. 0 = no floor.
+	MergeMinChecksBad  string            // merge_min_checks / WT_MERGE_MIN_CHECKS set to something that is not a count: the raw value. The gate refuses rather than run without the floor the operator asked for (#179).
 	CoordIssue         int               // a pinned GitHub issue used as the cross-machine coordination mirror (#36): when set, announce/ack/all-clear auto-mirror to it, and inbox + the merge gate read it back so a hold on one machine blocks/warns on another. 0 = off.
 	StructuredDocs     map[string]string // basename → section-delimiter regex (#22): docs that partition into sections/lanes, so a cross-window touch grades by SECTION (same section = HIGH) instead of the blanket shared-doc advisory. Per-doc because delimiters differ (CLAUDE.md by "## " headings, the resume memory by "**═══" lane bars). Config-file only.
 }
@@ -138,6 +140,7 @@ func ScaffoldConf(c *Config) string {
 	entry("hold_max_age", ageStr(c.HoldMaxAge), "24h")
 	entry("merge_is_deploy", boolStr(c.MergeIsDeploy), "false")
 	entry("merge_is_deploy_paths", strings.Join(c.MergeIsDeployPaths, ","), "infrastructure/**,envs/**")
+	entry("merge_min_checks", MinChecksString(c.MergeMinChecks, c.MergeMinChecksBad), "3")
 	issueStr := ""
 	if c.CoordIssue > 0 {
 		issueStr = strconv.Itoa(c.CoordIssue)
@@ -153,6 +156,7 @@ var knownKeys = map[string]bool{
 	"link_files": true, "claim_open_pr": true, "shared_docs": true,
 	"append_only_paths": true, "max_age": true, "hold_max_age": true,
 	"merge_is_deploy": true, "merge_is_deploy_paths": true, "coord_issue": true,
+	"merge_min_checks": true,
 }
 
 // UnknownKeys returns the parsed .wt.conf keys that wt does not recognize,
@@ -236,6 +240,9 @@ func ApplyConf(c *Config, m map[string]string) {
 	if v, ok := m["hold_max_age"]; ok {
 		c.HoldMaxAge = parseHoldMaxAge(v, c.HoldMaxAge)
 	}
+	if v, ok := m["merge_min_checks"]; ok {
+		applyMinChecks(c, v)
+	}
 	if v, ok := m["coord_issue"]; ok {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
 			c.CoordIssue = n
@@ -297,11 +304,58 @@ func applyEnv(c *Config) {
 	if v, ok := os.LookupEnv("WT_HOLD_MAX_AGE"); ok {
 		c.HoldMaxAge = parseHoldMaxAge(v, c.HoldMaxAge)
 	}
+	if v := os.Getenv("WT_MERGE_MIN_CHECKS"); v != "" {
+		applyMinChecks(c, v)
+	}
 	if v := os.Getenv("WT_COORD_ISSUE"); v != "" {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
 			c.CoordIssue = n
 		}
 	}
+}
+
+// applyMinChecks sets merge_min_checks from v (#179): a whole number ≥ 0, with
+// "off"/"none" for 0; blank leaves it as it was. Anything else is recorded in
+// MergeMinChecksBad and the floor is unset: merge-pr's checks gate then
+// refuses rather than quietly merge without the floor someone asked for (a typo
+// that disables a gate is the failure nobody notices).
+func applyMinChecks(c *Config, v string) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return
+	}
+	if n, ok := ParseMinChecks(v); ok {
+		c.MergeMinChecks, c.MergeMinChecksBad = n, ""
+		return
+	}
+	c.MergeMinChecks, c.MergeMinChecksBad = 0, v
+}
+
+// ParseMinChecks reads a merge_min_checks value: a whole number ≥ 0, or
+// "off"/"none" (0). ok=false for anything else, a negative number included.
+// Pure.
+func ParseMinChecks(v string) (int, bool) {
+	switch v = strings.ToLower(strings.TrimSpace(v)); v {
+	case "off", "none":
+		return 0, true
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// MinChecksString renders merge_min_checks for the scaffold and doctor: "off",
+// the count, or the value that is not one. Pure.
+func MinChecksString(n int, bad string) string {
+	switch {
+	case bad != "":
+		return fmt.Sprintf("%q (not a count: merge-pr refuses until it is fixed)", bad)
+	case n <= 0:
+		return "off"
+	}
+	return strconv.Itoa(n)
 }
 
 // parseHoldMaxAge resolves a hold_max_age value: "0"/"off"/"never" → 0 (expiry

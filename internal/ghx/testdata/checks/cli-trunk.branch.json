@@ -1,0 +1,1 @@
+{"name":"trunk","protected":true,"protection":{"enabled":true,"required_status_checks":{"enforcement_level":"non_admins","contexts":["build (macos-latest)","build (ubuntu-latest)","build (windows-latest)"],"checks":[{"context":"build (macos-latest)","app_id":null},{"context":"build (ubuntu-latest)","app_id":null},{"context":"build (windows-latest)","app_id":null}]}}}
