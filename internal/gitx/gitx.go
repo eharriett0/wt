@@ -1516,8 +1516,9 @@ func LastCommitAge(dir string, now time.Time) (time.Duration, error) {
 // status.showUntrackedFiles says (#208). A plain porcelain status honours a
 // `no` there: a worktree holding only untracked work read as clean, and `wt
 // clean -y`, merge-pr's auto-clean and `release --clean`, which remove only a
-// clean worktree, removed it, untracked files and all. Ignored files never
-// counted, and still don't.
+// clean worktree, removed it, untracked files and all. An edit to a tracked file
+// that git status skips (assume-unchanged, skip-worktree, core.ignoreStat)
+// counts too (#210). Ignored files never counted, and still don't.
 func IsClean(dir string) bool {
 	entries, err := StatusEntries(dir)
 	return err == nil && len(entries) == 0
@@ -1772,8 +1773,15 @@ func parseCommitLines(out string) []Commit {
 // status.showUntrackedFiles=no, which hides untracked files from a plain
 // porcelain status, and from `git worktree remove`'s own check too: it deleted
 // them with the worktree (measured, git 2.39). Ignored files are not listed.
-// Submodule changes are (--ignore-submodules=none). Read-only: it reads other
-// windows' worktrees, and must not take their index.lock.
+// Submodule changes are (--ignore-submodules=none, as `git worktree remove`'s
+// own check reads them), whatever submodule.<name>.ignore says.
+//
+// An edit git status never looks at is listed too (#210): a tracked file
+// flagged assume-unchanged (core.ignoreStat=true flags every file it checks
+// out) or skip-worktree whose content is not the index's (hiddenEdits). git
+// status hid such an edit, and `git worktree remove` deleted it. Unreadable
+// either way is an error, which IsClean reads as dirty. Read-only: it reads
+// other windows' worktrees, and must not take their index.lock.
 func StatusEntries(dir string) ([]string, error) {
 	out, err := runRawReadOnly(dir, "status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none")
 	if err != nil {
@@ -1785,7 +1793,11 @@ func StatusEntries(dir string) ([]string, error) {
 			lines = append(lines, ln)
 		}
 	}
-	return lines, nil
+	hidden, err := hiddenEdits(dir)
+	if err != nil {
+		return nil, err
+	}
+	return append(lines, hidden...), nil
 }
 
 // DeleteBranchAt deletes local branch, and only while it still points at tip

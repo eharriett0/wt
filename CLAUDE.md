@@ -235,6 +235,16 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   (`--untracked-files=normal`); `WorktreeRemove` carries a scoped `-c
   status.showUntrackedFiles=normal`, one command's argument, never the process
   env (#92). Ignored files are unchanged: never dirty, deleted with the worktree.
+  ⚠ **So does an edit git status never looks at (#210).** A tracked file
+  flagged `--assume-unchanged` or `--skip-worktree`, or every file a checkout
+  writes under `core.ignoreStat=true`, is skipped by git status and by `git
+  worktree remove`'s check, which deleted the edit. `StatusEntries` reads the
+  flags from `git ls-files -z -s -v` (lower-case tag = assume-unchanged, `S`/`s`
+  = skip-worktree) and lists each flagged file that exists and differs from its
+  index blob: regular files hashed by git (`hash-object --stdin-paths`, so clean
+  and eol filters apply as for `git add`), symlinks by their target. A file the
+  entry no longer has on disk loses nothing and is skipped; anything that can't
+  be compared counts as changed (fail closed).
   ⚠ **An upstream is not a push (#175).** `wt new` branches from
   `origin/<base>`, and git's default `branch.autoSetupMerge` records that as the
   new branch's upstream, so `HasUpstream` is true from birth. The "never pushed"
