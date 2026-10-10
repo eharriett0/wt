@@ -347,7 +347,8 @@ func pushCollisionBlocks(c *config.Config, ws []collide.Window, root string, pat
 
 	// Grade IDENTICALLY to `wt check` + pre-commit (#92, #97): shared-docs +
 	// append-only are advisory; a code file blocks only when the two windows'
-	// changed line-ranges OVERLAP (disjoint hunks stay advisory).
+	// edits are one conflict region by git's rule (they overlap, or touch with no
+	// unchanged line between, #199); hunks git merges cleanly stay advisory.
 	hard, soft := gradeConflicts(c, active, root, ws, gitx.ChangedRanges, gitx.ChangedRangesNew)
 	if len(hard) == 0 {
 		if len(soft) > 0 {
@@ -415,8 +416,10 @@ type rangeFn func(worktree, base, path string) []gitx.LineRange
 // gradeConflicts splits active conflicts into hard (real overlap) vs soft
 // (advisory) using the SAME rule as `wt check` + the pre-push guard: shared-docs
 // and append-only paths are advisory, and a code file is HARD only when the two
-// windows' changed line-ranges OVERLAP — disjoint hunks in the same file stay
-// advisory. Single-source so pre-push and pre-commit can never disagree (#92, #97).
+// windows' edits are one conflict region in a git merge (collide.ConflictSeverity:
+// they overlap, or touch with no unchanged line between, #199) — hunks git
+// merges cleanly stay advisory. Single-source so pre-push and pre-commit can
+// never disagree (#92, #97).
 // ranges is BASE-frame (line grading — two windows' ranges must share the base
 // frame to be comparable, #108); sectionRanges is NEW-frame (attributing a diff
 // to its own current-content sections, #123). Same fn in tests, different in
@@ -515,8 +518,10 @@ func HookPreCommit(c *config.Config) int {
 			active, stale := collide.PartitionConflicts(conflicts, live)
 			// Grade IDENTICALLY to the pre-push guard + `wt check` (#97): shared-docs
 			// and append-only paths are advisory, and a code file is "hard" only when
-			// the two windows' changed line-ranges OVERLAP — disjoint hunks stay
-			// advisory. Unlike pre-push this NEVER blocks; it's an awareness notice.
+			// the two windows' edits are one conflict region by git's rule (overlap,
+			// or touch with no unchanged line between, #199) — hunks git merges
+			// cleanly stay advisory. Unlike pre-push this NEVER blocks; it's an
+			// awareness notice.
 			hard, soft := gradeConflicts(c, active, root, ws, gitx.ChangedRanges, gitx.ChangedRangesNew)
 			if len(hard) > 0 {
 				files := distinctPaths(hard)

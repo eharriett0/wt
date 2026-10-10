@@ -140,7 +140,7 @@ func mcpToolDescriptors() []map[string]any {
 			"name": "wt_status",
 			"description": "Every active window in this repo (worktree, branch, claimed issue, files touched) " +
 				"plus graded cross-window overlaps. An overlap lists only live windows (merged, closed-PR and dormant ones are left out) " +
-				"and is HIGH when some pair of them would each block in wt_check (overlapping hunks, or the same section of a structured doc); " +
+				"and is HIGH when some pair of them would each block in wt_check (hunks git would merge as one conflict: overlapping, or touching with no unchanged line between; or the same section of a structured doc); " +
 				"a window whose copy is already on base, already landed, or untracked contests nothing. Read-only.",
 			"inputSchema": obj(map[string]any{
 				"blocking": map[string]any{"type": "boolean", "description": "return only HIGH-risk overlaps"},
@@ -149,7 +149,7 @@ func mcpToolDescriptors() []map[string]any {
 		{
 			"name": "wt_check",
 			"description": "Before editing: is any other live window touching these paths? Returns per-path " +
-				"grading (HIGH overlapping hunks vs disjoint/advisory). Read-only.",
+				"grading (HIGH: hunks that overlap or touch, which git merges as one conflict; low: disjoint/advisory). Read-only.",
 			"inputSchema": obj(map[string]any{
 				"paths":           map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "repo-relative or absolute paths to check, matched exactly; a bare name that is no path in the repo (e.g. foo.go) matches any touched file with that basename"},
 				"include_stale":   map[string]any{"type": "boolean", "description": "include merged/dormant windows"},

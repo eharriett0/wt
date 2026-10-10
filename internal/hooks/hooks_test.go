@@ -50,6 +50,24 @@ func TestGradeConflicts(t *testing.T) {
 			[]gitx.LineRange{rng(1, 2)}, []gitx.LineRange{rng(10, 11)}, false,
 		},
 		{
+			"#199 touching hunks are hard: git merges them as one conflict region",
+			&config.Config{Base: "main"},
+			collide.Conflict{Path: "foo.go", Window: "winA"},
+			[]gitx.LineRange{rng(11, 11)}, []gitx.LineRange{rng(10, 10)}, true,
+		},
+		{
+			"#199 one unchanged line between stays advisory",
+			&config.Config{Base: "main"},
+			collide.Conflict{Path: "foo.go", Window: "winA"},
+			[]gitx.LineRange{rng(12, 12)}, []gitx.LineRange{rng(10, 10)}, false,
+		},
+		{
+			"#199 insertions at neighbouring gaps stay advisory",
+			&config.Config{Base: "main"},
+			collide.Conflict{Path: "foo.go", Window: "winA"},
+			[]gitx.LineRange{{Start: 11, End: 12, Gap: true}}, []gitx.LineRange{{Start: 10, End: 11, Gap: true}}, false,
+		},
+		{
 			"shared doc is advisory even when ranges overlap",
 			&config.Config{Base: "main", SharedDocs: []string{"CLAUDE.md"}},
 			collide.Conflict{Path: "CLAUDE.md", Window: "winA"},
@@ -334,9 +352,11 @@ func twoWorktrees(t *testing.T) (self, other string) {
 // structured_doc is configured to catch — two windows editing the same lane of a
 // hand-merged doc — blocked in `wt check` and sailed through the pre-push guard.
 //
-// Note the ranges in the same-section case are DISJOINT (line 5 vs line 6). That
-// is deliberate: it proves the SECTION grade is what fires, not the hunk grade,
-// which would call disjoint lines advisory.
+// Note the ranges in the same-section case are DISJOINT (line 5 vs line 7, an
+// unchanged line between, so git merges them cleanly). That is deliberate: it
+// proves the SECTION grade is what fires, not the hunk grade, which would call
+// those lines advisory. (Lines 5 and 6 no longer show it: touching edits are one
+// conflict region in git, so the hunk grade calls them HIGH too, #199.)
 func TestGradeConflictsStructuredDoc(t *testing.T) {
 	self, other := twoWorktrees(t)
 	ws := []collide.Window{{Branch: "winA", Worktree: other}}
@@ -351,7 +371,7 @@ func TestGradeConflictsStructuredDoc(t *testing.T) {
 		{
 			"same section is HARD even when the line ranges are disjoint",
 			map[string]string{"CLAUDE.md": "^## "},
-			[]gitx.LineRange{rng(5, 5)}, []gitx.LineRange{rng(6, 6)}, true,
+			[]gitx.LineRange{rng(5, 5)}, []gitx.LineRange{rng(7, 7)}, true,
 		},
 		{
 			"disjoint sections stay advisory",
