@@ -89,24 +89,25 @@ func checksAction(s merge.ChecksStatus, dryRun, checksOK, tty bool) gateAction {
 // head commit and what the base branch requires, decides (merge.DecideChecks),
 // prints the summary, and returns the commit to pin the merge to (the one it
 // read; "" when the checks could not be read), the verdict's label for the
-// dry-run line (green, none, blocked, unread) and whether to go on. stdin and
-// tty are where a terminal's answer comes from.
+// dry-run line (green, none, blocked, unread), the host of the PR it read ("" =
+// none; the deploy gate's status check needs it, #178) and whether to go on.
+// stdin and tty are where a terminal's answer comes from.
 //
 // ⚠ --admin never gets past it: --admin bypasses GitHub's required checks, so
 // this is the one check left. --bypass does not either (it is for wt's
 // empty-diff, placeholder, foreign-lane and hold guards); --checks-ok does.
-func checksGate(pr string, o checksOpts, stdin io.Reader, tty bool, r checksReads) (pin, label string, ok bool) {
+func checksGate(pr string, o checksOpts, stdin io.Reader, tty bool, r checksReads) (pin, label, host string, ok bool) {
 	read, in := readChecks(pr, o, r)
 	v := merge.DecideChecks(in)
-	label = v.Label()
+	label, host = v.Label(), read.Host
 	fmt.Println(checksLine(pr, read.Head, v))
 	act := checksAction(v.Status, o.dryRun, o.checksOK, tty)
 	switch act {
 	case gateProceed:
-		return read.Head, label, true
+		return read.Head, label, host, true
 	case gateNote:
 		ui.Warn("%s", noChecksNote(pr, v))
-		return read.Head, label, true
+		return read.Head, label, host, true
 	}
 	for _, l := range checksDetail(v, read.Head) {
 		ui.Warn("%s", l)
@@ -116,30 +117,30 @@ func checksGate(pr string, o checksOpts, stdin io.Reader, tty bool, r checksRead
 	case gatePreview:
 		if o.checksOK {
 			ui.Warn("--dry-run: %s; --checks-ok is set, so a real merge would merge anyway.", why)
-			return read.Head, label, true
+			return read.Head, label, host, true
 		}
 		ui.Warn("--dry-run: a real merge would REFUSE here (or ask at a terminal): %s.", why)
 		for _, h := range refuseHints(pr, v, o) {
 			ui.Info("%s", h)
 		}
-		return read.Head, label, true
+		return read.Head, label, host, true
 	case gateOverride:
 		ui.Warn("--checks-ok set — merging PR #%s anyway: %s.%s", pr, why, adminTail(o.admin))
-		return read.Head, label, true
+		return read.Head, label, host, true
 	case gateAsk:
 		fmt.Fprintf(os.Stderr, "%s PR #%s: %s.%s Type %s to merge anyway (anything else aborts): ",
 			ui.Yellow("→"), pr, why, adminTail(o.admin), ui.Bold("merge"))
 		if strings.TrimSpace(readLine(stdin)) == "merge" {
-			return read.Head, label, true
+			return read.Head, label, host, true
 		}
 		ui.Err("aborted — PR #%s not merged.", pr)
-		return "", label, false
+		return "", label, host, false
 	}
 	ui.Err("refusing to merge PR #%s — %s.", pr, why)
 	for _, h := range refuseHints(pr, v, o) {
 		ui.Info("%s", h)
 	}
-	return "", label, false
+	return "", label, host, false
 }
 
 // readChecks reads the head commit's checks and, from its base branch in its

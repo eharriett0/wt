@@ -49,6 +49,7 @@ func printHelp() {
 	fmt.Println("    " + d("set ") + c("merge_min_checks") + d(" to refuse when fewer ran. ") + c("--checks-ok") + d(" merges anyway; --bypass and --admin don't."))
 	fmt.Println("    " + d("set ") + c("merge_is_deploy") + d(" for GitOps repos (merge auto-applies to prod): refuses"))
 	fmt.Println("    " + d("a draft PR, banners the deploy, and requires a typed confirm / --confirm-deploy."))
+	fmt.Println("    " + d("on github.com it first warns (never blocks) when githubstatus.com reports an Actions incident."))
 	fmt.Println("    " + d("scope it with ") + c("merge_is_deploy_paths") + d(" (globs, ** ok) so the gate skips docs/CI/scripts-only PRs."))
 	fmt.Println("    " + d("prefix a glob with ") + c("!") + d(" to carve out a class that can't deploy inside one that can (e.g. a README beside the code it documents)."))
 	fmt.Println("    " + d("--admin forwards to gh pr merge to bypass a required-review branch (keeps the guard)."))
