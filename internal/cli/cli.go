@@ -93,6 +93,8 @@ func Main(args []string) int {
 		return cmdInit(rest)
 	case "clean":
 		return cmdClean(rest)
+	case "discard":
+		return cmdDiscard(rest)
 	case "claim":
 		return cmdClaim(rest)
 	case "adopt":
@@ -191,6 +193,39 @@ func cmdClean(args []string) int {
 	}
 	return withConfig(func(c *config.Config) int {
 		if err := worktree.Clean(c, *apply, *staleIndex, *allRoots, names); err != nil {
+			ui.Err("%v", err)
+			return 1
+		}
+		return 0
+	})
+}
+
+// discardUsage is `wt discard`'s usage line (#177).
+const discardUsage = "usage: wt discard <name> [--drop-commits] [--dry-run] [--all-roots]"
+
+// cmdDiscard is `wt discard <name>` (#177): drop ONE throwaway worktree, its
+// local branch and its claim. Exactly one name, never a list: discard is never a
+// sweep, and each run lists what that one worktree holds. The guards are
+// worktree.DecideDiscard; exit 64 for usage, 1 for any refusal (a --dry-run that
+// a real run would refuse included) or failure.
+func cmdDiscard(args []string) int {
+	if code, done := guardHelp(args, discardUsage); done {
+		return code
+	}
+	fs := flag.NewFlagSet("discard", flag.ContinueOnError)
+	dropCommits := fs.Bool("drop-commits", false, "also drop commits that no branch on origin has (they are listed first)")
+	dryRun := fs.Bool("dry-run", false, "print what would happen and change nothing (origin is still fetched, as a real run fetches it)")
+	allRoots := fs.Bool("all-roots", false, "allow a worktree outside worktree_root, as wt clean --all-roots evaluates them (#101)")
+	pos, passthrough, err := parseInterspersed(fs, args)
+	if err != nil {
+		return 64
+	}
+	if len(pos) != 1 || pos[0] == "" || len(passthrough) > 0 {
+		ui.Err("%s — exactly one worktree (a directory, a branch, or a path): discard is never a sweep", discardUsage)
+		return 64
+	}
+	return withConfig(func(c *config.Config) int {
+		if _, err := worktree.Discard(c, pos[0], worktree.DiscardOpts{DropCommits: *dropCommits, DryRun: *dryRun, AllRoots: *allRoots}); err != nil {
 			ui.Err("%v", err)
 			return 1
 		}
@@ -577,13 +612,7 @@ func removeActiveWorkForBranch(c *config.Config, branch string) {
 	if content == "" {
 		return
 	}
-	var issue string
-	for _, e := range activework.Parse(content) {
-		if e.Branch == branch {
-			issue = e.Issue
-			break
-		}
-	}
+	issue := activework.IssueForBranch(activework.Parse(content), branch)
 	if issue == "" {
 		return
 	}
