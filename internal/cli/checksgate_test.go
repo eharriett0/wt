@@ -259,14 +259,23 @@ func TestChecksGate(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := tc.fake
-			var pin, label string
+			var pin, label, host string
 			var ok bool
 			stdin := strings.NewReader(tc.answer)
 			stdout, stderr := captureT(t, func() {
-				pin, label, ok = checksGate("7", tc.opts, stdin, tc.tty, f.reads())
+				pin, label, host, ok = checksGate("7", tc.opts, stdin, tc.tty, f.reads())
 			})
 			if pin != tc.pin || ok != tc.ok {
 				t.Errorf("checksGate = (%q, %v), want (%q, %v)", pin, ok, tc.pin, tc.ok)
+			}
+			// #178: the host of the PR it read, for the deploy gate's status read;
+			// none when the checks could not be read.
+			wantHost := f.read.Host
+			if f.err != nil {
+				wantHost = ""
+			}
+			if host != wantHost {
+				t.Errorf("checksGate host = %q, want %q", host, wantHost)
 			}
 			if tc.label != "" && label != tc.label {
 				t.Errorf("checksGate label = %q, want %q", label, tc.label)

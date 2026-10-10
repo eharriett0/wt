@@ -391,6 +391,21 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   (awesome-o's one workflow is path-filtered, so its PRs legitimately carry
   none), so the deterministic "CI never started" signals are a required check
   and `merge_min_checks`.
+- **The deploy gate's GitHub status read only WARNS, and fails open (#178).**
+  Inside the deploy confirm (draft refusal → prod banner → status → confirm),
+  for a PR on github.com (`merge.GitHubStatusCovers`; the host is the checks
+  gate's PR-URL read, so an ssh alias or a forwarded `-R` resolves, else
+  origin's), merge-pr GETs githubstatus.com's `summary.json` (net/http, 3s for
+  the whole read: wt's one direct network call) and warns when a component
+  naming Actions is not `operational` or an unresolved incident names Actions
+  (whole word, in its name, components or updates' affected components). Pure
+  `merge.DecideActionsStatus`: a degraded signal outranks unknown, and a page
+  that does not SAY operational (no Actions component, no incident list, not
+  JSON, unreachable) is unknown: one "could not check" line, never silence.
+  Never a refusal, `--confirm-deploy` still merges; a dry run prints the same
+  lines; a draft, a non-deploy PR and a non-github.com host read nothing.
+  ⚠ `WT_GITHUB_STATUS_URL` is the test seam, and the cli package's `TestMain`
+  points it at a scheme that fails offline, so no test reaches the real page.
 - **"No PR" must be an `ok=false`, never a parsed placeholder (#168).**
   `PRForBranch`'s old `.[0] | …` query printed `null null` for a branch with
   no PR, which parsed as a PR in state `null`. Every caller then matched no
