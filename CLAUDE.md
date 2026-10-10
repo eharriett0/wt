@@ -76,37 +76,60 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   change that includes a line on either side of its gap, or another insertion at
   that gap. ⚠ **A span can't say that**: it encodes an insertion as both
   neighbours of its gap, so a touch rule over spans claims a line too many next
-  to every insertion, and plain overlap flagged insertions at neighbouring gaps
-  (git merges them cleanly: all 5 of main's false HIGHs where git is clean every
-  way). So a base-frame `LineRange` carries `Gap` (an insertion between `Start`
-  and `End`=`Start+1`): `parseHunkRangesOld` sets it; `mapHunk` keeps an
+  to every insertion, and plain overlap flagged insertions at neighbouring gaps.
+  So a base-frame `LineRange` carries `Gap` (an insertion between `Start` and
+  `End`=`Start+1`): `parseHunkRangesOld` sets it; `mapHunk` keeps an
   unconflicted behind-branch hunk's shape and makes a conflicting one claim
   exactly its surviving lines plus base's replacement (a base deletion is its
-  deletion point, a Gap, never its neighbours as lines); `LinesToBase` keeps a
-  pending edit's, and the pending edit is what git will report: a Codex run of
-  added lines beside no removed line is an insertion (it used to be dropped), a
-  Claude Edit claims what replacing `old_string` with `new_string` changes
-  (`claudeEditClaim`: not the context lines it carries to be unique, which
-  under the touch rule would deny an edit beside another window's), each pure
-  insertion/deletion widened over every position git may slide it to
-  (`insertionClaim`/`deletionClaim`). NEW-frame ranges never set Gap (a span
-  there only errs toward flagging); `Overlaps` stays the span intersection, for
-  sections. After: 0 conflicts graded low and 0 false HIGHs on the same 800
-  scenarios (and on 400 with repeated lines);
-  `TestLineRangeConflicts_MatchesGitMergeFile` holds real `git diff -U0` ranges
-  to `git merge-file` on 766 single-edit pairs. A touching pair's display span
-  is the seam's two lines (`overlap L10-11`).
-- **The pre-edit hooks grade what `wt check` will say once the edit is made
-  (#108/#184).** `regradePending`: every hunk-graded entry (HIGH *or* FYI: a
-  window whose earlier edits were disjoint can be about to overlap) is HIGH iff
-  this window's own ranges ∪ the pending edit conflict with the other window's,
-  by the rule `wt check` grades by (`collide.ConflictSeverity`, #199). The
-  pending edit is located in the on-disk file and moved into base numbering
-  through this worktree's own diff (`gitx.LinesToBase`, the same mapping with the
-  sides swapped), so a window that is behind base or already edited the file is
-  graded exactly, not file-level. Only when that can't be computed (a Write, a
-  non-unique `old_string`, a binary file, a git error) does an entry stay as a
-  file-level heads-up, and then it is never dropped.
+  deletion point, a Gap, never its neighbours as lines). NEW-frame ranges never
+  set Gap (a span there only errs toward flagging); `Overlaps` stays the span
+  intersection, for sections. A touching pair's display span is the seam's two
+  lines (`overlap L10-11`).
+  ⚠ **The exact gap is only right if the diff puts an edit WHERE git's merge
+  does (#199 review).** An inserted `}` beside an equal one, a blank line, a
+  rewrite among repeated lines can sit in more than one gap, and a plain `git
+  diff` (myers, the indent heuristic, the user's `diff.algorithm`) picks another
+  gap than merge-ort (histogram, no indent heuristic). Measured that way, two
+  insertions graded a gap apart (clean) were one gap in git and conflicted, and
+  check, status and pre-push all let them through where main's looser spans had
+  blocked. So every range-measuring diff passes `gitx.gradeDiffFlags`
+  (`--diff-algorithm=histogram --no-indent-heuristic --inter-hunk-context=0
+  --no-color --no-ext-diff --no-textconv`, after the revs, so a failure-injection
+  matcher still finds the first rev at `args[2]`), and `scopedEnv` strips
+  `GIT_DIFF_OPTS` (it beats `-U0`). A flag beats config, `GIT_CONFIG_PARAMETERS`
+  included, so that one stays (a caller's `git -c` may matter to other calls).
+  The truth assumed is merge-ort's (the default since git 2.34; `merge-tree
+  --write-tree`, rebase, the forge's merge button); a `-s recursive` merge aligns
+  like myers. Pinned by `TestChangedRanges_MatchMergeTree` (775 single-edit pairs
+  on a slider-heavy file vs `git merge-tree`) and `TestGrade_FollowsMergeAlignment`
+  (check, status and pre-push from both sides); `TestLineRangeConflicts_MatchesGitMergeFile`
+  (unique lines vs `git merge-file`) pins only the rule.
+- **The pre-edit hooks grade what `wt check` will say once the edit is made, by
+  construction (#108/#184/#199).** A hook predicts the FILE the edit will produce
+  and measures it with `wt check`'s own diffs and base mapping
+  (`gitx.ChangedRangesWith`: the copy goes in as a blob, through the file's clean
+  filters with `hash-object --path`, into a throwaway object directory, so the
+  repo's objects are only read). `regradePending`: every hunk-graded entry (HIGH
+  *or* FYI: a window whose earlier edits were disjoint can be about to overlap)
+  is HIGH iff those ranges conflict with the other window's
+  (`collide.ConflictSeverity`); an edit that puts the file back to base's copy
+  reads HIGH like `wt check`'s empty side, as a heads-up, not a confirmed
+  overlap. Claude (`claudePendingContent`): Claude Code's Edit replayed (refused
+  for an absent `old_string`, or a repeated one without `replace_all`; an empty
+  `new_string` takes the newline after it), MultiEdit's edits in turn, Write's
+  content; a CRLF file is edited as LF (the edit's own CRLFs too) and written
+  back CRLF (measured with Claude Code's own tools). Codex (`codex_apply.go`): apply_patch replayed, held
+  to the app's bundled CLI by `TestApplyPatchOps_MatchesCodex`: each chunk sought
+  from where the last ended, fuzzy whitespace and punctuation tiers, context
+  lines written as the patch spells them, `@@ <line>` and End-of-File anchors, a
+  context-less chunk appended, and ⚠ every file it writes ends with a newline, so
+  a file without one also changes its last line. ⚠ Don't go back to guessing the
+  changed lines from the hunk (the `old_string`'s lines, the union of every gap a
+  slide could take): a diff can place an inserted or deleted line in several
+  gaps, a guess misses where git puts it, and the union denied edits `wt check`
+  grades low. Only when the file can't be predicted (an edit the tool refuses, a
+  file mixing line endings, a patch apply_patch rejects, a new file, a git error)
+  does an entry stay as a file-level heads-up, and then it is never dropped.
 - **Coordination ownership is ONE predicate, and it includes the session (#163).**
   Two agent sessions started in one checkout resolve to the same window id, so
   each treated the other's announcements as its own: `inbox clear`, `wt holds`
@@ -243,10 +266,10 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   downgraded a real collision; `*.md` folded every .md file's hunks into one
   file's ranges; a leading `:` is magic (`:colon.md` measured `colon.md`). Every
   `-- <path>` call passes `gitx.literalPath(p)` (`:(literal)<p>`): IsTracked*,
-  IsUntracked, ChangedRangesChecked/ChangedRangesNew, LinesToBase,
-  uncommittedRangesNew. Prefixing the path, not `git --literal-pathspecs`, keeps
-  the subcommand at `args[0]`, where the `gitOutput` failure-injection tests
-  match it (a per-call env var would need the seam itself changed). ⚠
+  IsUntracked, ChangedRangesChecked/ChangedRangesNew, uncommittedRangesNew.
+  Prefixing the path, not `git --literal-pathspecs`, keeps the subcommand at
+  `args[0]`, where the `gitOutput` failure-injection tests match it (the seam
+  also takes a per-call env and stdin since #199, for ChangedRangesWith). ⚠
   `scopedEnv` strips `GIT_LITERAL_PATHSPECS` (and the glob/noglob/icase
   switches): git exports it to the hooks of `git --literal-pathspecs …`, and
   under it git reads `:(literal)` as part of the name, which then matches
@@ -418,13 +441,11 @@ exit 0** (advisory / fail-open; a coordination nicety must never break the sessi
 - `wt _hook codex-edit` (**PreToolUse**, matcher `apply_patch`): parses the patch's
   `*** {Update|Add|Delete|Move} File:` targets, grades them via `buildCheckReport`
   (the same grader as `wt check`), then RE-grades each hunk-graded entry (HIGH or
-  FYI) against this window's own ranges plus the patch's actual hunks — localized
-  in the current file via `locateRange` (`parseCodexPatch` → per-hunk pre-image of
-  context+removed lines; removed runs are changes, a run of added lines beside no
-  removed line an insertion, #199) and moved into base numbering by
-  `gitx.LinesToBase` — with the same `regradePending` as the Claude hook
-  (#108/#184). A disjoint patch
-  to a shared file therefore stays silent. Emits `additionalContext` on overlap;
+  FYI) against this window's ranges as they will read once the patch is applied:
+  `predictCodexPatch` replays apply_patch over the on-disk files
+  (`codex_apply.go`) and `gitx.ChangedRangesWith` measures each result, with the
+  same `regradePending` as the Claude hook (#108/#184/#199). A disjoint patch to
+  a shared file therefore stays silent. Emits `additionalContext` on overlap;
   `WT_CODEX_HOOK_BLOCK=1` upgrades a **confirmed** HIGH (a computed hunk overlap) to
   `deny` — a file-level-only match never denies.
 

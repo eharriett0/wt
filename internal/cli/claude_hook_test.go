@@ -6,8 +6,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/eharriett0/wt/internal/gitx"
 )
 
 func TestParseClaudeEdit(t *testing.T) {
@@ -115,94 +113,62 @@ func TestClaudeDecision(t *testing.T) {
 	}
 }
 
-func TestLocateRange(t *testing.T) {
-	content := "line1\nline2\nline3\nline4\n" // lines 1..4
+// #199 review: the pre-edit hook grades the file the edit produces, so it must
+// produce what Claude Code does: a Write's content; an Edit's replacement, which
+// the tool refuses for an old_string that is absent or (without replace_all) not
+// unique; MultiEdit's edits in turn; an empty new_string taking the deleted
+// text's newline with it; a CRLF file edited as LF and written back as CRLF
+// (both measured against Claude Code's own Edit and Write).
+func TestClaudePendingContent(t *testing.T) {
+	payload := func(tool string, input map[string]any) []byte {
+		b, _ := json.Marshal(map[string]any{"tool_name": tool, "tool_input": input})
+		return b
+	}
+	edit := func(old, new string, all bool) []byte {
+		return payload("Edit", map[string]any{"file_path": "f", "old_string": old, "new_string": new, "replace_all": all})
+	}
+	multi := func(edits ...map[string]any) []byte {
+		return payload("MultiEdit", map[string]any{"file_path": "f", "edits": edits})
+	}
+	e := func(old, new string) map[string]any { return map[string]any{"old_string": old, "new_string": new} }
+	const file = "a\nb\nc\nb\n"
 	cases := []struct {
-		name      string
-		old       string
-		wantStart int
-		wantEnd   int
-		wantOK    bool
+		name    string
+		raw     []byte
+		content string
+		exists  bool
+		want    string
+		ok      bool
 	}{
-		{"single line", "line2\n", 2, 2, true},
-		{"multi line span", "line2\nline3\n", 2, 3, true},
-		{"first line", "line1\n", 1, 1, true},
-		{"empty old_string → not localizable", "", 0, 0, false},
-		{"absent → not localizable", "nope", 0, 0, false},
-		{"ambiguous (appears twice) → not localizable", "line", 0, 0, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			r, ok := locateRange(content, tc.old)
-			if ok != tc.wantOK || (ok && (r.Start != tc.wantStart || r.End != tc.wantEnd)) {
-				t.Fatalf("locateRange(%q) = (%+v, %v), want (L%d-%d, %v)", tc.old, r, ok, tc.wantStart, tc.wantEnd, tc.wantOK)
-			}
-		})
-	}
-}
-
-func TestClaudeEditRanges(t *testing.T) {
-	content := "a\nb\nc\nd\ne\nf\n" // 6 lines
-	// Edit locates its old_string
-	raw := `{"tool_name":"Edit","tool_input":{"file_path":"x","old_string":"b\n","new_string":"B\n"}}`
-	if r, ok := claudeEditRanges([]byte(raw), content); !ok || len(r) != 1 || r[0].Start != 2 || r[0].End != 2 {
-		t.Errorf("Edit: (%+v, %v)", r, ok)
-	}
-	// #199: the claim is what the edit changes, not the context old_string carries
-	ctx := `{"tool_name":"Edit","tool_input":{"file_path":"x","old_string":"a\nb\nc\n","new_string":"a\nB\nc\n"}}`
-	if r, ok := claudeEditRanges([]byte(ctx), content); !ok || len(r) != 1 || r[0] != (gitx.LineRange{Start: 2, End: 2}) {
-		t.Errorf("Edit with context lines: (%+v, %v), want line 2 only", r, ok)
-	}
-	// MultiEdit unions all locatable ranges
-	multi := `{"tool_name":"MultiEdit","tool_input":{"file_path":"x","edits":[{"old_string":"b\n"},{"old_string":"e\n"}]}}`
-	if r, ok := claudeEditRanges([]byte(multi), content); !ok || len(r) != 2 {
-		t.Errorf("MultiEdit: (%+v, %v)", r, ok)
-	}
-	// Write has no locatable region → file-level fallback
-	if _, ok := claudeEditRanges([]byte(`{"tool_name":"Write","tool_input":{"file_path":"x","content":"whole"}}`), content); ok {
-		t.Error("Write should not be localizable")
-	}
-	// an old_string not in the file → not localizable (file-level fallback)
-	if _, ok := claudeEditRanges([]byte(`{"tool_name":"Edit","tool_input":{"old_string":"zzz\n"}}`), content); ok {
-		t.Error("absent old_string should not be localizable")
-	}
-	// a MultiEdit where one edit can't be located → whole thing falls back
-	mixed := `{"tool_name":"MultiEdit","tool_input":{"edits":[{"old_string":"b\n"},{"old_string":"zzz\n"}]}}`
-	if _, ok := claudeEditRanges([]byte(mixed), content); ok {
-		t.Error("MultiEdit with an unlocatable edit should fall back")
-	}
-}
-
-// #199: a pending Edit claims what git will report once it is made: the lines it
-// changes, not the context its old_string carries to be unique (since touching
-// edits conflict, claiming a context line would flag a window editing the line
-// beside it), and an Edit that only adds or drops lines is that insertion or
-// deletion, over every position git may slide it to.
-func TestClaudeEditClaim(t *testing.T) {
-	content := "a\nb\nc\nd\ne\nf\n" // lines 1..6
-	gap := func(p int) gitx.LineRange { return gitx.LineRange{Start: p, End: p + 1, Gap: true} }
-	chg := func(s, e int) gitx.LineRange { return gitx.LineRange{Start: s, End: e} }
-	cases := []struct {
-		name, content, old, new string
-		want                    gitx.LineRange
-	}{
-		{"rewrite a line", content, "b\n", "B\n", chg(2, 2)},
-		{"context lines are not claimed", content, "a\nb\nc\n", "a\nB\nc\n", chg(2, 2)},
-		{"two changed lines inside context", content, "b\nc\nd\n", "b\nC\nD\n", chg(3, 4)},
-		{"append after a line: an insertion", content, "c\n", "c\nX\n", gap(3)},
-		{"prepend before a line: an insertion", content, "c\n", "X\nc\n", gap(2)},
-		{"insert between two context lines", content, "b\nc\n", "b\nX\nc\n", gap(2)},
-		{"drop a line between context lines", content, "b\nc\nd\n", "b\nd\n", chg(3, 3)},
-		{"drop the whole old_string", content, "b\n", "", chg(2, 2)},
-		{"a mid-line old_string claims its whole line", content, "d", "D", chg(4, 4)},
-		{"joining the next line claims it too", content, "c\n", "c", chg(3, 4)},
-		{"a no-op claims what it touches", content, "c\n", "c\n", chg(3, 3)},
-		{"an insertion git may slide claims its slide", "a\nx\nx\nb\n", "a\nx\n", "a\nx\nx\n", chg(2, 3)},
-		{"the unterminated last line: what it touches", "a\nb", "b", "B", chg(2, 2)},
+		{"edit", edit("c\n", "C\n", false), file, true, "a\nb\nC\nb\n", true},
+		{"old_string not unique: the tool refuses", edit("b", "B", false), file, true, "", false},
+		{"replace_all", edit("b", "B", true), file, true, "a\nB\nc\nB\n", true},
+		{"old_string absent", edit("zz", "Z", false), file, true, "", false},
+		{"old_string empty", edit("", "Z", false), file, true, "", false},
+		{"no change", edit("c", "c", false), file, true, "", false},
+		{"deleting a line's text takes its newline", edit("c", "", false), file, true, "a\nb\nb\n", true},
+		{"deleting the whole line, newline included", edit("c\n", "", false), file, true, "a\nb\nb\n", true},
+		{"deleting text mid-line keeps the newline", edit("x", "", false), "axb\n", true, "ab\n", true},
+		{"deleting a last line with no newline", edit("\nz", "", false), "a\nz", true, "a", true},
+		{"replace_all deletes only the ones a newline follows with it", edit("b", "", true), "b\nb", true, "b", true},
+		{"multiedit, in turn", multi(e("a\n", "A\n"), e("A\nb", "AB")), file, true, "AB\nc\nb\n", true},
+		{"multiedit, a refused edit refuses all", multi(e("a\n", "A\n"), e("zz", "Z")), file, true, "", false},
+		{"crlf: matched as LF, written as CRLF", edit("b\nc", "B\nC", false), "a\r\nb\r\nc\r\n", true, "a\r\nB\r\nC\r\n", true},
+		{"crlf: an edit's own CRLFs read as LF", edit("b\r\nc\r\n", "B\r\n", false), "a\r\nb\r\nc\r\n", true, "a\r\nB\r\n", true},
+		{"a CR in an edit of an LF file: not predicted", edit("b\r\n", "B\n", false), "a\nb\nc\n", true, "", false},
+		{"mixed line endings: not predicted", edit("c", "C", false), "a\r\nb\nc\n", true, "", false},
+		{"a lone CR: not predicted", edit("c", "C", false), "a\rb\nc\n", true, "", false},
+		{"no file to edit", edit("c", "C", false), "", false, "", false},
+		{"write: its content", payload("Write", map[string]any{"file_path": "f", "content": "new\n"}), file, true, "new\n", true},
+		{"write onto a CRLF file: as given", payload("Write", map[string]any{"file_path": "f", "content": "a\nB\n"}), "a\r\nb\r\n", true, "a\nB\n", true},
+		{"write creating a file", payload("Write", map[string]any{"file_path": "f", "content": "n\n"}), "", false, "n\n", true},
+		{"another tool", payload("NotebookEdit", map[string]any{"file_path": "f"}), file, true, "", false},
+		{"garbage", []byte("{"), file, true, "", false},
 	}
 	for _, c := range cases {
-		if got := claudeEditClaim(c.content, c.old, c.new); got != c.want {
-			t.Errorf("%s: claudeEditClaim(%q -> %q) = %v, want %v", c.name, c.old, c.new, got, c.want)
+		got, ok := claudePendingContent(c.raw, c.content, c.exists)
+		if ok != c.ok || got != c.want {
+			t.Errorf("%s: claudePendingContent = %q, %v; want %q, %v", c.name, got, ok, c.want, c.ok)
 		}
 	}
 }

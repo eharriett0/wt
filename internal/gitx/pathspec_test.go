@@ -128,29 +128,22 @@ func TestChangedRanges_BehindBranchPathIsLiteral(t *testing.T) {
 	}
 }
 
-// LinesToBase maps a pending edit through this worktree's own diff of the file.
-// The names are as base has them, so line 5 on disk is base line 5; only the
-// decoys moved (three lines inserted atop each). Read as patterns, line 5 maps
-// to line 2. Base-less, the mapping holds only while the file has no
-// uncommitted change; the decoys' unstaged, then staged, changes must not count.
-func TestLinesToBase_PathIsLiteral(t *testing.T) {
+// ChangedRangesWith measures the pending copy of the file the name names, as
+// base has it (`<base>:<path>`), never a decoy: each name's pending edit is line
+// 5, each decoy's committed one line 30.
+func TestChangedRangesWith_PathIsLiteral(t *testing.T) {
 	dir := psRepo(t)
-	for _, p := range psNames {
-		insertTop(t, dir, p.decoy)
+	runGit(t, dir, "checkout", "-qb", "feat")
+	for i, p := range psNames {
+		editLineN(t, dir, p.decoy, decoyTag(i), 30)
 	}
-	check := func(state string) {
-		t.Helper()
-		for _, p := range psNames {
-			for _, base := range []string{"main", "no-such-base"} {
-				if got, ok := LinesToBase(dir, base, p.name, line5); !ok || !reflect.DeepEqual(got, line5) {
-					t.Errorf("LinesToBase(%q, base %s), decoys %s = %v, %v; want %v, true", p.name, base, state, got, ok, line5)
-				}
-			}
+	runGit(t, dir, "commit", "-qam", "decoys")
+	for i, p := range psNames {
+		pending := strings.Replace(readFileT(t, dir, p.name), fmt.Sprintf("%s l05\n", nameTag(i)), "EDITED\n", 1)
+		if got, ok := ChangedRangesWith(dir, "main", p.name, []byte(pending)); !ok || !reflect.DeepEqual(got, line5) {
+			t.Errorf("ChangedRangesWith(%q) = %v, %v; want %v, true", p.name, got, ok, line5)
 		}
 	}
-	check("unstaged")
-	runGit(t, dir, "add", "-A")
-	check("staged")
 }
 
 // Base-less, ChangedRanges reads the unstaged and the staged diff. Each name's

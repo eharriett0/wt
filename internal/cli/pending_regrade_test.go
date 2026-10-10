@@ -35,39 +35,38 @@ func TestRegradePending(t *testing.T) {
 
 	type kept map[string]bool // window → confirmed
 	never := func(CheckEntry) bool { return false }
+	gap := func(p int) []gitx.LineRange { return []gitx.LineRange{{Start: p, End: p + 1, Gap: true}} }
 	cases := []struct {
-		name      string
-		entries   []CheckEntry
-		cur       []gitx.LineRange
-		curOK     bool
-		pending   []gitx.LineRange
-		pendingOK bool
-		subsumed  func(CheckEntry) bool
-		want      kept
+		name     string
+		entries  []CheckEntry
+		after    []gitx.LineRange
+		afterOK  bool
+		subsumed func(CheckEntry) bool
+		want     kept
 	}{
-		{"pending overlaps: HIGH entry fires, confirmed", []CheckEntry{blocking}, nil, true, spans(20, 20), true, never, kept{"blk": true}},
-		{"pending disjoint: HIGH entry dropped", []CheckEntry{blocking}, nil, true, spans(30, 30), true, never, kept{}},
-		// #199: the grade is git's rule, as in `wt check`: a pending edit touching
-		// the other window's line conflicts, one line clear of it doesn't; a
-		// pending insertion meets only a change of a line next to its gap.
-		{"pending touches the other's line: fires", []CheckEntry{fyi}, nil, true, spans(21, 21), true, never, kept{"fyi": true}},
-		{"pending touches from above: fires", []CheckEntry{blocking}, nil, true, spans(19, 19), true, never, kept{"blk": true}},
-		{"pending one line clear: dropped", []CheckEntry{blocking}, nil, true, spans(22, 22), true, never, kept{}},
-		{"pending insertion right after the other's line: fires", []CheckEntry{fyi}, nil, true, []gitx.LineRange{{Start: 20, End: 21, Gap: true}}, true, never, kept{"fyi": true}},
-		{"pending insertion one line clear: dropped", []CheckEntry{fyi}, nil, true, []gitx.LineRange{{Start: 21, End: 22, Gap: true}}, true, never, kept{}},
-		{"own edit touching it already: still HIGH after", []CheckEntry{blocking}, spans(21, 23), true, spans(30, 30), true, never, kept{"blk": true}},
-		{"FYI entry re-graded: pending overlaps → fires", []CheckEntry{fyi}, spans(35, 35), true, spans(20, 20), true, never, kept{"fyi": true}},
-		{"FYI entry, pending disjoint: stays silent", []CheckEntry{fyi}, spans(35, 35), true, spans(30, 30), true, never, kept{}},
-		{"own earlier edit already overlaps: still HIGH after", []CheckEntry{blocking}, spans(19, 21), true, spans(30, 30), true, never, kept{"blk": true}},
-		{"newly HIGH but #122 subsumed: dropped", []CheckEntry{fyi}, nil, true, spans(20, 20), true, func(CheckEntry) bool { return true }, kept{}},
-		{"own ranges unknown: conservative heads-up", []CheckEntry{blocking, fyi}, nil, false, spans(30, 30), true, never, kept{"blk": false, "fyi": false}},
-		{"pending unlocatable: conservative heads-up", []CheckEntry{blocking, fyi}, nil, true, nil, false, never, kept{"blk": false, "fyi": false}},
-		{"no line ranges to grade: heads-up for a HIGH", []CheckEntry{indeterminate, section}, nil, true, spans(30, 30), true, never, kept{"indet": false, "sect": false}},
-		{"entries no edit can make HIGH stay out", notHunkGraded, nil, false, nil, false, never, kept{}},
+		{"after overlaps: HIGH entry fires, confirmed", []CheckEntry{blocking}, spans(20, 20), true, never, kept{"blk": true}},
+		{"after disjoint: HIGH entry dropped", []CheckEntry{blocking}, spans(30, 30), true, never, kept{}},
+		// #199: the grade is git's rule, as in `wt check`: an edit touching the
+		// other window's line conflicts, one line clear of it doesn't; an
+		// insertion meets only a change of a line next to its gap.
+		{"after touches the other's line: fires", []CheckEntry{fyi}, spans(21, 21), true, never, kept{"fyi": true}},
+		{"after touches from above: fires", []CheckEntry{blocking}, spans(19, 19), true, never, kept{"blk": true}},
+		{"after one line clear: dropped", []CheckEntry{blocking}, spans(22, 22), true, never, kept{}},
+		{"an insertion right after the other's line: fires", []CheckEntry{fyi}, gap(20), true, never, kept{"fyi": true}},
+		{"an insertion one line clear: dropped", []CheckEntry{fyi}, gap(21), true, never, kept{}},
+		{"FYI entry re-graded: after overlaps → fires", []CheckEntry{fyi}, spans(20, 20, 35, 35), true, never, kept{"fyi": true}},
+		{"FYI entry, after disjoint: stays silent", []CheckEntry{fyi}, spans(30, 30, 35, 35), true, never, kept{}},
+		{"newly HIGH but #122 subsumed: dropped", []CheckEntry{fyi}, spans(20, 20), true, func(CheckEntry) bool { return true }, kept{}},
+		// The edit puts this window's copy back to base's: `wt check` reads the
+		// empty side as indeterminate, HIGH, with no hunk overlap to confirm.
+		{"after empty: a heads-up, as wt check's indeterminate HIGH", []CheckEntry{blocking, fyi}, nil, true, never, kept{"blk": false, "fyi": false}},
+		{"after unknown: conservative heads-up", []CheckEntry{blocking, fyi}, nil, false, never, kept{"blk": false, "fyi": false}},
+		{"no line ranges to grade: heads-up for a HIGH", []CheckEntry{indeterminate, section}, spans(30, 30), true, never, kept{"indet": false, "sect": false}},
+		{"entries no edit can make HIGH stay out", notHunkGraded, nil, false, never, kept{}},
 	}
 	for _, c := range cases {
 		got := kept{}
-		for _, g := range regradePending(c.entries, c.cur, c.curOK, c.pending, c.pendingOK, c.subsumed) {
+		for _, g := range regradePending(c.entries, c.after, c.afterOK, c.subsumed) {
 			got[g.entry.Window] = g.confirmed
 		}
 		if !reflect.DeepEqual(got, c.want) {
@@ -80,8 +79,8 @@ func TestRegradePending(t *testing.T) {
 	// edit (checked when graded), never pays for it.
 	calls := 0
 	count := func(CheckEntry) bool { calls++; return false }
-	regradePending([]CheckEntry{blocking, fyi}, nil, true, spans(30, 30), true, count)
-	regradePending([]CheckEntry{blocking}, nil, true, spans(20, 20), true, count)
+	regradePending([]CheckEntry{blocking, fyi}, spans(30, 30), true, count)
+	regradePending([]CheckEntry{blocking}, spans(20, 20), true, count)
 	if calls != 0 {
 		t.Errorf("subsumed called %d times for entries that don't newly become HIGH, want 0", calls)
 	}
@@ -135,10 +134,10 @@ func TestPreEditHooks_BehindWindow(t *testing.T) {
 	}
 }
 
-// A git failure measuring this window's own ranges must never read as "no
-// edits" (#184 review): graded against the pending edit alone, a disjoint-looking
-// edit would go silent while `wt check` (which reads the failure as
-// indeterminate) says HIGH. The hooks keep a file-level heads-up instead.
+// A git failure measuring this window's ranges must never read as "no edits"
+// (#184 review): an empty set reads as "back to base" (indeterminate) and a
+// disjoint-looking edit would go silent while `wt check` (which reads the
+// failure as indeterminate) says HIGH. The hooks keep a file-level heads-up.
 func TestPreEditHooks_UnmeasurableOwnRangesStayHeadsUp(t *testing.T) {
 	wc := behindHookRepo(t)
 	writeT(t, wc, "data.txt", strings.Replace(readT(t, wc, "data.txt"), "l35\n", "C35\n", 1))
@@ -149,9 +148,9 @@ func TestPreEditHooks_UnmeasurableOwnRangesStayHeadsUp(t *testing.T) {
 		t.Fatalf("precondition: a disjoint edit with measurable ranges: claude says %s, want silent", got)
 	}
 
-	orig := ownRanges
-	t.Cleanup(func() { ownRanges = orig })
-	ownRanges = func(dir, base, file string) ([]gitx.LineRange, bool) { return nil, false }
+	orig := pendingRanges
+	t.Cleanup(func() { pendingRanges = orig })
+	pendingRanges = func(dir, base, file string, content []byte) ([]gitx.LineRange, bool) { return nil, false }
 	if got := hookVerdict(t, runHookCapture(t, hookClaudeEdit, claudeEditPayload(wc, "l30"))); got != "file-level" {
 		t.Errorf("own ranges unmeasurable: claude says %s, want a file-level heads-up", got)
 	}

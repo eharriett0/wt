@@ -84,7 +84,10 @@ Hunks are graded by git's own 3-way merge rule: only edits git would merge as
 that touch with no unchanged line between them (one window editing line 10 and
 another line 11 conflict in git too). A pure insertion meets only an edit of a
 line on either side of it, or another insertion at the same spot, so insertions
-after lines 10 and 11 stay apart. An indeterminate case where your side has no
+after lines 10 and 11 stay apart. Edits are placed where git's merge places them
+(histogram diff, no indent heuristic, whatever your diff config says): an
+inserted line that could sit in more than one spot, beside an equal one, is
+graded at the spot the merge will use. An indeterminate case where your side has no
 edits yet is kept blocking too, to be safe. Hunks with an unchanged line between
 them are downgraded to a non-blocking FYI. A branch that has fallen behind base
 is graded on its own edits only: a line base added or changed after it forked is
@@ -331,7 +334,9 @@ usual failure mode is that the *agents doing the editing* never run `wt check`.
 `wt install-claude-hook` closes that. It wires **two** Claude Code hooks:
 
 - **`PreToolUse`** (matcher `Edit|Write|MultiEdit`) — runs the same collision
-  grading as `wt check` on the file an agent is about to touch.
+  grading as `wt check` on the file an agent is about to touch, graded on the
+  file the edit will produce, so it says what `wt check` will say once the edit
+  is made.
 - **`UserPromptSubmit`** (`wt _hook claude-context`) — each turn, injects a
   snapshot of what other live windows are doing: cross-window file overlaps
   **plus** un-acked coordination signals — a `merge-main` hold another window
@@ -401,11 +406,12 @@ hooks = false
 - Both hooks are injected **only when** another live window overlaps a file
   (silent otherwise), with the current window excluded and a `wt check <file>`
   reminder.
-- The edit hook re-grades against the patch's actual hunks, moved into base line
-  numbers through this worktree's own diff (so it stays exact when the worktree is
-  behind base or already edited the file), so a **disjoint** patch to a shared
-  file stays silent — no crying wolf on parallel appends. Lines the patch only
-  inserts are graded as the insertion git will see, by the same rule as `wt check`.
+- The edit hook grades the file the patch will produce (apply_patch replayed,
+  down to the newline it adds at the end of every file it writes), measured the
+  way `wt check` measures it (so it stays exact when the worktree is behind base
+  or already edited the file): a **disjoint** patch to a shared file stays
+  silent — no crying wolf on parallel appends — and one that will collide is
+  flagged before it is applied.
 - Advisory by default. Set `WT_CODEX_HOOK_BLOCK=1` to have the edit hook `deny`
   a **confirmed** HIGH overlap (a heads-up-only file-level match never denies).
 - Fail-open; `WT_SKIP_COLLISION=1` to silence; ≤1-worktree repos skipped.

@@ -238,6 +238,9 @@ func TestMapHunksToBase(t *testing.T) {
 		{"branch insert at the top vs base rewriting line 1", []diffHunk{{1, 1, 1, 1}}, []diffHunk{ins(0)}, []LineRange{span(1, 1)}},
 		{"branch insert just above a base rewrite", []diffHunk{{8, 1, 8, 2}}, []diffHunk{ins(7)}, []LineRange{span(8, 9)}},
 		{"branch insert just below a base deletion: its point", []diffHunk{{5, 2, 4, 0}}, []diffHunk{ins(6)}, []LineRange{gapAt(4)}},
+		// Inside the deleted block, the insertion's own gap (shifted by the
+		// deletion) would land two lines up from where base's deletion is.
+		{"branch insert inside a base-deleted block: its point", []diffHunk{{5, 4, 4, 0}}, []diffHunk{ins(6)}, []LineRange{gapAt(4)}},
 		{"branch insert below a base insert shifts", []diffHunk{insTop2}, []diffHunk{ins(7)}, []LineRange{gapAt(9)}},
 		{"branch insert one line clear of a base rewrite: no claim", []diffHunk{{8, 1, 8, 1}}, []diffHunk{ins(6)}, []LineRange{gapAt(6)}},
 		{"branch insert at the top, base untouched", nil, []diffHunk{ins(0)}, []LineRange{gapAt(0)}},
@@ -522,11 +525,11 @@ func failGit(t *testing.T, match func(args []string) bool) {
 	t.Helper()
 	orig := gitOutput
 	t.Cleanup(func() { gitOutput = orig })
-	gitOutput = func(dir string, args ...string) ([]byte, error) {
+	gitOutput = func(dir string, env []string, stdin []byte, args ...string) ([]byte, error) {
 		if match(args) {
 			return nil, errors.New("injected git failure")
 		}
-		return orig(dir, args...)
+		return orig(dir, env, stdin, args...)
 	}
 }
 
@@ -564,10 +567,13 @@ func TestChangedRanges_GitFailureNeverReadsAsNoEdits(t *testing.T) {
 	}
 }
 
-// LinesToBase is the pre-edit hooks' frame mapping: a pending edit located in the
-// on-disk file, moved into base line numbers through the worktree's own diff
-// against base, landing where ChangedRanges will report it once made.
-func TestLinesToBase(t *testing.T) {
+// ChangedRangesWith is the pre-edit hooks' measurement (#199 review): the ranges
+// ChangedRanges will report once the worktree's copy of the file holds content,
+// measured before it does. It must BE that measurement, so every case here
+// writes the content and asks ChangedRanges too: up to date, with uncommitted
+// edits of its own, behind base (the merge-base mapping), and an edit of a line
+// base rewrote. It never writes an object into the repo.
+func TestChangedRangesWith(t *testing.T) {
 	dir := gitRepo(t)
 	base := twentyLineFile(t, dir)
 	writeFile(t, dir, "other.txt", "x\n")
@@ -575,27 +581,30 @@ func TestLinesToBase(t *testing.T) {
 	runGit(t, dir, "commit", "-qm", "base")
 	runGit(t, dir, "branch", "behind")
 
-	at := func(dir, file string, spans ...LineRange) []LineRange {
+	objects := func() string { return gitOut(t, dir, "count-objects", "-v") }
+	same := func(dir, file, content string, want []LineRange) {
 		t.Helper()
-		got, ok := LinesToBase(dir, "main", file, spans)
-		if !ok {
-			t.Fatalf("LinesToBase(%s) not ok", file)
+		before := objects()
+		got, ok := ChangedRangesWith(dir, "main", file, []byte(content))
+		if after := objects(); after != before {
+			t.Errorf("ChangedRangesWith wrote into the repo's objects:\nbefore %s\nafter %s", before, after)
 		}
-		return got
+		if !ok || !reflect.DeepEqual(got, want) {
+			t.Errorf("ChangedRangesWith = %v, %v; want %v, true", got, ok, want)
+		}
+		orig := readFileT(t, dir, file)
+		writeFile(t, dir, file, content)
+		defer writeFile(t, dir, file, orig)
+		if wt := ChangedRanges(dir, "main", file); !reflect.DeepEqual(wt, got) {
+			t.Errorf("ChangedRanges with that content written = %v, ChangedRangesWith said %v", wt, got)
+		}
 	}
-	if got, want := at(dir, "data.txt", span(5, 5)), []LineRange{span(5, 5)}; !reflect.DeepEqual(got, want) {
-		t.Errorf("up to date, untouched: %v, want identity %v", got, want)
-	}
-	// #199: a pending insertion keeps its shape, so it meets only edits next to
-	// its gap, as ChangedRanges will report it once made.
-	if got, want := at(dir, "data.txt", gapAt(5)), []LineRange{gapAt(5)}; !reflect.DeepEqual(got, want) {
-		t.Errorf("up to date, an insertion: %v, want the same gap %v", got, want)
-	}
-	// An uncommitted 2-line insert at the top: on-disk line 7 is base line 5.
+	same(dir, "data.txt", replaceLine("line05", "line05 EDITED")(base), []LineRange{span(5, 5)})
+	same(dir, "data.txt", strings.Replace(base, "line05\n", "line05\nINS\n", 1), []LineRange{gapAt(5)})
+	same(dir, "data.txt", base, nil) // back to base: no edits
+	// An uncommitted 2-line insert at the top stays the window's own edit.
 	writeFile(t, dir, "data.txt", "u1\nu2\n"+base)
-	if got, want := at(dir, "data.txt", span(7, 7)), []LineRange{span(5, 5)}; !reflect.DeepEqual(got, want) {
-		t.Errorf("own insert above: %v, want %v", got, want)
-	}
+	same(dir, "data.txt", "u1\nu2\n"+replaceLine("line05", "line05 EDITED")(base), []LineRange{gapAt(0), span(5, 5)})
 	writeFile(t, dir, "data.txt", base)
 
 	// Base then gains a top line and rewrites line 10; `behind` has neither.
@@ -603,49 +612,39 @@ func TestLinesToBase(t *testing.T) {
 	runGit(t, dir, "commit", "-qam", "main moves data.txt after `behind` forked")
 	wt := filepath.Join(t.TempDir(), "wt-behind")
 	runGit(t, dir, "worktree", "add", "-q", wt, "behind")
+	same(wt, "data.txt", replaceLine("line05", "line05 EDITED")(base), []LineRange{span(6, 6)})
+	same(wt, "data.txt", strings.Replace(base, "line05\n", "line05\nINS\n", 1), []LineRange{gapAt(6)})
+	// Base rewrote line 10: an edit of it lands on base's rewrite, one touching
+	// it claims the rewrite too, and an insertion right after it as well.
+	same(wt, "data.txt", replaceLine("line10", "line10 EDITED")(base), []LineRange{span(11, 11)})
+	same(wt, "data.txt", replaceLine("line11", "line11 EDITED")(base), []LineRange{span(11, 12)})
+	same(wt, "data.txt", strings.Replace(base, "line10\n", "line10\nINS\n", 1), []LineRange{span(11, 11)})
+	same(wt, "other.txt", "x\ny\n", []LineRange{gapAt(1)})
 
-	if got, want := at(wt, "data.txt", span(5, 5)), []LineRange{span(6, 6)}; !reflect.DeepEqual(got, want) {
-		t.Errorf("behind, base inserted above: %v, want %v", got, want)
+	// A file git stores LF and checks out CRLF (a text eol attribute): the pending
+	// copy goes through the same conversion as the working tree's.
+	writeFile(t, dir, ".gitattributes", "crlf.txt text eol=crlf\n")
+	writeFile(t, dir, "crlf.txt", "one\ntwo\nthree\n")
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "commit", "-qm", "crlf.txt")
+	runGit(t, dir, "rm", "-q", "--cached", "crlf.txt")
+	runGit(t, dir, "reset", "-q", "--hard")
+	if on := readFileT(t, dir, "crlf.txt"); on != "one\r\ntwo\r\nthree\r\n" {
+		t.Fatalf("precondition: crlf.txt checked out as %q", on)
 	}
-	if got, want := at(wt, "data.txt", gapAt(5)), []LineRange{gapAt(6)}; !reflect.DeepEqual(got, want) {
-		t.Errorf("behind, an insertion below base's insert: %v, want %v", got, want)
-	}
-	if got, want := at(wt, "data.txt", gapAt(10)), []LineRange{span(11, 11)}; !reflect.DeepEqual(got, want) {
-		t.Errorf("behind, an insertion right after a line base rewrote: %v, want base's rewrite %v", got, want)
-	}
-	if got, want := at(wt, "data.txt", span(10, 10)), []LineRange{span(11, 11)}; !reflect.DeepEqual(got, want) {
-		t.Errorf("behind, on a line base rewrote: %v, want base's rewrite %v", got, want)
-	}
-	if got, want := at(wt, "data.txt", span(11, 11)), []LineRange{span(11, 12)}; !reflect.DeepEqual(got, want) {
-		t.Errorf("behind, touching a line base rewrote: %v, want %v (claims the rewrite, as ChangedRanges will)", got, want)
-	}
-	if got, want := at(wt, "other.txt", span(1, 1)), []LineRange{span(1, 1)}; !reflect.DeepEqual(got, want) {
-		t.Errorf("behind, but base never touched other.txt: %v, want identity %v", got, want)
-	}
-	// The pending edit, once made, is reported by ChangedRanges exactly there.
-	writeFile(t, wt, "data.txt", replaceLine("line11", "line11 EDITED")(base))
-	if got, want := ChangedRanges(wt, "main", "data.txt"), []LineRange{span(11, 12)}; !reflect.DeepEqual(got, want) {
-		t.Errorf("after the edit, ChangedRanges = %v, want %v (what LinesToBase predicted)", got, want)
-	}
+	same(dir, "crlf.txt", "one\r\nTWO\r\nthree\r\n", []LineRange{span(2, 2)})
 
-	// Can't be measured → ok=false, never the on-disk numbers: a git error, a
-	// binary file, a base-less repo with uncommitted changes.
-	writeFile(t, dir, "bin.dat", "\x00\x01\x02 base\n")
-	runGit(t, dir, "add", "bin.dat")
-	runGit(t, dir, "commit", "-qm", "binary")
-	writeFile(t, dir, "bin.dat", "\x00\x01\x02 changed\n")
-	if _, ok := LinesToBase(dir, "main", "bin.dat", []LineRange{span(1, 1)}); ok {
-		t.Error("binary file that differs from base: want ok=false")
+	// Can't be measured that way → ok=false: a base-less repo, a file base
+	// doesn't have, a git error.
+	if _, ok := ChangedRangesWith(dir, "no-such-base", "data.txt", []byte(base)); ok {
+		t.Error("base-less: want ok=false (the index frame can't take a pending copy)")
 	}
-	if _, ok := LinesToBase(dir, "no-such-base", "data.txt", []LineRange{span(1, 1)}); !ok {
-		t.Error("base-less, nothing uncommitted in data.txt: want the base-less fallback's identity")
-	}
-	if _, ok := LinesToBase(dir, "no-such-base", "bin.dat", []LineRange{span(1, 1)}); ok {
-		t.Error("base-less with an uncommitted change: want ok=false")
+	if _, ok := ChangedRangesWith(dir, "main", "new.txt", []byte("n\n")); ok {
+		t.Error("a file absent from base: want ok=false")
 	}
 	failGit(t, func(args []string) bool { return len(args) > 0 && args[0] == "diff" })
-	if _, ok := LinesToBase(wt, "main", "other.txt", []LineRange{span(1, 1)}); ok {
-		t.Error("git diff failing: want ok=false, never the on-disk numbers")
+	if _, ok := ChangedRangesWith(wt, "main", "other.txt", []byte("x\ny\n")); ok {
+		t.Error("git diff failing: want ok=false, never \"no edits\"")
 	}
 }
 
@@ -722,5 +721,43 @@ func TestChangedRanges_StaleBranchKeepsEditBaseAlsoMade(t *testing.T) {
 	}
 	if b := ChangedRanges(wtB, "main", "data.txt"); !anyOverlap(a, b) {
 		t.Errorf("A %v does NOT overlap B %v: B landing first makes A's merge conflict on line 5", a, b)
+	}
+}
+
+// A window's ranges are git's merge alignment whatever the user's diff config
+// or environment says (#199 review): config that moves or fuses hunks
+// (diff.algorithm, diff.indentHeuristic, diff.interHunkContext), colours them
+// (color.diff=always: no header would parse), hands the diff to an external
+// tool or rewrites the text (diff.external, a textconv driver), passed as `git
+// -c` from a hook (GIT_CONFIG_PARAMETERS), and GIT_DIFF_OPTS, which outranks
+// -U0 itself.
+func TestChangedRanges_IgnoresDiffConfig(t *testing.T) {
+	dir := gitRepo(t)
+	writeFile(t, dir, "data.txt", "a\n\n}\n\t}\nb\nc\nd\n")
+	writeFile(t, dir, ".gitattributes", "*.txt diff=upper\n")
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "commit", "-qm", "base")
+	// An inserted ")\n}" the indent heuristic reports a gap higher than a merge,
+	// and two edits one line apart that context would fuse.
+	writeFile(t, dir, "data.txt", "a\n\n}\n)\n}\n\t}\nB\nc\nD\n")
+	want := []LineRange{gapAt(3), span(5, 5), span(7, 7)}
+	if got := ChangedRanges(dir, "main", "data.txt"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("precondition: ChangedRanges = %v, want %v", got, want)
+	}
+	newFrame := ChangedRangesNew(dir, "main", "data.txt")
+	t.Setenv("GIT_CONFIG_PARAMETERS", "'diff.algorithm=myers' 'diff.indentHeuristic=true' 'diff.interHunkContext=5' "+
+		"'color.diff=always' 'color.ui=always' 'diff.external=/bin/false' 'diff.upper.textconv=tr a-z A-Z'")
+	t.Setenv("GIT_DIFF_OPTS", "--unified=3")
+	if got := ChangedRanges(dir, "main", "data.txt"); !reflect.DeepEqual(got, want) {
+		t.Errorf("under hostile diff config: ChangedRanges = %v, want %v", got, want)
+	}
+	if got := ChangedRangesNew(dir, "main", "data.txt"); !reflect.DeepEqual(got, newFrame) {
+		t.Errorf("under hostile diff config: ChangedRangesNew = %v, want %v", got, newFrame)
+	}
+	if got, ok := ChangedRangesWith(dir, "main", "data.txt", []byte("a\n\n}\n)\n}\n\t}\nB\nc\nD\n")); !ok || !reflect.DeepEqual(got, want) {
+		t.Errorf("under hostile diff config: ChangedRangesWith = %v, %v, want %v", got, ok, want)
+	}
+	if got := ChangedRanges(dir, "no-such-base", "data.txt"); !reflect.DeepEqual(got, ChangedRangesNew(dir, "no-such-base", "data.txt")) || len(got) != 3 {
+		t.Errorf("base-less, under hostile diff config: %v", got)
 	}
 }

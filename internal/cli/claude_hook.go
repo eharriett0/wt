@@ -15,7 +15,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 
 	"github.com/eharriett0/wt/internal/collide"
@@ -209,24 +208,22 @@ func hookClaudeEdit(r io.Reader) int {
 		return 0
 	}
 
-	// #108/#184: the hook fires at PRE-edit time, so buildCheckReport's "current"
-	// side (this worktree's own edits) doesn't yet include the edit the agent is
-	// ABOUT to make. Re-grade every entry the way `wt check` will once it's made:
-	// this window's own ranges plus the pending edit (what replacing old_string
-	// with new_string changes in the on-disk file, claudeEditClaim, then moved into
-	// base line numbers through this worktree's own diff, gitx.LinesToBase)
-	// against the other window's ranges. When that
-	// grade can't be computed (a Write, an old_string that isn't unique, a git
-	// error) the entry stays as a file-level heads-up instead of being dropped.
-	cur, curOK := ownRanges(root, c.Base, rel)
-	var pending []gitx.LineRange
-	pendingOK := false
-	if data, err := os.ReadFile(filepath.Join(root, rel)); err == nil {
-		if onDisk, ok := claudeEditRanges(b, string(data)); ok {
-			pending, pendingOK = gitx.LinesToBase(root, c.Base, rel, onDisk)
-		}
+	// #108/#184/#199: the hook fires at PRE-edit time, so buildCheckReport's
+	// "current" side (this worktree's own edits) doesn't yet include the edit the
+	// agent is ABOUT to make. Re-grade every entry the way `wt check` will once
+	// it's made: this window's ranges as they will read with the file the edit
+	// produces (claudePendingContent), measured by the same diff and base mapping
+	// as `wt check` (gitx.ChangedRangesWith), against the other window's ranges.
+	// When that can't be computed (an old_string the tool would reject, a line
+	// ending it doesn't model, a new file, a git error) the entry stays as a
+	// file-level heads-up instead of being dropped.
+	var after []gitx.LineRange
+	afterOK := false
+	data, readErr := os.ReadFile(filepath.Join(root, rel))
+	if content, ok := claudePendingContent(b, string(data), readErr == nil); ok {
+		after, afterOK = pendingRanges(root, c.Base, rel, []byte(content))
 	}
-	graded := regradePending(entries, cur, curOK, pending, pendingOK, func(e CheckEntry) bool {
+	graded := regradePending(entries, after, afterOK, func(e CheckEntry) bool {
 		return subsumedByBase(e.otherWorktree, c.Base, rel) // that window's, not a namesake's (#193)
 	})
 
@@ -244,15 +241,18 @@ func hookClaudeEdit(r io.Reader) int {
 	return 0
 }
 
-// ownRanges is gitx.ChangedRangesChecked: this window's own ranges, ok=false when
-// git couldn't measure them. A var only so the fail-safe test can make that
-// measurement fail and pin that the hooks then keep a file-level heads-up rather
-// than grade the pending edit against an empty set (#184 review).
-var ownRanges = gitx.ChangedRangesChecked
+// pendingRanges is gitx.ChangedRangesWith: this window's ranges as they will
+// read once the pending edit is made, ok=false when git couldn't measure them.
+// A var only so the fail-safe test can make that measurement fail and pin that
+// the hooks then keep a file-level heads-up rather than read the failure as "no
+// edits" (#184 review).
+var pendingRanges = gitx.ChangedRangesWith
 
 // pendingGrade is one collision entry regradePending keeps for a pending edit.
 // confirmed: graded from the edit itself (the file collides once it's made);
-// false: a file-level heads-up, kept because that grade couldn't be computed.
+// false: a file-level heads-up, kept because that grade couldn't be computed,
+// or because the edit leaves this window no edits to overlap with (`wt check`'s
+// indeterminate HIGH).
 type pendingGrade struct {
 	entry     CheckEntry
 	confirmed bool
@@ -260,212 +260,136 @@ type pendingGrade struct {
 
 // regradePending keeps exactly the entries `wt check` will grade HIGH once an
 // agent's pending edit is made, the pre-edit hooks' block predicate (it MUST
-// equal `wt check`'s, #92/#108). cur is this window's own ranges and pending the
-// edit's, both in base line numbers and each edit with its shape
-// (ChangedRangesChecked, LinesToBase); a hunk-graded entry, HIGH or FYI alike, is
-// HIGH afterwards iff cur ∪ pending conflicts with the other window's ranges by
-// git's rule, the one `wt check` grades by (collide.ConflictSeverity: they
+// equal `wt check`'s, #92/#108). after is this window's ranges as `wt check`
+// will read them then: the file the edit produces, measured by the same diff and
+// base mapping (gitx.ChangedRangesWith, #199 review), so the grade is `wt
+// check`'s by construction, not a guess at which lines the edit changes. A
+// hunk-graded entry, HIGH or FYI alike, is HIGH afterwards iff after conflicts
+// with the other window's ranges by git's rule (collide.ConflictSeverity: they
 // overlap, or touch with no unchanged line between, #199). An FYI entry is
 // re-graded too: a window whose earlier edits were disjoint can still be about
-// to overlap (#184 review).
-// A newly-HIGH entry is then put through the #122 subsumed check `wt check`
-// applies to every HIGH (subsumed is only called for those).
+// to overlap (#184 review). A newly-HIGH entry is then put through the #122
+// subsumed check `wt check` applies to every HIGH (subsumed is only called for
+// those). An edit that leaves this window's copy as base's (after empty) reads
+// HIGH, as `wt check` reads an empty side (indeterminate), but no hunk overlap
+// is computed, so it is a heads-up, not a confirmed overlap.
 //
-// When that grade can't be computed (curOK/pendingOK false, or an entry graded
-// without line ranges: an indeterminate side, a structured-doc section) the entry
-// is kept as a file-level heads-up if it could become HIGH: never dropped on an
-// unknown. Left out: entries no edit of this window can make HIGH (stale, already
-// merged, untracked, subsumed, append-only), and shared-doc advisories, which
-// the hooks have never graded per edit (a structured doc's section grade is
-// `wt check`'s and pre-push's). Pure.
-func regradePending(entries []CheckEntry, cur []gitx.LineRange, curOK bool, pending []gitx.LineRange, pendingOK bool, subsumed func(CheckEntry) bool) []pendingGrade {
+// When that grade can't be computed (afterOK false, or an entry graded without
+// line ranges: an indeterminate side, a structured-doc section) the entry is
+// kept as a file-level heads-up if it could become HIGH: never dropped on an
+// unknown. Left out: entries no edit of this window can make HIGH (stale,
+// already merged, untracked, subsumed, append-only), and shared-doc advisories,
+// which the hooks have never graded per edit (a structured doc's section grade
+// is `wt check`'s and pre-push's). Pure.
+func regradePending(entries []CheckEntry, after []gitx.LineRange, afterOK bool, subsumed func(CheckEntry) bool) []pendingGrade {
 	var out []pendingGrade
 	for _, e := range entries {
 		hunkGraded := len(e.OtherRanges) > 0 && !e.Subsumed && (e.Category == CatBlocking || e.Category == CatFYI)
 		if e.Category != CatBlocking && !hunkGraded {
 			continue
 		}
-		if !hunkGraded || !curOK || !pendingOK {
+		if !hunkGraded || !afterOK {
 			out = append(out, pendingGrade{entry: e})
 			continue
 		}
-		after := make([]gitx.LineRange, 0, len(cur)+len(pending))
-		after = append(append(after, cur...), pending...)
 		if collide.ConflictSeverity(after, e.OtherRanges, false) != collide.SevHigh {
 			continue
 		}
 		if e.Category != CatBlocking && subsumed(e) {
 			continue
 		}
-		out = append(out, pendingGrade{entry: e, confirmed: true})
+		out = append(out, pendingGrade{entry: e, confirmed: len(after) > 0})
 	}
 	return out
 }
 
-// locateRange finds old in content and returns the 1-based inclusive line range
-// it spans. ok=false when old is empty, absent, or occurs more than once
-// (ambiguous — Edit requires a unique old_string, but be safe). Pure.
-func locateRange(content, old string) (gitx.LineRange, bool) {
-	if old == "" || strings.Count(content, old) != 1 {
-		return gitx.LineRange{}, false
-	}
-	i := strings.Index(content, old)
-	start := 1 + strings.Count(content[:i], "\n")
-	// end = line of the LAST character: a trailing "\n" terminates its own line,
-	// it doesn't extend the range into the next one ("line2\n" spans line 2 only).
-	end := start + strings.Count(old, "\n")
-	if strings.HasSuffix(old, "\n") {
-		end--
-	}
-	return gitx.LineRange{Start: start, End: end}, true
-}
-
-// claudeEditRanges returns the edits a pending Edit/MultiEdit will make, by
-// locating each old_string in the CURRENT (pre-edit) file content and comparing
-// it with its new_string (claudeEditClaim). ok=false for Write (whole-file, no
-// region), or any old_string that can't be uniquely located — the caller then
-// falls back to a file-level heads-up rather than claim a hunk overlap it can't
-// compute. Pure — the testable core.
-func claudeEditRanges(raw []byte, content string) ([]gitx.LineRange, bool) {
+// claudePendingContent is the edited file's content once a Claude Code Edit,
+// MultiEdit or Write lands, computed the way Claude Code computes it (#199
+// review): a Write's content as given; an Edit's replacement of old_string in
+// the file (applyClaudeEdit), each MultiEdit edit on the previous one's result.
+// Claude Code matches a CRLF file as LF and writes it back as CRLF; an edit's
+// own CRLFs are read as LF there too (if the tool didn't, it would find no match
+// and make no edit, so nothing is graded wrongly). ok=false when it can't be
+// told: an edit the tool would reject (old_string absent, or not unique without
+// replace_all), a missing file, a file mixing line endings, a lone CR, an
+// unknown tool. The hook then keeps its file-level heads-up. Pure.
+func claudePendingContent(raw []byte, content string, exists bool) (string, bool) {
 	type edit struct {
-		OldString string `json:"old_string"`
-		NewString string `json:"new_string"`
+		OldString  string `json:"old_string"`
+		NewString  string `json:"new_string"`
+		ReplaceAll bool   `json:"replace_all"`
 	}
 	var p struct {
 		ToolName  string `json:"tool_name"`
 		ToolInput struct {
-			OldString string `json:"old_string"`
-			NewString string `json:"new_string"`
-			Edits     []edit `json:"edits"`
+			edit
+			Content *string `json:"content"`
+			Edits   []edit  `json:"edits"`
 		} `json:"tool_input"`
 	}
 	if err := json.Unmarshal(raw, &p); err != nil {
-		return nil, false
+		return "", false
 	}
 	var edits []edit
 	switch p.ToolName {
+	case "Write":
+		if p.ToolInput.Content == nil {
+			return "", false
+		}
+		return *p.ToolInput.Content, true
 	case "Edit":
-		edits = []edit{{p.ToolInput.OldString, p.ToolInput.NewString}}
+		edits = []edit{p.ToolInput.edit}
 	case "MultiEdit":
 		edits = p.ToolInput.Edits
-	default:
-		return nil, false // Write / unknown → no locatable region
 	}
-	if len(edits) == 0 {
-		return nil, false
+	if !exists || len(edits) == 0 {
+		return "", false
 	}
-	var ranges []gitx.LineRange
+	crlf := strings.Contains(content, "\r")
+	if crlf {
+		// Only a file whose every line ends CRLF has one reading as LF.
+		if n := strings.Count(content, "\r\n"); n != strings.Count(content, "\n") || n != strings.Count(content, "\r") {
+			return "", false
+		}
+		content = strings.ReplaceAll(content, "\r\n", "\n")
+	}
 	for _, e := range edits {
-		if _, ok := locateRange(content, e.OldString); !ok {
-			return nil, false // ambiguous / not found → file-level fallback
+		if crlf {
+			e.OldString = strings.ReplaceAll(e.OldString, "\r\n", "\n")
+			e.NewString = strings.ReplaceAll(e.NewString, "\r\n", "\n")
 		}
-		ranges = append(ranges, claudeEditClaim(content, e.OldString, e.NewString))
-	}
-	return ranges, true
-}
-
-// claudeEditClaim is the edit replacing old (found exactly once in content) with
-// new makes, the way git's -U0 diff will report it once made (#199). An
-// old_string usually carries context lines to be unique, and claiming them as
-// changed would flag a window editing the line beside one: a conflict git
-// doesn't have, and since #199 a touch, so a deny under WT_CLAUDE_HOOK_BLOCK.
-// So the claim is the whole lines old touches, less any leading and trailing
-// lines the replacement leaves as they were: a change of what is left, or, when
-// the replacement only adds lines there, an insertion (insertionClaim), or only
-// drops lines, a deletion (deletionClaim), each over every position git may
-// slide it to. A replacement that doesn't end its last line (it joins the next
-// one) claims the touched lines and the next. Pure.
-func claudeEditClaim(content, old, new string) gitx.LineRange {
-	at := strings.Index(content, old)
-	start := strings.LastIndex(content[:at], "\n") + 1 // the first touched line
-	end := at + len(old)
-	if !strings.HasSuffix(old, "\n") { // finish the last touched line
-		if i := strings.Index(content[end:], "\n"); i >= 0 {
-			end += i + 1
-		} else {
-			end = len(content)
+		if strings.Contains(e.OldString+e.NewString, "\r") {
+			return "", false
 		}
-	}
-	first := 1 + strings.Count(content[:start], "\n")
-	oldBlock, newBlock := content[start:end], content[start:at]+new+content[at+len(old):end]
-	touched := gitx.LineRange{Start: first, End: first + strings.Count(strings.TrimSuffix(oldBlock, "\n"), "\n")}
-	if !strings.HasSuffix(oldBlock, "\n") {
-		return touched // the file's last line, unterminated: no line-wise compare
-	}
-	if newBlock != "" && !strings.HasSuffix(newBlock, "\n") {
-		touched.End++ // the replacement joins the next line onto its last
-		return touched
-	}
-	blockLines := func(b string) []string {
-		if b == "" {
-			return nil
+		next, ok := applyClaudeEdit(content, e.OldString, e.NewString, e.ReplaceAll)
+		if !ok {
+			return "", false
 		}
-		return strings.Split(strings.TrimSuffix(b, "\n"), "\n")
+		content = next
 	}
-	o, n := blockLines(oldBlock), blockLines(newBlock)
-	p := 0
-	for p < len(o) && p < len(n) && o[p] == n[p] {
-		p++
+	if crlf {
+		content = strings.ReplaceAll(content, "\n", "\r\n")
 	}
-	q := 0
-	for q < len(o)-p && q < len(n)-p && o[len(o)-1-q] == n[len(n)-1-q] {
-		q++
-	}
-	switch {
-	case len(o)-p-q == 0 && len(n)-p-q == 0:
-		return touched // changes nothing
-	case len(o)-p-q == 0:
-		return insertionClaim(fileLines(content), first+p-1, n[p:len(n)-q])
-	case len(n)-p-q == 0:
-		return deletionClaim(fileLines(content), first+p, first+len(o)-q-1)
-	}
-	return gitx.LineRange{Start: first + p, End: first + len(o) - q - 1}
+	return content, true
 }
 
-// fileLines splits content into its lines (1-based line n is index n-1); a
-// final newline ends the last line rather than starting another. Pure.
-func fileLines(content string) []string {
-	return strings.Split(strings.TrimSuffix(content, "\n"), "\n")
-}
-
-// insertionClaim is the edit inserting block below line g of file makes, as git
-// may report it: git aligns an insertion whose last line repeats the line above
-// it (or whose first line repeats the line below) anywhere along that run, so
-// the block can land in any gap from lo to hi. One gap (lo == hi) is that Gap.
-// Several claim the lines between them, lo+1..hi: as a change that conflicts with
-// exactly the edits an insertion into one of those gaps would (#199). Pure.
-func insertionClaim(file []string, g int, block []string) gitx.LineRange {
-	lo, hi := g, g
-	b := slices.Clone(block)
-	for lo > 0 && lo <= len(file) && b[len(b)-1] == file[lo-1] {
-		b = append([]string{b[len(b)-1]}, b[:len(b)-1]...)
-		lo--
+// applyClaudeEdit is Claude Code's replacement of old with new in content:
+// refused (ok=false) when old is empty, unchanged by new, absent, or found more
+// than once without replaceAll; the first match replaced, or every one under
+// replaceAll. Deleting (new empty) an old that doesn't end its line takes the
+// newline after it too, when one follows. Pure.
+func applyClaudeEdit(content, old, new string, replaceAll bool) (string, bool) {
+	n := strings.Count(content, old)
+	if old == "" || old == new || n == 0 || (n > 1 && !replaceAll) {
+		return "", false
 	}
-	b = slices.Clone(block)
-	for hi >= 0 && hi < len(file) && b[0] == file[hi] {
-		b = append(b[1:], b[0])
-		hi++
+	if new == "" && !strings.HasSuffix(old, "\n") && strings.Contains(content, old+"\n") {
+		old += "\n"
 	}
-	if lo == hi {
-		return gitx.LineRange{Start: g, End: g + 1, Gap: true}
+	if replaceAll {
+		return strings.ReplaceAll(content, old, new), true
 	}
-	return gitx.LineRange{Start: lo + 1, End: hi}
-}
-
-// deletionClaim is the edit deleting lines start..end of file makes, as git may
-// report it: while the line above the block repeats its last line (or the line
-// below repeats its first) git can delete the block one line up (or down)
-// instead, so the claim spans every line it can slide across. Pure.
-func deletionClaim(file []string, start, end int) gitx.LineRange {
-	lo := start
-	for s, e := start, end; s > 1 && e <= len(file) && file[s-2] == file[e-1]; s, e = s-1, e-1 {
-		lo = s - 1
-	}
-	hi := end
-	for s, e := start, end; s >= 1 && e < len(file) && file[e] == file[s-1]; s, e = s+1, e+1 {
-		hi = e + 1
-	}
-	return gitx.LineRange{Start: lo, End: hi}
+	return strings.Replace(content, old, new, 1), true
 }
 
 // claudeHookSnippet is the .claude/settings.json entry that wires all three hooks:

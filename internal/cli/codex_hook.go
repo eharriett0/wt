@@ -529,113 +529,32 @@ func parseCodexEdit(b []byte) (cwd, patch string, relevant bool) {
 	return strings.TrimSpace(p.CWD), p.ToolInput.Command, p.ToolInput.Command != ""
 }
 
-// codexHunk is one apply_patch hunk. preImage is the ordered context+removed
-// lines (all present in the CURRENT file — used to locate the hunk via
-// locateRange); removed holds the offsets into preImage that are actually
-// removed (leading '-'), so we can range the MODIFIED lines precisely and NOT
-// the surrounding context (which anchors the hunk but isn't a change — including
-// it would false-flag edits merely adjacent to another window's, defeating wt's
-// -U0 exact-hunk grading; #117 review). added holds each run of added lines
-// ('+') and where it goes, so a run that only INSERTS (no removed line next to
-// it) is graded as the insertion git will see (#199).
-type codexHunk struct {
-	preImage []string
-	removed  []int
-	added    []codexAdd
-}
-
-// codexAdd is one run of consecutive added lines, inserted before preImage[at]
-// (at == len(preImage): after the hunk's last line).
-type codexAdd struct {
-	at    int
-	lines []string
-}
-
-// codexPatchFile is one file section of an apply_patch payload: its repo-relative
-// path (+ move destination) and its Update hunks.
+// codexPatchFile is one file section of an apply_patch payload: its path (+
+// move destination), as written in the patch until repoRelativePatch makes it
+// repo-relative.
 type codexPatchFile struct {
 	path    string
 	newPath string
-	hunks   []codexHunk
 }
 
-// parseCodexPatch parses an apply_patch payload into its file sections. Pure —
-// the testable core. Best-effort: it never errors, it just extracts what it can.
+// parseCodexPatch lists the files an apply_patch payload names, each section's
+// path and move destination. Best-effort and lenient on purpose: it never
+// errors, so a patch apply_patch itself would reject still gets its files
+// checked (file-level). What the patch does to them is applyPatchOps' job.
+// Pure.
 func parseCodexPatch(patch string) []codexPatchFile {
 	var files []codexPatchFile
-	var cur *codexPatchFile
-	var pre []string
-	var rem []int
-	var adds []codexAdd
-	adding := false // the open section is an Add File: its '+' lines are the file, not a hunk
-	flushHunk := func() {
-		// An update hunk with added lines but no pre-image is kept too: it has
-		// nothing to locate it by, which patchRangesInFile must report, not skip
-		// (#199).
-		if cur != nil && (len(pre) > 0 || (len(adds) > 0 && !adding)) {
-			cur.hunks = append(cur.hunks, codexHunk{preImage: pre, removed: rem, added: adds})
-		}
-		pre, rem, adds = nil, nil, nil
-	}
-	flushFile := func() {
-		flushHunk()
-		if cur != nil {
-			files = append(files, *cur)
-			cur = nil
-		}
-	}
-	start := func(ln, prefix string) {
-		flushFile()
-		cur = &codexPatchFile{path: strings.TrimSpace(strings.TrimPrefix(ln, prefix))}
-		adding = prefix == "*** Add File: "
-	}
-	lines := strings.Split(patch, "\n")
-	// Drop the single trailing "" a terminating newline produces, so it isn't
-	// mistaken for a blank context line appended to the last open hunk.
-	if n := len(lines); n > 0 && lines[n-1] == "" {
-		lines = lines[:n-1]
-	}
-	for _, ln := range lines {
-		switch {
-		case strings.HasPrefix(ln, "*** Update File: "):
-			start(ln, "*** Update File: ")
-		case strings.HasPrefix(ln, "*** Add File: "):
-			start(ln, "*** Add File: ")
-		case strings.HasPrefix(ln, "*** Delete File: "):
-			start(ln, "*** Delete File: ")
-		case strings.HasPrefix(ln, "*** Move File: "):
-			start(ln, "*** Move File: ")
-		case strings.HasPrefix(ln, "*** Move to: "):
-			if cur != nil {
-				cur.newPath = strings.TrimSpace(strings.TrimPrefix(ln, "*** Move to: "))
+	for _, ln := range strings.Split(patch, "\n") {
+		ln = strings.TrimSuffix(ln, "\r")
+		for _, prefix := range []string{"*** Update File: ", "*** Add File: ", "*** Delete File: ", "*** Move File: "} {
+			if p, ok := strings.CutPrefix(strings.TrimSpace(ln), prefix); ok {
+				files = append(files, codexPatchFile{path: strings.TrimSpace(p)})
 			}
-		case strings.HasPrefix(ln, "***"):
-			// Begin/End Patch + any other control line — not file content
-		case ln == "@@" || strings.HasPrefix(ln, "@@ "):
-			flushHunk() // hunk boundary — the @@ header isn't file content
-		case cur == nil:
-			// preamble noise
-		case strings.HasPrefix(ln, "+"):
-			// added line — NOT in the current file, so not pre-image; recorded
-			// with where it goes (a run continues while no pre-image line comes
-			// between)
-			if n := len(adds); n > 0 && adds[n-1].at == len(pre) {
-				adds[n-1].lines = append(adds[n-1].lines, ln[1:])
-			} else {
-				adds = append(adds, codexAdd{at: len(pre), lines: []string{ln[1:]}})
-			}
-		case strings.HasPrefix(ln, "-"):
-			rem = append(rem, len(pre))
-			pre = append(pre, ln[1:]) // removed line — present in the current file
-		case strings.HasPrefix(ln, " "):
-			pre = append(pre, ln[1:]) // context line — present in the current file
-		case ln == "":
-			// blank context line emitted WITHOUT a leading space (an apply_patch
-			// quirk); reached only inside an open hunk (cur==nil is caught above).
-			pre = append(pre, "")
+		}
+		if to, ok := strings.CutPrefix(strings.TrimSpace(ln), "*** Move to: "); ok && len(files) > 0 {
+			files[len(files)-1].newPath = strings.TrimSpace(to)
 		}
 	}
-	flushFile()
 	return files
 }
 
@@ -677,86 +596,13 @@ func patchPaths(files []codexPatchFile) []string {
 	return out
 }
 
-// contiguousRuns groups increasing offsets into [first,last] runs. Pure.
-func contiguousRuns(offsets []int) [][2]int {
-	if len(offsets) == 0 {
-		return nil
-	}
-	var runs [][2]int
-	s, e := offsets[0], offsets[0]
-	for _, o := range offsets[1:] {
-		if o == e+1 {
-			e = o
-			continue
-		}
-		runs = append(runs, [2]int{s, e})
-		s, e = o, o
-	}
-	return append(runs, [2]int{s, e})
-}
-
-// patchRangesInFile locates each hunk's pre-image in content and returns the
-// edits the patch makes there, the way git's -U0 diff will report them once it is
-// applied (#199): each run of REMOVED lines is a change of those lines (the
-// context around it anchors the hunk but isn't a change: ranging it would flag
-// edits merely next to another window's, #117 review), and each run of added
-// lines with no removed line beside it is an INSERTION (a Gap) between its two
-// pre-image neighbours. An insertion meets another window's change of either
-// neighbour in git, so skipping it (as this did before #199) let a patch that
-// only inserts next to another window's edit read as disjoint. A pure insertion
-// or deletion git may slide (lines that repeat the ones beside it, which git
-// shifts to align) claims every position it can slide to (insertionClaim,
-// deletionClaim), so the grade can't miss where git puts it.
-//
-// ok=false when a hunk can't be uniquely located (or has added lines and no
-// pre-image to locate them by), or the patch edits nothing — the caller then
-// falls back to a file-level advisory. The ranges are on-disk line numbers;
-// moving them into base numbers is the caller's job (pendingPatchRanges →
-// gitx.LinesToBase, the #108 lesson). Reuses locateRange. Pure.
-func patchRangesInFile(f codexPatchFile, content string) ([]gitx.LineRange, bool) {
-	file := fileLines(content)
-	var ranges []gitx.LineRange
-	for _, h := range f.hunks {
-		if len(h.preImage) == 0 {
-			if len(h.added) > 0 {
-				return nil, false // an insertion with nothing to place it by
-			}
-			continue
-		}
-		r, ok := locateRange(content, strings.Join(h.preImage, "\n"))
-		if !ok {
-			return nil, false
-		}
-		addedAt := func(lo, hi int) bool { // an added run goes in at an offset in [lo, hi]
-			return slices.ContainsFunc(h.added, func(a codexAdd) bool { return lo <= a.at && a.at <= hi })
-		}
-		for _, run := range contiguousRuns(h.removed) {
-			start, end := r.Start+run[0], r.Start+run[1]
-			if addedAt(run[0], run[1]+1) {
-				ranges = append(ranges, gitx.LineRange{Start: start, End: end}) // a replacement
-			} else {
-				ranges = append(ranges, deletionClaim(file, start, end))
-			}
-		}
-		for _, a := range h.added {
-			if slices.Contains(h.removed, a.at-1) || slices.Contains(h.removed, a.at) {
-				continue // replaces removed lines: their change covers it
-			}
-			ranges = append(ranges, insertionClaim(file, r.Start+a.at-1, a.lines))
-		}
-	}
-	if len(ranges) == 0 {
-		return nil, false
-	}
-	return ranges, true
-}
-
 // hookCodexEdit implements `wt _hook codex-edit` — a Codex PreToolUse hook on
 // apply_patch. It grades the patch's target files with the SAME engine as
-// `wt check`, re-graded against the patch's actual hunks in base line numbers
-// (regradePending, the #108/#184 lesson), and emits additionalContext on a HIGH
-// overlap — or, under WT_CODEX_HOOK_BLOCK=1, a `deny` for a CONFIRMED HIGH only.
-// Always exits 0 (fail-open); disjoint / no-overlap / ≤1-worktree stay silent.
+// `wt check`, re-graded against what each file will hold once the patch is
+// applied (predictCodexPatch, measured by gitx.ChangedRangesWith: regradePending,
+// the #108/#184/#199 lesson), and emits additionalContext on a HIGH overlap — or,
+// under WT_CODEX_HOOK_BLOCK=1, a `deny` for a CONFIRMED HIGH only. Always exits
+// 0 (fail-open); disjoint / no-overlap / ≤1-worktree stay silent.
 func hookCodexEdit(r io.Reader) int {
 	if os.Getenv("WT_SKIP_COLLISION") == "1" || os.Getenv("HOOK_DISABLE_MULTIWINDOW_CHECK") == "1" {
 		return 0
@@ -790,28 +636,19 @@ func hookCodexEdit(r io.Reader) int {
 		return 0
 	}
 	prefix, _ := gitx.ShowPrefix()
-	files := repoRelativePatch(parseCodexPatch(patch), root, prefix)
-	paths := patchPaths(files)
+	paths := patchPaths(repoRelativePatch(parseCodexPatch(patch), root, prefix)) // a move: the destination too (#117 review)
 	if len(paths) == 0 {
 		return 0
-	}
-	byPath := map[string]codexPatchFile{}
-	for _, f := range files {
-		if f.path != "" {
-			byPath[f.path] = f
-		}
-		if f.newPath != "" {
-			byPath[f.newPath] = f // a move grades the destination too (#117 review)
-		}
 	}
 
 	// #181: the patch's targets are real repo-relative paths, so they match
 	// EXACTLY, as the pre-push guard does; never by suffix or basename.
 	entries := buildCheckReport(c, ws, root, collide.ExactQueries(paths), false)
-	// Re-grade each path's entries against the patch's ACTUAL hunks the way `wt
-	// check` will grade the file once the patch is applied (regradePending, the
-	// same rule as the Claude hook): this window's own ranges plus the patch's,
-	// moved into base line numbers through this worktree's own diff (#108/#184).
+	// Re-grade each path's entries the way `wt check` will grade the file once
+	// the patch is applied (regradePending, the same rule as the Claude hook):
+	// this window's ranges as they will read with the file the patch produces
+	// (#108/#184/#199).
+	predicted, predictable := predictCodexPatch(patch, root, prefix)
 	byEntryPath := map[string][]CheckEntry{}
 	var order []string
 	for _, e := range entries {
@@ -823,9 +660,12 @@ func hookCodexEdit(r io.Reader) int {
 	var high []codexGradedEntry
 	anyConfirmed := false
 	for _, path := range order {
-		cur, curOK := ownRanges(root, c.Base, path)
-		pending, pendingOK := pendingPatchRanges(byPath, path, root, c.Base)
-		graded := regradePending(byEntryPath[path], cur, curOK, pending, pendingOK, func(e CheckEntry) bool {
+		var after []gitx.LineRange
+		afterOK := false
+		if content, touched := predicted[path]; predictable && touched {
+			after, afterOK = pendingRanges(root, c.Base, path, []byte(content))
+		}
+		graded := regradePending(byEntryPath[path], after, afterOK, func(e CheckEntry) bool {
 			return subsumedByBase(e.otherWorktree, c.Base, path) // that window's, not a namesake's (#193)
 		})
 		for _, g := range graded {
@@ -847,27 +687,45 @@ type codexGradedEntry struct {
 	confirmed bool
 }
 
-// pendingPatchRanges returns the patch's edited ranges for relPath in BASE line
-// numbers: located in the on-disk file, then moved through this worktree's own
-// diff against base (gitx.LinesToBase), so they share e.OtherRanges' frame even
-// when this worktree already differs from base, by its own edits or by base's it
-// is behind on (#108/#184). ok=false (unlocatable hunks, an add/delete, a git
-// error) → the caller keeps the entry as a file-level advisory rather than risk a
-// wrong grade.
-func pendingPatchRanges(byPath map[string]codexPatchFile, relPath, root, base string) ([]gitx.LineRange, bool) {
-	f, ok := byPath[relPath]
-	if !ok || len(f.hunks) == 0 {
-		return nil, false
-	}
-	data, err := os.ReadFile(filepath.Join(root, relPath))
+// predictCodexPatch is every file the patch touches as it will read once
+// apply_patch has run (applyPatchOps on the on-disk files): repo-relative path →
+// content, "" for a file it deletes (`wt check` then reads every line deleted,
+// as it does an emptied file). ok=false when that can't be told: a patch
+// apply_patch would reject or fail on, or a path outside the repo; the hook
+// then keeps its file-level heads-up.
+func predictCodexPatch(patch, root, prefix string) (map[string]string, bool) {
+	ops, err := parseApplyPatch(patch)
 	if err != nil {
 		return nil, false
 	}
-	onDisk, ok := patchRangesInFile(f, string(data))
-	if !ok {
+	// Keyed by repo-relative path, so two spellings of one file stay one file.
+	for i := range ops {
+		op := &ops[i]
+		if op.path = repoRelativePath(root, prefix, op.path); op.path == "" {
+			return nil, false
+		}
+		if op.moveTo != "" {
+			if op.moveTo = repoRelativePath(root, prefix, op.moveTo); op.moveTo == "" {
+				return nil, false
+			}
+		}
+	}
+	state, err := applyPatchOps(ops, func(p string) (string, bool) {
+		b, err := os.ReadFile(filepath.Join(root, p))
+		return string(b), err == nil
+	})
+	if err != nil {
 		return nil, false
 	}
-	return gitx.LinesToBase(root, base, relPath, onDisk)
+	out := make(map[string]string, len(state))
+	for p, c := range state {
+		if c != nil {
+			out[p] = *c
+		} else {
+			out[p] = ""
+		}
+	}
+	return out, true
 }
 
 // codexEditDecision shapes the PreToolUse stdout JSON. deny=true → permissionDecision

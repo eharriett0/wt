@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -160,4 +161,94 @@ func TestLineRangeConflicts_MatchesGitMergeFile(t *testing.T) {
 		t.Errorf("the span overlap rule agrees with git on all %d pairs: the shapes don't exercise #199", len(pairs))
 	}
 	t.Logf("%d pairs agree with git merge-file; the pre-#199 span overlap got %d wrong", len(pairs), spanRuleWrong)
+}
+
+// The grade must be git's MERGE, end to end (#199 review): two windows' ranges
+// as wt measures them (ChangedRangesWith, the same diffs as ChangedRanges),
+// graded by LineRange.Conflicts, against `git merge-tree` (merge-ort) on the
+// two edits as commits. The file repeats its lines ("}", blank, indented "}"),
+// so an inserted or deleted line can sit in more than one gap and a diff has to
+// choose: TestLineRangeConflicts_MatchesGitMergeFile's unique lines can't tell a
+// plain `git diff` (myers, indent heuristic) from merge-ort's alignment
+// (histogram, none). Pairs whose files come out identical are left out: git
+// takes identical edits cleanly, and wt, which grades positions, not content,
+// flags them on purpose.
+func TestChangedRanges_MatchMergeTree(t *testing.T) {
+	dir := gitRepo(t)
+	base := []string{"a", "", "}", "\t}", "", "}"}
+	text := func(ls []string) string { return strings.Join(ls, "\n") + "\n" }
+	writeFile(t, dir, "f.txt", text(base))
+	runGit(t, dir, "add", "f.txt")
+	runGit(t, dir, "commit", "-qm", "base")
+	git := func(stdin string, args ...string) (string, int) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Stdin = strings.NewReader(stdin)
+		out, err := cmd.Output()
+		var exit *exec.ExitError
+		if err != nil && !errors.As(err, &exit) {
+			t.Fatalf("git %v: %v", args, err)
+		}
+		code := 0
+		if exit != nil {
+			code = exit.ExitCode()
+		}
+		return strings.TrimSpace(string(out)), code
+	}
+	commitOf := func(content string) string {
+		blob, _ := git(content, "hash-object", "-w", "--stdin")
+		tree, _ := git("100644 blob "+blob+"\tf.txt\n", "mktree")
+		c, _ := git("", "commit-tree", tree, "-p", "main", "-m", "edit")
+		return c
+	}
+	type variant struct{ content, commit string }
+	var vs []variant
+	add := func(ls []string) {
+		c := text(ls)
+		vs = append(vs, variant{c, commitOf(c)})
+	}
+	for g := 0; g <= len(base); g++ { // insert one line at each gap
+		for _, l := range []string{"}", "", "\t}", "x"} {
+			add(slices.Insert(slices.Clone(base), g, l))
+		}
+	}
+	for i := range base { // delete one line, rewrite one line
+		add(slices.Delete(slices.Clone(base), i, i+1))
+		add(slices.Replace(slices.Clone(base), i, i+1, "y"))
+	}
+	ranges := make([][]LineRange, len(vs))
+	for i, v := range vs {
+		r, ok := ChangedRangesWith(dir, "main", "f.txt", []byte(v.content))
+		if !ok {
+			t.Fatalf("ChangedRangesWith(%q) not ok", v.content)
+		}
+		ranges[i] = r
+	}
+	conflicts := func(a, b []LineRange) bool {
+		for _, x := range a {
+			for _, y := range b {
+				if x.Conflicts(y) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	pairs := 0
+	for i := range vs {
+		for j := i + 1; j < len(vs); j++ {
+			if vs[i].content == vs[j].content {
+				continue
+			}
+			pairs++
+			_, code := git("", "merge-tree", "--write-tree", vs[i].commit, vs[j].commit)
+			if code > 1 {
+				t.Fatalf("git merge-tree exited %d", code)
+			}
+			if got := conflicts(ranges[i], ranges[j]); got != (code == 1) {
+				t.Errorf("%q %v vs %q %v: wt conflict=%v, git merge-tree conflict=%v", vs[i].content, ranges[i], vs[j].content, ranges[j], got, code == 1)
+			}
+		}
+	}
+	t.Logf("%d pairs agree with git merge-tree", pairs)
 }
