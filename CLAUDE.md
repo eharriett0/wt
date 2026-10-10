@@ -74,15 +74,38 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   graded exactly, not file-level. Only when that can't be computed (a Write, a
   non-unique `old_string`, a binary file, a git error) does an entry stay as a
   file-level heads-up, and then it is never dropped.
-- **Coordination ownership is ONE predicate, and it includes the session (#163).**
-  Two agent sessions started in one checkout resolve to the same window id, so
-  each treated the other's announcements as its own: `inbox clear`, `wt holds`
-  listing them as "yours", the merge-pr gate exempting their holds. `coord.Self.Owns`
-  = same window AND (same session OR either side session-less OR the record's
-  session is `MirrorSession` of self's token) is what inbox, acks, `holds` and the
-  gate all use, and every "same checkout, another session" label comes from
-  `Self.SharesCheckout` (derived from `Owns`); don't add a raw `r.Window == self`
-  compare. The window id itself stays path-based (#18 self-hold exemption, #156
+- **Coordination ownership is ONE decision, and only a real session token proves
+  a record is yours (#163, #211).** Two agent sessions started in one checkout
+  resolve to the same window id, so each treated the other's announcements as its
+  own (#163). `coord.Self.Attribute` classifies every record: **mine** (self's
+  token, or its `MirrorSession` hash; for a token-less reader, a token-less record
+  — the directory fallback), **another session** (a different session: tagged vs
+  another token, or tagged vs token-less in either direction), **unattributable**
+  (no session at all: written before sessions were recorded), or another window. `Owns`, `SharesCheckout` and
+  `Unattributed` are views of it; don't add a raw `r.Window == self` compare.
+  Per operation, always in the safe direction (#211):
+
+  | | mine | another session | unattributable |
+  |---|---|---|---|
+  | `wt holds` | "yours", with all-clear lines | counted, not listed as yours | own section, NO all-clear lines; holds listed, plain ones only <24h (older counted) |
+  | `all-clear` / `announce --clear` | posts | TTY asks; non-TTY refuses without `--not-mine` | same |
+  | merge-pr gate | exempt (#18) | gates | gates; stale at min(hold_max_age, 24h) |
+  | inbox / banner / per-turn hook | hidden | shown | shown <24h (`coord.UnattributedHorizon`); older counted in `wt inbox` |
+  | acks (waive for self) | count | don't | count only for a signal older than 24h |
+
+  ⚠ **`""` is NOT a wildcard (#211).** #163 kept pre-#163 records owned by every
+  session of their window, so `wt holds` listed a month of them as the current
+  session's own and offered `wt all-clear` beside each; one all-clear would have
+  released another live session's hold. The 24h horizon keeps the month of
+  pre-#163 records every upgraded log carries from flooding every inbox and
+  per-turn context at once. ⚠ **Accepted trade-off: two token-less shells in one
+  checkout are ONE party** (the directory fallback #211 itself suggests): a
+  `SessionNone` record is its token-less reader's own, so a terminal's own hold
+  never blocks it and #18's WT_WINDOW pinning works for terminals, at the cost
+  that two token-less agents in one checkout can't tell each other apart (the
+  #163 inbox hedge still fires when tagged sessions post there). `WT_SESSION` per
+  shell separates them. Only `""` is unattributable.
+  The window id itself stays path-based (#18 self-hold exemption, #156
   claims across restarts). The session is `WT_SESSION` → `CLAUDE_CODE_SESSION_ID`
   → `CODEX_SESSION_ID`, else `coord.SessionNone`. Claude Code keeps its id across
   `--resume`/`--continue`; `--fork-session`, **`/clear`** (the conversation reset
@@ -93,28 +116,25 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   shell command.
   ⚠ **Terminal ids (`TERM_SESSION_ID`/`ITERM_SESSION_ID`) are deliberately NOT
   sessions**: every tmux pane or editor started in the tab inherits them (false
-  confidence), and they split one person's tabs into parties (their own hold
-  blocks them from another tab, and #18's WT_WINDOW pinning across terminals stops
-  exempting it). ⚠ **`""` means ONLY a pre-#163 record** (the back-compat
-  wildcard). A session with no token stamps `coord.SessionNone`, so a token-less
-  shell and a Claude session in one checkout stay two parties; "simplifying" it
-  back to `""` silently re-merges them. Every writer stamps through
-  `stampRecord` (pinned). ⚠ **The per-turn hook reads the log as the session the
-  agent's own `wt` commands stamp** (`agentHookSession`): its inherited env first.
-  Claude Code sets `CLAUDE_CODE_SESSION_ID` in hook processes too, so its payload
-  is never consulted. Codex does NOT put `CODEX_SESSION_ID` in a hook's env (a
-  hook runs with the Codex process's own env snapshot,
-  `codex-rs/hooks/src/registry.rs`), but its payload `session_id` comes from the
-  same `Session::session_id()` (`core/src/hook_runtime.rs`), so codex-context
-  ONLY falls back to the payload id. ⚠ **The GitHub mirror carries
-  `coord.MirrorSession` (a hash), never the raw id**, and `Owns` matches a
-  session's own hash, or #18 breaks across clones that share only the mirror
-  (separate local logs). ⚠ **Hold advice:** `wt ack <id>` (waives the hold for
-  the reader only) always leads; `wt all-clear <id>` releases it for EVERY window
-  and is suggested only for a hold `coord.HoldLooksOrphaned` (12h old, or its
-  session silent for 4h), always saying so. In a single-worktree repo the per-turn
-  hook shows another session's entries plus every other window's HOLD (the gate
-  enforces those). Block-id reservations are still keyed by window only.
+  confidence). ⚠ A session with no token stamps `coord.SessionNone`, never `""`,
+  so a token-less shell and a Claude session in one checkout stay two parties.
+  Every writer stamps through `stampRecord` (pinned). ⚠ **The per-turn hook reads
+  the log as the session the agent's own `wt` commands stamp**
+  (`agentHookSession`): its inherited env first. Claude Code sets
+  `CLAUDE_CODE_SESSION_ID` in hook processes too, so its payload is never
+  consulted. Codex does NOT put `CODEX_SESSION_ID` in a hook's env (a hook runs
+  with the Codex process's own env snapshot, `codex-rs/hooks/src/registry.rs`),
+  but its payload `session_id` comes from the same `Session::session_id()`
+  (`core/src/hook_runtime.rs`), so codex-context ONLY falls back to the payload
+  id. ⚠ **The GitHub mirror carries `coord.MirrorSession` (a hash), never the raw
+  id**, and a session owns its own hash, or #18 breaks across clones that share
+  only the mirror (separate local logs). ⚠ **Hold advice:** `wt ack <id>` (waives
+  the hold for the reader only) always leads; `wt all-clear <id>` releases it for
+  EVERY window and is suggested only for a hold `coord.HoldLooksOrphaned` (12h old,
+  or its session silent for 4h), always saying so. In a single-worktree repo the
+  per-turn hook shows this checkout's non-mine entries plus every other window's
+  HOLD (the gate enforces those). Block-id reservations are still keyed by window
+  only.
 - **`ClassifyFacts` precedence:** open PR > merged PR > closed PR > dirty >
   unmerged > merged-by-ancestry. PR state outranks a dirty index (a
   merged/closed branch with leftover staged cruft is stale, not a permanent

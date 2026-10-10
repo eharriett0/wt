@@ -133,8 +133,9 @@ func SessionToken(getenv func(string) string) (token, source string) {
 
 // Self is a process's coordination identity: the checkout (WindowID — path
 // based and deliberately unchanged, #18/#156) plus the session within it (#163).
-// The zero Session matches every session (the pre-#163 behaviour); live callers
-// build Self with CurrentSelf, which always sets one.
+// A zero Session can prove nothing (Attribute: every record in its window is
+// unattributable); live callers build Self with CurrentSelf, which always sets
+// one.
 type Self struct {
 	Window  string
 	Session string
@@ -150,39 +151,91 @@ func CurrentSelf(getenv func(string) string, toplevel, branch string) Self {
 	return Self{Window: WindowID(getenv("WT_WINDOW"), toplevel, branch), Session: s}
 }
 
-// Owns reports whether r was written by self: same window AND (same session, or
-// either side carries no session at all). It is the ONE ownership predicate —
-// inbox, acks, `wt holds` and the merge-pr hold gate's own-hold exemption all go
-// through it (#163). Two sessions sharing a checkout resolve to the same window,
-// and before sessions each treated the other's announcements as its own: inbox
-// said "clear", `wt holds` listed them as yours, and the gate exempted their
-// holds. Both sides carrying a session (a token, or SessionNone) that differ is
-// another party — never own. An empty Session only exists on pre-#163 records
-// (and on a zero Self), so the wildcard keeps them exactly as they were.
+// Attribution is what self can PROVE about who wrote a record (#211). It is the
+// ONE ownership decision: Owns, SharesCheckout and Unattributed all derive from
+// it, and every operation decides per class, always in the safe direction (see
+// the table in CLAUDE.md).
+type Attribution int
+
+const (
+	// AttrOtherWindow: r was written from another window (checkout).
+	AttrOtherWindow Attribution = iota
+	// AttrMine: this session wrote r — its session is self's token, or the
+	// token's MirrorSession hash (the record read back from the GitHub mirror).
+	// For a token-less reader, a token-less (SessionNone) record from the same
+	// window is mine too: the directory fallback. Two token-less shells in one
+	// checkout are one party (WT_SESSION per shell separates them), so a
+	// terminal's own hold never blocks it (#18).
+	AttrMine
+	// AttrAnotherSession: provably another party in this checkout — a different
+	// token, or a token-less writer seen from a tagged session, or a tagged
+	// writer seen from a token-less one (#163).
+	AttrAnotherSession
+	// AttrUnattributable: wt can't tell. A record with no session at all —
+	// written before wt recorded sessions, or by an older wt — or any record read
+	// by a zero Self. Never "yours": #211 listed a month of such records as the
+	// current session's own and offered to all-clear them.
+	AttrUnattributable
+)
+
+// Attribute classifies r for self (#211): mine iff r carries self's token or
+// its mirror hash, or both r and self are token-less (the directory fallback);
+// another party iff r carries a session that is not self's; unattributable iff
+// r carries no session at all (""): a pre-#163 record proves nothing about
+// anyone. Pure.
+func (s Self) Attribute(r Record) Attribution {
+	switch {
+	case r.Window != s.Window:
+		return AttrOtherWindow
+	case r.Session == "" || s.Session == "":
+		return AttrUnattributable
+	case r.Session == s.Session:
+		return AttrMine // the same token, or both token-less (SessionNone)
+	case s.Session != SessionNone && r.Session == MirrorSession(s.Session):
+		return AttrMine
+	default:
+		return AttrAnotherSession
+	}
+}
+
+// Owns reports whether this session provably wrote r (Attribute == AttrMine). It
+// gates everything that treats a record as yours: the "your open announcements"
+// list and its all-clear lines (`wt holds`), an all-clear without confirmation,
+// the merge-pr gate's own-hold exemption (#18) and inbox's "you don't ack
+// yourself". Before #211 a record with no session was a wildcard every session
+// owned, so `wt holds` presented a month of pre-#163 records as the current
+// session's own.
 //
 // A record read back from the GitHub mirror carries MirrorSession(token), never
 // the token, so self also owns a record whose session is the hash of its own
 // token. Without that, #18 broke across checkouts that share only the mirror
-// (two clones with different directory names keep separate local logs): a
-// session pinned with WT_WINDOW announced a hold in one clone and was blocked by
-// it in the other. Only a real token hashes; "" and SessionNone never do, so a
-// token-less shell can't claim a tagged session's mirrored record. Pure.
-func (s Self) Owns(r Record) bool {
-	if r.Window != s.Window {
-		return false
-	}
-	if r.Session == "" || s.Session == "" || r.Session == s.Session {
-		return true
-	}
-	return s.Session != SessionNone && r.Session == MirrorSession(s.Session)
-}
+// (two clones with different directory names keep separate local logs). Pure.
+func (s Self) Owns(r Record) bool { return s.Attribute(r) == AttrMine }
 
-// SharesCheckout reports whether r was written from self's checkout by ANOTHER
-// session — the party #163 was about, whose records carry self's own window id.
-// Derived from Owns, so labels ("same checkout, another session") can never
-// disagree with the ownership decision. Pure.
-func (s Self) SharesCheckout(r Record) bool {
-	return r.Window == s.Window && !s.Owns(r)
+// SharesCheckout reports whether r was written from self's checkout by provably
+// ANOTHER session — the party #163 was about, whose records carry self's own
+// window id. Pure.
+func (s Self) SharesCheckout(r Record) bool { return s.Attribute(r) == AttrAnotherSession }
+
+// Unattributed reports whether r is in self's checkout but wt can't tell who
+// wrote it (AttrUnattributable, #211). Pure.
+func (s Self) Unattributed(r Record) bool { return s.Attribute(r) == AttrUnattributable }
+
+// UnattributedHorizon is how long an unattributable record stays a live signal
+// (#211): inbox, the hold banner and the per-turn hook show it this long, and
+// the merge-pr gate blocks on an unattributable hold this long at most (it may
+// expire sooner, at hold_max_age). Matches SharedCheckoutWindow and the default
+// hold_max_age, past which a hold stops blocking anyway. Without a bound, the
+// month of pre-#163 records every upgraded checkout carries would flood every
+// session's inbox and per-turn context at once.
+const UnattributedHorizon = 24 * time.Hour
+
+// unattributedLive reports whether an unattributable record is still inside
+// UnattributedHorizon. An undatable one is treated as live (surfaced, never
+// hidden). Pure.
+func unattributedLive(r Record, now time.Time) bool {
+	t, err := time.Parse(time.RFC3339, r.TS)
+	return err != nil || now.Sub(t) <= UnattributedHorizon
 }
 
 // ShortSession renders a session token for humans: SessionNone as "no session
@@ -369,17 +422,43 @@ func cleared(recs []Record) map[string]bool {
 	return m
 }
 
-// ackedBy reports the set of announce ids that self has acked. Another session's
-// ack in the same checkout is not self's (#163): it read the announcement, self
-// did not.
-func ackedBy(recs []Record, self Self) map[string]bool {
-	m := map[string]bool{}
+// selfAcks is what self's acks waive (#163, #211). An ack counts only for the
+// session that made it: another session's ack in the same checkout is not
+// self's (it read the announcement, self did not), so one session can never
+// consume a hold meant for another (#211's second symptom).
+type selfAcks struct {
+	mine   map[string]bool // acks this session made (Self.Owns)
+	legacy map[string]bool // acks with no session: written before sessions were recorded
+}
+
+// acksOf collects self's acks: the ones self owns (Self.Owns — so a token-less
+// shell's acks count for a token-less reader, the directory fallback). A pre-#163
+// ack (no session) counts only for an old announcement (covers): a young signal
+// acked that way re-surfaces for every session, the safe direction, while the
+// month of pre-#163 acks every upgraded checkout carries does not flood every
+// inbox. Pure.
+func acksOf(recs []Record, self Self) selfAcks {
+	a := selfAcks{mine: map[string]bool{}, legacy: map[string]bool{}}
 	for _, r := range recs {
-		if r.Kind == KindAck && r.AckOf != "" && self.Owns(r) {
-			m[r.AckOf] = true
+		if r.Kind != KindAck || r.AckOf == "" || r.Window != self.Window {
+			continue
+		}
+		switch self.Attribute(r) {
+		case AttrMine:
+			a.mine[r.AckOf] = true
+		case AttrUnattributable:
+			a.legacy[r.AckOf] = true
 		}
 	}
-	return m
+	return a
+}
+
+// covers reports whether self's acks waive announcement ann at now. Pure.
+func (a selfAcks) covers(ann Record, now time.Time) bool {
+	if a.mine[ann.ID] {
+		return true
+	}
+	return a.legacy[ann.ID] && Age(ann, now) > UnattributedHorizon
 }
 
 // Announcements returns all announce records (in log order).
@@ -393,29 +472,53 @@ func announcements(recs []Record) []Record {
 	return out
 }
 
-// Inbox returns announcements from OTHER windows — or from another session in
-// this same checkout (#163) — that self has not acked and that have not been
-// all-cleared, i.e. the ones needing this session's attention. Self's own
-// announcements are excluded (you don't ack yourself).
-func Inbox(recs []Record, self Self) []Record {
+// Inbox returns announcements from OTHER windows, from another session in this
+// same checkout (#163), and unattributable ones in this checkout still inside
+// UnattributedHorizon (#211: they surface rather than vanish) — that self has not
+// acked and that have not been all-cleared, i.e. the ones needing this session's
+// attention. Only self's OWN announcements are excluded (you don't ack yourself).
+func Inbox(recs []Record, self Self, now time.Time) []Record {
 	cl := cleared(recs)
-	acked := ackedBy(recs, self)
+	acked := acksOf(recs, self)
 	var out []Record
 	for _, a := range announcements(recs) {
-		if self.Owns(a) || cl[a.ID] || acked[a.ID] {
+		if self.Owns(a) || cl[a.ID] || acked.covers(a, now) {
 			continue
+		}
+		if self.Unattributed(a) && !unattributedLive(a, now) {
+			continue // past the horizon: counted by UnattributedBacklog, listed by `wt holds`
 		}
 		out = append(out, a)
 	}
 	return out
 }
 
+// UnattributedBacklog counts the open, un-acked unattributable announcements in
+// self's checkout that are past UnattributedHorizon (#211) — the ones Inbox no
+// longer shows — so `wt inbox` can say they exist instead of dropping them
+// silently. Pure.
+func UnattributedBacklog(recs []Record, self Self, now time.Time) (notes, holds int) {
+	cl := cleared(recs)
+	acked := acksOf(recs, self)
+	for _, a := range announcements(recs) {
+		if !self.Unattributed(a) || unattributedLive(a, now) || cl[a.ID] || acked.covers(a, now) {
+			continue
+		}
+		if len(a.Hold) > 0 {
+			holds++
+		} else {
+			notes++
+		}
+	}
+	return notes, holds
+}
+
 // PendingHolds returns the subset of this window's inbox (un-acked, un-cleared
 // announcements from OTHER windows or sessions) that declare a hold — the ones wt
 // should surface proactively before the window acts (the ambient-banner signal).
-func PendingHolds(recs []Record, self Self) []Record {
+func PendingHolds(recs []Record, self Self, now time.Time) []Record {
 	var out []Record
-	for _, a := range Inbox(recs, self) {
+	for _, a := range Inbox(recs, self, now) {
 		if len(a.Hold) > 0 {
 			out = append(out, a)
 		}
@@ -489,17 +592,19 @@ func WindowID(env, toplevel, branch string) string {
 	return "detached"
 }
 
-// ActiveHolds returns announcements from OTHER windows (or another session in
-// this checkout, #163) whose hold covers op, that have not been all-cleared and
-// that self has not acked. These are the holds that should block/warn an
-// operation (e.g. merge-pr checking "merge-main"). Acking a hold clears it for
-// self — you've acknowledged the coordination. Only self.Owns exempts a hold.
-func ActiveHolds(recs []Record, self Self, op string) []Record {
+// ActiveHolds returns announcements from OTHER windows, another session in this
+// checkout (#163), or an unattributable writer in it (#211), whose hold covers
+// op, that have not been all-cleared and that self has not acked. These are the
+// holds that should block/warn an operation (e.g. merge-pr checking
+// "merge-main"). Acking a hold clears it for self — you've acknowledged the
+// coordination. Only self.Owns exempts a hold (#18's creator exemption): a hold
+// wt can't attribute must never silently exempt whoever reads it.
+func ActiveHolds(recs []Record, self Self, op string, now time.Time) []Record {
 	cl := cleared(recs)
-	acked := ackedBy(recs, self)
+	acked := acksOf(recs, self)
 	var out []Record
 	for _, a := range announcements(recs) {
-		if self.Owns(a) || cl[a.ID] || acked[a.ID] {
+		if self.Owns(a) || cl[a.ID] || acked.covers(a, now) {
 			continue
 		}
 		if HoldCovers(a.Hold, op) {
@@ -596,10 +701,17 @@ func PruneLog(path string, now time.Time, blockMaxAge time.Duration) (dropped in
 // older than maxAge (when maxAge > 0) is `stale` — aged out, almost always a
 // crashed/forgotten window — and callers should WARN rather than hard-block on
 // it, so a dead window's --hold can't wedge everyone's merge-pr forever. maxAge
-// <= 0 disables expiry (everything fresh — the pre-#32 behavior).
+// <= 0 disables expiry (everything fresh — the pre-#32 behavior). An
+// unattributable hold (#211) goes stale at UnattributedHorizon at the latest,
+// the same bound inbox and the per-turn hook use, so the gate never blocks on an
+// unattributable hold they no longer show.
 func ActiveHoldsAt(recs []Record, self Self, op string, now time.Time, maxAge time.Duration) (fresh, stale []Record) {
-	for _, a := range ActiveHolds(recs, self, op) {
-		if maxAge > 0 && Age(a, now) > maxAge {
+	for _, a := range ActiveHolds(recs, self, op, now) {
+		limit := maxAge
+		if self.Unattributed(a) && (limit <= 0 || limit > UnattributedHorizon) {
+			limit = UnattributedHorizon
+		}
+		if limit > 0 && Age(a, now) > limit {
 			stale = append(stale, a)
 		} else {
 			fresh = append(fresh, a)
@@ -611,7 +723,8 @@ func ActiveHoldsAt(recs []Record, self Self, op string, now time.Time, maxAge ti
 // OwnOpenAnnouncements returns THIS session's own announcements that have not
 // been all-cleared — the holds/announcements you still own and can `wt
 // all-clear` (#34). Includes both hold and plain announcements; excludes cleared
-// ones, and another session's announcements in this same checkout (#163).
+// ones, another session's (#163) and unattributable ones (#211): only a record
+// this session provably wrote is listed as yours.
 func OwnOpenAnnouncements(recs []Record, self Self) []Record {
 	cl := cleared(recs)
 	var out []Record
@@ -624,14 +737,29 @@ func OwnOpenAnnouncements(recs []Record, self Self) []Record {
 }
 
 // SameCheckoutOpen returns the open (not all-cleared) announcements under self's
-// window that self does NOT own — another session's, in this same checkout
-// (#163). `wt holds` names them so reading your holds reveals a second party
-// instead of silently omitting it. Pure.
+// window from provably another session in this same checkout (#163). `wt holds`
+// names them so reading your holds reveals a second party instead of silently
+// omitting it. Pure.
 func SameCheckoutOpen(recs []Record, self Self) []Record {
 	cl := cleared(recs)
 	var out []Record
 	for _, a := range announcements(recs) {
 		if self.SharesCheckout(a) && !cl[a.ID] {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// UnattributedOpen returns the open (not all-cleared) announcements in self's
+// checkout that wt can't attribute to any session (#211): written before
+// sessions were recorded. `wt holds` lists them apart from yours, with no
+// all-clear lines. Pure.
+func UnattributedOpen(recs []Record, self Self) []Record {
+	cl := cleared(recs)
+	var out []Record
+	for _, a := range announcements(recs) {
+		if self.Unattributed(a) && !cl[a.ID] {
 			out = append(out, a)
 		}
 	}

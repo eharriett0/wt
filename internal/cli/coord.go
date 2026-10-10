@@ -4,9 +4,11 @@
 package cli
 
 import (
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -50,19 +52,41 @@ func repoNameFrom(common, root string) string {
 }
 
 // postedBy renders who posted r, for humans: the other window's id — or, when r
-// comes from THIS checkout (so its window id is yours), whether it is another
-// session's ("same checkout, another session", #163) or yours. Without that, the
-// reader sees its own window id and reasonably concludes it is looking at its own
-// announcement. Derived from Self.SharesCheckout/Owns, never a raw window
-// compare, so the label always agrees with the ownership decision. Pure.
+// comes from THIS checkout (so its window id is yours), whether it is yours,
+// another session's ("same checkout, another session", #163), or one wt can't
+// attribute (#211). Without that, the reader sees its own window id and
+// reasonably concludes it is looking at its own announcement. Derived from
+// Self.Attribute, never a raw window compare, so the label always agrees with
+// the ownership decision. Pure.
 func postedBy(r coord.Record, self coord.Self) string {
-	switch {
-	case self.SharesCheckout(r):
+	switch self.Attribute(r) {
+	case coord.AttrAnotherSession:
 		return "same checkout, another session (" + coord.ShortSession(r.Session) + ")"
-	case self.Owns(r):
+	case coord.AttrMine:
 		return "this window (yours)"
+	case coord.AttrUnattributable:
+		return "same checkout, " + unattributedLabel
 	default:
 		return r.Window
+	}
+}
+
+// unattributedLabel names a record wt can't attribute to any session (#211):
+// one with no session at all, written before wt recorded sessions.
+const unattributedLabel = "can't tell whose (written before wt recorded sessions)"
+
+// whoseRecord names who a record belongs to, for the all-clear guard (#211).
+// Pure.
+func whoseRecord(r coord.Record, self coord.Self) string {
+	switch self.Attribute(r) {
+	case coord.AttrMine:
+		return "yours"
+	case coord.AttrAnotherSession:
+		return "another session's, in this checkout (" + coord.ShortSession(r.Session) + ")"
+	case coord.AttrUnattributable:
+		return "unattributable " + strings.TrimPrefix(unattributedLabel, "can't tell whose ")
+	default:
+		return "another window's (" + r.Window + ")"
 	}
 }
 
@@ -154,13 +178,14 @@ func remoteRecords(issue int) []coord.Record {
 }
 
 func cmdAnnounce(args []string) int {
-	if code, done := guardHelp(args, `usage: wt announce "<message>" [--file <path>] [--issue N] [--hold "op,..."]   (or --clear <id>)`); done {
+	if code, done := guardHelp(args, `usage: wt announce "<message>" [--file <path>] [--issue N] [--hold "op,..."]   (or --clear <id> [--not-mine])`); done {
 		return code
 	}
 	fs := flag.NewFlagSet("announce", flag.ContinueOnError)
 	issue := fs.Int("issue", 0, "mirror this announcement as a comment on GitHub issue #N")
 	hold := fs.String("hold", "", "comma-separated ops other windows should avoid until all-clear (e.g. \"merge-main,flux-reconcile\")")
 	clear := fs.String("clear", "", "post an all-clear for announcement <id> instead of announcing")
+	notMine := fs.Bool("not-mine", false, "with --clear: release a hold this session can't prove it placed — it is released for EVERY window (#211)")
 	file := fs.String("file", "", "read the message from a file (or - for stdin) instead of the argument — opaque to the shell (#75)")
 	pos, _, err := parseInterspersed(fs, args)
 	if err != nil {
@@ -169,7 +194,7 @@ func cmdAnnounce(args []string) int {
 	return withConfig(func(c *config.Config) int {
 		path, self := coordCtx(c)
 		if *clear != "" {
-			return allClear(c, path, self, *clear)
+			return allClear(c, path, self, *clear, *notMine)
 		}
 		msg, ferr := readFreeform(*file, pos)
 		if ferr != nil {
@@ -199,11 +224,38 @@ func cmdAnnounce(args []string) int {
 }
 
 // inboxEntry is one `wt inbox --json` element: the record plus whether it comes
-// from another session in THIS checkout (#163) — its window equals yours, so a
-// JSON consumer can't tell otherwise. Embedding keeps the array-of-records shape.
+// from THIS checkout (#163) — its window equals yours, so a JSON consumer can't
+// tell otherwise — and, then, whose it is: "another_session", or
+// "unattributable" when wt can't tell (#211). Embedding keeps the
+// array-of-records shape.
 type inboxEntry struct {
 	coord.Record
-	SameCheckout bool `json:"same_checkout,omitempty"`
+	SameCheckout bool   `json:"same_checkout,omitempty"`
+	Attribution  string `json:"attribution,omitempty"`
+}
+
+// attributionTag is the JSON form of a same-checkout record's attribution
+// (#163/#211): "another_session", "unattributable", or "" (another window, or
+// yours). Pure.
+func attributionTag(r coord.Record, self coord.Self) string {
+	switch self.Attribute(r) {
+	case coord.AttrAnotherSession:
+		return "another_session"
+	case coord.AttrUnattributable:
+		return "unattributable"
+	}
+	return ""
+}
+
+// backlogLine tells `wt inbox` about the unattributable announcements it no
+// longer shows because they are past coord.UnattributedHorizon (#211), so they
+// don't vanish silently. "" when there are none. Pure.
+func backlogLine(notes, holds int) string {
+	if notes+holds == 0 {
+		return ""
+	}
+	return fmt.Sprintf("+ %d older announcement(s) in this checkout (%d with a hold) that wt can't attribute to any session — past %dh, so not shown; `wt holds` lists them",
+		notes+holds, holds, int(coord.UnattributedHorizon.Hours()))
 }
 
 // inboxClearMessage is what `wt inbox` prints when nothing is pending. It is a
@@ -246,23 +298,29 @@ func cmdInbox(args []string) int {
 		if iss := effectiveIssue(*issue, c); iss > 0 {
 			recs = coord.MergeByID(recs, remoteRecords(iss))
 		}
-		box := coord.Inbox(recs, self)
+		now := time.Now()
+		box := coord.Inbox(recs, self, now)
 		// newest-first: a fresh announcement is always at the top, never buried
 		// under a deep backlog of old un-acked records (#147).
 		for i, j := 0, len(box)-1; i < j; i, j = i+1, j-1 {
 			box[i], box[j] = box[j], box[i]
 		}
-		clearMsg, hedged := inboxClearMessage(recs, self, time.Now())
+		clearMsg, hedged := inboxClearMessage(recs, self, now)
+		backlog := backlogLine(coord.UnattributedBacklog(recs, self, now))
 		if *asJSON {
 			out := make([]inboxEntry, 0, len(box))
 			for _, a := range box {
-				out = append(out, inboxEntry{Record: a, SameCheckout: self.SharesCheckout(a)})
+				tag := attributionTag(a, self)
+				out = append(out, inboxEntry{Record: a, SameCheckout: tag != "", Attribution: tag})
 			}
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
 			_ = enc.Encode(out)
 			if len(box) == 0 && hedged {
 				ui.Warn("%s", clearMsg) // stderr: the JSON on stdout stays parseable
+			}
+			if backlog != "" {
+				ui.Warn("%s", backlog) // stderr, as above
 			}
 			return 0
 		}
@@ -272,10 +330,12 @@ func cmdInbox(args []string) int {
 			} else {
 				ui.OK("%s", clearMsg)
 			}
+			if backlog != "" {
+				ui.Info("%s", backlog)
+			}
 			return 0
 		}
 		ui.Info("%d un-acked announcement(s) from other windows/sessions (you: %s):", len(box), ui.Bold(selfLabel(self)))
-		now := time.Now()
 		for _, a := range box {
 			var tags string
 			if len(a.Hold) > 0 {
@@ -288,6 +348,9 @@ func cmdInbox(args []string) int {
 		}
 		if hedged {
 			ui.Warn("note: %s", tokenlessCaveat())
+		}
+		if backlog != "" {
+			ui.Info("%s", backlog)
 		}
 		ui.Step("ack: wt ack <id> --state \"<what this window is touching>\"")
 		return 0
@@ -382,7 +445,7 @@ func ackAll(c *config.Config) int {
 	path, self := coordCtx(c)
 	local, _ := coord.Load(path)
 	recs := coord.MergeByID(local, remoteRecords(c.CoordIssue))
-	notes, holdsLeft := bulkAckTargets(coord.Inbox(recs, self))
+	notes, holdsLeft := bulkAckTargets(coord.Inbox(recs, self, time.Now()))
 
 	heldNote := ""
 	if holdsLeft > 0 {
@@ -422,27 +485,98 @@ func bulkAckRecords(notes []coord.Record, self coord.Self, repo string, base tim
 	return out
 }
 
+const allClearUsage = "usage: wt all-clear <id> [--not-mine]"
+
 func cmdAllClear(args []string) int {
-	if code, done := guardPositionalArg(args, "usage: wt all-clear <id>"); done {
+	if code, done := guardHelp(args, allClearUsage); done {
 		return code
 	}
-	if len(args) < 1 {
-		ui.Err("usage: wt all-clear <id>")
+	fs := flag.NewFlagSet("all-clear", flag.ContinueOnError)
+	notMine := fs.Bool("not-mine", false, "release a hold this session can't prove it placed (another session's, another window's, or unattributable) — it is released for EVERY window (#211)")
+	pos, _, err := parseInterspersed(fs, args)
+	if err != nil {
+		return 64
+	}
+	if len(pos) != 1 {
+		ui.Err("%s", allClearUsage)
 		return 64
 	}
 	return withConfig(func(c *config.Config) int {
 		path, self := coordCtx(c)
-		return allClear(c, path, self, args[0])
+		return allClear(c, path, self, pos[0], *notMine)
 	})
 }
 
-func allClear(c *config.Config, path string, self coord.Self, id string) int {
+// clearVerdict is what `wt all-clear <id>` may do with an announcement (#211).
+type clearVerdict int
+
+const (
+	clearPost   clearVerdict = iota // yours, or --not-mine: post the all-clear
+	clearAsk                        // not yours, a person at a terminal: ask first
+	clearRefuse                     // not yours and nobody to ask: refuse, naming --not-mine
+)
+
+// allClearVerdict decides whether self may release ann (#211). An all-clear
+// releases a hold for EVERY window, so only a record this session provably wrote
+// (coord.Self.Owns) is released without a word. Anything else — another
+// session's, another window's, or one wt can't attribute — is asked about on a
+// terminal and refused otherwise until --not-mine says it is deliberate: #211's
+// operator was told a month of other sessions' announcements were theirs, and
+// one all-clear would have released another live session's hold silently.
+// Pure.
+func allClearVerdict(self coord.Self, ann coord.Record, notMine, interactive bool) clearVerdict {
+	switch {
+	case self.Owns(ann) || notMine:
+		return clearPost
+	case interactive:
+		return clearAsk
+	default:
+		return clearRefuse
+	}
+}
+
+// confirmInteractive reports whether a person can answer a confirmation prompt:
+// stdin is a terminal (not /dev/null) and stderr, where the prompt goes, is one
+// too. A variable so tests can drive the prompt.
+var confirmInteractive = func() bool {
+	if !stdinIsTTY() {
+		return false
+	}
+	fi, err := os.Stderr.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+// confirmAllClear asks, on stderr, whether to release a hold that isn't this
+// session's (#211); true only on y/yes read from in.
+func confirmAllClear(id, whose string, in io.Reader) bool {
+	ui.Warn("%s is %s, not this session's — all-clear releases it for EVERY window.", id, whose)
+	fmt.Fprintf(os.Stderr, "%s release %s anyway? [y/N] ", ui.Yellow("→"), id)
+	line, _ := bufio.NewReader(in).ReadString('\n')
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return true
+	}
+	return false
+}
+
+func allClear(c *config.Config, path string, self coord.Self, id string, notMine bool) int {
 	local, _ := coord.Load(path)
 	recs := coord.MergeByID(local, remoteRecords(c.CoordIssue)) // allow clearing a remote hold (#36)
 	ann, ok := findAnnounce(recs, id)
 	if !ok {
 		ui.Err("no announcement with id %s", id)
 		return 1
+	}
+	switch allClearVerdict(self, ann, notMine, confirmInteractive()) {
+	case clearRefuse:
+		ui.Err("refusing to all-clear %s: it is %s, not this session's, and all-clear releases it for EVERY window.", id, whoseRecord(ann, self))
+		ui.Info("to waive it for yourself only: wt ack %s   ·   to release it for everyone anyway: wt all-clear %s --not-mine", id, id)
+		return 1
+	case clearAsk:
+		if !confirmAllClear(id, whoseRecord(ann, self), os.Stdin) {
+			ui.Err("not released — %s still holds for every window (`wt ack %s` waives it for you only).", id, id)
+			return 1
+		}
 	}
 	r := newRecord(c, self, coord.KindAllClear)
 	r.AckOf = id
@@ -475,15 +609,20 @@ func mergeCoordGate(c *config.Config) int {
 	}
 	now := time.Now()
 	// Only self.Owns exempts a hold: another session's hold in THIS checkout
-	// gates the merge exactly like another window's (#163).
+	// gates the merge exactly like another window's (#163), and so does one wt
+	// can't attribute to any session (#211).
 	fresh, stale := coord.ActiveHoldsAt(recs, self, "merge-main", now, c.HoldMaxAge)
 	// Stale holds (aged out past hold_max_age — almost always a crashed/forgotten
 	// window) WARN but never block, so a dead window can't wedge merge forever (#32).
 	if len(stale) > 0 {
-		ui.Warn("%d stale merge-main hold(s) past hold_max_age — NOT blocking (likely a crashed window); wt all-clear releases one for EVERY window:", len(stale))
-		for _, h := range stale {
+		ui.Warn("%d stale merge-main hold(s) past hold_max_age — NOT blocking (likely a crashed window). None is this session's, so wt all-clear asks first; it releases one for EVERY window:", len(stale))
+		shown, more := newestHolds(stale, staleHoldsShown)
+		for _, h := range shown {
 			fmt.Fprintf(os.Stderr, "    %s  %s  %s  (all-clear: wt all-clear %s)\n",
 				ui.Bold(h.ID), ui.Cyan(postedBy(h, self)), ui.Dim(humanAge(coord.Age(h, now))), h.ID)
+		}
+		if more > 0 {
+			fmt.Fprintf(os.Stderr, "    %s\n", ui.Dim(fmt.Sprintf("…and %d older (wt holds lists this checkout's)", more)))
 		}
 	}
 	if len(fresh) == 0 {
@@ -518,12 +657,29 @@ func holdAdvice(holds, recs []coord.Record, self coord.Self, now time.Time) []st
 	if sameCheckoutHolder(holds, self) {
 		lines = append(lines, "a \"same checkout, another session\" hold may be your own from before a /clear, --fork-session or fresh start (each mints a new session id); if so, ack it")
 	}
+	if unattributedHolder(holds, self) {
+		lines = append(lines, "a \"can't tell whose\" hold carries no session (written before wt recorded sessions); it may be yours: if so, ack it")
+	}
 	for _, h := range holds {
 		if orphaned, why := coord.HoldLooksOrphaned(recs, h, now); orphaned {
-			lines = append(lines, fmt.Sprintf("%s looks orphaned (%s): if that session is gone, `wt all-clear %s` releases it for EVERY window", h.ID, why, h.ID))
+			lines = append(lines, fmt.Sprintf("%s looks orphaned (%s): if that session is gone, `wt all-clear %s` releases it for EVERY window (it asks first)", h.ID, why, h.ID))
 		}
 	}
 	return lines
+}
+
+// staleHoldsShown caps the gate's stale-hold list (#211): an upgraded checkout
+// can carry dozens of never-cleared pre-#163 holds, now that they no longer read
+// as the reader's own.
+const staleHoldsShown = 5
+
+// newestHolds returns the newest n of recs (log order is oldest first) and how many
+// it left out. Pure.
+func newestHolds(recs []coord.Record, n int) (shown []coord.Record, more int) {
+	if len(recs) <= n {
+		return recs, 0
+	}
+	return recs[len(recs)-n:], len(recs) - n
 }
 
 // sameCheckoutHolder reports whether any hold comes from another session in
@@ -537,26 +693,47 @@ func sameCheckoutHolder(holds []coord.Record, self coord.Self) bool {
 	return false
 }
 
-// holdersPhrase names who holds a gating hold: "another window", or — when any
-// holder is a different session in THIS checkout (#163) — says so, since that
-// holder shares your window id and would otherwise read as you. Pure.
-func holdersPhrase(holds []coord.Record, self coord.Self) string {
-	same, other := 0, 0
+// unattributedHolder reports whether any hold is one wt can't attribute to a
+// session in THIS checkout (#211). Pure.
+func unattributedHolder(holds []coord.Record, self coord.Self) bool {
 	for _, h := range holds {
-		if self.SharesCheckout(h) {
-			same++
-		} else {
-			other++
+		if self.Unattributed(h) {
+			return true
 		}
 	}
-	switch {
-	case same > 0 && other > 0:
-		return "another window AND another session in this checkout"
-	case same > 0:
-		return "another session in this checkout"
-	default:
+	return false
+}
+
+// holdersPhrase names who holds a gating hold: "another window", "another
+// session in this checkout" (#163), "an unattributable writer in this checkout"
+// (#211), joined when there are several kinds — a same-checkout holder shares
+// your window id and would otherwise read as you. Pure.
+func holdersPhrase(holds []coord.Record, self coord.Self) string {
+	var other, same, unattr bool
+	for _, h := range holds {
+		switch self.Attribute(h) {
+		case coord.AttrAnotherSession:
+			same = true
+		case coord.AttrUnattributable:
+			unattr = true
+		default:
+			other = true
+		}
+	}
+	var kinds []string
+	if other {
+		kinds = append(kinds, "another window")
+	}
+	if same {
+		kinds = append(kinds, "another session in this checkout")
+	}
+	if unattr {
+		kinds = append(kinds, "an unattributable writer in this checkout")
+	}
+	if len(kinds) == 0 {
 		return "another window"
 	}
+	return strings.Join(kinds, " AND ")
 }
 
 // cmdPruneCoord GCs the coordination log — drops completed (all-cleared)
@@ -597,10 +774,12 @@ func cmdPruneCoord(args []string) int {
 	})
 }
 
-// cmdHolds lists THIS window's own outstanding announcements/holds (each with a
+// cmdHolds lists THIS session's own outstanding announcements/holds (each with a
 // copy-pasteable all-clear line) + its block-id reservations, so the
 // announce->hold->all-clear lifecycle is self-service instead of grepping the
-// jsonl for an id (#34).
+// jsonl for an id (#34). Only records this session provably wrote are "yours"
+// (#211): ones wt can't attribute get their own section with no all-clear
+// lines, and another session's are counted, never listed as yours.
 func cmdHolds(args []string) int {
 	fs := flag.NewFlagSet("holds", flag.ContinueOnError)
 	if err := fs.Parse(args); err != nil {
@@ -613,23 +792,25 @@ func cmdHolds(args []string) int {
 			ui.Err("could not read coordination log: %v", err)
 			return 1
 		}
+		now := time.Now()
 		own := coord.OwnOpenAnnouncements(recs, self)
 		// #163: another session's open announcements in THIS checkout are not
 		// yours — but say they exist, so reading your holds reveals a second party.
 		others := coord.SameCheckoutOpen(recs, self)
-		defer sameCheckoutHoldsNote(others, recs, self, time.Now())
+		defer sameCheckoutHoldsNote(others, recs, self, now)
+		// #211: ones wt can't attribute to any session are not yours either.
+		defer unattributedHoldsSection(coord.UnattributedOpen(recs, self), now, c.HoldMaxAge)
 		// #152: block reservations live in per-file ledgers (cross-repo shared), not
 		// the per-repo announce/ack log. They stay keyed by window only — splitting
-		// them by session is out of scope for #163.
+		// them by session is out of scope for #163/#211.
 		var reserves []coord.Record
 		if home, herr := os.UserHomeDir(); herr == nil && home != "" {
 			reserves = coord.OwnBlockReservations(coord.LoadBlockLedgers(home), self.Window)
 		}
 		if len(own) == 0 && len(reserves) == 0 {
-			ui.OK("no outstanding holds/announcements or block reservations for this window (%s)", selfLabel(self))
+			ui.OK("no outstanding holds/announcements of yours, and no block reservations for this window (%s)", selfLabel(self))
 			return 0
 		}
-		now := time.Now()
 		if len(own) > 0 {
 			ui.Banner(fmt.Sprintf("your open announcements — window %s", selfLabel(self)))
 			for _, a := range own {
@@ -652,6 +833,75 @@ func cmdHolds(args []string) int {
 		}
 		return 0
 	})
+}
+
+// unattributedShown caps the holds `wt holds` lists in its can't-tell-whose
+// section (#211); the rest are counted.
+const unattributedShown = 10
+
+// unattributedView picks what `wt holds` lists of the open announcements in this
+// checkout that wt can't attribute to any session (#211): the newest
+// unattributedShown HOLDS (a hold can still gate, and a stale one needs someone
+// to release it) and the plain announcements still inside
+// coord.UnattributedHorizon. Older ones are only counted: plain ones are
+// informational and past any live signal, and a month of them is what buried
+// #211's operator's real holds under "your open announcements". Newest first.
+// Pure.
+func unattributedView(open []coord.Record, now time.Time) (show []coord.Record, olderHolds, olderNotes int) {
+	held := 0
+	for i := len(open) - 1; i >= 0; i-- {
+		a := open[i]
+		switch {
+		case len(a.Hold) > 0 && held < unattributedShown:
+			held++
+			show = append(show, a)
+		case len(a.Hold) > 0:
+			olderHolds++
+		case coord.Age(a, now) <= coord.UnattributedHorizon:
+			show = append(show, a)
+		default:
+			olderNotes++
+		}
+	}
+	return show, olderHolds, olderNotes
+}
+
+// unattributedHoldStale reports whether the merge-pr gate no longer blocks on an
+// unattributable hold a (coord.ActiveHoldsAt's rule): past hold_max_age, or past
+// coord.UnattributedHorizon, whichever comes first. Pure.
+func unattributedHoldStale(a coord.Record, now time.Time, maxAge time.Duration) bool {
+	limit := maxAge
+	if limit <= 0 || limit > coord.UnattributedHorizon {
+		limit = coord.UnattributedHorizon
+	}
+	return coord.Age(a, now) > limit
+}
+
+// unattributedHoldsSection prints `wt holds`' section for open announcements in
+// this checkout that wt can't attribute to any session (#211), WITHOUT all-clear
+// lines: they are not provably yours, and an all-clear releases a hold for every
+// window. Nothing when there are none.
+func unattributedHoldsSection(open []coord.Record, now time.Time, maxAge time.Duration) {
+	if len(open) == 0 {
+		return
+	}
+	show, olderHolds, olderNotes := unattributedView(open, now)
+	ui.Banner(fmt.Sprintf("can't tell whose — %d open in this checkout, no session wt can match (NOT listed as yours)", len(open)))
+	for _, a := range show {
+		tag := ""
+		if len(a.Hold) > 0 {
+			tag = " " + ui.Yellow("[hold: "+strings.Join(a.Hold, ",")+"]")
+			if unattributedHoldStale(a, now, maxAge) {
+				tag += ui.Dim(" (stale: no longer blocks merge-pr)")
+			}
+		}
+		fmt.Printf("  %s  %s%s\n    %s\n", ui.Bold(a.ID), ui.Dim(humanAge(coord.Age(a, now))), tag, a.Message)
+	}
+	if olderHolds+olderNotes > 0 {
+		fmt.Printf("  %s\n", ui.Dim(fmt.Sprintf("+ %d older hold(s) and %d plain announcement(s) older than %dh not listed (plain ones are informational; nothing to release)",
+			olderHolds, olderNotes, int(coord.UnattributedHorizon.Hours()))))
+	}
+	ui.Info("wt can't tell who wrote these (written before wt recorded sessions). `wt ack <id>` waives a hold for you only; `wt all-clear <id>` asks first, since it releases it for EVERY window.")
 }
 
 // sameCheckoutHoldsNote tells `wt holds` that ANOTHER session in this checkout
@@ -691,7 +941,7 @@ func peerHoldBanner(c *config.Config) {
 	if err != nil {
 		return
 	}
-	holds := coord.PendingHolds(recs, self)
+	holds := coord.PendingHolds(recs, self, time.Now())
 	if len(holds) == 0 {
 		return
 	}

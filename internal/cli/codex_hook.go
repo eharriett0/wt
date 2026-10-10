@@ -245,8 +245,9 @@ func hookAgentContext(r io.Reader, codex bool) int {
 	if logPath, self := coordCtx(c); logPath != "" {
 		self.Session = agentHookSession(self.Session, codex, parseHookSessionID(b))
 		if recs, rerr := coord.Load(logPath); rerr == nil {
-			box := hookInbox(coord.Inbox(recs, self), self, overlaps)
-			if msg, has := coordContextMessage(box, c.MaxAge, time.Now()); has {
+			now := time.Now()
+			box := hookInbox(coord.Inbox(recs, self, now), self, overlaps)
+			if msg, has := coordContextMessage(box, c.MaxAge, now); has {
 				parts = append(parts, msg)
 			}
 		}
@@ -343,17 +344,19 @@ func parseHookSessionID(b []byte) string {
 // hookInbox picks the coordination entries for the per-turn context. With other
 // worktrees present it is the whole inbox, as before #163. In a single-worktree
 // repo (where the hook used to stay silent altogether) it is everything from
-// another session in this same checkout (#163) PLUS every un-acked HOLD from
-// another window: the merge gate enforces those whether or not that window's
-// worktree still exists (a removed worktree's hold, a WT_WINDOW-pinned session in
-// this very checkout, a same-named clone sharing the log), so the hook never
-// hides one. Plain announcements from other windows stay out, as before. Entries
-// come back labelled (labelForContext). Pure.
+// THIS checkout that isn't provably yours — another session's (#163), or one wt
+// can't attribute (#211; Inbox keeps only those still inside
+// coord.UnattributedHorizon) — PLUS every un-acked HOLD from another window: the
+// merge gate enforces those whether or not that window's worktree still exists
+// (a removed worktree's hold, a WT_WINDOW-pinned session in this very checkout,
+// a same-named clone sharing the log), so the hook never hides one. Plain
+// announcements from other windows stay out, as before. Entries come back
+// labelled (labelForContext). Pure.
 func hookInbox(box []coord.Record, self coord.Self, otherWorktrees bool) []coord.Record {
 	if !otherWorktrees {
 		var keep []coord.Record
 		for _, r := range box {
-			if self.SharesCheckout(r) || len(r.Hold) > 0 {
+			if r.Window == self.Window || len(r.Hold) > 0 {
 				keep = append(keep, r)
 			}
 		}

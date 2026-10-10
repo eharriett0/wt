@@ -175,8 +175,8 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 | `wt announce "<msg>"` | Tell other windows a change is starting `[--hold "merge-main,…"] [--issue N]` |
 | `wt inbox` | Un-acked announcements from other windows, and from another session working in this same checkout (labelled; see below). `[--issue N]` also reads back the cross-machine mirror `[--json]` |
 | `wt ack <id>` | Acknowledge one `[--state "what this window is touching"]` |
-| `wt all-clear <id>` | Release your hold |
-| `wt holds` | YOUR outstanding announcements/holds + block reservations, with copy-pasteable all-clear lines |
+| `wt all-clear <id>` | Release your hold — for EVERY window. On a hold that isn't provably this session's it asks first on a terminal, and otherwise refuses unless you pass `--not-mine` |
+| `wt holds` | YOUR outstanding announcements/holds (only ones this session wrote) + block reservations, with copy-pasteable all-clear lines; this checkout's records wt can't attribute to any session are listed apart, without them |
 | `wt prune-coord` | GC the coordination log — drop resolved handshakes + aged block reservations `[--block-max-age D]` |
 | `wt block-id <file>` | Atomically reserve the next append-log id so two windows never grab the same `NEWEST-N`. `--written N` marks a reservation done (clears the banner; frees it if never written) `[--pattern] [--format]` |
 | `wt append <doc> --section H "txt"` | Locked, section-scoped append to a structured shared doc (parallel adds can't clobber) |
@@ -203,8 +203,13 @@ like another session's: `wt ack <id>` waives it for you only (`wt all-clear <id>
 would release it for every window). Terminal tabs are not sessions: a person's
 tabs, and anything started in them, stay one party. A shell with no session id is
 never silently merged with one that has: it sees that session's announcements,
-and `inbox` hedges rather than reporting a confident "clear". Records written before
-sessions existed keep the old window-only behaviour.
+and `inbox` hedges rather than reporting a confident "clear". Shells with no
+session id fall back to the directory: in one checkout they are one party, so a
+terminal is never blocked by its own hold (set `WT_SESSION` per shell to tell
+them apart). A record wt can't attribute to any session (written before wt
+recorded sessions) is never "yours": `wt holds` lists it apart with no all-clear
+line, `wt all-clear` asks before releasing it, its hold gates `merge-pr` for up
+to 24h, and `inbox` shows it for 24h (then only counts it).
 
 Structured shared docs (`structured_doc.<name>` in config) upgrade the blanket
 "shared doc — advisory" to **section-aware** grading: two windows editing the

@@ -23,8 +23,16 @@ func ids(recs []Record) []string {
 	return out
 }
 
+// tok is the session these window-level tests run as: since #211 only a record
+// carrying the reader's own token is its own (a record with no session is
+// unattributable), so every record here is stamped with it.
+const tok = "s1"
+
+// testNow is "now" for the window-level tests: an hour after rec's timestamp.
+var testNow = time.Date(2026, 7, 18, 13, 0, 0, 0, time.UTC)
+
 func rec(kind, window, id, ackOf string, hold ...string) Record {
-	return Record{ID: id, TS: "2026-07-18T12:00:00Z", Window: window, Repo: "eagle-valley", Kind: kind, AckOf: ackOf, Hold: hold}
+	return Record{ID: id, TS: "2026-07-18T12:00:00Z", Window: window, Repo: "eagle-valley", Kind: kind, AckOf: ackOf, Hold: hold, Session: tok}
 }
 
 func TestAppendLoadRoundTrip(t *testing.T) {
@@ -85,7 +93,7 @@ func TestInbox(t *testing.T) {
 		rec(KindAnnounce, "other", "a3", ""),        // from other, will be all-cleared → hidden
 		rec(KindAllClear, "other", "y", "a3"),
 	}
-	got := Inbox(recs, Self{Window: "dep-sweep"})
+	got := Inbox(recs, Self{Window: "dep-sweep", Session: tok}, testNow)
 	if len(got) != 1 || got[0].ID != "a1" {
 		t.Fatalf("inbox should be [a1], got %+v", ids(got))
 	}
@@ -93,28 +101,28 @@ func TestInbox(t *testing.T) {
 
 func TestActiveHoldsBlocksUntilAckedOrCleared(t *testing.T) {
 	base := []Record{
-		{ID: "a1", Kind: KindAnnounce, Window: "roll-nodes", Hold: []string{"merge-main", "flux-reconcile"}},
+		{ID: "a1", Session: tok, Kind: KindAnnounce, Window: "roll-nodes", Hold: []string{"merge-main", "flux-reconcile"}},
 	}
 	// Un-acked hold covering merge-main → blocks.
-	if h := ActiveHolds(base, Self{Window: "dep-sweep"}, "merge-main"); len(h) != 1 {
+	if h := ActiveHolds(base, Self{Window: "dep-sweep", Session: tok}, "merge-main", testNow); len(h) != 1 {
 		t.Fatalf("expected 1 active hold, got %d", len(h))
 	}
 	// Op not covered → no block.
-	if h := ActiveHolds(base, Self{Window: "dep-sweep"}, "kubectl-mutate:loki"); len(h) != 0 {
+	if h := ActiveHolds(base, Self{Window: "dep-sweep", Session: tok}, "kubectl-mutate:loki", testNow); len(h) != 0 {
 		t.Fatalf("uncovered op should not block, got %d", len(h))
 	}
 	// After self acks → cleared for self.
-	acked := append(append([]Record{}, base...), Record{ID: "k", Kind: KindAck, Window: "dep-sweep", AckOf: "a1"})
-	if h := ActiveHolds(acked, Self{Window: "dep-sweep"}, "merge-main"); len(h) != 0 {
+	acked := append(append([]Record{}, base...), Record{ID: "k", Session: tok, Kind: KindAck, Window: "dep-sweep", AckOf: "a1"})
+	if h := ActiveHolds(acked, Self{Window: "dep-sweep", Session: tok}, "merge-main", testNow); len(h) != 0 {
 		t.Fatalf("acked hold should not block self, got %d", len(h))
 	}
 	// After all-clear → cleared for everyone.
-	clr := append(append([]Record{}, base...), Record{ID: "z", Kind: KindAllClear, Window: "roll-nodes", AckOf: "a1"})
-	if h := ActiveHolds(clr, Self{Window: "dep-sweep"}, "merge-main"); len(h) != 0 {
+	clr := append(append([]Record{}, base...), Record{ID: "z", Session: tok, Kind: KindAllClear, Window: "roll-nodes", AckOf: "a1"})
+	if h := ActiveHolds(clr, Self{Window: "dep-sweep", Session: tok}, "merge-main", testNow); len(h) != 0 {
 		t.Fatalf("all-cleared hold should not block, got %d", len(h))
 	}
 	// A window never blocks on its OWN hold.
-	if h := ActiveHolds(base, Self{Window: "roll-nodes"}, "merge-main"); len(h) != 0 {
+	if h := ActiveHolds(base, Self{Window: "roll-nodes", Session: tok}, "merge-main", testNow); len(h) != 0 {
 		t.Fatalf("self hold should not block self, got %d", len(h))
 	}
 }
@@ -127,7 +135,7 @@ func TestPendingHolds(t *testing.T) {
 		rec(KindAnnounce, "other", "a3", "", "flux-reconcile"),  // will be acked → excluded
 		rec(KindAck, "self", "k", "a3"),
 	}
-	got := PendingHolds(recs, Self{Window: "self"})
+	got := PendingHolds(recs, Self{Window: "self", Session: tok}, testNow)
 	if len(got) != 1 || got[0].ID != "a1" {
 		t.Fatalf("PendingHolds should be [a1], got %+v", ids(got))
 	}
@@ -205,19 +213,19 @@ func TestSelfBlockFixedByStableIdentity(t *testing.T) {
 		t.Fatalf("identity drifted across branch flip: %q != %q", selfAtAnnounce, selfAtMerge)
 	}
 	recs := []Record{
-		{ID: "a1", Kind: KindAnnounce, Window: selfAtAnnounce, Hold: []string{"merge-main"}},
+		{ID: "a1", Session: tok, Kind: KindAnnounce, Window: selfAtAnnounce, Hold: []string{"merge-main"}},
 	}
-	if h := ActiveHolds(recs, Self{Window: selfAtMerge}, "merge-main"); len(h) != 0 {
+	if h := ActiveHolds(recs, Self{Window: selfAtMerge, Session: tok}, "merge-main", testNow); len(h) != 0 {
 		t.Fatalf("coordinator self-blocked on its OWN hold: got %d", len(h))
 	}
 	other := WindowID("", "/x/me-worktrees/dep-sweep", "dep-sweep")
-	if h := ActiveHolds(recs, Self{Window: other}, "merge-main"); len(h) != 1 {
+	if h := ActiveHolds(recs, Self{Window: other, Session: tok}, "merge-main", testNow); len(h) != 1 {
 		t.Fatalf("a genuinely different window must still be blocked: got %d", len(h))
 	}
 	// WT_WINDOW override also yields a stable, self-exempting identity across dirs.
 	pinned := WindowID("roll-coordinator", "/anywhere/else", "any-branch")
-	recs2 := []Record{{ID: "a2", Kind: KindAnnounce, Window: WindowID("roll-coordinator", top, "roll"), Hold: []string{"merge-main"}}}
-	if h := ActiveHolds(recs2, Self{Window: pinned}, "merge-main"); len(h) != 0 {
+	recs2 := []Record{{ID: "a2", Session: tok, Kind: KindAnnounce, Window: WindowID("roll-coordinator", top, "roll"), Hold: []string{"merge-main"}}}
+	if h := ActiveHolds(recs2, Self{Window: pinned, Session: tok}, "merge-main", testNow); len(h) != 0 {
 		t.Fatalf("WT_WINDOW-pinned coordinator self-blocked across dirs: got %d", len(h))
 	}
 }
@@ -235,8 +243,8 @@ func TestDistinctTreesSameBasenameDoNotCollapse(t *testing.T) {
 		t.Fatalf("distinct trees collapsed to one identity %q — over-relax regression", a)
 	}
 	// clone B must still be blocked by clone A's merge-main hold.
-	recs := []Record{{ID: "h", Kind: KindAnnounce, Window: a, Hold: []string{"merge-main"}}}
-	if h := ActiveHolds(recs, Self{Window: b}, "merge-main"); len(h) != 1 {
+	recs := []Record{{ID: "h", Session: tok, Kind: KindAnnounce, Window: a, Hold: []string{"merge-main"}}}
+	if h := ActiveHolds(recs, Self{Window: b, Session: tok}, "merge-main", testNow); len(h) != 1 {
 		t.Fatalf("clone B must be blocked by clone A's hold, got %d", len(h))
 	}
 	// main checkout vs a worktree that happens to share the leaf name: distinct.
@@ -254,7 +262,7 @@ func TestActiveHoldsAt(t *testing.T) {
 			TS: now.Add(-time.Duration(ageH) * time.Hour).Format(time.RFC3339)}
 	}
 	recs := []Record{mk("a", "winA", 1), mk("b", "winB", 48)} // a fresh, b 2 days old
-	fresh, stale := ActiveHoldsAt(recs, Self{Window: "self"}, "merge-main", now, 24*time.Hour)
+	fresh, stale := ActiveHoldsAt(recs, Self{Window: "self", Session: tok}, "merge-main", now, 24*time.Hour)
 	if len(fresh) != 1 || fresh[0].ID != "a" {
 		t.Errorf("fresh = %+v, want [a]", fresh)
 	}
@@ -262,7 +270,7 @@ func TestActiveHoldsAt(t *testing.T) {
 		t.Errorf("stale = %+v, want [b]", stale)
 	}
 	// maxAge 0 disables expiry — everything fresh (pre-#32 behavior)
-	f0, s0 := ActiveHoldsAt(recs, Self{Window: "self"}, "merge-main", now, 0)
+	f0, s0 := ActiveHoldsAt(recs, Self{Window: "self", Session: tok}, "merge-main", now, 0)
 	if len(f0) != 2 || len(s0) != 0 {
 		t.Errorf("maxAge=0: fresh=%d stale=%d, want 2/0", len(f0), len(s0))
 	}
@@ -270,13 +278,13 @@ func TestActiveHoldsAt(t *testing.T) {
 
 func TestOwnOpenAnnouncements(t *testing.T) {
 	recs := []Record{
-		{ID: "1", Kind: KindAnnounce, Window: "me"},
-		{ID: "2", Kind: KindAnnounce, Window: "other"},            // not mine
-		{ID: "3", Kind: KindAnnounce, Window: "me"},               // mine, will be cleared
-		{ID: "x", Kind: KindAllClear, Window: "me", AckOf: "3"},   // clears 3
-		{ID: "4", Kind: KindBlockReserve, Window: "me", Block: 5}, // not an announcement
+		{ID: "1", Session: tok, Kind: KindAnnounce, Window: "me"},
+		{ID: "2", Session: tok, Kind: KindAnnounce, Window: "other"},            // not mine
+		{ID: "3", Session: tok, Kind: KindAnnounce, Window: "me"},               // mine, will be cleared
+		{ID: "x", Session: tok, Kind: KindAllClear, Window: "me", AckOf: "3"},   // clears 3
+		{ID: "4", Session: tok, Kind: KindBlockReserve, Window: "me", Block: 5}, // not an announcement
 	}
-	own := OwnOpenAnnouncements(recs, Self{Window: "me"})
+	own := OwnOpenAnnouncements(recs, Self{Window: "me", Session: tok})
 	if len(own) != 1 || own[0].ID != "1" {
 		t.Errorf("OwnOpenAnnouncements = %+v, want just id 1 (2=other, 3=cleared)", own)
 	}

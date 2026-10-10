@@ -340,14 +340,19 @@ type mcpCoordRecord struct {
 	Hold    []string `json:"hold,omitempty"`
 	Issue   int      `json:"issue,omitempty"`
 	TS      string   `json:"ts,omitempty"`
-	// SameCheckout marks a record from ANOTHER session in this very checkout
-	// (#163): its window equals "self", so a client can't tell it apart otherwise.
+	// SameCheckout marks a record from this very checkout that isn't yours —
+	// another session's (#163) or unattributable (#211): its window equals
+	// "self", so a client can't tell it apart otherwise.
 	SameCheckout bool `json:"same_checkout,omitempty"`
+	// Attribution says whose a same-checkout record is: "another_session", or
+	// "unattributable" when wt can't tell (#211).
+	Attribution string `json:"attribution,omitempty"`
 }
 
 func toMCPCoord(r coord.Record, self coord.Self) mcpCoordRecord {
+	tag := attributionTag(r, self)
 	return mcpCoordRecord{ID: r.ID, Window: r.Window, Session: r.Session, Message: r.Message, Hold: r.Hold,
-		Issue: r.Issue, TS: r.TS, SameCheckout: self.SharesCheckout(r)}
+		Issue: r.Issue, TS: r.TS, SameCheckout: tag != "", Attribution: tag}
 }
 
 // mcpInbox returns un-acked announcements from other windows/sessions
@@ -360,7 +365,7 @@ func mcpInbox(c *config.Config) (string, bool) {
 	if err != nil {
 		return "could not read coordination log: " + err.Error(), true
 	}
-	box := coord.Inbox(recs, self)
+	box := coord.Inbox(recs, self, time.Now())
 	out := make([]mcpCoordRecord, 0, len(box))
 	for _, r := range box {
 		out = append(out, toMCPCoord(r, self))
@@ -383,7 +388,7 @@ func mcpHolds(c *config.Config) (string, bool) {
 	if err != nil {
 		return "could not read coordination log: " + err.Error(), true
 	}
-	holds := coord.PendingHolds(recs, self)
+	holds := coord.PendingHolds(recs, self, time.Now())
 	out := make([]mcpCoordRecord, 0, len(holds))
 	for _, r := range holds {
 		out = append(out, toMCPCoord(r, self))

@@ -25,16 +25,126 @@ func TestPostedBy(t *testing.T) {
 	}{
 		{coord.Record{Window: "/work/repo", Session: "24288609-c37a-43a9-8a82-80e93779324e"}, "same checkout, another session (session 24288609…)"},
 		{coord.Record{Window: "/work/repo", Session: coord.SessionNone}, "same checkout, another session (no session token)"},
-		// Your own record — or a pre-#163 one, which is yours by the wildcard — must
-		// never be labelled as another session's (review finding: cmdAck did).
+		// Your own record must never be labelled as another session's (review
+		// finding: cmdAck did) — and a pre-#163 one is NOT yours (#211): it is named
+		// as one wt can't attribute.
 		{coord.Record{Window: "/work/repo", Session: "A"}, "this window (yours)"},
-		{coord.Record{Window: "/work/repo"}, "this window (yours)"},
+		{coord.Record{Window: "/work/repo"}, "same checkout, can't tell whose (written before wt recorded sessions)"},
 		{coord.Record{Window: "/work/repo-worktrees/roll", Session: "R"}, "/work/repo-worktrees/roll"},
 	}
 	for _, tc := range cases {
 		if got := postedBy(tc.rec, self); got != tc.want {
 			t.Errorf("postedBy(%+v) = %q, want %q", tc.rec, got, tc.want)
 		}
+	}
+	// A token-less shell's own token-less record is its own (the directory
+	// fallback); a pre-#163 one is unattributable to it too.
+	tokenless := coord.Self{Window: "/work/repo", Session: coord.SessionNone}
+	if got := postedBy(coord.Record{Window: "/work/repo", Session: coord.SessionNone}, tokenless); got != "this window (yours)" {
+		t.Errorf("token-less pair label = %q", got)
+	}
+	if got := postedBy(coord.Record{Window: "/work/repo"}, tokenless); got != "same checkout, can't tell whose (written before wt recorded sessions)" {
+		t.Errorf("token-less reader, pre-#163 record label = %q", got)
+	}
+}
+
+// #211: who a record belongs to, as the all-clear guard names it.
+func TestWhoseRecord(t *testing.T) {
+	self := coord.Self{Window: "/w", Session: "aaaaaaaa-1111-2222-3333-444444444444"}
+	cases := []struct {
+		rec  coord.Record
+		want string
+	}{
+		{coord.Record{Window: "/w", Session: self.Session}, "yours"},
+		{coord.Record{Window: "/w", Session: "bbbbbbbb-5555-6666-7777-888888888888"}, "another session's, in this checkout (session bbbbbbbb…)"},
+		{coord.Record{Window: "/w"}, "unattributable (written before wt recorded sessions)"},
+		{coord.Record{Window: "/elsewhere", Session: "C"}, "another window's (/elsewhere)"},
+	}
+	for _, tc := range cases {
+		if got := whoseRecord(tc.rec, self); got != tc.want {
+			t.Errorf("whoseRecord(%+v) = %q, want %q", tc.rec, got, tc.want)
+		}
+	}
+}
+
+// The all-clear guard (#211): an all-clear releases a hold for EVERY window, so
+// only a record this session provably wrote is released without a word. Anything
+// else is asked about on a terminal, refused otherwise, and released only with
+// --not-mine. Before, `wt all-clear` released any id silently — #211's operator
+// nearly released another live session's hold that `wt holds` had listed as theirs.
+func TestAllClearVerdict(t *testing.T) {
+	self := coord.Self{Window: "/w", Session: "A"}
+	mine := coord.Record{Window: "/w", Session: "A"}
+	mirroredMine := coord.Record{Window: "/w", Session: coord.MirrorSession("A")}
+	another := coord.Record{Window: "/w", Session: "B"}
+	legacy := coord.Record{Window: "/w"}
+	otherWin := coord.Record{Window: "/elsewhere", Session: "C"}
+	tokenless := coord.Record{Window: "/w", Session: coord.SessionNone}
+	cases := []struct {
+		name         string
+		self         coord.Self
+		rec          coord.Record
+		notMine, tty bool
+		want         clearVerdict
+	}{
+		{"mine → post", self, mine, false, false, clearPost},
+		{"mine read back from the mirror → post", self, mirroredMine, false, false, clearPost},
+		{"another session's, no terminal → refuse", self, another, false, false, clearRefuse},
+		{"another session's, terminal → ask", self, another, false, true, clearAsk},
+		{"another session's, --not-mine → post", self, another, true, false, clearPost},
+		{"pre-#163 (unattributable), no terminal → refuse", self, legacy, false, false, clearRefuse},
+		{"pre-#163, terminal → ask", self, legacy, false, true, clearAsk},
+		{"another window's, no terminal → refuse", self, otherWin, false, false, clearRefuse},
+		{"token-less shell, its own token-less record (directory fallback) → post", coord.Self{Window: "/w", Session: coord.SessionNone}, tokenless, false, false, clearPost},
+		{"token-less shell, a pre-#163 record → refuse", coord.Self{Window: "/w", Session: coord.SessionNone}, legacy, false, false, clearRefuse},
+		{"token-less shell, a tagged session's record → refuse", coord.Self{Window: "/w", Session: coord.SessionNone}, another, false, false, clearRefuse},
+	}
+	for _, tc := range cases {
+		if got := allClearVerdict(tc.self, tc.rec, tc.notMine, tc.tty); got != tc.want {
+			t.Errorf("%s: allClearVerdict = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// `wt holds` lists, of the announcements in this checkout wt can't attribute
+// (#211): the newest holds (capped) and the plain ones still inside the horizon;
+// older ones are only counted — a month of them is what buried the operator's
+// real holds.
+func TestUnattributedView(t *testing.T) {
+	now := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) string { return now.Add(-d).Format(time.RFC3339) }
+	var open []coord.Record
+	for i := 0; i < unattributedShown+3; i++ { // oldest first, as the log is
+		open = append(open, coord.Record{ID: fmt.Sprintf("h%02d", i), TS: at(time.Duration(40-i) * 24 * time.Hour), Hold: []string{"merge-main"}})
+	}
+	open = append(open,
+		coord.Record{ID: "oldnote", TS: at(5 * 24 * time.Hour)},
+		coord.Record{ID: "freshnote", TS: at(time.Hour)},
+	)
+	show, olderHolds, olderNotes := unattributedView(open, now)
+	got := recIDs(show)
+	if len(got) != unattributedShown+1 || got[0] != "freshnote" || got[1] != fmt.Sprintf("h%02d", unattributedShown+2) || olderHolds != 3 || olderNotes != 1 {
+		t.Errorf("unattributedView = %v (+%d holds, +%d notes); want freshnote then the %d newest holds, +3 holds, +1 note", got, olderHolds, olderNotes, unattributedShown)
+	}
+	for _, id := range got {
+		if id == "oldnote" {
+			t.Errorf("a plain announcement past the horizon must be counted, not listed: %v", got)
+		}
+	}
+	// stale = no longer blocks merge-pr: past hold_max_age or the horizon, whichever is first
+	h := coord.Record{TS: at(10 * time.Hour)}
+	if unattributedHoldStale(h, now, 24*time.Hour) || !unattributedHoldStale(h, now, 2*time.Hour) || unattributedHoldStale(h, now, 0) {
+		t.Error("a 10h-old unattributable hold: fresh under 24h/0 hold_max_age, stale under 2h")
+	}
+	if !unattributedHoldStale(coord.Record{TS: at(30 * time.Hour)}, now, 0) {
+		t.Error("an unattributable hold past the 24h horizon is stale even with hold_max_age off")
+	}
+	if backlogLine(0, 0) != "" || !strings.Contains(backlogLine(4, 1), "+ 5 older announcement(s) in this checkout (1 with a hold)") {
+		t.Errorf("backlogLine = %q", backlogLine(4, 1))
+	}
+	shown, more := newestHolds(open[:4], 2)
+	if strings.Join(recIDs(shown), ",") != "h02,h03" || more != 2 {
+		t.Errorf("newestHolds = %v +%d, want [h02 h03] +2", recIDs(shown), more)
 	}
 }
 
@@ -49,6 +159,8 @@ func TestHoldersPhrase(t *testing.T) {
 		{[]coord.Record{other}, "another window"},
 		{[]coord.Record{same}, "another session in this checkout"},
 		{[]coord.Record{other, same}, "another window AND another session in this checkout"},
+		{[]coord.Record{{Window: "/w"}}, "an unattributable writer in this checkout"},
+		{[]coord.Record{other, {Window: "/w"}}, "another window AND an unattributable writer in this checkout"},
 	}
 	for _, tc := range cases {
 		if got := holdersPhrase(tc.holds, self); got != tc.want {
@@ -59,6 +171,9 @@ func TestHoldersPhrase(t *testing.T) {
 	// same-checkout holder.
 	if !sameCheckoutHolder([]coord.Record{other, same}, self) || sameCheckoutHolder([]coord.Record{other}, self) {
 		t.Error("sameCheckoutHolder must be true iff a holder shares this checkout")
+	}
+	if !unattributedHolder([]coord.Record{other, {Window: "/w"}}, self) || unattributedHolder([]coord.Record{other, same}, self) {
+		t.Error("unattributedHolder must be true iff a holder is unattributable in this checkout")
 	}
 }
 
@@ -87,6 +202,7 @@ func TestHoldAdvice(t *testing.T) {
 		{"its session silent for hours: all-clear offered", []coord.Record{silent}, []string{"silent"}, true},
 		{"placed 13h ago: all-clear offered", []coord.Record{old}, []string{"old"}, false},
 		{"mixed: only the orphaned one is offered", []coord.Record{liveSame, old}, []string{"old"}, true},
+		{"a young pre-#163 hold here: ack + can't-tell-whose note, NO all-clear", []coord.Record{{ID: "legacy", Window: "/w", TS: at(time.Hour), Hold: []string{"merge-main"}}}, nil, false},
 	}
 	for _, tc := range cases {
 		lines := holdAdvice(tc.holds, tc.holds, self, now)
@@ -110,6 +226,14 @@ func TestHoldAdvice(t *testing.T) {
 		if got := strings.Contains(all, "/clear"); got != tc.wantClrNt {
 			t.Errorf("%s: /clear note = %v, want %v:\n%s", tc.name, got, tc.wantClrNt, all)
 		}
+	} // #211: an unattributable holder gets the can't-tell-whose note (it may be
+	// yours: ack it); a holder wt can attribute does not.
+	unattr := coord.Record{ID: "legacy", Window: "/w", TS: at(time.Hour), Hold: []string{"merge-main"}}
+	if all := strings.Join(holdAdvice([]coord.Record{unattr}, nil, self, now), "\n"); !strings.Contains(all, "can't tell whose") {
+		t.Errorf("an unattributable holder must get the can't-tell-whose note:\n%s", all)
+	}
+	if all := strings.Join(holdAdvice([]coord.Record{liveSame, liveOther}, nil, self, now), "\n"); strings.Contains(all, "can't tell whose") {
+		t.Errorf("attributable holders must not get the can't-tell-whose note:\n%s", all)
 	}
 }
 
@@ -151,10 +275,10 @@ func TestBulkAckRecords(t *testing.T) {
 	}
 	// An ack by this session clears the note for it and for no other session.
 	recs := append([]coord.Record{{ID: "n1", Kind: coord.KindAnnounce, Window: "/x", Session: "X"}}, got[0])
-	if box := coord.Inbox(recs, self); len(box) != 0 {
+	if box := coord.Inbox(recs, self, base); len(box) != 0 {
 		t.Errorf("A's own bulk ack must clear n1 for A: %v", box)
 	}
-	if box := coord.Inbox(recs, coord.Self{Window: "/w", Session: "B"}); len(box) != 1 {
+	if box := coord.Inbox(recs, coord.Self{Window: "/w", Session: "B"}, base); len(box) != 1 {
 		t.Errorf("A's bulk ack must not clear n1 for B: %v", box)
 	}
 }
@@ -251,15 +375,16 @@ func TestHookInbox(t *testing.T) {
 		{ID: "gone", Window: "/work/repo-worktrees/removed-long-ago", Session: "R"},
 		{ID: "held", Window: "/work/repo-worktrees/removed-long-ago", Session: "R", Hold: []string{"merge-main"}},
 		{ID: "pinned", Window: "awin", Session: "P", Hold: []string{"merge-main"}}, // a WT_WINDOW-pinned session here
+		{ID: "legacy", Window: "/work/repo"},                                       // can't tell whose (#211)
 	}
 	got := hookInbox(box, self, false)
-	if strings.Join(recIDs(got), ",") != "same,held,pinned" {
-		t.Fatalf("single worktree: hookInbox = %v, want [same held pinned] (other windows' plain notes stay out, their holds never)", recIDs(got))
+	if strings.Join(recIDs(got), ",") != "same,held,pinned,legacy" {
+		t.Fatalf("single worktree: hookInbox = %v, want [same held pinned legacy] (other windows' plain notes stay out, their holds never; this checkout's unattributable ones in)", recIDs(got))
 	}
 	if got[0].Window != "same checkout, another session (session B)" || got[1].Window != "/work/repo-worktrees/removed-long-ago" {
 		t.Errorf("labels = %q, %q", got[0].Window, got[1].Window)
 	}
-	if got := hookInbox(box, self, true); len(got) != 4 {
+	if got := hookInbox(box, self, true); len(got) != 5 {
 		t.Errorf("other worktrees present: hookInbox = %+v, want the whole inbox", got)
 	}
 }
@@ -331,10 +456,14 @@ func TestInboxEntryJSON(t *testing.T) {
 func TestToMCPCoord(t *testing.T) {
 	self := coord.Self{Window: "/w", Session: "A"}
 	got := toMCPCoord(coord.Record{ID: "x", Window: "/w", Session: "B"}, self)
-	if !got.SameCheckout || got.Session != "B" {
+	if !got.SameCheckout || got.Session != "B" || got.Attribution != "another_session" {
 		t.Errorf("same-checkout MCP record = %+v", got)
 	}
-	if other := toMCPCoord(coord.Record{ID: "y", Window: "/other", Session: "C"}, self); other.SameCheckout {
+	// #211: a same-checkout record wt can't attribute is flagged, and says so.
+	if legacy := toMCPCoord(coord.Record{ID: "l", Window: "/w"}, self); !legacy.SameCheckout || legacy.Attribution != "unattributable" {
+		t.Errorf("unattributable MCP record = %+v", legacy)
+	}
+	if other := toMCPCoord(coord.Record{ID: "y", Window: "/other", Session: "C"}, self); other.SameCheckout || other.Attribution != "" {
 		t.Errorf("another window flagged same-checkout: %+v", other)
 	}
 }
@@ -467,4 +596,144 @@ func captureStdoutForTest(t *testing.T, f func()) string {
 	_ = w.Close()
 	b, _ := io.ReadAll(r)
 	return string(b)
+}
+
+// TestUnattributedWiring drives the real commands over #211's shape: one
+// checkout whose log carries pre-#163 (session-less) records next to two live
+// sessions' holds. It pins what the pure tests can't: `wt holds` lists only this
+// session's records as yours (with all-clear lines), the all-clear guard refuses
+// anything else without a terminal or --not-mine (and asks on one), `announce
+// --clear` is guarded the same way, and a young pre-#163 hold gates merge-pr.
+func TestUnattributedWiring(t *testing.T) {
+	repo, home := t.TempDir(), t.TempDir()
+	gitInitForTest(t, repo)
+	t.Setenv("HOME", home)
+	for _, k := range []string{"WT_SESSION", "CODEX_SESSION_ID", "WT_WINDOW", "WT_COORD_ISSUE"} {
+		t.Setenv(k, "")
+	}
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "aaaaaaaa-1111-2222-3333-444444444444")
+	t.Chdir(repo)
+	c, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath, self := coordCtx(c)
+	now := time.Now().UTC()
+	at := func(d time.Duration) string { return now.Add(-d).Format(time.RFC3339) }
+	recs := []coord.Record{
+		{ID: "legacyhold", Window: self.Window, TS: at(time.Hour), Hold: []string{"merge-main"}, Message: "pre-#163 hold"},
+		{ID: "legacynote", Window: self.Window, TS: at(5 * 24 * time.Hour), Message: "pre-#163 note"},
+		{ID: "minehold", Window: self.Window, Session: self.Session, TS: at(time.Minute), Hold: []string{"merge-main"}, Message: "mine"},
+		{ID: "bhold", Window: self.Window, Session: "bbbbbbbb-5555-6666-7777-888888888888", TS: at(time.Minute), Hold: []string{"merge-main"}, Message: "B's"},
+	}
+	for _, r := range recs {
+		r.Kind, r.Repo = coord.KindAnnounce, "repo"
+		if err := coord.Append(logPath, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clears := func() []string {
+		all, _ := coord.Load(logPath)
+		var out []string
+		for _, r := range all {
+			if r.Kind == coord.KindAllClear {
+				out = append(out, r.AckOf)
+			}
+		}
+		return out
+	}
+
+	out, _ := captureOutputForTest(t, func() { cmdHolds(nil) })
+	if !strings.Contains(out, "all-clear: wt all-clear minehold") {
+		t.Errorf("`wt holds` must list this session's own hold with its all-clear line:\n%s", out)
+	}
+	for _, id := range []string{"legacyhold", "legacynote", "bhold"} {
+		if strings.Contains(out, "wt all-clear "+id) {
+			t.Errorf("`wt holds` offered an all-clear for %s, which is not this session's:\n%s", id, out)
+		}
+	}
+	if !strings.Contains(out, "can't tell whose") || !strings.Contains(out, "legacyhold") || strings.Contains(out, "legacynote") {
+		t.Errorf("`wt holds` must list the young pre-#163 hold apart, and only count the 5-day-old note:\n%s", out)
+	}
+
+	// inbox surfaces the young pre-#163 hold (labelled) and counts the old note.
+	inbox, _ := captureOutputForTest(t, func() { cmdInbox(nil) })
+	if !strings.Contains(inbox, "legacyhold  same checkout, can't tell whose") || strings.Contains(inbox, "legacynote") ||
+		!strings.Contains(inbox, "+ 1 older announcement(s) in this checkout (0 with a hold)") {
+		t.Errorf("`wt inbox` must show the young pre-#163 hold and count, not list, the 5-day-old note:\n%s", inbox)
+	}
+
+	interactive := false
+	defer func(old func() bool) { confirmInteractive = old }(confirmInteractive)
+	confirmInteractive = func() bool { return interactive }
+	for _, id := range []string{"legacyhold", "bhold"} {
+		if code := cmdAllClear([]string{id}); code != 1 {
+			t.Errorf("non-TTY all-clear of %s (not this session's) = exit %d, want 1 (refused)", id, code)
+		}
+	}
+	if code := cmdAnnounce([]string{"--clear", "bhold"}); code != 1 {
+		t.Errorf("non-TTY `announce --clear` of another session's hold = exit %d, want 1", code)
+	}
+	if got := clears(); len(got) != 0 {
+		t.Fatalf("a refused all-clear wrote %v", got)
+	}
+	// The pre-#163 hold is an hour old: it is not exempt for this session. Seven
+	// more, days old, only warn — and the warning lists the newest few, not all.
+	for i := 0; i < staleHoldsShown+2; i++ {
+		old := coord.Record{ID: fmt.Sprintf("oldhold%d", i), Kind: coord.KindAnnounce, Repo: "repo", Window: self.Window,
+			TS: at(time.Duration(48+i) * time.Hour), Hold: []string{"merge-main"}}
+		if err := coord.Append(logPath, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var gateErr string
+	var code int
+	_, gateErr = captureOutputForTest(t, func() { code = mergeCoordGate(c) })
+	if code != 1 || !strings.Contains(gateErr, "an unattributable writer in this checkout") {
+		t.Errorf("merge gate = %d, want 1: a young pre-#163 hold must gate, not exempt whoever reads it:\n%s", code, gateErr)
+	}
+	if !strings.Contains(gateErr, fmt.Sprintf("%d stale merge-main hold(s)", staleHoldsShown+2)) || !strings.Contains(gateErr, "…and 2 older") {
+		t.Errorf("the gate must count every stale hold but list only the newest %d:\n%s", staleHoldsShown, gateErr)
+	}
+	interactive = true
+	if code := withStdinCode(t, "n\n", func() int { return cmdAllClear([]string{"bhold"}) }); code != 1 {
+		t.Errorf("answering n = exit %d, want 1", code)
+	}
+	if code := withStdinCode(t, "y\n", func() int { return cmdAllClear([]string{"bhold"}) }); code != 0 {
+		t.Errorf("answering y = exit %d, want 0", code)
+	}
+	interactive = false
+	if code := cmdAllClear([]string{"legacyhold", "--not-mine"}); code != 0 {
+		t.Errorf("--not-mine = exit %d, want 0", code)
+	}
+	if code := cmdAllClear([]string{"minehold"}); code != 0 {
+		t.Errorf("all-clear of this session's own hold = exit %d, want 0 (no prompt, no flag)", code)
+	}
+	if got := strings.Join(clears(), ","); got != "bhold,legacyhold,minehold" {
+		t.Errorf("all-clears written = %s, want bhold (asked, y), legacyhold (--not-mine), minehold (own)", got)
+	}
+}
+
+// withStdinCode runs f with os.Stdin reading payload and its output captured.
+func withStdinCode(t *testing.T, payload string, f func() int) (code int) {
+	t.Helper()
+	captureOutputForTest(t, func() { withStdinForTest(t, payload, func() { code = f() }) })
+	return code
+}
+
+// captureOutputForTest returns what f prints to os.Stdout and os.Stderr.
+func captureOutputForTest(t *testing.T, f func()) (stdout, stderr string) {
+	t.Helper()
+	er, ew, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stderr
+	os.Stderr = ew
+	done := make(chan string)
+	go func() { b, _ := io.ReadAll(er); done <- string(b) }()
+	stdout = captureStdoutForTest(t, f)
+	os.Stderr = old
+	_ = ew.Close()
+	return stdout, <-done
 }
