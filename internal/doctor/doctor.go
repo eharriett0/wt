@@ -32,10 +32,10 @@ type Report struct {
 	Repo     string `json:"repo"` // "" when not in a git repository
 	GH       bool   `json:"gh"`
 	GHAuthed bool   `json:"gh_authed"`
-	// An auth check with no forge host to scope to (outside a repo, or a
-	// local-path origin) asks gh about EVERY host, so doctor reads it per host
-	// (#183). Both stay empty for a check scoped to the repo's host (#100/#102),
-	// and for one that passed.
+	// A check that did not pass outright is read per host (#183, and #203 for one
+	// scoped to the repo's host): each host's state (ok / failed / timeout /
+	// unreachable / unknown, decided by its active account) and, from gh 2.81+,
+	// gh's own error for it. Both stay empty for a check that passed.
 	GHHosts       []ghx.HostAuth `json:"gh_hosts,omitempty"`
 	GHAuthUnknown bool           `json:"gh_auth_unknown,omitempty"` // that check proved nothing either way
 
@@ -167,22 +167,28 @@ func build(c *config.Config) *Report {
 	return rep
 }
 
-// ghAuth reads doctor's gh verdict from one auth check (#183). Pure.
+// ghAuth reads doctor's gh verdict from one auth check (#183/#203). Pure.
 //
-// A check scoped to the repo's forge host (#100/#102), or one that passed, is read
-// exactly as before: gh's exit code. An UNSCOPED check (no forge host: outside a
-// repo, or a local-path origin) asks gh about every configured host, and its exit
-// code is an aggregate: one unreachable Enterprise host fails it for a github.com
-// login that is fine, the #100 false positive. So that one is read per host:
+// A check that passed (st.OK: every host checked has a working ACTIVE account) is
+// "authenticated", as before. Any other is read per host, scoped to the repo's
+// host or not: an UNSCOPED check (no forge host: outside a repo, or a local-path
+// origin) asks gh about every configured host, and one unreachable Enterprise host
+// fails it for a github.com login that is fine (#183); a SCOPED one can fail
+// because the repo's host timed out or could not be reached (#203). Both are the
+// #100 false positive when read as "NOT authenticated". So:
 //   - a host authenticated → authed; the failing ones are named, not hidden
 //   - every host failed to log in, or gh has no host at all → NOT authenticated
-//   - otherwise (a timeout, or output wt cannot read) → unknown: nothing was
-//     proven about the login, so doctor must not claim "NOT authenticated"
+//   - otherwise (a timeout, an unreachable host, output wt cannot read) →
+//     unknown: nothing was proven about the login, so doctor must not claim
+//     "NOT authenticated". A scoped check wt cannot read names its host.
 func ghAuth(st ghx.AuthStatus) (authed bool, hosts []ghx.HostAuth, unknown bool) {
-	if st.Host != "" || st.OK {
-		return st.OK, nil, false
+	if st.OK {
+		return true, nil, false
 	}
 	if !st.Parsed {
+		if st.Host != "" {
+			return false, []ghx.HostAuth{{Host: st.Host, State: ghx.HostAuthUnknown}}, true
+		}
 		return false, nil, true
 	}
 	for _, h := range st.Hosts {
@@ -626,7 +632,7 @@ func render(rep *Report) {
 }
 
 // ghLine is doctor's gh line: whether it warns, and what it says. Pure. A check
-// scoped to the repo's host only ever reaches the three pre-#183 lines, unchanged.
+// that passed, or a definite NOT authenticated, prints the pre-#183 lines.
 func ghLine(rep *Report) (warn bool, msg string) {
 	switch {
 	case rep.GHAuthed && len(rep.GHHosts) > 0: // an unscoped check, read per host (#183)
@@ -657,6 +663,8 @@ func ghLine(rep *Report) (warn bool, msg string) {
 		return true, "gh — found, but auth could not be verified: " + strings.Join(hs, ", ")
 	case rep.GH && rep.GHAuthUnknown:
 		return true, "gh — found, but auth could not be verified: with no repository host to scope it to, `gh auth status` checks every configured host, and it failed with output wt could not read (run it to see why)"
+	case rep.GH && failedUnconfirmed(rep.GHHosts):
+		return true, "gh — found but NOT authenticated, or offline: gh before 2.81 reports a host it cannot reach as a failed login (claim/release/merge-pr need `gh auth login`)"
 	case rep.GH:
 		return true, "gh — found but NOT authenticated (claim/release/merge-pr need `gh auth login`)"
 	default:
@@ -664,7 +672,21 @@ func ghLine(rep *Report) (warn bool, msg string) {
 	}
 }
 
-// hostAuthPhrase names a host and what gh said about it, in gh's own terms.
+// failedUnconfirmed reports a "failed" host read from gh's human output, which
+// carries no error (#203): gh before 2.81 prints that same "Failed to log in …
+// token invalid" for a host it never reached, so it does not prove the token
+// dead. gh 2.81+ answers in JSON, where "failed" is an HTTP 401 and carries it.
+func failedUnconfirmed(hosts []ghx.HostAuth) bool {
+	for _, h := range hosts {
+		if h.State == ghx.HostAuthFailed && h.Error == "" {
+			return true
+		}
+	}
+	return false
+}
+
+// hostAuthPhrase names a host and what gh said about it. Short: `wt doctor
+// --json` carries gh's own error for each host (gh 2.81+).
 func hostAuthPhrase(h ghx.HostAuth) string {
 	switch h.State {
 	case ghx.HostAuthOK:
@@ -673,8 +695,13 @@ func hostAuthPhrase(h ghx.HostAuth) string {
 		return h.Host + " failed to log in"
 	case ghx.HostAuthTimeout:
 		return h.Host + " timed out"
+	case ghx.HostAuthUnreachable:
+		return "couldn't reach " + h.Host
 	}
-	return h.Host + " unreadable"
+	if h.Error != "" { // gh's error says nothing about the token (a 403, a 5xx): relay it
+		return h.Host + " could not be checked (gh: " + strings.TrimSpace(strings.SplitN(h.Error, "\n", 2)[0]) + ")"
+	}
+	return "wt could not read gh's answer for " + h.Host
 }
 
 // sessionLine renders the doctor's "session" row (#163): the token, shortened

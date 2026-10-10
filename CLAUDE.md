@@ -637,8 +637,34 @@ The formula supports `head "…", branch: "main"` for `--HEAD` builds.
   active account decides a host). gh writes every host section to **stderr**
   once any account fails, so `authCheck` captures BOTH streams; stdout alone
   reads as unparseable. A timeout or unreadable output proves nothing about the
-  login → "could not be verified", never "NOT authenticated". `Authed()` stays
-  the exit code: it only gates gh calls that need the repo's host anyway.
+  login → "could not be verified", never "NOT authenticated".
+  ⚠ **No exit code is the answer, scoped or not (#203).** `gh auth status
+  --hostname H` exits 1 for an INACTIVE account's dead token on H too, so
+  `Authed()` gated every gh call off while the active account worked, and a
+  timeout on H read "NOT authenticated". `AuthedFor` is pure `authOK`: every
+  host gh reported has a working ACTIVE account (human-form exit 0 is a yes;
+  unreadable or no host is a no), and doctor reads a scoped check per host too.
+  ⚠ **A yes is safety-relevant:** `Authed()` sets `PRChecked`, which dormancy
+  needs (an idle branch is suppressed only when "no PR" was checkable), so a
+  human-form exit 1 is a yes only when an inactive account's failure in a
+  section wt READ explains it (`textAuthStatus`); a failing section wt can't
+  read leaves it a no.
+  ⚠ gh's human output prints "X Failed to log in … token invalid" for a host it
+  never REACHED (DNS, refused); only `gh auth status --json hosts` (gh 2.81+,
+  cli/cli#11544) keeps gh's error. `runAuthCheck` asks `--json hosts --active`
+  first (stdout only: gh writes notes to stderr even then; it exits 0 whatever
+  the login) and falls back to the human form IN THE SAME memoized check when gh
+  refuses the flag ("unknown flag: --json", remembered per process in
+  `authNoJSON`, so gh < 2.81 costs one flag error per process, no network) or
+  answers without the JSON; any other failure falls back once, not remembered
+  (`jsonAuthOutcome`, pure). Pure `classifyAuthError`: only a 401 is `failed`
+  (REST "HTTP 401: …", GraphQL for a GH_TOKEN "non-200 OK status code: 401 …");
+  no HTTP answer (`Get "<url>": …`) is `unreachable`; any other status (a 403
+  rate limit, a 5xx) is `unknown`. A human-output `failed` stays ambiguous, so
+  doctor's NOT-authenticated line says "or offline" for it (`failedUnconfirmed`:
+  a failed host with no gh error). `wt doctor --json` (additive): `gh_hosts[]`
+  gains state `unreachable` and `error` (gh's text, 2.81+), and a scoped check
+  that did not pass now carries `gh_hosts`/`gh_auth_unknown` too.
 - **A backtick code span DOES suppress GitHub's linked-issue parser — measured, #164.**
   One PR, one already-closed issue, body varied and `closingIssuesReferences` sampled:
 
