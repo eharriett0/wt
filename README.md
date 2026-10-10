@@ -79,21 +79,30 @@ config.yaml   — overlapping L88-95  → HIGH   (exit 3, blocks)
 inventory.yaml — 6 windows, 0 overlapping hunks → low (FYI, exit 0)
 ```
 
-Only **overlapping line ranges** (or an indeterminate case where your side has
-no edits yet — kept blocking, to be safe) count as HIGH and drive exit 3.
-Provably-disjoint hunks are downgraded to a non-blocking FYI. A branch that has
-fallen behind base is graded on its own edits only: a line base added or changed
-after it forked is never counted as that branch's edit, unless the branch's own
-edit touches it (no unchanged line between), where git would conflict. Two
-escape hatches
-make files always-advisory regardless of hunks: `shared_docs` (basename match,
-default `CLAUDE.md,MEMORY.md`) and `append_only_paths` (globs — changelogs,
-inventory lists).
+Hunks are graded by git's own 3-way merge rule: only edits git would merge as
+**one conflict region** count as HIGH and drive exit 3 — edits that overlap, or
+that touch with no unchanged line between them (one window editing line 10 and
+another line 11 conflict in git too). A pure insertion meets only an edit of a
+line on either side of it, or another insertion at the same spot, so insertions
+after lines 10 and 11 stay apart. Edits are placed where git's merge places them
+(histogram diff, no indent heuristic, whatever your diff config says): an
+inserted line that could sit in more than one spot, beside an equal one, is
+graded at the spot the merge will use. An indeterminate case where your side has no
+edits yet is kept blocking too, to be safe. Hunks with an unchanged line between
+them are downgraded to a non-blocking FYI. A branch that has fallen behind base
+is graded on its own edits only: a line base added or changed after it forked is
+never counted as that branch's edit, unless the branch's own edit touches it (no
+unchanged line between), where git would conflict. Two escape hatches make files
+always-advisory regardless of hunks: `shared_docs` (basename match, default
+`CLAUDE.md,MEMORY.md`) and `append_only_paths` (globs — changelogs, inventory
+lists).
 
 `wt check --show-diff` previews the *other* window's hunk ranges inline so you
 can eyeball disjoint-ness; `wt check --json` / `wt status --json` emit the same
 data structured (with a `severity` field and `blocking` flag) for tooling and
-pre-push hooks.
+pre-push hooks. A range with `"Gap": true` is an insertion between lines `Start`
+and `End`; `overlap_spans` gives the lines where two windows' edits meet (for
+edits that only touch, the line on each side).
 
 ### Stale branches don't count
 
@@ -377,7 +386,9 @@ usual failure mode is that the *agents doing the editing* never run `wt check`.
 `wt install-claude-hook` closes that. It wires **two** Claude Code hooks:
 
 - **`PreToolUse`** (matcher `Edit|Write|MultiEdit`) — runs the same collision
-  grading as `wt check` on the file an agent is about to touch.
+  grading as `wt check` on the file an agent is about to touch, graded on the
+  file the edit will produce, so it says what `wt check` will say once the edit
+  is made.
 - **`UserPromptSubmit`** (`wt _hook claude-context`) — each turn, injects a
   snapshot of what other live windows are doing: cross-window file overlaps
   **plus** un-acked coordination signals — a `merge-main` hold another window
@@ -447,10 +458,12 @@ hooks = false
 - Both hooks are injected **only when** another live window overlaps a file
   (silent otherwise), with the current window excluded and a `wt check <file>`
   reminder.
-- The edit hook re-grades against the patch's actual hunks, moved into base line
-  numbers through this worktree's own diff (so it stays exact when the worktree is
-  behind base or already edited the file), so a **disjoint** patch to a shared
-  file stays silent — no crying wolf on parallel appends.
+- The edit hook grades the file the patch will produce (apply_patch replayed,
+  down to the newline it adds at the end of every file it writes), measured the
+  way `wt check` measures it (so it stays exact when the worktree is behind base
+  or already edited the file): a **disjoint** patch to a shared file stays
+  silent — no crying wolf on parallel appends — and one that will collide is
+  flagged before it is applied.
 - Advisory by default. Set `WT_CODEX_HOOK_BLOCK=1` to have the edit hook `deny`
   a **confirmed** HIGH overlap (a heads-up-only file-level match never denies).
 - Fail-open; `WT_SKIP_COLLISION=1` to silence; ≤1-worktree repos skipped.

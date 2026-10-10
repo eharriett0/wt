@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -60,112 +61,29 @@ func TestParseCodexEdit(t *testing.T) {
 	}
 }
 
+// parseCodexPatch lists every file a patch names, leniently: the paths are
+// checked even when apply_patch would reject the patch.
 func TestParseCodexPatch(t *testing.T) {
 	patch := `*** Begin Patch
 *** Update File: internal/a.go
 @@ func f()
- ctx line
 -old line
 +new line
- tail
-@@ func g()
--only removed
 *** Add File: internal/b.go
 +brand new
-+content
 *** Delete File: internal/c.go
+*** Update File: old/x.go
+*** Move to: new/x.go
+@@
+-gone
 *** End Patch`
-	files := parseCodexPatch(patch)
-	if len(files) != 3 {
-		t.Fatalf("got %d files, want 3: %+v", len(files), files)
+	got := parseCodexPatch(patch)
+	want := []codexPatchFile{{path: "internal/a.go"}, {path: "internal/b.go"}, {path: "internal/c.go"}, {path: "old/x.go", newPath: "new/x.go"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("parseCodexPatch = %+v, want %+v", got, want)
 	}
-	// Update: two hunks; pre-image is context+removed, removed offsets tracked.
-	up := files[0]
-	if up.path != "internal/a.go" {
-		t.Errorf("update path=%q", up.path)
-	}
-	if len(up.hunks) != 2 {
-		t.Fatalf("update hunks=%d want 2: %+v", len(up.hunks), up.hunks)
-	}
-	if got := strings.Join(up.hunks[0].preImage, "\n"); got != "ctx line\nold line\ntail" {
-		t.Errorf("hunk 0 pre-image=%q", got)
-	}
-	// pre-image is [ctx, old, tail]; only "old line" is removed → offset 1.
-	if len(up.hunks[0].removed) != 1 || up.hunks[0].removed[0] != 1 {
-		t.Errorf("hunk 0 removed offsets=%v want [1]", up.hunks[0].removed)
-	}
-	if strings.Join(up.hunks[1].preImage, "\n") != "only removed" || len(up.hunks[1].removed) != 1 {
-		t.Errorf("hunk 1=%+v", up.hunks[1])
-	}
-	// Add: path only, no hunks (added lines aren't in the current file).
-	if files[1].path != "internal/b.go" || len(files[1].hunks) != 0 {
-		t.Errorf("add section=%+v", files[1])
-	}
-	// Delete: path only.
-	if files[2].path != "internal/c.go" || len(files[2].hunks) != 0 {
-		t.Errorf("delete section=%+v", files[2])
-	}
-}
-
-func TestParseCodexPatch_Move(t *testing.T) {
-	patch := "*** Update File: old/x.go\n*** Move to: new/x.go\n ctx\n-gone\n"
-	files := parseCodexPatch(patch)
-	if len(files) != 1 || files[0].path != "old/x.go" || files[0].newPath != "new/x.go" {
-		t.Fatalf("move parse=%+v", files)
-	}
-	if strings.Join(files[0].hunks[0].preImage, "\n") != "ctx\ngone" {
-		t.Errorf("move pre-image=%v", files[0].hunks[0].preImage)
-	}
-	if len(files[0].hunks[0].removed) != 1 || files[0].hunks[0].removed[0] != 1 {
-		t.Errorf("move removed=%v want [1]", files[0].hunks[0].removed)
-	}
-}
-
-func TestParseCodexPatch_BareBlankContextLine(t *testing.T) {
-	// apply_patch sometimes emits a blank CONTEXT line without a leading space
-	// (bare ""). It must be captured so a hunk spanning a blank line still
-	// locates (#117 review #2). The trailing "" from the final newline must NOT
-	// pollute the last hunk.
-	patch := "*** Update File: x.go\n@@\n a\n\n-b\n+B\n"
-	files := parseCodexPatch(patch)
-	if len(files) != 1 || len(files[0].hunks) != 1 {
-		t.Fatalf("parse=%+v", files)
-	}
-	h := files[0].hunks[0]
-	// pre-image: ["a", "", "b"] — blank line preserved; "b" removed at offset 2.
-	if strings.Join(h.preImage, "|") != "a||b" {
-		t.Errorf("pre-image=%q want a||b", strings.Join(h.preImage, "|"))
-	}
-	if len(h.removed) != 1 || h.removed[0] != 2 {
-		t.Errorf("removed=%v want [2]", h.removed)
-	}
-	// It locates against real blank-line-containing content, ranging only "b".
-	ranges, ok := patchRangesInFile(files[0], "a\n\nb\nc\n")
-	if !ok || len(ranges) != 1 || ranges[0].Start != 3 || ranges[0].End != 3 {
-		t.Errorf("locate blank-context hunk: ok=%v ranges=%v want line 3", ok, ranges)
-	}
-}
-
-func TestContiguousRuns(t *testing.T) {
-	cases := []struct {
-		in   []int
-		want [][2]int
-	}{
-		{nil, nil},
-		{[]int{2}, [][2]int{{2, 2}}},
-		{[]int{1, 2, 3}, [][2]int{{1, 3}}},
-		{[]int{1, 2, 5, 6, 9}, [][2]int{{1, 2}, {5, 6}, {9, 9}}},
-	}
-	for _, c := range cases {
-		got := contiguousRuns(c.in)
-		if len(got) != len(c.want) {
-			t.Fatalf("runs(%v)=%v want %v", c.in, got, c.want)
-		}
-		for i := range got {
-			if got[i] != c.want[i] {
-				t.Errorf("runs(%v)[%d]=%v want %v", c.in, i, got[i], c.want[i])
-			}
-		}
+	if got := parseCodexPatch("*** Update File: a.go\r\n-x\r\n"); len(got) != 1 || got[0].path != "a.go" {
+		t.Errorf("unbounded, CRLF: %+v", got)
 	}
 }
 
@@ -180,56 +98,6 @@ func TestPatchPaths(t *testing.T) {
 	want := []string{"a.go", "b.go", "c.go"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("patchPaths=%v want %v", got, want)
-	}
-}
-
-func TestPatchRangesInFile(t *testing.T) {
-	content := "package x\n\nfunc f() {\n\treturn 1\n}\n\nfunc g() {\n\treturn 2\n}\n"
-	// Hunk: context "func f() {" (line 3), REMOVED "\treturn 1" (line 4),
-	// context "}" (line 5). The block locates at line 3; only the removed line
-	// is ranged → [4,4], NOT the context-inclusive [3,5].
-	f := codexPatchFile{path: "x.go", hunks: []codexHunk{{
-		preImage: []string{"func f() {", "\treturn 1", "}"},
-		removed:  []int{1},
-	}}}
-	ranges, ok := patchRangesInFile(f, content)
-	if !ok || len(ranges) != 1 {
-		t.Fatalf("locate: ok=%v ranges=%v", ok, ranges)
-	}
-	if ranges[0].Start != 4 || ranges[0].End != 4 {
-		t.Errorf("range=%+v want line 4 only (context excluded)", ranges[0])
-	}
-
-	// Pure-addition hunk (all context, nothing removed) modifies no existing line
-	// → contributes no range → the only-hunk case falls back to file-level.
-	fAdd := codexPatchFile{path: "x.go", hunks: []codexHunk{{
-		preImage: []string{"func f() {"},
-		removed:  nil,
-	}}}
-	if _, ok := patchRangesInFile(fAdd, content); ok {
-		t.Error("pure-addition hunk should produce no range")
-	}
-
-	// Non-unique block → cannot localize → ok=false (file-level fallback).
-	dup := "\treturn 1\n\treturn 1\n"
-	fAmb := codexPatchFile{path: "x.go", hunks: []codexHunk{{
-		preImage: []string{"\treturn 1"}, removed: []int{0},
-	}}}
-	if _, ok := patchRangesInFile(fAmb, dup); ok {
-		t.Error("ambiguous block should not localize")
-	}
-
-	// A block that isn't present → ok=false.
-	fMiss := codexPatchFile{path: "x.go", hunks: []codexHunk{{
-		preImage: []string{"nonexistent line"}, removed: []int{0},
-	}}}
-	if _, ok := patchRangesInFile(fMiss, content); ok {
-		t.Error("missing block should not localize")
-	}
-
-	// No hunks at all (an add/delete) → ok=false.
-	if _, ok := patchRangesInFile(codexPatchFile{path: "x.go"}, content); ok {
-		t.Error("no-hunk file should not localize")
 	}
 }
 

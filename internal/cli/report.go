@@ -74,9 +74,9 @@ type CheckEntry struct {
 	Window         string           `json:"window"`
 	Liveness       string           `json:"liveness"`
 	Category       Category         `json:"category"`
-	Severity       string           `json:"severity"` // HIGH | low
-	OtherRanges    []gitx.LineRange `json:"other_ranges,omitempty"`
-	OverlapSpans   []gitx.LineRange `json:"overlap_spans,omitempty"`
+	Severity       string           `json:"severity"`                  // HIGH | low
+	OtherRanges    []gitx.LineRange `json:"other_ranges,omitempty"`    // the other window's edits, base frame; Gap = an insertion (#199)
+	OverlapSpans   []gitx.LineRange `json:"overlap_spans,omitempty"`   // where the two windows' edits are one conflict region (collide.ConflictSpans)
 	SharedSections []string         `json:"shared_sections,omitempty"` // #22: same section(s) both windows edit → HIGH
 	AlreadyMerged  bool             `json:"already_merged,omitempty"`  // #109: other window's blob == origin/base — stale index, not a live collision
 	Untracked      bool             `json:"untracked,omitempty"`       // #113: other window's claim is an untracked file — no committed content to collide with
@@ -297,7 +297,7 @@ func gradeEntry(c *config.Config, f gradeFacts, currentWorktree, otherWt string,
 		}
 		e.OtherRanges = other
 		sev := collide.ConflictSeverity(cur, other, appendOnly)
-		e.OverlapSpans = collide.OverlappingSpans(cur, other)
+		e.OverlapSpans = collide.ConflictSpans(cur, other)
 		switch {
 		case sev != collide.SevHigh:
 			e.Category, e.Severity = CatFYI, "low"
