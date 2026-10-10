@@ -206,3 +206,16 @@ func TestStatusEntries_HiddenEditsWithOddNames(t *testing.T) {
 		t.Fatalf("StatusEntries = %q, %v; want the %d edits", got, err, len(names))
 	}
 }
+
+// Every path goes to `hash-object --stdin-paths` C-quoted: unquoted, a file
+// named "a.txt" (quotes included) is read back as a.txt, hashed as that other
+// file, and an edit to it reads clean when a.txt still holds its old content.
+func TestStatusEntries_HiddenEditsAreHashedByTheirOwnName(t *testing.T) {
+	_, wt := hiddenFixture(t, false, map[string]string{"a.txt": "v1\n", `"a.txt"`: "v1\n"})
+	hide(t, wt, "assume-unchanged", `"a.txt"`)
+	writeFile(t, wt, `"a.txt"`, "v2: edited\n")
+	got, err := StatusEntries(wt)
+	if err != nil || len(got) != 1 || !strings.Contains(got[0], `"a.txt"`) {
+		t.Errorf("StatusEntries = %q, %v; want the edit of \"a.txt\" listed", got, err)
+	}
+}

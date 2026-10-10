@@ -47,6 +47,7 @@ func TestCmdMergePR_autoCleanKeepsUntrackedFilesTheConfigHides(t *testing.T) {
 		{"an assume-unchanged edit: the lane is kept, edit and all (#210)", "conf.txt", "assume-unchanged", true},
 		{"a skip-worktree edit: the lane is kept, edit and all (#210)", "conf.txt", "skip-worktree", true},
 		{"an edit core.ignoreStat hides: the lane is kept, edit and all (#210)", "conf.txt", "core.ignoreStat", true},
+		{"a git repository in the lane's ignored files: the lane is kept, repository and all (#177 review)", "vendor/dep/work.txt", "nested", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			parent, err := filepath.EvalSymlinks(t.TempDir())
@@ -58,11 +59,13 @@ func TestCmdMergePR_autoCleanKeepsUntrackedFilesTheConfigHides(t *testing.T) {
 			if out, err := exec.Command(gitBin, "init", "-q", "-b", "main", repo).CombinedOutput(); err != nil {
 				t.Fatalf("git init: %v\n%s", err, out)
 			}
-			if err := os.WriteFile(filepath.Join(repo, "conf.txt"), []byte("v1\n"), 0o644); err != nil {
-				t.Fatal(err)
+			for name, content := range map[string]string{"conf.txt": "v1\n", ".gitignore": "vendor/\n"} {
+				if err := os.WriteFile(filepath.Join(repo, name), []byte(content), 0o644); err != nil {
+					t.Fatal(err)
+				}
 			}
 			setup := [][]string{
-				{"-C", repo, "add", "conf.txt"},
+				{"-C", repo, "add", "conf.txt", ".gitignore"},
 				{"-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "base"},
 			}
 			if tc.mech == "core.ignoreStat" { // the lane's checkout flags every file
@@ -91,9 +94,22 @@ func TestCmdMergePR_autoCleanKeepsUntrackedFilesTheConfigHides(t *testing.T) {
 				_ = os.Remove(filepath.Join(ghDir, name))
 			}
 			file := filepath.Join(lane, tc.file)
+			if tc.mech == "nested" { // a clone in an ignored directory, with a commit of its own
+				dep := filepath.Join(lane, "vendor", "dep")
+				if out, err := exec.Command(gitBin, "init", "-q", dep).CombinedOutput(); err != nil {
+					t.Fatalf("git init: %v\n%s", err, out)
+				}
+			}
 			if tc.file != "" {
 				if err := os.WriteFile(file, []byte("not committed\n"), 0o644); err != nil {
 					t.Fatal(err)
+				}
+				if tc.mech == "nested" {
+					for _, args := range [][]string{{"add", "work.txt"}, {"-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "unpushed"}} {
+						if out, err := exec.Command(gitBin, append([]string{"-C", filepath.Dir(file)}, args...)...).CombinedOutput(); err != nil {
+							t.Fatalf("git %v: %v\n%s", args, err, out)
+						}
+					}
 				}
 				if st, _ := exec.Command(gitBin, "-C", lane, "status", "--porcelain").Output(); len(st) != 0 {
 					t.Fatalf("fixture: git status shows %q; it should hide the work", st)
@@ -126,8 +142,12 @@ func TestCmdMergePR_autoCleanKeepsUntrackedFilesTheConfigHides(t *testing.T) {
 				t.Errorf("the uncommitted work in %s is gone (%v)", tc.file, err)
 			}
 			// wt's own check refuses, before git is asked to remove anything.
-			if w := string(warned); !strings.Contains(w, "worktree for feat-x not auto-removed: has uncommitted changes") {
-				t.Errorf("stderr = %q, want auto-clean's own refusal of uncommitted changes", w)
+			want := "worktree for feat-x not auto-removed: has uncommitted changes"
+			if tc.mech == "nested" {
+				want = "worktree for feat-x not auto-removed: it holds a git repository in its ignored files (vendor/dep)"
+			}
+			if w := string(warned); !strings.Contains(w, want) {
+				t.Errorf("stderr = %q, want %q", w, want)
 			}
 		})
 	}

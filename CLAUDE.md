@@ -245,6 +245,25 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   and eol filters apply as for `git add`), symlinks by their target. A file the
   entry no longer has on disk loses nothing and is skipped; anything that can't
   be compared counts as changed (fail closed).
+  ⚠ **Liveness reads the same `StatusEntries`** (`IsClean` → `LiveFacts.Dirty`,
+  doctor's counts): untracked files a `showUntrackedFiles=no` config hides,
+  hidden tracked edits, and submodule changes (`--ignore-submodules=none`, as
+  git's own removal check reads them, overriding `submodule.<name>.ignore`) now
+  make a window dirty, and **dirty is never suppressed** (#87). A merged-by-
+  ancestry, tip-merged or dormant window holding such junk therefore stays
+  surfaced: exactly what the same window reads in a default-config repo, and
+  untracked files were already its touched paths (`TouchedFiles` lists them
+  with `-uall`). Silence junk with ignore rules, not by hiding it from status.
+  ⚠ **What git status never shows but the removal deletes or git refuses
+  blocks a clean worktree too** (`removalBlocked`, in `remove()` and in clean's
+  listing, #174): a git repository below an ignored path (`gitx.NestedRepos`:
+  `ls-files -o -i --exclude-standard --directory`, then a walk for `.git`
+  entries, symlinks not followed; `git worktree remove` deleted it, unpushed
+  commits and all) and a checked-out submodule (`gitx.PopulatedSubmodules`, git's
+  `validate_no_submodules`). Not part of `IsClean`: the walk is too slow for
+  liveness, and a nested clone is no collision. Any read error blocks.
+  `release --clean` keeps origin's placeholder too when the removal is refused
+  (it used to delete it and keep the worktree).
   ⚠ **An upstream is not a push (#175).** `wt new` branches from
   `origin/<base>`, and git's default `branch.autoSetupMerge` records that as the
   new branch's upstream, so `HasUpstream` is true from birth. The "never pushed"
@@ -283,13 +302,20 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   the main checkout a candidate, so a name that also picks it out is ambiguous).
   `DecideDiscard` is pure; no flag unlocks anything but its own guard (an
   exhaustive test pins it): the main checkout, a detached HEAD (mid-rebase), the
-  base branch, the window it runs in, a dirty tree, a locked worktree are refused
+  base branch, the window it runs in, a dirty tree, a locked worktree, a git
+  repository in its ignored files and a checked-out submodule are refused
   whatever the flags; out-of-root needs `--all-roots`, which keeps discard's
   reach equal to clean's (#101). ⚠ **"Unique" is read from origin itself**
   (`ls-remote --heads`), never `rev-list --not --remotes`: a branch deleted on
   origin from the web or another clone leaves a stale `origin/<branch>` here that
-  hid the canary's own commit, and a later prune drops it. Offline, the tracking
-  refs stand in, minus `origin/<branch>` itself. The fetch is `--no-prune`: a
+  hid the canary's own commit, and a later prune drops it. ⚠ **Offline, only
+  `origin/<base>` as last fetched is trusted** (every other commit counts, and
+  the plan says origin couldn't be asked): trusting the tracking refs minus
+  `origin/<branch>` let a canary pushed under ANOTHER name, or to another remote,
+  and deleted there, go without `--drop-commits` (#177 review). The plan also
+  says which listed commits another ref here keeps (`gitx.RefTipsExcept`: other
+  refs, the stash, other worktrees' HEADs) and which become unreachable. The
+  fetch is `--no-prune`: a
   prune deletes other branches' stale refs, which can be the only copy of
   someone's commits. ⚠ `CommitsOnlyOn` verifies the tip first: under
   `--ignore-missing` a missing tip read as "no commits". ⚠ Measured on git 2.39:
@@ -305,8 +331,27 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   deletes main. A worktree whose directory is gone has nothing on disk to lose
   (git removes just its record, measured); one that is no longer a work tree's
   top (replaced since git recorded it, #198 review), or any other unreadable
-  status, counts as dirty. The branch is deleted only at the tip that was listed
-  (`DeleteBranchAt`), never forced, and origin is never touched.
+  status, counts as dirty. ⚠ **"The window it runs in" compares directories,
+  not path text** (`holdsCwd`: walk up from "." via ".." with `os.SameFile`): a
+  cwd reached by a differently-cased path (macOS) or a symlink was not "under"
+  the worktree, which was removed from under the command; an unreadable cwd
+  counts as held. Once it removes, discard's git runs in the main checkout
+  (`WorktreeRemoveIn`, `DeleteBranchAt(dir, …)`), never in the deleted
+  worktree. ⚠ **The branch is deleted only at the tip that was listed, in ONE
+  step**: `git update-ref -d refs/heads/<b> <tip>` (`git branch -D` deletes
+  whatever is there by then, so a commit landing between a separate check and it
+  was dropped), after `branchBusy` makes `branch -D`'s own in-use check
+  (checked out, case twins folded, or being rebased/bisected: the
+  `rebase-*/head-name` and `BISECT_START` files of every worktree's git dir), and
+  then its `branch.<b>` config section goes. Never forced; origin is never
+  touched. `wt release <issue>` is suggested only when no other claim on the
+  issue is left (`claimNotes`): release removes claims by issue.
+  Known gaps, left as follow-ups: a commit only a reflog reaches (the removed
+  worktree's HEAD reflog, the branch's own) is neither listed nor kept;
+  `--drop-commits` drops what the run lists, with no pin to a tip reviewed
+  earlier; another session working in the target is seen only through a dirty
+  tree; a directory on an unmounted volume that is not `git worktree lock`ed
+  reads as gone.
 - **`wt adopt` never checks out, creates or moves a branch onto anything but the
   target (#167).** `git worktree add <path> <branch>` takes `refs/heads/<branch>`
   whenever it exists, so a stale branch left by an earlier PR that reused the

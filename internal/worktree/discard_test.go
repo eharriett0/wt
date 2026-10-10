@@ -46,6 +46,11 @@ func TestDecideDiscard_Table(t *testing.T) {
 		{"its branch checked out elsewhere too: refused", with(func(k *DiscardCase) { k.SharedBranch = true }), true, true, DiscardSharedBranch},
 		{"locked: refused", with(func(k *DiscardCase) { k.Locked = true }), true, true, DiscardLocked},
 		{"placement before content: the window it runs in, dirty too", with(func(k *DiscardCase) { k.HoldsCwd = true; k.Dirty = true }), false, false, DiscardHoldsCwd},
+		{"a git repository in its ignored files: refused whatever the flags", with(func(k *DiscardCase) { k.NestedRepo = true }), true, true, DiscardNestedRepo},
+		{"a checked-out submodule: refused whatever the flags", with(func(k *DiscardCase) { k.Submodule = true }), true, true, DiscardSubmodule},
+		{"dirty and a nested repository: the dirty tree is named first", with(func(k *DiscardCase) { k.Dirty = true; k.NestedRepo = true }), true, true, DiscardDirty},
+		{"a nested repository and a submodule: the repository is named first", with(func(k *DiscardCase) { k.NestedRepo = true; k.Submodule = true }), true, true, DiscardNestedRepo},
+		{"a submodule with uncounted commits: the submodule is named first", with(func(k *DiscardCase) { k.Submodule = true; k.Counted = false }), true, true, DiscardSubmodule},
 	}
 	for _, c := range cases {
 		if got := DecideDiscard(c.k, c.drop, c.roots); got != c.want {
@@ -57,10 +62,10 @@ func TestDecideDiscard_Table(t *testing.T) {
 // eachDiscardCase runs fn on every combination of DiscardCase's guards, with
 // Unique 0 or 2.
 func eachDiscardCase(fn func(DiscardCase)) {
-	for bits := 0; bits < 1<<11; bits++ {
+	for bits := 0; bits < 1<<13; bits++ {
 		b := func(i int) bool { return bits&(1<<i) != 0 }
 		k := DiscardCase{Primary: b(0), Detached: b(1), OnBase: b(2), HoldsCwd: b(3), OutOfRoot: b(4),
-			Nests: b(5), SharedBranch: b(6), Locked: b(7), Dirty: b(8), Counted: b(9)}
+			Nests: b(5), SharedBranch: b(6), Locked: b(7), Dirty: b(8), Counted: b(9), NestedRepo: b(11), Submodule: b(12)}
 		if b(10) {
 			k.Unique = 2
 		}
@@ -75,7 +80,7 @@ func TestDecideDiscard_GoOnlyWhenEveryGuardIsClear(t *testing.T) {
 		for _, drop := range []bool{false, true} {
 			for _, roots := range []bool{false, true} {
 				clear := !k.Primary && !k.Detached && !k.OnBase && !k.HoldsCwd && (!k.OutOfRoot || roots) &&
-					!k.Nests && !k.SharedBranch && !k.Locked && !k.Dirty && k.Counted && (k.Unique == 0 || drop)
+					!k.Nests && !k.SharedBranch && !k.Locked && !k.Dirty && !k.NestedRepo && !k.Submodule && k.Counted && (k.Unique == 0 || drop)
 				if got := DecideDiscard(k, drop, roots); (got == DiscardGo) != clear {
 					t.Fatalf("DecideDiscard(%+v, drop=%v, all-roots=%v) = %d, want go=%v", k, drop, roots, got, clear)
 				}
@@ -237,6 +242,7 @@ func (f *adoptFixture) assertDiscarded(r DiscardResult, err error, dir, branch s
 func TestDiscard_Canary_DeletedOnOriginElsewhere(t *testing.T) {
 	f := newDiscardFixture(t)
 	dir, tip := f.canary()
+	gitW(t, f.repo, "config", "fetch.prune", "true") // discard's fetch must not prune anyway: origin/canary stays
 	keep := f.worktreeOn("keep", f.base)
 	gitW(t, f.origin, "update-ref", "-d", "refs/heads/canary") // deleted on origin, not from here
 	if n := gitOutW(t, f.repo, "rev-list", "--count", "canary", "--not", "--remotes"); n != "0" {

@@ -610,15 +610,19 @@ func WorktreeBranchesUnder(root string) ([]string, error) {
 type WorktreeRef struct {
 	Path   string
 	Branch string
-	Locked bool // `git worktree lock`ed: git refuses to remove it (#177)
+	Head   string // the commit HEAD is at, "" for a worktree whose HEAD is unborn (#177 review)
+	Locked bool   // `git worktree lock`ed: git refuses to remove it (#177)
 }
 
 // WorktreeList returns every worktree of this repo with its checked-out branch.
 // Detached worktrees have Branch == "". (Companion to WorktreePaths /
 // WorktreeBranchesUnder — this one pairs path↔branch, which `wt doctor`'s
 // upstream check needs per-worktree, #76.)
-func WorktreeList() ([]WorktreeRef, error) {
-	out, err := Run("worktree", "list", "--porcelain")
+func WorktreeList() ([]WorktreeRef, error) { return WorktreeListIn("") }
+
+// WorktreeListIn is WorktreeList with git run in dir ("" = the current directory).
+func WorktreeListIn(dir string) ([]WorktreeRef, error) {
+	out, err := RunDir(dir, "worktree", "list", "--porcelain")
 	if err != nil {
 		return nil, err
 	}
@@ -637,6 +641,10 @@ func WorktreeList() ([]WorktreeRef, error) {
 			cur.Path = strings.TrimSpace(strings.TrimPrefix(ln, "worktree "))
 		case strings.HasPrefix(ln, "branch "):
 			cur.Branch = strings.TrimPrefix(strings.TrimSpace(strings.TrimPrefix(ln, "branch ")), "refs/heads/")
+		case strings.HasPrefix(ln, "HEAD "):
+			if h := strings.TrimSpace(strings.TrimPrefix(ln, "HEAD ")); !AllZeroSHA(h) {
+				cur.Head = h
+			}
 		case ln == "locked" || strings.HasPrefix(ln, "locked "):
 			cur.Locked = true
 		}
@@ -667,14 +675,7 @@ func pathUnder(path, root string) bool {
 // carries a scoped `-c status.showUntrackedFiles=normal`, which git hands to the
 // status it runs: one command's setting, never the process environment (the #92
 // env-scoping lesson). The error carries git's stderr.
-func WorktreeRemove(path string, force bool) error {
-	args := withUntrackedShown("worktree", "remove")
-	if force {
-		args = append(args, "--force")
-	}
-	_, err := runReporting("", append(args, path)...)
-	return err
-}
+func WorktreeRemove(path string, force bool) error { return WorktreeRemoveIn("", path, force) }
 
 // withUntrackedShown prefixes a git command with `-c
 // status.showUntrackedFiles=normal`, so any status it runs lists untracked files
@@ -1684,32 +1685,6 @@ func parseRemoteHeads(out string) map[string]string {
 	return heads
 }
 
-// RemoteTrackingTips returns the commit of every remote-tracking ref
-// (refs/remotes/...) as last fetched, except the ref named exactly except
-// (#177). `wt discard` falls back on them when origin cannot be asked.
-func RemoteTrackingTips(except string) ([]string, error) {
-	out, err := Run("for-each-ref", "--format=%(objectname) %(refname)", "refs/remotes")
-	if err != nil {
-		return nil, err
-	}
-	return pickTrackingTips(out, except), nil
-}
-
-// pickTrackingTips reads `for-each-ref --format='%(objectname) %(refname)'`
-// output and returns every commit but the one of the ref named exactly except.
-// Pure.
-func pickTrackingTips(out, except string) []string {
-	var tips []string
-	for _, ln := range strings.Split(out, "\n") {
-		sha, ref, ok := strings.Cut(strings.TrimSpace(ln), " ")
-		if !ok || sha == "" || ref == except {
-			continue
-		}
-		tips = append(tips, sha)
-	}
-	return tips
-}
-
 // Commit is one commit: its full id and its subject line.
 type Commit struct {
 	SHA, Subject string
@@ -1798,22 +1773,6 @@ func StatusEntries(dir string) ([]string, error) {
 		return nil, err
 	}
 	return append(lines, hidden...), nil
-}
-
-// DeleteBranchAt deletes local branch, and only while it still points at tip
-// (#177): `wt discard` read the branch's commits at tip, and a commit made
-// since is not one the operator was shown. Checked as late as possible, like
-// FastForwardBranch's. `git branch -D` also refuses a branch a worktree has
-// checked out. The error carries git's stderr.
-func DeleteBranchAt(branch, tip string) error {
-	if branch == "" || tip == "" {
-		return fmt.Errorf("delete needs a branch and its tip, got %q %q", branch, tip)
-	}
-	if cur := BranchTip(branch); cur != tip {
-		return fmt.Errorf("%s is at %s now, not %s", branch, cur, tip)
-	}
-	_, err := runReporting("", "branch", "-D", branch)
-	return err
 }
 
 // Abs resolves a possibly-relative path against the repo root.

@@ -122,3 +122,32 @@ func TestRelease_CleanKeepsEditsGitStatusHides(t *testing.T) {
 		})
 	}
 }
+
+// #177 review: a git repository below an ignored path is kept by `release
+// --clean` too (the shared removal gate, worktree.Remove): git status never
+// looks there, and `git worktree remove` deleted it, unpushed commits and all.
+func TestRelease_CleanKeepsARepositoryInIgnoredFiles(t *testing.T) {
+	f := newClaimFixture(t)
+	if err := os.WriteFile(filepath.Join(f.repo, ".gitignore"), []byte("vendor/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.git(f.repo, "add", ".gitignore")
+	f.git(f.repo, "commit", "-q", "-m", "ignore vendor")
+	f.git(f.repo, "push", "-q", "origin", "main")
+	if err := f.claim(true); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	dep := filepath.Join(f.dir(), "vendor", "dep")
+	f.git(f.dir(), "init", "-q", dep)
+	f.git(dep, "commit", "-q", "--allow-empty", "-m", "unpushed work in an ignored clone")
+	out, err := capturedRelease(t, f)
+	if err != nil {
+		t.Fatalf("Release: %v\n%s", err, out)
+	}
+	if want := "it holds a git repository in its ignored files (vendor/dep)"; !strings.Contains(out, want) {
+		t.Errorf("release said:\n%s\nwant %q", out, want)
+	}
+	if _, serr := os.Stat(filepath.Join(dep, ".git")); serr != nil || f.ref(f.repo, "refs/heads/"+claimBranch) == "" || f.ref(f.origin, "refs/heads/"+claimBranch) == "" {
+		t.Errorf("the nested repository (%v), the branch or origin's placeholder is gone", serr)
+	}
+}

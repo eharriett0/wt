@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"strings"
 	"testing"
 )
 
@@ -24,18 +23,6 @@ func TestParseRemoteHeads(t *testing.T) {
 	}
 	if got := parseRemoteHeads(""); len(got) != 0 {
 		t.Errorf("parseRemoteHeads(\"\") = %v, want none", got)
-	}
-}
-
-func TestPickTrackingTips(t *testing.T) {
-	out := "aaa refs/remotes/origin/main\n" +
-		"bbb refs/remotes/origin/canary\n" +
-		"ccc refs/remotes/origin/canary-2\n" + // a name that merely starts the same stays
-		"ddd refs/remotes/upstream/canary\n" + // another remote's stays
-		"\n"
-	got := pickTrackingTips(out, "refs/remotes/origin/canary")
-	if want := []string{"aaa", "ccc", "ddd"}; !reflect.DeepEqual(got, want) {
-		t.Errorf("pickTrackingTips = %v, want %v", got, want)
 	}
 }
 
@@ -117,37 +104,5 @@ func TestUntrackedFilesHiddenByConfig(t *testing.T) {
 	}
 	if _, err := os.Stat(wt); !os.IsNotExist(err) {
 		t.Errorf("the worktree is still there (stat: %v)", err)
-	}
-}
-
-// DeleteBranchAt deletes a branch only at the tip it was given, and its error
-// carries git's reason.
-func TestDeleteBranchAt(t *testing.T) {
-	dir := gitRepo(t)
-	t.Chdir(dir)
-	runGit(t, dir, "branch", "x")
-	at := gitOut(t, dir, "rev-parse", "x")
-	runGit(t, dir, "checkout", "-q", "x")
-	runGit(t, dir, "commit", "--allow-empty", "-qm", "moved")
-	runGit(t, dir, "checkout", "-q", "main")
-	if err := DeleteBranchAt("x", at); err == nil || !strings.Contains(err.Error(), "now") {
-		t.Errorf("DeleteBranchAt on a moved branch = %v, want a refusal", err)
-	}
-	moved := gitOut(t, dir, "rev-parse", "x")
-	runGit(t, dir, "checkout", "-q", "x")
-	if err := DeleteBranchAt("x", moved); err == nil || !strings.Contains(err.Error(), "checked out") {
-		t.Errorf("DeleteBranchAt on a checked-out branch = %v, want git's refusal", err)
-	}
-	runGit(t, dir, "checkout", "-q", "main")
-	if err := DeleteBranchAt("x", moved); err != nil {
-		t.Fatalf("DeleteBranchAt: %v", err)
-	}
-	if BranchTip("x") != "" {
-		t.Error("x is still there")
-	}
-	for _, c := range [][2]string{{"", moved}, {"main", ""}} {
-		if err := DeleteBranchAt(c[0], c[1]); err == nil {
-			t.Errorf("DeleteBranchAt(%q, %q) = nil, want an error", c[0], c[1])
-		}
 	}
 }
