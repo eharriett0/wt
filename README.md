@@ -528,7 +528,11 @@ Color is auto-disabled when stdout isn't a TTY; force off with `NO_COLOR=1`.
 - `gh` (GitHub CLI), authenticated — only for `claim` / `release` / `merge-pr`.
   `new` / `clean` / `status` / `check` / `install-hooks` need only `git`.
 
-Run `wt doctor` to check.
+Run `wt doctor` to check. It judges each gh host by the account gh uses there,
+and says "could not be verified", not "NOT authenticated", when a host timed out
+or could not be reached. Telling an unreachable host from a rejected token needs
+gh 2.81 or newer (`gh auth status --json`); older gh reports both as a failed
+login, and doctor says so.
 
 ## License
 
