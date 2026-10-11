@@ -3,6 +3,7 @@
 package ghx
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -78,6 +79,20 @@ func authStatusArgs(host string) []string {
 	return args
 }
 
+// authStatusJSONArgs is the same check in gh's machine-readable form (gh 2.81+,
+// #203): `--json hosts` gives each account's state AND gh's error, so wt can tell
+// a host it never reached from a token the host rejected (the human output says
+// "token invalid" for both). `--active` checks only the account gh uses on each
+// host, the one that decides it; it predates --json, so any gh with this form has
+// it. This form always exits 0 unless gh itself fails.
+func authStatusJSONArgs(host string) []string {
+	args := []string{"auth", "status", "--json", "hosts", "--active"}
+	if host != "" {
+		args = append(args, "--hostname", host)
+	}
+	return args
+}
+
 // authTTL bounds how long an AuthedFor answer is reused (#172). One command asks
 // once per PR lookup (every worktree in `wt clean`, every colliding window in a
 // hook), and the answer does not change mid-command. The bound is for `wt mcp`,
@@ -87,12 +102,15 @@ const authTTL = time.Minute
 var (
 	authMu   sync.Mutex
 	authMemo = map[string]authAnswer{}
+	// authNoJSON: this gh rejected `auth status --json` (it predates 2.81), so the
+	// human form is asked directly from then on. Per process: a gh upgraded under
+	// a long-lived `wt mcp` is picked up when it restarts.
+	authNoJSON bool
 )
 
 type authAnswer struct {
-	ok  bool
-	out string // what gh printed, both streams: AuthStatusFor reads it per host (#183)
-	at  time.Time
+	st AuthStatus // what that check said, per host (#183/#203)
+	at time.Time
 }
 
 // authFresh reports whether an answer taken at `at` may be reused at now: not in
@@ -106,24 +124,51 @@ func authFresh(at, now time.Time) bool {
 // authCheck runs `gh auth status` for host, or reuses an answer younger than
 // authTTL. The lock is held across the gh call so that concurrent first callers
 // (ClassifyWindows runs 8) share one check (#172).
-func authCheck(host string) authAnswer {
+func authCheck(host string) AuthStatus {
 	authMu.Lock()
 	defer authMu.Unlock()
 	now := time.Now()
 	if a, ok := authMemo[host]; ok && authFresh(a.at, now) {
-		return a
+		return a.st
 	}
-	// BOTH streams (#183): once any account fails, gh writes every host section to
-	// stderr, and that is exactly the output AuthStatusFor needs to read.
-	out, err := exec.Command("gh", authStatusArgs(host)...).CombinedOutput()
-	a := authAnswer{ok: err == nil, out: string(out), at: now}
-	authMemo[host] = a
-	return a
+	st := runAuthCheck(host)
+	authMemo[host] = authAnswer{st: st, at: now}
+	return st
 }
 
-// AuthedFor reports whether gh has an authenticated account FOR host: gh's exit
-// code. The answer is memoized per host for authTTL (#172).
-func AuthedFor(host string) bool { return authCheck(host).ok }
+// runAuthCheck asks gh once (#203): the JSON form, unless this gh is known to
+// lack it, and the human form (#183) only when the JSON form gave no answer
+// (jsonAuthOutcome). On gh 2.81+ that is one run; before it, the first check
+// also spends one flag error (no network) to learn there is no JSON form.
+// Called with authMu held.
+func runAuthCheck(host string) AuthStatus {
+	if !authNoJSON {
+		// Separate streams: the JSON is stdout, and gh writes notes to stderr even
+		// then ("You are not logged into any GitHub hosts", an update notice).
+		var stdout, stderr bytes.Buffer
+		cmd := exec.Command("gh", authStatusJSONArgs(host)...)
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		err := cmd.Run()
+		st, fallback, noJSON := jsonAuthOutcome(host, err == nil, stdout.String(), stderr.String())
+		if !fallback {
+			return st
+		}
+		if noJSON {
+			authNoJSON = true
+		}
+	}
+	// BOTH streams (#183): once any account fails, gh writes every host section to
+	// stderr, and that is exactly the output the per-host reading needs.
+	out, err := exec.Command("gh", authStatusArgs(host)...).CombinedOutput()
+	return textAuthStatus(host, err == nil, string(out))
+}
+
+// AuthedFor reports whether gh can use host (#203): each host gh checked has an
+// ACTIVE account whose token works (authOK). Not the bare exit code: an inactive
+// account with a dead token fails that while gh calls to the host work. A timeout,
+// an unreachable host or output wt cannot read is a no. Memoized per host for
+// authTTL (#172).
+func AuthedFor(host string) bool { return authCheck(host).OK }
 
 // Authed reports whether gh is authenticated for the host THIS repo uses.
 //
@@ -142,7 +187,8 @@ func AuthedFor(host string) bool { return authCheck(host).ok }
 // and a bare check validates every configured host: about 6 s with two (#172).
 // AuthedFor's memo is what keeps that to once per command. Its exit code is then
 // an aggregate, which is why doctor reads it per host instead (RepoAuthStatus,
-// #183); this boolean only gates gh calls that need the repo's host anyway.
+// #183). Even scoped, the exit code is not the answer (#203): it also fails for
+// an INACTIVE account on the host, so AuthedFor decides by the active one.
 func Authed() bool { return AuthedFor(RepoHost()) }
 
 // CurrentUser returns the authenticated login.

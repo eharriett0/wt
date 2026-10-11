@@ -201,6 +201,72 @@ func Parse(content string) []Entry {
 
 func unbacktick(s string) string { return strings.Trim(strings.TrimSpace(s), "`") }
 
+// RemoveBranchSections removes every claim section recorded on branch, and only
+// those (#177): `wt discard` drops the claims of the branch it deleted. Two
+// worktrees can hold claims for one issue, and RemoveSection, which removes by
+// issue, would drop the other worktree's claim too. A section runs from its
+// "## #<issue>" header to the next "## " line, as RemoveSection reads it. It
+// returns the new content and the issues whose sections went. Pure.
+func RemoveBranchSections(content, branch string) (string, []string) {
+	if branch == "" {
+		return content, nil
+	}
+	var out, section, removed []string
+	issue := ""
+	flush := func() {
+		if section == nil {
+			return
+		}
+		onBranch := false
+		for _, ln := range section[1:] {
+			if strings.HasPrefix(ln, "- Branch: ") {
+				onBranch = unbacktick(strings.TrimPrefix(ln, "- Branch: ")) == branch
+				break
+			}
+		}
+		if onBranch {
+			removed = append(removed, issue)
+		} else {
+			out = append(out, section...)
+		}
+		section = nil
+	}
+	for _, ln := range strings.Split(content, "\n") {
+		if strings.HasPrefix(ln, "## ") {
+			flush()
+			if fields := strings.Fields(strings.TrimPrefix(ln, "## ")); len(fields) > 0 && strings.HasPrefix(fields[0], "#") {
+				issue, section = strings.TrimPrefix(fields[0], "#"), []string{ln}
+				continue
+			}
+		}
+		if section != nil {
+			section = append(section, ln)
+			continue
+		}
+		out = append(out, ln)
+	}
+	flush()
+	if len(removed) == 0 {
+		return content, nil
+	}
+	return strings.Join(out, "\n"), removed
+}
+
+// IssueForBranch returns the issue of the first claim recorded on branch, or ""
+// (#40). merge-pr's auto-clean drops that claim's section when the branch goes.
+// Pure.
+func IssueForBranch(entries []Entry, branch string) string {
+	if branch == "" {
+		return ""
+	}
+	for _, e := range entries {
+		if e.Branch == branch {
+			return e.Issue
+		}
+	}
+	return ""
+}
+
 // Read returns the file content, or "" if the file doesn't exist.
 func Read(path string) string {
 	b, err := os.ReadFile(path)

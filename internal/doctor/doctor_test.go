@@ -92,14 +92,18 @@ func TestPushDefaultFollowsUpstream(t *testing.T) {
 // the gh check is a bare `gh auth status`, whose exit code fails if ANY host does.
 // One unreachable Enterprise host made doctor say "NOT authenticated" for a
 // github.com login that was fine: #100 again, because #102 only fixed it in a
-// repo. The unscoped check is now read per host. A scoped check, the #100/#102
-// path, is still read from the exit code alone, unchanged.
+// repo. The unscoped check is now read per host. #203: so is a scoped check that
+// did not pass, because a timeout or an unreachable repo host proves nothing
+// about the login either; and offline (gh 2.81+ says so) is not a dead token.
 func TestGHAuth(t *testing.T) {
 	ok := ghx.HostAuth{Host: "github.com", State: ghx.HostAuthOK}
 	gheTimeout := ghx.HostAuth{Host: "ghe.example.com", State: ghx.HostAuthTimeout}
 	ghFailed := ghx.HostAuth{Host: "github.com", State: ghx.HostAuthFailed}
 	gheFailed := ghx.HostAuth{Host: "ghe.example.com", State: ghx.HostAuthFailed}
 	unreadable := ghx.HostAuth{Host: "ghe.example.com", State: ghx.HostAuthUnknown}
+	ghTimeout := ghx.HostAuth{Host: "github.com", State: ghx.HostAuthTimeout}
+	ghOffline := ghx.HostAuth{Host: "github.com", State: ghx.HostAuthUnreachable, Error: `Get "https://api.github.com/": dial tcp: lookup api.github.com: no such host`}
+	gheOffline := ghx.HostAuth{Host: "ghe.example.com", State: ghx.HostAuthUnreachable, Error: `Get "https://ghe.example.com/api/v3/": dial tcp: lookup ghe.example.com: no such host`}
 
 	cases := []struct {
 		name    string
@@ -110,9 +114,21 @@ func TestGHAuth(t *testing.T) {
 	}{
 		{"in a repo: the scoped check passes", ghx.AuthStatus{Host: "github.com", OK: true, Parsed: true, Hosts: []ghx.HostAuth{ok}},
 			true, nil, false},
-		{"in a repo: a failing scoped check is NOT authenticated, as before (#100/#102)",
-			ghx.AuthStatus{Host: "github.com", Parsed: true, Hosts: []ghx.HostAuth{{Host: "github.com", State: ghx.HostAuthTimeout}}},
+		{"#203: in a repo, the repo's host timed out → unknown, never NOT authenticated",
+			ghx.AuthStatus{Host: "github.com", Parsed: true, Hosts: []ghx.HostAuth{ghTimeout}},
+			false, []ghx.HostAuth{ghTimeout}, true},
+		{"#203: in a repo, gh 2.81+ could not reach the host → unknown",
+			ghx.AuthStatus{Host: "github.com", Parsed: true, Hosts: []ghx.HostAuth{ghOffline}},
+			false, []ghx.HostAuth{ghOffline}, true},
+		{"in a repo: the active account's token is dead → NOT authenticated, as before",
+			ghx.AuthStatus{Host: "github.com", Parsed: true, Hosts: []ghx.HostAuth{ghFailed}},
+			false, []ghx.HostAuth{ghFailed}, false},
+		{"in a repo: gh has no account on the repo's host → NOT authenticated",
+			ghx.AuthStatus{Host: "github.com", Parsed: true},
 			false, nil, false},
+		{"#203: in a repo, output wt cannot read → unknown, naming the repo's host",
+			ghx.AuthStatus{Host: "github.com"},
+			false, []ghx.HostAuth{{Host: "github.com", State: ghx.HostAuthUnknown}}, true},
 		{"unscoped and gh passed: authenticated, as before", ghx.AuthStatus{OK: true, Parsed: true, Hosts: []ghx.HostAuth{ok}},
 			true, nil, false},
 		{"#183: unscoped, github.com ok and the Enterprise host timed out → authenticated",
@@ -137,6 +153,12 @@ func TestGHAuth(t *testing.T) {
 			false, []ghx.HostAuth{ghFailed, unreadable}, true},
 		{"unscoped, output wt cannot read at all → unknown", ghx.AuthStatus{},
 			false, nil, true},
+		{"#203: offline, gh 2.81+ reaches no host → unknown, never NOT authenticated",
+			ghx.AuthStatus{Parsed: true, Hosts: []ghx.HostAuth{gheOffline, ghOffline}},
+			false, []ghx.HostAuth{gheOffline, ghOffline}, true},
+		{"#203: github.com ok, the Enterprise host unreachable → authenticated",
+			ghx.AuthStatus{Parsed: true, Hosts: []ghx.HostAuth{gheOffline, ok}},
+			true, []ghx.HostAuth{gheOffline, ok}, false},
 	}
 	for _, c := range cases {
 		authed, hosts, unknown := ghAuth(c.st)
@@ -146,13 +168,15 @@ func TestGHAuth(t *testing.T) {
 	}
 }
 
-// TestGHLine pins doctor's gh line. The three pre-#183 lines are the ones a check
-// scoped to the repo's host still prints, so they are pinned byte-for-byte; the
-// rest exist only for an unscoped check, and none of them may say "NOT
-// authenticated" when a host is authenticated or nothing was proven (#183).
+// TestGHLine pins doctor's gh line. The three pre-#183 lines are what a check that
+// passed or definitely failed prints, so they are pinned byte-for-byte; none of
+// the others may say "NOT authenticated" when a host is authenticated or nothing
+// was proven (#183/#203).
 func TestGHLine(t *testing.T) {
 	ok := ghx.HostAuth{Host: "github.com", State: ghx.HostAuthOK}
 	gheTimeout := ghx.HostAuth{Host: "ghe.example.com", State: ghx.HostAuthTimeout}
+	dns := `Get "https://api.github.com/": dial tcp: lookup api.github.com: no such host`
+	gheDNS := `Get "https://ghe.example.com/api/v3/": dial tcp: lookup ghe.example.com: no such host`
 	cases := []struct {
 		name string
 		rep  Report
@@ -171,7 +195,7 @@ func TestGHLine(t *testing.T) {
 		{"several failing hosts are counted and named",
 			Report{GH: true, GHAuthed: true, GHHosts: []ghx.HostAuth{ok, gheTimeout, {Host: "old.example.com", State: ghx.HostAuthFailed}}},
 			false, "gh — authenticated on github.com (2 other hosts failing: ghe.example.com timed out, old.example.com failed to log in)"},
-		{"every host authenticated (only an inactive account failed)",
+		{"every host authenticated, read per host",
 			Report{GH: true, GHAuthed: true, GHHosts: []ghx.HostAuth{ok, {Host: "ghe.example.com", State: ghx.HostAuthOK}}},
 			false, "gh — authenticated on github.com, ghe.example.com"},
 		{"nothing proven: every host timed out",
@@ -180,6 +204,29 @@ func TestGHLine(t *testing.T) {
 		{"nothing proven: output wt could not read",
 			Report{GH: true, GHAuthUnknown: true},
 			true, "gh — found, but auth could not be verified: with no repository host to scope it to, `gh auth status` checks every configured host, and it failed with output wt could not read (run it to see why)"},
+		{"#203: in a repo, the repo's host timed out",
+			Report{GH: true, GHAuthUnknown: true, GHHosts: []ghx.HostAuth{{Host: "github.com", State: ghx.HostAuthTimeout}}},
+			true, "gh — found, but auth could not be verified: github.com timed out"},
+		{"#203: offline, and gh 2.81+ says so",
+			Report{GH: true, GHAuthUnknown: true, GHHosts: []ghx.HostAuth{
+				{Host: "github.com", State: ghx.HostAuthUnreachable, Error: dns}, {Host: "ghe.example.com", State: ghx.HostAuthUnreachable, Error: gheDNS}}},
+			true, "gh — found, but auth could not be verified: couldn't reach github.com, couldn't reach ghe.example.com"},
+		{"#203: authenticated, the other host could not be reached",
+			Report{GH: true, GHAuthed: true, GHHosts: []ghx.HostAuth{ok, {Host: "ghe.example.com", State: ghx.HostAuthUnreachable, Error: gheDNS}}},
+			false, "gh — authenticated on github.com (1 other host failing: couldn't reach ghe.example.com)"},
+		{"#203: the host answered, but not about the token: gh's words, first line",
+			Report{GH: true, GHAuthUnknown: true, GHHosts: []ghx.HostAuth{{Host: "github.com", State: ghx.HostAuthUnknown,
+				Error: "HTTP 403: API rate limit exceeded for user ID 1. (https://api.github.com/)\nmore"}}},
+			true, "gh — found, but auth could not be verified: github.com could not be checked (gh: HTTP 403: API rate limit exceeded for user ID 1. (https://api.github.com/))"},
+		{"#203: a check wt cannot read names its host",
+			Report{GH: true, GHAuthUnknown: true, GHHosts: []ghx.HostAuth{{Host: "github.com", State: ghx.HostAuthUnknown}}},
+			true, "gh — found, but auth could not be verified: wt could not read gh's answer for github.com"},
+		{"#203: gh 2.81+ says the token is dead (an HTTP 401): plainly NOT authenticated",
+			Report{GH: true, GHHosts: []ghx.HostAuth{{Host: "github.com", State: ghx.HostAuthFailed, Error: "HTTP 401: Bad credentials (https://api.github.com/)"}}},
+			true, "gh — found but NOT authenticated (claim/release/merge-pr need `gh auth login`)"},
+		{"#203: gh before 2.81 prints that failure for an unreachable host too: say so",
+			Report{GH: true, GHHosts: []ghx.HostAuth{{Host: "github.com", State: ghx.HostAuthFailed}}},
+			true, "gh — found but NOT authenticated, or offline: gh before 2.81 reports a host it cannot reach as a failed login (claim/release/merge-pr need `gh auth login`)"},
 	}
 	for _, c := range cases {
 		warn, msg := ghLine(&c.rep)
@@ -192,8 +239,9 @@ func TestGHLine(t *testing.T) {
 	}
 }
 
-// A check scoped to the repo's host emits exactly the pre-#183 gh keys, so
-// `wt doctor --json` in a repo is unchanged; an unscoped one adds the breakdown.
+// A check that passed emits exactly the pre-#183 gh keys, so `wt doctor --json`
+// in a repo whose host authenticates is unchanged; one that did not adds the
+// breakdown, scoped (#203) or not (#183), with gh's error from gh 2.81+.
 func TestReportJSONGHFields(t *testing.T) {
 	keys := func(rep Report) []string {
 		b, err := json.Marshal(rep)
@@ -214,9 +262,22 @@ func TestReportJSONGHFields(t *testing.T) {
 		return ks
 	}
 	scoped := Report{GH: true}
-	scoped.GHAuthed, scoped.GHHosts, scoped.GHAuthUnknown = ghAuth(ghx.AuthStatus{Host: "github.com"})
+	scoped.GHAuthed, scoped.GHHosts, scoped.GHAuthUnknown = ghAuth(ghx.AuthStatus{Host: "github.com", OK: true, Parsed: true,
+		Hosts: []ghx.HostAuth{{Host: "github.com", State: ghx.HostAuthOK}}})
 	if got := keys(scoped); !reflect.DeepEqual(got, []string{"gh", "gh_authed"}) {
-		t.Errorf("scoped check JSON gh keys = %v, want [gh gh_authed] (unchanged)", got)
+		t.Errorf("scoped check that passed: JSON gh keys = %v, want [gh gh_authed] (unchanged)", got)
+	}
+	timedOut := Report{GH: true}
+	timedOut.GHAuthed, timedOut.GHHosts, timedOut.GHAuthUnknown = ghAuth(ghx.AuthStatus{Host: "github.com", Parsed: true,
+		Hosts: []ghx.HostAuth{{Host: "github.com", State: ghx.HostAuthTimeout}}})
+	if b, _ := json.Marshal(timedOut); !strings.Contains(string(b), `"gh_authed":false,"gh_hosts":[{"host":"github.com","state":"timeout"}],"gh_auth_unknown":true`) {
+		t.Errorf("#203 scoped timeout JSON = %s, want the host and gh_auth_unknown", b)
+	}
+	offline := Report{GH: true}
+	offline.GHAuthed, offline.GHHosts, offline.GHAuthUnknown = ghAuth(ghx.AuthStatus{Host: "github.com", Parsed: true,
+		Hosts: []ghx.HostAuth{{Host: "github.com", State: ghx.HostAuthUnreachable, Error: `Get "https://api.github.com/": dial tcp: lookup api.github.com: no such host`}}})
+	if b, _ := json.Marshal(offline); !strings.Contains(string(b), `"gh_hosts":[{"host":"github.com","state":"unreachable","error":"Get \"https://api.github.com/\": dial tcp: lookup api.github.com: no such host"}],"gh_auth_unknown":true`) {
+		t.Errorf("#203 offline JSON = %s, want state unreachable with gh's error", b)
 	}
 	unscoped := Report{GH: true}
 	unscoped.GHAuthed, unscoped.GHHosts, unscoped.GHAuthUnknown = ghAuth(ghx.AuthStatus{Parsed: true, Hosts: []ghx.HostAuth{

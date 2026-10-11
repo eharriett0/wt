@@ -465,7 +465,12 @@ func cleanAbandonedWorktree(c *config.Config, e activework.Entry) {
 	// delete must be the SAME placeholder we just proved abandoned (#159 review).
 	localTip, _ := gitx.RunDir(c.Root, "rev-parse", "refs/heads/"+e.Branch)
 	if err := worktree.Remove(c, e.Worktree, e.Branch, false); err != nil {
-		ui.Warn("--clean: couldn't remove worktree: %v", err)
+		// Kept whole, as a dirty worktree is above: the remote placeholder is
+		// what a re-claim re-attaches to (#177 review). The gate now also refuses
+		// a clean worktree (a git repository in its ignored files), so this is
+		// no longer only git's rare refusal.
+		ui.Warn("--clean: couldn't remove worktree, so it, its branch and origin's placeholder were left in place: %v", err)
+		return
 	}
 	// #159: claim also PUSHED this branch, so removing only the worktree + local
 	// branch leaves the remote placeholder behind — re-claiming the same issue then

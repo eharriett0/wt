@@ -31,6 +31,9 @@ func printHelp() {
 	fmt.Printf("    %s        %s\n", c("wt new <branch>"), "create a worktree on a new branch from the base")
 	fmt.Printf("    %s              %s\n", c("wt init"), "scaffold a commented .wt.conf for this repo (derived defaults)  "+d("[--force]"))
 	fmt.Printf("    %s              %s\n", c("wt clean"), "list worktrees whose branch already shipped  "+d("(-y to remove; name worktrees to limit it to them: `wt clean -y <name>...`, each must match exactly one; --stale-index reports merged leftover-index ones; --all-roots also evaluates worktrees outside worktree_root, which still block pushes)"))
+	fmt.Printf("    %s   %s\n", c("wt discard <name>"), "drop ONE throwaway worktree + its local branch + its claim, which clean keeps as never pushed  "+d("[--drop-commits] [--dry-run] [--all-roots]"))
+	fmt.Println("    " + d("exact name only, never a sweep; refuses a dirty tree, a git repository in its ignored files, the base branch, the main checkout and the window it runs in;"))
+	fmt.Println("    " + d("lists the commits no branch on origin has and drops them only with ") + c("--drop-commits") + d("; never deletes the branch on origin."))
 	fmt.Println()
 
 	fmt.Println(b(g("  ✦ CLAIM A UNIT OF WORK")) + d("  — assign issue + worktree + draft PR + record"))

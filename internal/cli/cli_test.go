@@ -316,6 +316,28 @@ func TestHelpGuardWiring(t *testing.T) {
 	}
 }
 
+// #177: `wt discard` takes exactly one name (it is never a sweep), and every
+// usage mistake is exit 64 before any git I/O: no name, two names, an unknown
+// flag, a `--` passthrough. --help is its usage, exit 0.
+func TestDiscardUsage(t *testing.T) {
+	t.Setenv("WT_NO_UPDATE_CHECK", "1")
+	if code := Main([]string{"discard", "--help"}); code != 0 {
+		t.Errorf("wt discard --help exit = %d, want 0", code)
+	}
+	for _, args := range [][]string{
+		{"discard"},
+		{"discard", "a", "b"},
+		{"discard", "--drop-commits"},
+		{"discard", "a", "--force"},
+		{"discard", "a", "--", "b"},
+		{"discard", ""},
+	} {
+		if code := Main(args); code != 64 {
+			t.Errorf("wt %q exit = %d, want 64", args, code)
+		}
+	}
+}
+
 // TestDeployDryRunNote pins what `merge-pr --dry-run` says once the deploy gate
 // applies (#170). It must follow deployGate's own order, so a draft is reported as
 // a refusal even when --confirm-deploy is set, and it must never read as a pass.

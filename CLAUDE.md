@@ -17,7 +17,7 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   the hook drivers (`runHook`, `claude_hook.go`).
 - **gitx** / **ghx** — thin `git` / `gh` shell-outs.
 - **hooks** — git hook shims + `HookPrePush`/`HookPreCommit`.
-- **worktree** — `wt new`/`clean` (data-loss-critical; see below).
+- **worktree** — `wt new`/`clean`/`discard` (data-loss-critical; see below).
 - **merge** — `merge-pr` guard + closing-keyword lint. **doctor**, **coord**,
   **activework**, **todos**, **config**, **section**, **ui**, **selfupdate**,
   **lock**.
@@ -64,16 +64,72 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   failing fall back to the plain base diff (over-reports); git failing outright
   → `ChangedRangesChecked` ok=false, `ChangedRanges` nil (graders: indeterminate
   = HIGH), `ChangedRangesNew` the whole file. `gitOutput` is the test seam.
-- **The pre-edit hooks grade what `wt check` will say once the edit is made
-  (#108/#184).** `regradePending`: every hunk-graded entry (HIGH *or* FYI: a
-  window whose earlier edits were disjoint can be about to overlap) is HIGH iff
-  this window's own ranges ∪ the pending edit overlap the other window's. The
-  pending edit is located in the on-disk file and moved into base numbering
-  through this worktree's own diff (`gitx.LinesToBase`, the same mapping with the
-  sides swapped), so a window that is behind base or already edited the file is
-  graded exactly, not file-level. Only when that can't be computed (a Write, a
-  non-unique `old_string`, a binary file, a git error) does an entry stay as a
-  file-level heads-up, and then it is never dropped.
+- **Two windows' edits are graded by git's 3-way rule, which needs each edit's
+  SHAPE (#199).** git merges two edits as ONE conflict region unless an
+  unchanged line separates them, so windows editing lines 10 and 11 conflict,
+  yet every grader called them disjoint (line OVERLAP): 32 of 170 real
+  conflicts in an 800-scenario fuzz vs `git merge-tree`, 24 with both windows
+  current. All of them (`check`, status, banner, pre-push/pre-commit,
+  `regradePending`) go through `collide.ConflictSeverity`/`ConflictSpans`, which
+  compare edits with `LineRange.Conflicts` (= `hunksConflict` on their old
+  sides): changes conflict when they overlap or touch; an insertion only with a
+  change that includes a line on either side of its gap, or another insertion at
+  that gap. ⚠ **A span can't say that**: it encodes an insertion as both
+  neighbours of its gap, so a touch rule over spans claims a line too many next
+  to every insertion, and plain overlap flagged insertions at neighbouring gaps.
+  So a base-frame `LineRange` carries `Gap` (an insertion between `Start` and
+  `End`=`Start+1`): `parseHunkRangesOld` sets it; `mapHunk` keeps an
+  unconflicted behind-branch hunk's shape and makes a conflicting one claim
+  exactly its surviving lines plus base's replacement (a base deletion is its
+  deletion point, a Gap, never its neighbours as lines). NEW-frame ranges never
+  set Gap (a span there only errs toward flagging); `Overlaps` stays the span
+  intersection, for sections. A touching pair's display span is the seam's two
+  lines (`overlap L10-11`).
+  ⚠ **The exact gap is only right if the diff puts an edit WHERE git's merge
+  does (#199 review).** An inserted `}` beside an equal one, a blank line, a
+  rewrite among repeated lines can sit in more than one gap, and a plain `git
+  diff` (myers, the indent heuristic, the user's `diff.algorithm`) picks another
+  gap than merge-ort (histogram, no indent heuristic). Measured that way, two
+  insertions graded a gap apart (clean) were one gap in git and conflicted, and
+  check, status and pre-push all let them through where main's looser spans had
+  blocked. So every range-measuring diff passes `gitx.gradeDiffFlags`
+  (`--diff-algorithm=histogram --no-indent-heuristic --inter-hunk-context=0
+  --no-color --no-ext-diff --no-textconv`, after the revs, so a failure-injection
+  matcher still finds the first rev at `args[2]`), and `scopedEnv` strips
+  `GIT_DIFF_OPTS` (it beats `-U0`). A flag beats config, `GIT_CONFIG_PARAMETERS`
+  included, so that one stays (a caller's `git -c` may matter to other calls).
+  The truth assumed is merge-ort's (the default since git 2.34; `merge-tree
+  --write-tree`, rebase, the forge's merge button); a `-s recursive` merge aligns
+  like myers. Pinned by `TestChangedRanges_MatchMergeTree` (775 single-edit pairs
+  on a slider-heavy file vs `git merge-tree`) and `TestGrade_FollowsMergeAlignment`
+  (check, status and pre-push from both sides); `TestLineRangeConflicts_MatchesGitMergeFile`
+  (unique lines vs `git merge-file`) pins only the rule.
+- **The pre-edit hooks grade what `wt check` will say once the edit is made, by
+  construction (#108/#184/#199).** A hook predicts the FILE the edit will produce
+  and measures it with `wt check`'s own diffs and base mapping
+  (`gitx.ChangedRangesWith`: the copy goes in as a blob, through the file's clean
+  filters with `hash-object --path`, into a throwaway object directory, so the
+  repo's objects are only read). `regradePending`: every hunk-graded entry (HIGH
+  *or* FYI: a window whose earlier edits were disjoint can be about to overlap)
+  is HIGH iff those ranges conflict with the other window's
+  (`collide.ConflictSeverity`); an edit that puts the file back to base's copy
+  reads HIGH like `wt check`'s empty side, as a heads-up, not a confirmed
+  overlap. Claude (`claudePendingContent`): Claude Code's Edit replayed (refused
+  for an absent `old_string`, or a repeated one without `replace_all`; an empty
+  `new_string` takes the newline after it), MultiEdit's edits in turn, Write's
+  content; a CRLF file is edited as LF (the edit's own CRLFs too) and written
+  back CRLF (measured with Claude Code's own tools). Codex (`codex_apply.go`): apply_patch replayed, held
+  to the app's bundled CLI by `TestApplyPatchOps_MatchesCodex`: each chunk sought
+  from where the last ended, fuzzy whitespace and punctuation tiers, context
+  lines written as the patch spells them, `@@ <line>` and End-of-File anchors, a
+  context-less chunk appended, and ⚠ every file it writes ends with a newline, so
+  a file without one also changes its last line. ⚠ Don't go back to guessing the
+  changed lines from the hunk (the `old_string`'s lines, the union of every gap a
+  slide could take): a diff can place an inserted or deleted line in several
+  gaps, a guess misses where git puts it, and the union denied edits `wt check`
+  grades low. Only when the file can't be predicted (an edit the tool refuses, a
+  file mixing line endings, a patch apply_patch rejects, a new file, a git error)
+  does an entry stay as a file-level heads-up, and then it is never dropped.
 - **Coordination ownership is ONE decision, and only a real session token proves
   a record is yours (#163, #211).** Two agent sessions started in one checkout
   resolve to the same window id, so each treated the other's announcements as its
@@ -140,7 +196,8 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   merged/closed branch with leftover staged cruft is stale, not a permanent
   HIGH — #79), except a MERGED PR found only by the tip commit (#168, below).
 - **The hook block predicate MUST equal `wt check`.** Advisory means advisory in
-  both; disjoint hunks don't block in either. `pushCollisionBlocks` mirrors
+  both; disjoint hunks (an unchanged line between) don't block in either, and
+  touching ones block in both (#199). `pushCollisionBlocks` mirrors
   `buildCheckReport`'s hunk grading on purpose (#92). If you change the grading,
   change both (or they'll disagree and get bypassed). The **structured-doc
   SECTION grade** is part of that equality (#98) and is single-sourced in
@@ -229,10 +286,10 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   downgraded a real collision; `*.md` folded every .md file's hunks into one
   file's ranges; a leading `:` is magic (`:colon.md` measured `colon.md`). Every
   `-- <path>` call passes `gitx.literalPath(p)` (`:(literal)<p>`): IsTracked*,
-  IsUntracked, ChangedRangesChecked/ChangedRangesNew, LinesToBase,
-  uncommittedRangesNew. Prefixing the path, not `git --literal-pathspecs`, keeps
-  the subcommand at `args[0]`, where the `gitOutput` failure-injection tests
-  match it (a per-call env var would need the seam itself changed). ⚠
+  IsUntracked, ChangedRangesChecked/ChangedRangesNew, uncommittedRangesNew.
+  Prefixing the path, not `git --literal-pathspecs`, keeps the subcommand at
+  `args[0]`, where the `gitOutput` failure-injection tests match it (the seam
+  also takes a per-call env and stdin since #199, for ChangedRangesWith). ⚠
   `scopedEnv` strips `GIT_LITERAL_PATHSPECS` (and the glob/noglob/icase
   switches): git exports it to the hooks of `git --literal-pathspecs …`, and
   under it git reads `:(literal)` as part of the name, which then matches
@@ -247,6 +304,43 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   on the BASE branch** (`ReapableBranch`): "patch-equivalent on base" is
   trivially true for the base itself, so every downstream verdict says shipped
   and the printed command becomes `git branch -D main` (#101).
+  ⚠ **Untracked files count whatever `status.showUntrackedFiles` says (#208).**
+  A repo set to `no` hid them from a plain porcelain status AND from `git
+  worktree remove`'s own check, so `clean -y`, merge-pr's auto-clean and
+  `release --clean` deleted a worktree's untracked work (measured, git 2.39).
+  `IsClean` and every dirty count read `gitx.StatusEntries`
+  (`--untracked-files=normal`); `WorktreeRemove` carries a scoped `-c
+  status.showUntrackedFiles=normal`, one command's argument, never the process
+  env (#92). Ignored files are unchanged: never dirty, deleted with the worktree.
+  ⚠ **So does an edit git status never looks at (#210).** A tracked file
+  flagged `--assume-unchanged` or `--skip-worktree`, or every file a checkout
+  writes under `core.ignoreStat=true`, is skipped by git status and by `git
+  worktree remove`'s check, which deleted the edit. `StatusEntries` reads the
+  flags from `git ls-files -z -s -v` (lower-case tag = assume-unchanged, `S`/`s`
+  = skip-worktree) and lists each flagged file that exists and differs from its
+  index blob: regular files hashed by git (`hash-object --stdin-paths`, so clean
+  and eol filters apply as for `git add`), symlinks by their target. A file the
+  entry no longer has on disk loses nothing and is skipped; anything that can't
+  be compared counts as changed (fail closed).
+  ⚠ **Liveness reads the same `StatusEntries`** (`IsClean` → `LiveFacts.Dirty`,
+  doctor's counts): untracked files a `showUntrackedFiles=no` config hides,
+  hidden tracked edits, and submodule changes (`--ignore-submodules=none`, as
+  git's own removal check reads them, overriding `submodule.<name>.ignore`) now
+  make a window dirty, and **dirty is never suppressed** (#87). A merged-by-
+  ancestry, tip-merged or dormant window holding such junk therefore stays
+  surfaced: exactly what the same window reads in a default-config repo, and
+  untracked files were already its touched paths (`TouchedFiles` lists them
+  with `-uall`). Silence junk with ignore rules, not by hiding it from status.
+  ⚠ **What git status never shows but the removal deletes or git refuses
+  blocks a clean worktree too** (`removalBlocked`, in `remove()` and in clean's
+  listing, #174): a git repository below an ignored path (`gitx.NestedRepos`:
+  `ls-files -o -i --exclude-standard --directory`, then a walk for `.git`
+  entries, symlinks not followed; `git worktree remove` deleted it, unpushed
+  commits and all) and a checked-out submodule (`gitx.PopulatedSubmodules`, git's
+  `validate_no_submodules`). Not part of `IsClean`: the walk is too slow for
+  liveness, and a nested clone is no collision. Any read error blocks.
+  `release --clean` keeps origin's placeholder too when the removal is refused
+  (it used to delete it and keep the worktree).
   ⚠ **An upstream is not a push (#175).** `wt new` branches from
   `origin/<base>`, and git's default `branch.autoSetupMerge` records that as the
   new branch's upstream, so `HasUpstream` is true from birth. The "never pushed"
@@ -275,6 +369,66 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   must pick out exactly ONE worktree (`CheckNames`): none is a typo, two is a
   directory name that is also another worktree's branch. Either stops the run
   with nothing cleaned, so a bad `-y` list never removes "the rest" of it.
+- **`wt discard` is the ONLY command that drops unpushed commits (#177), and only
+  for an exact name with `--drop-commits`.** It removes ONE worktree its owner
+  declared throwaway (a canary pushed, used and deleted on origin), its local
+  branch and the claim sections recorded ON THAT BRANCH
+  (`activework.RemoveBranchSections`; auto-clean's removal by issue would also
+  drop another worktree's claim on the same issue). Never a sweep: one name,
+  resolved by `DiscardTarget` (clean's `MatchedName` + `CheckNames` wording, with
+  the main checkout a candidate, so a name that also picks it out is ambiguous).
+  `DecideDiscard` is pure; no flag unlocks anything but its own guard (an
+  exhaustive test pins it): the main checkout, a detached HEAD (mid-rebase), the
+  base branch, the window it runs in, a dirty tree, a locked worktree, a git
+  repository in its ignored files and a checked-out submodule are refused
+  whatever the flags; out-of-root needs `--all-roots`, which keeps discard's
+  reach equal to clean's (#101). ⚠ **"Unique" is read from origin itself**
+  (`ls-remote --heads`), never `rev-list --not --remotes`: a branch deleted on
+  origin from the web or another clone leaves a stale `origin/<branch>` here that
+  hid the canary's own commit, and a later prune drops it. ⚠ **Offline, only
+  `origin/<base>` as last fetched is trusted** (every other commit counts, and
+  the plan says origin couldn't be asked): trusting the tracking refs minus
+  `origin/<branch>` let a canary pushed under ANOTHER name, or to another remote,
+  and deleted there, go without `--drop-commits` (#177 review). The plan also
+  says which listed commits another ref here keeps (`gitx.RefTipsExcept`: other
+  refs, the stash, other worktrees' HEADs) and which become unreachable. The
+  fetch is `--no-prune`: a
+  prune deletes other branches' stale refs, which can be the only copy of
+  someone's commits. ⚠ `CommitsOnlyOn` verifies the tip first: under
+  `--ignore-missing` a missing tip read as "no commits". ⚠ Measured on git 2.39:
+  `git worktree remove` deletes a worktree nested (ignored) inside the one
+  removed, so a worktree with another inside is refused; and
+  `status.showUntrackedFiles=no` blinds a plain porcelain status AND worktree
+  remove's own check, which deleted the untracked files, so `StatusEntries`
+  passes `--untracked-files=normal` and `WorktreeRemove` a scoped `-c
+  status.showUntrackedFiles=normal` (every removal, #208). ⚠ With
+  `core.ignorecase` a case twin is one loose ref file and git's in-use check
+  compares names exactly (#167), so the
+  base and branch-in-use checks fold case (`sameBranch`): `git branch -D Main`
+  deletes main. A worktree whose directory is gone has nothing on disk to lose
+  (git removes just its record, measured); one that is no longer a work tree's
+  top (replaced since git recorded it, #198 review), or any other unreadable
+  status, counts as dirty. ⚠ **"The window it runs in" compares directories,
+  not path text** (`holdsCwd`: walk up from "." via ".." with `os.SameFile`): a
+  cwd reached by a differently-cased path (macOS) or a symlink was not "under"
+  the worktree, which was removed from under the command; an unreadable cwd
+  counts as held. Once it removes, discard's git runs in the main checkout
+  (`WorktreeRemoveIn`, `DeleteBranchAt(dir, …)`), never in the deleted
+  worktree. ⚠ **The branch is deleted only at the tip that was listed, in ONE
+  step**: `git update-ref -d refs/heads/<b> <tip>` (`git branch -D` deletes
+  whatever is there by then, so a commit landing between a separate check and it
+  was dropped), after `branchBusy` makes `branch -D`'s own in-use check
+  (checked out, case twins folded, or being rebased/bisected: the
+  `rebase-*/head-name` and `BISECT_START` files of every worktree's git dir), and
+  then its `branch.<b>` config section goes. Never forced; origin is never
+  touched. `wt release <issue>` is suggested only when no other claim on the
+  issue is left (`claimNotes`): release removes claims by issue.
+  Known gaps, left as follow-ups: a commit only a reflog reaches (the removed
+  worktree's HEAD reflog, the branch's own) is neither listed nor kept;
+  `--drop-commits` drops what the run lists, with no pin to a tip reviewed
+  earlier; another session working in the target is seen only through a dirty
+  tree; a directory on an unmounted volume that is not `git worktree lock`ed
+  reads as gone.
 - **`wt adopt` never checks out, creates or moves a branch onto anything but the
   target (#167).** `git worktree add <path> <branch>` takes `refs/heads/<branch>`
   whenever it exists, so a stale branch left by an earlier PR that reused the
@@ -476,11 +630,11 @@ exit 0** (advisory / fail-open; a coordination nicety must never break the sessi
 - `wt _hook codex-edit` (**PreToolUse**, matcher `apply_patch`): parses the patch's
   `*** {Update|Add|Delete|Move} File:` targets, grades them via `buildCheckReport`
   (the same grader as `wt check`), then RE-grades each hunk-graded entry (HIGH or
-  FYI) against this window's own ranges plus the patch's actual hunks — localized
-  in the current file via `locateRange` (`parseCodexPatch` → per-hunk pre-image of
-  context+removed lines) and moved into base numbering by `gitx.LinesToBase` —
-  with the same `regradePending` as the Claude hook (#108/#184). A disjoint patch
-  to a shared file therefore stays silent. Emits `additionalContext` on overlap;
+  FYI) against this window's ranges as they will read once the patch is applied:
+  `predictCodexPatch` replays apply_patch over the on-disk files
+  (`codex_apply.go`) and `gitx.ChangedRangesWith` measures each result, with the
+  same `regradePending` as the Claude hook (#108/#184/#199). A disjoint patch to
+  a shared file therefore stays silent. Emits `additionalContext` on overlap;
   `WT_CODEX_HOOK_BLOCK=1` upgrades a **confirmed** HIGH (a computed hunk overlap) to
   `deny` — a file-level-only match never denies.
 
@@ -560,8 +714,34 @@ The formula supports `head "…", branch: "main"` for `--HEAD` builds.
   active account decides a host). gh writes every host section to **stderr**
   once any account fails, so `authCheck` captures BOTH streams; stdout alone
   reads as unparseable. A timeout or unreadable output proves nothing about the
-  login → "could not be verified", never "NOT authenticated". `Authed()` stays
-  the exit code: it only gates gh calls that need the repo's host anyway.
+  login → "could not be verified", never "NOT authenticated".
+  ⚠ **No exit code is the answer, scoped or not (#203).** `gh auth status
+  --hostname H` exits 1 for an INACTIVE account's dead token on H too, so
+  `Authed()` gated every gh call off while the active account worked, and a
+  timeout on H read "NOT authenticated". `AuthedFor` is pure `authOK`: every
+  host gh reported has a working ACTIVE account (human-form exit 0 is a yes;
+  unreadable or no host is a no), and doctor reads a scoped check per host too.
+  ⚠ **A yes is safety-relevant:** `Authed()` sets `PRChecked`, which dormancy
+  needs (an idle branch is suppressed only when "no PR" was checkable), so a
+  human-form exit 1 is a yes only when an inactive account's failure in a
+  section wt READ explains it (`textAuthStatus`); a failing section wt can't
+  read leaves it a no.
+  ⚠ gh's human output prints "X Failed to log in … token invalid" for a host it
+  never REACHED (DNS, refused); only `gh auth status --json hosts` (gh 2.81+,
+  cli/cli#11544) keeps gh's error. `runAuthCheck` asks `--json hosts --active`
+  first (stdout only: gh writes notes to stderr even then; it exits 0 whatever
+  the login) and falls back to the human form IN THE SAME memoized check when gh
+  refuses the flag ("unknown flag: --json", remembered per process in
+  `authNoJSON`, so gh < 2.81 costs one flag error per process, no network) or
+  answers without the JSON; any other failure falls back once, not remembered
+  (`jsonAuthOutcome`, pure). Pure `classifyAuthError`: only a 401 is `failed`
+  (REST "HTTP 401: …", GraphQL for a GH_TOKEN "non-200 OK status code: 401 …");
+  no HTTP answer (`Get "<url>": …`) is `unreachable`; any other status (a 403
+  rate limit, a 5xx) is `unknown`. A human-output `failed` stays ambiguous, so
+  doctor's NOT-authenticated line says "or offline" for it (`failedUnconfirmed`:
+  a failed host with no gh error). `wt doctor --json` (additive): `gh_hosts[]`
+  gains state `unreachable` and `error` (gh's text, 2.81+), and a scoped check
+  that did not pass now carries `gh_hosts`/`gh_auth_unknown` too.
 - **A backtick code span DOES suppress GitHub's linked-issue parser — measured, #164.**
   One PR, one already-closed issue, body varied and `closingIssuesReferences` sampled:
 
