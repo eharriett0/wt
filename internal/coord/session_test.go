@@ -7,66 +7,85 @@ import (
 	"time"
 )
 
-// #163: two agent sessions started in ONE checkout resolve to the same window id
-// (path-based, deliberately kept — #18/#156), so the window alone can't tell them
-// apart. Self.Owns is the ONE ownership predicate that adds the session.
-func TestSelfOwns(t *testing.T) {
+// #163 / #211: two agent sessions started in ONE checkout resolve to the same
+// window id (path-based, deliberately kept — #18/#156), so the window alone can't
+// tell them apart. Self.Attribute is the ONE ownership decision: the same real
+// token (or its mirror hash) is provably yours; a token-less record read by a
+// token-less reader is yours only by the directory fallback (#18 — wt can't prove
+// it); a different session is another party; and a record with no session at all
+// is UNATTRIBUTABLE, never yours (#211: a month of pre-#163 records was listed as
+// the current session's own).
+func TestAttribute(t *testing.T) {
 	const w, other = "/x/repo", "/x/other"
 	cases := []struct {
 		name string
 		self Self
 		rec  Record
-		want bool
+		want Attribution
 	}{
-		{"same window, same session", Self{w, "A"}, Record{Window: w, Session: "A"}, true},
-		{"same window, DIFFERENT session — another party in this checkout", Self{w, "A"}, Record{Window: w, Session: "B"}, false},
-		{"pre-#163 record (no session) is a wildcard — exactly today's behaviour", Self{w, "A"}, Record{Window: w}, true},
-		{"zero-session self (no session known) is a wildcard", Self{Window: w}, Record{Window: w, Session: "B"}, true},
-		{"neither side has a session", Self{Window: w}, Record{Window: w}, true},
-		{"token-less self vs token-less record: indistinguishable → same", Self{w, SessionNone}, Record{Window: w, Session: SessionNone}, true},
-		{"token-less self vs tagged record → another party", Self{w, SessionNone}, Record{Window: w, Session: "B"}, false},
-		{"tagged self vs token-less record → another party", Self{w, "A"}, Record{Window: w, Session: SessionNone}, false},
-		{"other window, same session → not own", Self{w, "A"}, Record{Window: other, Session: "A"}, false},
-		{"other window, no session → not own", Self{w, "A"}, Record{Window: other}, false},
-		{"other window, zero self → not own", Self{Window: w}, Record{Window: other}, false},
+		{"same window, same session", Self{w, "A"}, Record{Window: w, Session: "A"}, AttrMine},
+		{"same window, DIFFERENT session — another party in this checkout", Self{w, "A"}, Record{Window: w, Session: "B"}, AttrAnotherSession},
+		{"pre-#163 record (no session) is unattributable, never a wildcard (#211)", Self{w, "A"}, Record{Window: w}, AttrUnattributable},
+		{"zero-session self proves nothing", Self{Window: w}, Record{Window: w, Session: "B"}, AttrUnattributable},
+		{"neither side has a session", Self{Window: w}, Record{Window: w}, AttrUnattributable},
+		{"token-less self vs token-less record: the directory fallback, not proof (#18)", Self{w, SessionNone}, Record{Window: w, Session: SessionNone}, AttrMineFallback},
+		{"token-less self vs pre-#163 record", Self{w, SessionNone}, Record{Window: w}, AttrUnattributable},
+		{"token-less self vs tagged record → another party", Self{w, SessionNone}, Record{Window: w, Session: "B"}, AttrAnotherSession},
+		{"tagged self vs token-less record → another party", Self{w, "A"}, Record{Window: w, Session: SessionNone}, AttrAnotherSession},
+		{"other window, same session: still another window for the gate", Self{w, "A"}, Record{Window: other, Session: "A"}, AttrOtherWindow},
+		{"other window, no session", Self{w, "A"}, Record{Window: other}, AttrOtherWindow},
+		{"other window, zero self", Self{Window: w}, Record{Window: other}, AttrOtherWindow},
+		{"other window, both token-less: no fallback across checkouts", Self{w, SessionNone}, Record{Window: other, Session: SessionNone}, AttrOtherWindow},
 		// The GitHub mirror carries MirrorSession(token): self still owns its own
 		// record read back from there (#18 across clones that share only the mirror).
-		{"own record read back from the mirror (hashed) → own", Self{w, "A"}, Record{Window: w, Session: MirrorSession("A")}, true},
-		{"another session's mirrored record → another party", Self{w, "A"}, Record{Window: w, Session: MirrorSession("B")}, false},
-		{"token-less self never claims a tagged session's mirrored record", Self{w, SessionNone}, Record{Window: w, Session: MirrorSession("A")}, false},
-		{"own mirrored record from another window → not own", Self{w, "A"}, Record{Window: other, Session: MirrorSession("A")}, false},
+		{"own record read back from the mirror (hashed) → mine", Self{w, "A"}, Record{Window: w, Session: MirrorSession("A")}, AttrMine},
+		{"another session's mirrored record → another party", Self{w, "A"}, Record{Window: w, Session: MirrorSession("B")}, AttrAnotherSession},
+		{"token-less self never claims a tagged session's mirrored record", Self{w, SessionNone}, Record{Window: w, Session: MirrorSession("A")}, AttrAnotherSession},
+		{"own mirrored record from another window", Self{w, "A"}, Record{Window: other, Session: MirrorSession("A")}, AttrOtherWindow},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := tc.self.Owns(tc.rec); got != tc.want {
-				t.Errorf("%+v.Owns(%+v) = %v, want %v", tc.self, tc.rec, got, tc.want)
+			got := tc.self.Attribute(tc.rec)
+			if got != tc.want {
+				t.Errorf("%+v.Attribute(%+v) = %v, want %v", tc.self, tc.rec, got, tc.want)
+			}
+			// The predicates are views of Attribute and can never disagree.
+			if tc.self.Owns(tc.rec) != (got == AttrMine || got == AttrMineFallback) || tc.self.SharesCheckout(tc.rec) != (got == AttrAnotherSession) ||
+				tc.self.Unattributed(tc.rec) != (got == AttrUnattributable) {
+				t.Errorf("Owns/SharesCheckout/Unattributed disagree with Attribute=%v for %+v", got, tc.rec)
+			}
+			if got == AttrMine && !tc.self.ProvablyWrote(tc.rec) {
+				t.Errorf("a provably-mine record must be ProvablyWrote: %+v", tc.rec)
+			}
+			if got == AttrMineFallback && tc.self.ProvablyWrote(tc.rec) {
+				t.Errorf("the directory fallback proves nothing: %+v", tc.rec)
 			}
 		})
 	}
 }
 
-// SharesCheckout = same window AND not owned: the one source for every
-// "same checkout, another session" label, so a label can't contradict Owns.
-func TestSharesCheckout(t *testing.T) {
-	const w = "/x/repo"
+// ProvablyWrote (#211 review F5) is authorship by token, in ANY window: what lets
+// `wt all-clear` release a record without asking. Only a real token proves it;
+// "" and SessionNone never do, whatever the window.
+func TestProvablyWrote(t *testing.T) {
 	cases := []struct {
-		name string
 		self Self
 		rec  Record
 		want bool
 	}{
-		{"another session here", Self{w, "A"}, Record{Window: w, Session: "B"}, true},
-		{"token-less session here vs tagged self", Self{w, "A"}, Record{Window: w, Session: SessionNone}, true},
-		{"own session", Self{w, "A"}, Record{Window: w, Session: "A"}, false},
-		{"pre-#163 record here is owned, not another session", Self{w, "A"}, Record{Window: w}, false},
-		{"another window is not 'this checkout'", Self{w, "A"}, Record{Window: "/x/other", Session: "B"}, false},
+		{Self{"/w", "A"}, Record{Window: "/w", Session: "A"}, true},
+		{Self{"/w", "A"}, Record{Window: "/elsewhere", Session: "A"}, true},
+		{Self{"/w", "A"}, Record{Window: "/elsewhere", Session: MirrorSession("A")}, true},
+		{Self{"/w", "A"}, Record{Window: "/w", Session: "B"}, false},
+		{Self{"/w", "A"}, Record{Window: "/w"}, false},
+		{Self{"/w", SessionNone}, Record{Window: "/w", Session: SessionNone}, false},
+		{Self{"/w", SessionNone}, Record{Window: "/elsewhere", Session: SessionNone}, false},
+		{Self{Window: "/w"}, Record{Window: "/w"}, false},
+		{Self{Window: "/w"}, Record{Window: "/w", Session: MirrorSession("")}, false},
 	}
 	for _, tc := range cases {
-		if got := tc.self.SharesCheckout(tc.rec); got != tc.want {
-			t.Errorf("%s: SharesCheckout = %v, want %v", tc.name, got, tc.want)
-		}
-		if tc.want && tc.self.Owns(tc.rec) {
-			t.Errorf("%s: a record can't be both another session's and owned", tc.name)
+		if got := tc.self.ProvablyWrote(tc.rec); got != tc.want {
+			t.Errorf("%+v.ProvablyWrote(%+v) = %v, want %v", tc.self, tc.rec, got, tc.want)
 		}
 	}
 }
@@ -111,7 +130,9 @@ func TestCurrentSelf(t *testing.T) {
 	if s := CurrentSelf(env(nil), "/x/repo", "main"); s.Session != SessionNone || s.Window != "/x/repo" {
 		t.Errorf("token-less CurrentSelf = %+v, want {/x/repo none}", s)
 	}
-	// Two terminal tabs of one human are one (token-less) session, as before.
+	// Two terminal tabs of one human are one (token-less) session, as before:
+	// tab ids are not sessions, and a token-less record is a token-less reader's
+	// own (the directory fallback).
 	t1 := CurrentSelf(env(map[string]string{"TERM_SESSION_ID": "t1"}), "/x/repo", "main")
 	t2 := CurrentSelf(env(map[string]string{"TERM_SESSION_ID": "t2"}), "/x/repo", "main")
 	if t1 != t2 || !t2.Owns(Record{Window: "/x/repo", Session: t1.Session}) {
@@ -135,17 +156,18 @@ func TestCurrentSelf(t *testing.T) {
 func TestTwoSessionsShareCheckout(t *testing.T) {
 	const w = "/work/repo" // the primary checkout, no worktrees
 	a, b := Self{w, "A"}, Self{w, "B"}
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
 	recs := []Record{
 		{ID: "n1", Kind: KindAnnounce, Window: w, Session: "B", Message: "moving prod tags"},
 		{ID: "h1", Kind: KindAnnounce, Window: w, Session: "B", Message: "pushing rebuilds", Hold: []string{"merge-main"}},
 	}
-	if got := ids(Inbox(recs, a)); strings.Join(got, ",") != "n1,h1" {
+	if got := ids(Inbox(recs, a, now)); strings.Join(got, ",") != "n1,h1" {
 		t.Errorf("A's inbox = %v, want [n1 h1] — another session's announcements must reach A", got)
 	}
-	if got := ids(PendingHolds(recs, a)); strings.Join(got, ",") != "h1" {
+	if got := ids(PendingHolds(recs, a, now)); strings.Join(got, ",") != "h1" {
 		t.Errorf("A's pending holds = %v, want [h1]", got)
 	}
-	if got := ActiveHolds(recs, a, "merge-main"); len(got) != 1 || got[0].ID != "h1" {
+	if got := ActiveHolds(recs, a, "merge-main", now); len(got) != 1 || got[0].ID != "h1" {
 		t.Errorf("A's merge gate holds = %v, want [h1] — B's hold must NOT be exempted for A", ids(got))
 	}
 	if got := OwnOpenAnnouncements(recs, a); len(got) != 0 {
@@ -156,10 +178,10 @@ func TestTwoSessionsShareCheckout(t *testing.T) {
 	}
 	// B, the announcer: unchanged — its own inbox is empty, it is exempt from its
 	// own hold (#18), and its holds are its own.
-	if got := Inbox(recs, b); len(got) != 0 {
+	if got := Inbox(recs, b, now); len(got) != 0 {
 		t.Errorf("B's inbox = %v, want empty (you don't ack yourself)", ids(got))
 	}
-	if got := ActiveHolds(recs, b, "merge-main"); len(got) != 0 {
+	if got := ActiveHolds(recs, b, "merge-main", now); len(got) != 0 {
 		t.Errorf("B self-blocked on its OWN hold: %v", ids(got))
 	}
 	if got := ids(OwnOpenAnnouncements(recs, b)); strings.Join(got, ",") != "n1,h1" {
@@ -170,7 +192,7 @@ func TestTwoSessionsShareCheckout(t *testing.T) {
 	}
 	// A acks the plain note → it leaves A's inbox; the hold still gates A.
 	recs = append(recs, Record{ID: "k1", Kind: KindAck, Window: w, Session: "A", AckOf: "n1"})
-	if got := ids(Inbox(recs, a)); strings.Join(got, ",") != "h1" {
+	if got := ids(Inbox(recs, a, now)); strings.Join(got, ",") != "h1" {
 		t.Errorf("after A acks n1, A's inbox = %v, want [h1]", got)
 	}
 }
@@ -180,64 +202,440 @@ func TestTwoSessionsShareCheckout(t *testing.T) {
 func TestAckedByIsPerSession(t *testing.T) {
 	const w = "/work/repo"
 	a, b := Self{w, "A"}, Self{w, "B"}
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
 	recs := []Record{
 		{ID: "x", Kind: KindAnnounce, Window: "/work/repo-worktrees/roll", Session: "R", Hold: []string{"merge-main"}},
 		{ID: "k", Kind: KindAck, Window: w, Session: "B", AckOf: "x"}, // B acked it
 	}
-	if got := Inbox(recs, b); len(got) != 0 {
+	if got := Inbox(recs, b, now); len(got) != 0 {
 		t.Errorf("B acked x, B's inbox = %v, want empty", ids(got))
 	}
-	if got := ids(Inbox(recs, a)); strings.Join(got, ",") != "x" {
+	if got := ids(Inbox(recs, a, now)); strings.Join(got, ",") != "x" {
 		t.Errorf("A's inbox = %v, want [x] — B's ack must not clear it for A", got)
 	}
-	if got := ActiveHolds(recs, a, "merge-main"); len(got) != 1 {
+	if got := ActiveHolds(recs, a, "merge-main", now); len(got) != 1 {
 		t.Errorf("A's gate = %v, want [x] — B's ack must not waive the hold for A", ids(got))
 	}
-	if got := ActiveHolds(recs, b, "merge-main"); len(got) != 0 {
+	if got := ActiveHolds(recs, b, "merge-main", now); len(got) != 0 {
 		t.Errorf("B acked the hold, B's gate = %v, want none", ids(got))
 	}
 }
 
-// Back-compat: records written before sessions existed (no "session" field, as
-// every pre-#163 log line and every older wt binary writes them) keep EXACTLY
-// today's window-only behaviour, whatever session reads them.
-func TestPreSessionRecordsKeepWindowBehaviour(t *testing.T) {
+// #211: a record written before sessions existed (no "session" field — every
+// pre-#163 log line, every older wt binary) proves nothing about who wrote it.
+// It used to be a wildcard every session in its window owned, so `wt holds`
+// listed a month of them as the current session's own (with all-clear lines),
+// the merge gate exempted their holds for everyone, and inbox hid them. Now it is
+// unattributable: never yours, surfaced while it could be live
+// (UnattributedHorizon), and a young unattributable hold gates.
+func TestPreSessionRecordsAreUnattributable(t *testing.T) {
 	const w = "/work/repo"
+	now := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) string { return now.Add(-d).Format(time.RFC3339) }
 	legacy := []Record{
-		{ID: "mine", Kind: KindAnnounce, Window: w, Hold: []string{"merge-main"}},
-		{ID: "theirs", Kind: KindAnnounce, Window: "/work/other", Hold: []string{"merge-main"}},
-		{ID: "ack", Kind: KindAck, Window: w, AckOf: "theirs"},
+		{ID: "young", Kind: KindAnnounce, Window: w, TS: at(2 * time.Hour), Hold: []string{"merge-main"}},
+		{ID: "old", Kind: KindAnnounce, Window: w, TS: at(30 * 24 * time.Hour), Hold: []string{"merge-main"}},
+		{ID: "oldnote", Kind: KindAnnounce, Window: w, TS: at(20 * 24 * time.Hour), Message: "fyi"},
 	}
 	for _, self := range []Self{{w, "A"}, {w, SessionNone}, {Window: w}} {
-		if got := Inbox(legacy, self); len(got) != 0 {
-			t.Errorf("%+v: inbox = %v, want empty (own legacy announce excluded, legacy ack counts)", self, ids(got))
+		if got := OwnOpenAnnouncements(legacy, self); len(got) != 0 {
+			t.Errorf("%+v: own open = %v, want none — a pre-#163 record is nobody's to all-clear", self, ids(got))
 		}
-		if got := ActiveHolds(legacy, self, "merge-main"); len(got) != 0 {
-			t.Errorf("%+v: gate = %v, want none (#18 own-hold exemption preserved)", self, ids(got))
+		if got := ids(UnattributedOpen(legacy, self)); strings.Join(got, ",") != "young,old,oldnote" {
+			t.Errorf("%+v: unattributed open = %v, want all three", self, got)
 		}
-		if got := ids(OwnOpenAnnouncements(legacy, self)); strings.Join(got, ",") != "mine" {
-			t.Errorf("%+v: own open = %v, want [mine]", self, got)
+		if got := ids(Inbox(legacy, self, now)); strings.Join(got, ",") != "young" {
+			t.Errorf("%+v: inbox = %v, want [young] — surfaced while live, the month-old ones only counted", self, got)
 		}
-		if got := OtherSessions(legacy, self, time.Now(), 0); len(got) != 0 {
+		if n, h := UnattributedBacklog(legacy, self, now); n != 1 || h != 1 {
+			t.Errorf("%+v: backlog = %d notes, %d holds; want 1, 1", self, n, h)
+		}
+		fresh, stale := ActiveHoldsAt(legacy, self, "merge-main", now, 0) // hold_max_age disabled
+		if strings.Join(ids(fresh), ",") != "young" || strings.Join(ids(stale), ",") != "old" {
+			t.Errorf("%+v: gate fresh=%v stale=%v; want the young hold to BLOCK and the old one stale even with expiry off", self, ids(fresh), ids(stale))
+		}
+		if got := OtherSessions(legacy, self, now, 0); len(got) != 0 {
 			t.Errorf("%+v: OtherSessions = %+v, want none (a legacy record names no party)", self, got)
 		}
-		if InboxClearAmbiguous(legacy, self, time.Now()) {
-			t.Errorf("%+v: legacy-only log must not hedge the inbox", self)
+		if InboxClearAmbiguous(legacy, self, now) {
+			t.Errorf("%+v: a legacy-only log must not hedge the inbox", self)
+		}
+		// An undatable one can't be shown to be old: surfaced, never hidden.
+		undated := []Record{{ID: "undated", Kind: KindAnnounce, Window: w, TS: "garbage"}}
+		if got := ids(Inbox(undated, self, now)); strings.Join(got, ",") != "undated" {
+			t.Errorf("%+v: undatable unattributable record = %v, want it in the inbox", self, got)
 		}
 	}
 }
 
-// A session that has no token at all (SessionNone) still keeps the old behaviour
-// with OTHER token-less writers — they are indistinguishable, as before.
-func TestTokenlessSessionsStayIndistinguishable(t *testing.T) {
-	const w = "/work/repo"
-	self := Self{w, SessionNone}
-	recs := []Record{{ID: "h", Kind: KindAnnounce, Window: w, Session: SessionNone, Hold: []string{"merge-main"}}}
-	if got := ActiveHolds(recs, self, "merge-main"); len(got) != 0 {
-		t.Errorf("token-less self vs token-less hold = %v, want exempt (unchanged)", ids(got))
+// #211's second symptom: an ack waives a signal ONLY for the session that made
+// it. Tagged sessions: per session (#163). An ack with no session counts only
+// when it predates the log's first session-stamped record (pre-upgrade history,
+// #211 review F1) AND its signal is older than UnattributedHorizon: a young hold
+// it acked gates every session again (the safe direction), while the month of
+// pre-upgrade acks every upgraded log carries doesn't flood every inbox.
+func TestAcksCountOnlyForTheirSession(t *testing.T) {
+	const w, other = "/work/repo", "/work/repo-worktrees/roll"
+	now := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) string { return now.Add(-d).Format(time.RFC3339) }
+	recs := []Record{
+		// pre-upgrade history: another window's note, acked here with no session
+		{ID: "old", Kind: KindAnnounce, Window: other, TS: at(10 * 24 * time.Hour), Hold: []string{"merge-main"}},
+		{ID: "k2", Kind: KindAck, Window: w, TS: at(9 * 24 * time.Hour), AckOf: "old"},
+		// sessions begin here 5 days ago
+		{ID: "first", Kind: KindAnnounce, Window: other, Session: "R", TS: at(5 * 24 * time.Hour)},
+		{ID: "young", Kind: KindAnnounce, Window: other, Session: "R", TS: at(time.Hour), Hold: []string{"merge-main"}},
+		{ID: "k1", Kind: KindAck, Window: w, TS: at(50 * time.Minute), AckOf: "young"},               // a still-running older wt's ack
+		{ID: "k3", Kind: KindAck, Window: w, Session: "B", TS: at(40 * time.Minute), AckOf: "young"}, // session B's ack
 	}
-	if got := Inbox(recs, self); len(got) != 0 {
-		t.Errorf("token-less inbox = %v, want empty (unchanged)", ids(got))
+	cases := []struct {
+		name  string
+		self  Self
+		inbox string // ids still in the inbox
+	}{
+		{"session A: neither B's ack nor the older wt's ack waives the young hold", Self{w, "A"}, "first,young"},
+		{"session B: its own ack waives it", Self{w, "B"}, "first"},
+		{"a token-less shell: same as A", Self{w, SessionNone}, "first,young"},
+	}
+	for _, tc := range cases {
+		if got := strings.Join(ids(Inbox(recs, tc.self, now)), ","); got != tc.inbox {
+			t.Errorf("%s: inbox = [%s], want [%s]", tc.name, got, tc.inbox)
+		}
+		fresh, _ := ActiveHoldsAt(recs, tc.self, "merge-main", now, 24*time.Hour)
+		if got := strings.Join(ids(fresh), ","); got != strings.TrimPrefix(strings.TrimPrefix(tc.inbox, "first"), ",") {
+			t.Errorf("%s: gate = [%s]", tc.name, got)
+		}
+	}
+}
+
+// #211 review F1, the shape that held: session C's hold in another window, 30h
+// old, under hold_max_age=7d; a minute ago an older wt in A's checkout (another
+// party: maybe another session there) acked it with no session. That ack must
+// waive nothing for A, which never acked — not in the gate, not in the inbox,
+// and not when every record comes back through the GitHub mirror.
+func TestFreshSessionlessAckWaivesNothing(t *testing.T) {
+	const w, other = "/work/repo", "/work/repo-worktrees/roll"
+	now := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) string { return now.Add(-d).Format(time.RFC3339) }
+	local := []Record{
+		{ID: "h", Kind: KindAnnounce, Window: other, Session: "C", TS: at(30 * time.Hour), Hold: []string{"merge-main"}},
+		{ID: "k", Kind: KindAck, Window: w, TS: at(time.Minute), AckOf: "h"},
+	}
+	var bodies []string
+	for _, r := range local {
+		bodies = append(bodies, "mirrored\n\n"+MirrorJSONBlock(r))
+	}
+	viaMirror := MergeByID(nil, ParseMirroredRecords(bodies))
+	for name, recs := range map[string][]Record{"local log": local, "mirror only": viaMirror} {
+		for _, self := range []Self{{w, "A"}, {w, SessionNone}} {
+			fresh, stale := ActiveHoldsAt(recs, self, "merge-main", now, 7*24*time.Hour)
+			if strings.Join(ids(fresh), ",") != "h" || len(stale) != 0 {
+				t.Errorf("%s, %+v: gate fresh=%v stale=%v — want h to block: nobody in this session acked it", name, self, ids(fresh), ids(stale))
+			}
+			if got := strings.Join(ids(Inbox(recs, self, now)), ","); got != "h" {
+				t.Errorf("%s, %+v: inbox = [%s], want [h]", name, self, got)
+			}
+		}
+	}
+	// An ack is written after its announcement, so a session-less ack of a
+	// session-stamped hold can never be history. Only a pre-upgrade ack of a
+	// pre-upgrade signal still counts.
+	hist := []Record{
+		{ID: "n", Kind: KindAnnounce, Window: other, TS: at(9 * 24 * time.Hour), Hold: []string{"merge-main"}},
+		{ID: "k", Kind: KindAck, Window: w, TS: at(8 * 24 * time.Hour), AckOf: "n"},
+		{ID: "s", Kind: KindAnnounce, Window: other, Session: "C", TS: at(7 * 24 * time.Hour)},
+	}
+	if fresh, stale := ActiveHoldsAt(hist, Self{w, "A"}, "merge-main", now, 0); len(fresh)+len(stale) != 0 {
+		t.Errorf("a pre-upgrade ack of a pre-upgrade hold still waives it (M17): fresh=%v stale=%v", ids(fresh), ids(stale))
+	}
+	if got := Inbox(hist, Self{w, "A"}, now); strings.Join(ids(got), ",") != "s" {
+		t.Errorf("inbox = %v, want [s] — the pre-upgrade ack still keeps its old signal out", ids(got))
+	}
+}
+
+// #211 review F2: the 24h cap is for pre-upgrade history only. A record with no
+// session written AFTER the log first carried one is a still-running older wt's
+// — maybe another party's live hold — and gets hold_max_age like another
+// window's. Pins hold_max_age > 24h and off (M05/M28), and another session's
+// hold never takes the cap (M45).
+func TestHoldLimitCapsOnlyPreSessionHistory(t *testing.T) {
+	const w = "/work/repo"
+	now := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) string { return now.Add(-d).Format(time.RFC3339) }
+	recs := []Record{
+		{ID: "hist", Kind: KindAnnounce, Window: w, TS: at(30 * time.Hour), Hold: []string{"merge-main"}},
+		{ID: "first", Kind: KindAnnounce, Window: "/work/x", Session: "Z", TS: at(28 * time.Hour)},
+		{ID: "live", Kind: KindAnnounce, Window: w, TS: at(25 * time.Hour), Hold: []string{"merge-main"}},
+		{ID: "other", Kind: KindAnnounce, Window: w, Session: "B", TS: at(25 * time.Hour), Hold: []string{"merge-main"}},
+		{ID: "elsewhere", Kind: KindAnnounce, Window: "/work/y", TS: at(25 * time.Hour), Hold: []string{"merge-main"}},
+	}
+	self := Self{w, "A"}
+	cases := []struct {
+		maxAge       time.Duration
+		fresh, stale string
+	}{
+		{7 * 24 * time.Hour, "live,other,elsewhere", "hist"}, // only history is capped at 24h
+		{0, "live,other,elsewhere", "hist"},                  // hold_max_age off: history still capped, the rest never expire
+		{24 * time.Hour, "", "hist,live,other,elsewhere"},    // the default: everyone stale past 24h
+		{2 * time.Hour, "", "hist,live,other,elsewhere"},
+	}
+	for _, tc := range cases {
+		fresh, stale := ActiveHoldsAt(recs, self, "merge-main", now, tc.maxAge)
+		if strings.Join(ids(fresh), ",") != tc.fresh || strings.Join(ids(stale), ",") != tc.stale {
+			t.Errorf("hold_max_age=%v: fresh=%v stale=%v; want fresh=[%s] stale=[%s]", tc.maxAge, ids(fresh), ids(stale), tc.fresh, tc.stale)
+		}
+	}
+	v := ViewOf(recs, self)
+	for id, want := range map[string]bool{"hist": true, "live": false, "other": false, "elsewhere": false} {
+		r := recs[map[string]int{"hist": 0, "live": 2, "other": 3, "elsewhere": 4}[id]]
+		if _, capped := v.HoldLimit(r, 7*24*time.Hour); capped != want {
+			t.Errorf("HoldLimit(%s).capped = %v, want %v", id, capped, want)
+		}
+	}
+	// The inbox: history drops out past 24h, a still-running older wt's record
+	// and another session's never do (M43).
+	if got := strings.Join(ids(Inbox(recs, self, now)), ","); got != "first,live,other,elsewhere" {
+		t.Errorf("inbox = [%s], want [first live other elsewhere]", got)
+	}
+	// A log with no session-stamped record at all (the upgrade, before any
+	// session-aware write): every datable record with no session is history, so
+	// a month of it neither floods the inbox nor gates past 24h.
+	upgrade := []Record{recs[0], recs[2]}
+	if fresh, stale := ActiveHoldsAt(upgrade, self, "merge-main", now, 0); len(fresh) != 0 || strings.Join(ids(stale), ",") != "hist,live" {
+		t.Errorf("no epoch: fresh=%v stale=%v, want both stale", ids(fresh), ids(stale))
+	}
+	if got := Inbox(upgrade, self, now); len(got) != 0 {
+		t.Errorf("no epoch: inbox = %v, want empty (both past the horizon)", ids(got))
+	}
+	// An undatable session-stamped record proves nothing about when sessions began.
+	if at, ok := SessionEpoch([]Record{{Session: "Z", TS: "garbage"}, {Session: "Y", TS: "2026-10-01T00:00:00Z"}}); !ok || at.Format(time.RFC3339) != "2026-10-01T00:00:00Z" {
+		t.Errorf("SessionEpoch = %v %v", at, ok)
+	}
+	if _, ok := SessionEpoch([]Record{{TS: "2026-10-01T00:00:00Z"}}); ok {
+		t.Errorf("a log with no session has no epoch")
+	}
+}
+
+// A pre-upgrade ack of a pre-upgrade signal waives it only when the signal is
+// older than UnattributedHorizon: here the upgrade was 3h ago, and another
+// window's 5h-old session-less hold, acked 4h ago with no session, must gate
+// every session again (it can't be shown that this session acked it). The
+// 30h-old one acked the same way stays waived, so an upgraded inbox doesn't flood.
+func TestPreSessionAckOnlyWaivesOldSignals(t *testing.T) {
+	const w, other = "/work/repo", "/work/repo-worktrees/roll"
+	now := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) string { return now.Add(-d).Format(time.RFC3339) }
+	recs := []Record{
+		{ID: "old", Kind: KindAnnounce, Window: other, TS: at(30 * time.Hour), Hold: []string{"merge-main"}},
+		{ID: "young", Kind: KindAnnounce, Window: other, TS: at(5 * time.Hour), Hold: []string{"merge-main"}},
+		{ID: "k-old", Kind: KindAck, Window: w, TS: at(29 * time.Hour), AckOf: "old"},
+		{ID: "k-young", Kind: KindAck, Window: w, TS: at(4 * time.Hour), AckOf: "young"},
+		{ID: "first", Kind: KindAnnounce, Window: "/work/x", Session: "Z", TS: at(3 * time.Hour)},
+	}
+	self := Self{w, "A"}
+	fresh, stale := ActiveHoldsAt(recs, self, "merge-main", now, 0)
+	if strings.Join(ids(fresh), ",") != "young" || len(stale) != 0 {
+		t.Errorf("gate fresh=%v stale=%v, want only the young hold (its pre-upgrade ack can't be shown to be this session's)", ids(fresh), ids(stale))
+	}
+	if got := strings.Join(ids(Inbox(recs, self, now)), ","); got != "young,first" {
+		t.Errorf("inbox = [%s], want [young first]", got)
+	}
+}
+
+// The epoch is the FIRST session-stamped record, and a record with no session
+// dated exactly then is not history (#211 review): either reading the other way
+// would cap a still-running older wt's hold at 24h. Here "between" was written
+// after sessions began (at 28h) though before a later session record (at 1h),
+// and "same" in the very second the first session record was.
+func TestEpochIsTheFirstSessionRecord(t *testing.T) {
+	const w = "/work/repo"
+	now := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) string { return now.Add(-d).Format(time.RFC3339) }
+	recs := []Record{
+		{ID: "first", Kind: KindAnnounce, Window: "/work/x", Session: "Z", TS: at(28 * time.Hour)},
+		{ID: "same", Kind: KindAnnounce, Window: w, TS: at(28 * time.Hour), Hold: []string{"merge-main"}},
+		{ID: "between", Kind: KindAnnounce, Window: w, TS: at(26 * time.Hour), Hold: []string{"merge-main"}},
+		{ID: "late", Kind: KindAck, Window: "/work/y", Session: "Y", TS: at(time.Hour), AckOf: "first"},
+	}
+	self := Self{w, "A"}
+	if e, ok := SessionEpoch(recs); !ok || !e.Equal(now.Add(-28*time.Hour)) {
+		t.Fatalf("SessionEpoch = %v %v, want the first session record (28h ago)", e, ok)
+	}
+	v := ViewOf(recs, self)
+	for _, r := range recs[1:3] {
+		if v.PreSession(r) {
+			t.Errorf("%s is not history: it was written at or after the first session record", r.ID)
+		}
+	}
+	fresh, stale := ActiveHoldsAt(recs, self, "merge-main", now, 7*24*time.Hour)
+	if strings.Join(ids(fresh), ",") != "same,between" || len(stale) != 0 {
+		t.Errorf("hold_max_age=7d: fresh=%v stale=%v, want both still gating (no 24h cap)", ids(fresh), ids(stale))
+	}
+}
+
+// The horizon and the cap are both "older than 24h", exactly (M35/M36): at 24h a
+// pre-upgrade record still shows and its hold still gates; a second later it
+// doesn't.
+func TestUnattributedHorizonBoundary(t *testing.T) {
+	const w = "/work/repo"
+	now := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
+	mk := func(age time.Duration) []Record {
+		return []Record{{ID: "h", Kind: KindAnnounce, Window: w, TS: now.Add(-age).Format(time.RFC3339), Hold: []string{"merge-main"}}}
+	}
+	self := Self{w, "A"}
+	if got := Inbox(mk(UnattributedHorizon), self, now); len(got) != 1 {
+		t.Errorf("at exactly 24h the record still shows: %v", ids(got))
+	}
+	if fresh, _ := ActiveHoldsAt(mk(UnattributedHorizon), self, "merge-main", now, 0); len(fresh) != 1 {
+		t.Errorf("at exactly 24h the hold still gates")
+	}
+	if got := Inbox(mk(UnattributedHorizon+time.Second), self, now); len(got) != 0 {
+		t.Errorf("a second past 24h it no longer shows: %v", ids(got))
+	}
+	if fresh, stale := ActiveHoldsAt(mk(UnattributedHorizon+time.Second), self, "merge-main", now, 0); len(fresh) != 0 || len(stale) != 1 {
+		t.Errorf("a second past 24h it is stale")
+	}
+	if n, h := UnattributedBacklog(mk(UnattributedHorizon+time.Second), self, now); n != 0 || h != 1 {
+		t.Errorf("backlog = %d/%d, want 0/1", n, h)
+	}
+}
+
+// What `wt inbox` counts and `wt holds` lists of pre-upgrade records leaves out
+// the ones already resolved: all-cleared (M12b, M13b) or waived by a pre-upgrade
+// ack (M11b).
+func TestUnattributedCountsSkipResolved(t *testing.T) {
+	const w = "/work/repo"
+	now := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) string { return now.Add(-d).Format(time.RFC3339) }
+	recs := []Record{
+		{ID: "open", Kind: KindAnnounce, Window: w, TS: at(5 * 24 * time.Hour)},
+		{ID: "cleared", Kind: KindAnnounce, Window: w, TS: at(5 * 24 * time.Hour), Hold: []string{"merge-main"}},
+		{ID: "c", Kind: KindAllClear, Window: w, TS: at(4 * 24 * time.Hour), AckOf: "cleared"},
+		{ID: "acked", Kind: KindAnnounce, Window: w, TS: at(5 * 24 * time.Hour), Hold: []string{"merge-main"}},
+		{ID: "k", Kind: KindAck, Window: w, TS: at(4 * 24 * time.Hour), AckOf: "acked"},
+		{ID: "first", Kind: KindAnnounce, Window: "/work/x", Session: "Z", TS: at(3 * 24 * time.Hour)},
+	}
+	self := Self{w, "A"}
+	if n, h := UnattributedBacklog(recs, self, now); n != 1 || h != 0 {
+		t.Errorf("backlog = %d notes, %d holds; want 1, 0 (cleared and acked ones are resolved)", n, h)
+	}
+	if got := strings.Join(ids(UnattributedOpen(recs, self)), ","); got != "open,acked" {
+		t.Errorf("UnattributedOpen = [%s], want [open acked] (an all-cleared one is gone)", got)
+	}
+	if got := strings.Join(ids(NoSessionOpen(recs)), ","); got != "open,acked" {
+		t.Errorf("NoSessionOpen = [%s]", got)
+	}
+	// GatingHolds agrees with the gate for merge-main.
+	recs = append(recs, Record{ID: "g", Kind: KindAnnounce, Window: w, Session: "B", TS: at(time.Hour), Hold: []string{"merge-main"}},
+		Record{ID: "f", Kind: KindAnnounce, Window: w, Session: "B", TS: at(time.Hour), Hold: []string{"flux"}},
+		Record{ID: "s", Kind: KindAnnounce, Window: w, Session: "B", TS: at(72 * time.Hour), Hold: []string{"merge-main"}}) // past hold_max_age: stale, gates nothing
+	fresh, _ := ActiveHoldsAt(recs, self, "merge-main", now, 24*time.Hour)
+	gating := GatingHolds(recs, self, now, 24*time.Hour)
+	if strings.Join(ids(fresh), ",") != "g" || len(gating) != 2 || !gating["g"] || !gating["f"] {
+		t.Errorf("GatingHolds = %v, gate fresh = %v", gating, ids(fresh))
+	}
+}
+
+// `wt prune-coord --legacy` (#211 review): drops only pre-upgrade records that
+// gate or show nothing for ANY reader — a plain one past 24h, a hold past both
+// the 24h cap and hold_max_age (never with hold_max_age off: other windows still
+// gate on it) — with their acks, and nothing it didn't list.
+func TestLegacyPrunable(t *testing.T) {
+	const w = "/work/repo"
+	now := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) string { return now.Add(-d).Format(time.RFC3339) }
+	recs := []Record{
+		{ID: "oldnote", Kind: KindAnnounce, Window: w, TS: at(20 * 24 * time.Hour)},
+		{ID: "oldhold", Kind: KindAnnounce, Window: w, TS: at(10 * 24 * time.Hour), Hold: []string{"merge-main"}},
+		{ID: "k", Kind: KindAck, Window: "/work/y", TS: at(9 * 24 * time.Hour), AckOf: "oldhold"}, // pre-upgrade too (a session-stamped one would move the epoch here)
+		{ID: "midhold", Kind: KindAnnounce, Window: w, TS: at(3 * 24 * time.Hour), Hold: []string{"merge-main"}},
+		{ID: "youngnote", Kind: KindAnnounce, Window: w, TS: at(20 * time.Hour)},
+		{ID: "undated", Kind: KindAnnounce, Window: w, TS: "garbage"},
+		{ID: "cleared", Kind: KindAnnounce, Window: w, TS: at(20 * 24 * time.Hour)},
+		{ID: "c", Kind: KindAllClear, Window: w, TS: at(19 * 24 * time.Hour), AckOf: "cleared"},
+		{ID: "first", Kind: KindAnnounce, Window: "/work/x", Session: "Z", TS: at(60 * time.Hour)},
+		{ID: "liveold", Kind: KindAnnounce, Window: w, TS: at(48 * time.Hour)},              // after sessions began, 2 days old: a live older wt's, never pruned
+		{ID: "livelegacy", Kind: KindAnnounce, Window: w, TS: at(14 * time.Hour)},           // after sessions began: maybe live
+		{ID: "tagged", Kind: KindAnnounce, Window: w, Session: "B", TS: at(10 * time.Hour)}, // a session's: never legacy
+	}
+	cases := []struct {
+		maxAge time.Duration
+		want   string
+	}{
+		{24 * time.Hour, "oldnote,oldhold,midhold"},
+		{7 * 24 * time.Hour, "oldnote,oldhold"}, // midhold still gates other windows for 4 more days
+		{0, "oldnote"},                          // hold_max_age off: no hold ever expires for other windows
+	}
+	for _, tc := range cases {
+		if got := strings.Join(ids(LegacyPrunable(recs, now, tc.maxAge)), ","); got != tc.want {
+			t.Errorf("hold_max_age=%v: LegacyPrunable = [%s], want [%s]", tc.maxAge, got, tc.want)
+		}
+	}
+	path := filepath.Join(t.TempDir(), "repo.jsonl")
+	for _, r := range recs {
+		if err := Append(path, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dry, n, err := PruneLegacy(path, now, 7*24*time.Hour, false)
+	if after, _ := Load(path); err != nil || n != 0 || len(dry) != 2 || len(after) != len(recs) {
+		t.Fatalf("dry run: cands=%v dropped=%d err=%v, log %d → %d; want 2 candidates and nothing dropped", ids(dry), n, err, len(recs), len(after))
+	}
+	cands, n, err := PruneLegacy(path, now, 7*24*time.Hour, true)
+	after, _ := Load(path)
+	if err != nil || strings.Join(ids(cands), ",") != "oldnote,oldhold" || n != 3 || len(after) != len(recs)-3 {
+		t.Fatalf("apply: cands=%v dropped=%d err=%v, log now %v", ids(cands), n, err, ids(after))
+	}
+	for _, r := range after {
+		if r.ID == "oldnote" || r.ID == "oldhold" || r.ID == "k" {
+			t.Errorf("%s survived the drop", r.ID)
+		}
+	}
+	if again, n, _ := PruneLegacy(path, now, 7*24*time.Hour, true); len(again) != 0 || n != 0 {
+		t.Errorf("a second run drops nothing: %v %d", ids(again), n)
+	}
+}
+
+// A token-less shell owns the token-less records of its own window — the
+// directory fallback #211 itself suggests, and #18: a terminal's own hold never
+// blocks it, and WT_WINDOW pinning across checkouts works for terminals. The
+// accepted cost: two token-less shells in one checkout are one party (WT_SESSION
+// per shell separates them). A tagged session still sees a token-less writer as
+// another party, and a pre-#163 record (no session at all) stays
+// unattributable to the token-less shell too.
+func TestTokenlessShellsAreOneParty(t *testing.T) {
+	const w = "/work/repo"
+	now := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
+	ts := now.Add(-time.Hour).Format(time.RFC3339)
+	self := Self{w, SessionNone}
+	recs := []Record{
+		{ID: "h", Kind: KindAnnounce, Window: w, Session: SessionNone, TS: ts, Hold: []string{"merge-main"}},
+		{ID: "legacy", Kind: KindAnnounce, Window: w, TS: ts, Hold: []string{"merge-main"}},
+	}
+	if got := ids(ActiveHolds(recs, self, "merge-main", now)); strings.Join(got, ",") != "legacy" {
+		t.Errorf("token-less self's gate = %v, want only the pre-#163 hold (its own token-less hold is exempt, #18)", got)
+	}
+	if got := ids(Inbox(recs, self, now)); strings.Join(got, ",") != "legacy" {
+		t.Errorf("token-less inbox = %v, want only the pre-#163 hold", got)
+	}
+	if got := ids(OwnOpenAnnouncements(recs, self)); strings.Join(got, ",") != "h" {
+		t.Errorf("token-less own open = %v, want [h]", got)
+	}
+	// #18 across checkouts: the same token-less shell pinned with WT_WINDOW.
+	if got := ActiveHolds([]Record{{ID: "p", Kind: KindAnnounce, Window: "pin", Session: SessionNone, Hold: []string{"merge-main"}}}, Self{"pin", SessionNone}, "merge-main", now); len(got) != 0 {
+		t.Errorf("a WT_WINDOW-pinned terminal is blocked by its own hold: %v", ids(got))
+	}
+	// A tagged session in the same checkout is another party to it, and is gated.
+	if got := ids(ActiveHolds(recs, Self{w, "A"}, "merge-main", now)); strings.Join(got, ",") != "h,legacy" {
+		t.Errorf("tagged session's gate = %v, want both holds", got)
+	}
+	// Its acks are its own: they waive for it, and for no tagged session.
+	acked := append(recs, Record{ID: "k", Kind: KindAck, Window: w, Session: SessionNone, AckOf: "legacy"})
+	if got := ActiveHolds(acked, self, "merge-main", now); len(got) != 0 {
+		t.Errorf("after its own ack: gate = %v, want waived", ids(got))
+	}
+	if got := ids(ActiveHolds(acked, Self{w, "A"}, "merge-main", now)); strings.Join(got, ",") != "h,legacy" {
+		t.Errorf("a token-less ack must not waive anything for a tagged session: %v", got)
 	}
 }
 
@@ -406,7 +804,7 @@ func TestShortSession(t *testing.T) {
 }
 
 // The session survives the log round-trip and the GitHub mirror; a pre-#163 line
-// (no "session" key) loads with Session == "" — the back-compat wildcard.
+// (no "session" key) loads with Session == "" — unattributable (#211).
 func TestSessionRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "repo.jsonl")
 	if err := Append(path, Record{ID: "a", Kind: KindAnnounce, Window: "/w", Session: "B"}); err != nil {
@@ -470,7 +868,7 @@ func TestMirroredOwnHoldAcrossClones(t *testing.T) {
 	remote := ParseMirroredRecords([]string{"📣 **wt announce**\n\n" + MirrorJSONBlock(hold)})
 	recs := MergeByID(nil, remote) // clone two's own log is empty
 
-	if got := ActiveHolds(recs, Self{pinned, a}, "merge-main"); len(got) != 0 {
+	if got := ActiveHolds(recs, Self{pinned, a}, "merge-main", now); len(got) != 0 {
 		t.Errorf("the hold's creator is blocked by its own hold in the other clone: %v", ids(got))
 	}
 	if got := ids(OwnOpenAnnouncements(recs, Self{pinned, a})); strings.Join(got, ",") != "h" {
@@ -480,12 +878,12 @@ func TestMirroredOwnHoldAcrossClones(t *testing.T) {
 		t.Errorf("a session's own mirrored records must not warn it about itself: %+v", got)
 	}
 	for _, other := range []Self{{pinned, b}, {pinned, SessionNone}} {
-		if got := ActiveHolds(recs, other, "merge-main"); len(got) != 1 {
+		if got := ActiveHolds(recs, other, "merge-main", now); len(got) != 1 {
 			t.Errorf("%+v: gate = %v, want the hold — it is another party's", other, ids(got))
 		}
 	}
 	// Clone one reads its local raw copy first (MergeByID: local wins) — unchanged.
-	if got := ActiveHolds(MergeByID([]Record{hold}, remote), Self{pinned, a}, "merge-main"); len(got) != 0 {
+	if got := ActiveHolds(MergeByID([]Record{hold}, remote), Self{pinned, a}, "merge-main", now); len(got) != 0 {
 		t.Errorf("creator blocked in the clone that placed the hold: %v", ids(got))
 	}
 }

@@ -171,15 +171,19 @@ func mcpToolDescriptors() []map[string]any {
 		{
 			"name": "wt_inbox",
 			"description": "Un-acked coordination announcements from OTHER windows (a window signalling a " +
-				"disruptive change — an incident, a roll, a deploy), including another session working in THIS " +
-				"same checkout (same_checkout: true). Each carries an id to `wt ack`. Read-only, local.",
+				"disruptive change — an incident, a roll, a deploy), plus records from THIS same checkout that are " +
+				"not yours (same_checkout: true): attribution \"another_session\" is another agent session working " +
+				"here; \"unattributable\" carries no session at all (written by a wt without session support), so " +
+				"wt can't tell whose it is — treat it as possibly someone else's. Each carries an id to `wt ack`. " +
+				"Read-only, local.",
 			"inputSchema": obj(map[string]any{}),
 		},
 		{
 			"name": "wt_holds",
-			"description": "Active HOLDS from other windows (or another session in this same checkout) — an " +
-				"operation (e.g. merge-main, rebase) another window asked you to avoid until it posts all-clear. " +
-				"Check before advising a merge/rebase. Read-only, local.",
+			"description": "Active HOLDS from other windows, from another session in this same checkout, or from " +
+				"a writer wt can't attribute (same_checkout / attribution as in wt_inbox) — an operation (e.g. " +
+				"merge-main, rebase) someone asked you to avoid until they post all-clear. Check before advising a " +
+				"merge/rebase. Read-only, local.",
 			"inputSchema": obj(map[string]any{}),
 		},
 	}
@@ -340,14 +344,20 @@ type mcpCoordRecord struct {
 	Hold    []string `json:"hold,omitempty"`
 	Issue   int      `json:"issue,omitempty"`
 	TS      string   `json:"ts,omitempty"`
-	// SameCheckout marks a record from ANOTHER session in this very checkout
-	// (#163): its window equals "self", so a client can't tell it apart otherwise.
+	// SameCheckout marks a record from this very checkout that isn't yours —
+	// another session's (#163) or unattributable (#211): its window equals
+	// "self", so a client can't tell it apart otherwise. Since #211 it no longer
+	// means "another session" alone: read Attribution.
 	SameCheckout bool `json:"same_checkout,omitempty"`
+	// Attribution says whose a same-checkout record is: "another_session", or
+	// "unattributable" when it carries no session at all and wt can't tell (#211).
+	Attribution string `json:"attribution,omitempty"`
 }
 
 func toMCPCoord(r coord.Record, self coord.Self) mcpCoordRecord {
+	tag := attributionTag(r, self)
 	return mcpCoordRecord{ID: r.ID, Window: r.Window, Session: r.Session, Message: r.Message, Hold: r.Hold,
-		Issue: r.Issue, TS: r.TS, SameCheckout: self.SharesCheckout(r)}
+		Issue: r.Issue, TS: r.TS, SameCheckout: tag != "", Attribution: tag}
 }
 
 // mcpInbox returns un-acked announcements from other windows/sessions
@@ -360,7 +370,7 @@ func mcpInbox(c *config.Config) (string, bool) {
 	if err != nil {
 		return "could not read coordination log: " + err.Error(), true
 	}
-	box := coord.Inbox(recs, self)
+	box := coord.Inbox(recs, self, time.Now())
 	out := make([]mcpCoordRecord, 0, len(box))
 	for _, r := range box {
 		out = append(out, toMCPCoord(r, self))
@@ -383,7 +393,7 @@ func mcpHolds(c *config.Config) (string, bool) {
 	if err != nil {
 		return "could not read coordination log: " + err.Error(), true
 	}
-	holds := coord.PendingHolds(recs, self)
+	holds := coord.PendingHolds(recs, self, time.Now())
 	out := make([]mcpCoordRecord, 0, len(holds))
 	for _, r := range holds {
 		out = append(out, toMCPCoord(r, self))
