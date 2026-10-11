@@ -130,37 +130,62 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   grades low. Only when the file can't be predicted (an edit the tool refuses, a
   file mixing line endings, a patch apply_patch rejects, a new file, a git error)
   does an entry stay as a file-level heads-up, and then it is never dropped.
-- **Coordination ownership is ONE decision, and only a real session token proves
-  a record is yours (#163, #211).** Two agent sessions started in one checkout
-  resolve to the same window id, so each treated the other's announcements as its
-  own (#163). `coord.Self.Attribute` classifies every record: **mine** (self's
-  token, or its `MirrorSession` hash; for a token-less reader, a token-less record
-  — the directory fallback), **another session** (a different session: tagged vs
-  another token, or tagged vs token-less in either direction), **unattributable**
-  (no session at all: written before sessions were recorded), or another window. `Owns`, `SharesCheckout` and
-  `Unattributed` are views of it; don't add a raw `r.Window == self` compare.
+- **Coordination ownership is ONE decision, and only a real session token
+  PROVES a record is yours (#163, #211).** Two agent sessions started in one
+  checkout resolve to the same window id, so each treated the other's
+  announcements as its own (#163). `coord.Self.Attribute` classifies every
+  record: **mine** (self's real token, or its `MirrorSession` hash: proven),
+  **directory fallback** (a token-less reader and a token-less record from the
+  same window: counted as yours, NOT proven), **another session** (a different
+  session: tagged vs another token, or tagged vs token-less in either direction),
+  **unattributable** (no session at all: written by a wt without session
+  support), or another window. `coord.View` (`ViewOf(recs, self)`) splits
+  unattributable records by the log's **session epoch** (`SessionEpoch`: the
+  first datable record carrying a session, ANY window of the log as read):
+  before it, **pre-session** history; at or after it, or undatable, a
+  **still-running older wt**. `Owns` (mine + fallback), `ProvablyWrote` (own
+  token or hash, any window), `SharesCheckout`, `Unattributed`, `PreSession` and
+  `HoldLimit` are views of these; don't add a raw `r.Window == self` compare.
   Per operation, always in the safe direction (#211):
 
-  | | mine | another session | unattributable |
-  |---|---|---|---|
-  | `wt holds` | "yours", with all-clear lines | counted, not listed as yours | own section, NO all-clear lines; holds listed, plain ones only <24h (older counted) |
-  | `all-clear` / `announce --clear` | posts | TTY asks; non-TTY refuses without `--not-mine` | same |
-  | merge-pr gate | exempt (#18) | gates | gates; stale at min(hold_max_age, 24h) |
-  | inbox / banner / per-turn hook | hidden | shown | shown <24h (`coord.UnattributedHorizon`); older counted in `wt inbox` |
-  | acks (waive for self) | count | don't | count only for a signal older than 24h |
+  | | mine (proven) | directory fallback | another session | no session, pre-session | no session, later (older wt running) |
+  |---|---|---|---|---|---|
+  | `wt holds` | "yours", with all-clear lines | "yours", all-clear line + caveat | counted, not listed as yours | own section, NO all-clear lines: holds that still gate always listed, others newest 10; plain ones <24h (older counted) | same section, labelled "written by a wt without session support"; plain ones always listed |
+  | `all-clear` / `announce --clear` | posts (from another checkout too: "yours, placed from checkout X") | TTY asks; non-TTY refuses without `--not-mine`, naming WT_SESSION | TTY asks; non-TTY refuses without `--not-mine` | same | same |
+  | merge-pr gate | exempt (#18) | exempt (#18) | gates (hold_max_age) | gates; stale at min(hold_max_age, 24h) | gates (hold_max_age) |
+  | inbox / banner / per-turn hook | hidden | hidden | shown | shown <24h (`coord.UnattributedHorizon`); older counted in `wt inbox` | shown |
+  | acks (waive for self) | count | count | don't | count only for a signal older than 24h | never |
+  | `wt prune-coord --legacy` | — | — | — | dropped (with -y) once nothing needs it: plain >24h, a hold past both 24h and hold_max_age (never with hold_max_age off) | kept |
 
+  Another window's records gate with hold_max_age and their acks never count, as
+  before; a record carrying this session's token from another checkout still
+  GATES (one session runs several lanes: subagents share their parent's id), it
+  is only labelled "yours, placed from checkout X" and released without asking.
   ⚠ **`""` is NOT a wildcard (#211).** #163 kept pre-#163 records owned by every
   session of their window, so `wt holds` listed a month of them as the current
   session's own and offered `wt all-clear` beside each; one all-clear would have
-  released another live session's hold. The 24h horizon keeps the month of
-  pre-#163 records every upgraded log carries from flooding every inbox and
-  per-turn context at once. ⚠ **Accepted trade-off: two token-less shells in one
-  checkout are ONE party** (the directory fallback #211 itself suggests): a
-  `SessionNone` record is its token-less reader's own, so a terminal's own hold
-  never blocks it and #18's WT_WINDOW pinning works for terminals, at the cost
-  that two token-less agents in one checkout can't tell each other apart (the
-  #163 inbox hedge still fires when tagged sessions post there). `WT_SESSION` per
-  shell separates them. Only `""` is unattributable.
+  released another live session's hold. The 24h horizon and cap keep the month of
+  pre-upgrade records every upgraded log carries from flooding every inbox and
+  per-turn context, and from gating forever under hold_max_age=off. ⚠ **The epoch
+  is the whole log's, not one window's** (#211 review): a session-less ack
+  written a minute earlier, in a window no session-aware wt had written from yet,
+  waived another window's live hold for everyone there. An ack is written after
+  its announcement, so a session-less ack of a session-stamped hold is never
+  history. A log with NO session-stamped record (the upgrade, before any
+  session-aware write) reads every datable session-less record as history; a
+  `View` not built by `ViewOf` reads none as history (the safe zero value). ⚠
+  **Accepted trade-off: two token-less shells in one checkout are ONE party for
+  the gate and the inbox** (the directory fallback #211 itself suggests): a
+  terminal's own hold never blocks it and #18's WT_WINDOW pinning works for
+  terminals, at the cost that two token-less agents in one checkout can't tell
+  each other apart (the #163 inbox hedge still fires when tagged sessions post
+  there). Releasing is where it would hurt, so `all-clear` treats the fallback as
+  unproven. `WT_SESSION` per shell separates them. ⚠ **Rollout:** a window still
+  on v0.1.33 (no sessions: writes `""`, exempts itself from every hold in its own
+  checkout) or v0.1.34 (#163: `""` is a wildcard every session owns; all-clear
+  never asks) behaves as before until upgraded. What a v0.1.33 window writes
+  after the log first carried a session reads as a still-running older wt's:
+  its holds gate for hold_max_age, its acks waive nothing.
   The window id itself stays path-based (#18 self-hold exemption, #156
   claims across restarts). The session is `WT_SESSION` → `CLAUDE_CODE_SESSION_ID`
   → `CODEX_SESSION_ID`, else `coord.SessionNone`. Claude Code keeps its id across

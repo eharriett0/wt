@@ -185,9 +185,9 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 | `wt announce "<msg>"` | Tell other windows a change is starting `[--hold "merge-main,…"] [--issue N]` |
 | `wt inbox` | Un-acked announcements from other windows, and from another session working in this same checkout (labelled; see below). `[--issue N]` also reads back the cross-machine mirror `[--json]` |
 | `wt ack <id>` | Acknowledge one `[--state "what this window is touching"]` |
-| `wt all-clear <id>` | Release your hold — for EVERY window. On a hold that isn't provably this session's it asks first on a terminal, and otherwise refuses unless you pass `--not-mine` |
-| `wt holds` | YOUR outstanding announcements/holds (only ones this session wrote) + block reservations, with copy-pasteable all-clear lines; this checkout's records wt can't attribute to any session are listed apart, without them |
-| `wt prune-coord` | GC the coordination log — drop resolved handshakes + aged block reservations `[--block-max-age D]` |
+| `wt all-clear <id>` | Release your hold — for EVERY window. A hold carrying this session's own token is released at once (also one placed from another checkout); anything else (another session's or window's, one with no session recorded, and a shell's own hold when it has no session token, which wt can't prove) asks first on a terminal, and otherwise refuses unless you pass `--not-mine` |
+| `wt holds` | YOUR outstanding announcements/holds + block reservations, with copy-pasteable all-clear lines (a token-less shell's own are marked: wt can't prove them); this checkout's records wt can't attribute to any session are listed apart, without them, every hold that still gates included. Reads the mirror like `inbox` `[--issue N]` |
+| `wt prune-coord` | GC the coordination log — drop resolved handshakes + aged block reservations `[--block-max-age D]`. `--legacy` lists the open announcements written before wt recorded sessions that gate or show nothing for anyone any more; `--legacy -y` drops them with their acks (a one-time cleanup after upgrading) |
 | `wt block-id <file>` | Atomically reserve the next append-log id so two windows never grab the same `NEWEST-N`. `--written N` marks a reservation done (clears the banner; frees it if never written) `[--pattern] [--format]` |
 | `wt append <doc> --section H "txt"` | Locked, section-scoped append to a structured shared doc (parallel adds can't clobber) |
 | `wt install-hooks` | Install pre-push (base guard + collision check + base-conflict warning) + pre-commit (collision notice) `[--force]` |
@@ -215,11 +215,28 @@ tabs, and anything started in them, stay one party. A shell with no session id i
 never silently merged with one that has: it sees that session's announcements,
 and `inbox` hedges rather than reporting a confident "clear". Shells with no
 session id fall back to the directory: in one checkout they are one party, so a
-terminal is never blocked by its own hold (set `WT_SESSION` per shell to tell
-them apart). A record wt can't attribute to any session (written before wt
-recorded sessions) is never "yours": `wt holds` lists it apart with no all-clear
-line, `wt all-clear` asks before releasing it, its hold gates `merge-pr` for up
-to 24h, and `inbox` shows it for 24h (then only counts it).
+terminal is never blocked by its own hold, but wt can't prove such a record is
+yours, so `wt all-clear` asks before releasing it (set `WT_SESSION` per shell to
+tell shells apart and make their records provable). A record carrying your
+session's token from another checkout reads "yours, placed from checkout X" and
+`wt all-clear` releases it without asking; its hold still gates the other
+checkouts' merges (subagents share their parent's session id, and each works its
+own lane). A record wt can't attribute to any session (no session recorded) is
+never "yours": `wt holds` lists it apart with no all-clear line, and `wt
+all-clear` asks before releasing it. If it was written before this repo's log
+first carried a session (pre-upgrade history), its hold gates `merge-pr` for up
+to 24h and `inbox` shows it for 24h, then only counts it; an ack written that
+way still keeps an older signal out of your inbox. If it was written after (a
+wt without session support still running next to an upgraded one), it is
+treated like another party's: its hold gates for `hold_max_age`, it stays in
+`inbox`, and its acks waive nothing for anyone.
+
+**Rollout.** Windows still running wt v0.1.33 or v0.1.34 behave as before until
+they are upgraded: v0.1.33 records no session and exempts itself from every hold
+placed in its own checkout; v0.1.34 treats a record with no session as every
+session's own and releases any hold without asking. Upgrade every machine and
+shell that shares a coordination log (or its mirror issue); after upgrading,
+`wt prune-coord --legacy` lists the pre-upgrade backlog nothing needs any more.
 
 Structured shared docs (`structured_doc.<name>` in config) upgrade the blanket
 "shared doc — advisory" to **section-aware** grading: two windows editing the

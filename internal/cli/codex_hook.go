@@ -246,7 +246,7 @@ func hookAgentContext(r io.Reader, codex bool) int {
 		self.Session = agentHookSession(self.Session, codex, parseHookSessionID(b))
 		if recs, rerr := coord.Load(logPath); rerr == nil {
 			now := time.Now()
-			box := hookInbox(coord.Inbox(recs, self, now), self, overlaps)
+			box := hookInbox(coord.Inbox(recs, self, now), coord.ViewOf(recs, self), overlaps)
 			if msg, has := coordContextMessage(box, c.MaxAge, now); has {
 				parts = append(parts, msg)
 			}
@@ -344,36 +344,37 @@ func parseHookSessionID(b []byte) string {
 // hookInbox picks the coordination entries for the per-turn context. With other
 // worktrees present it is the whole inbox, as before #163. In a single-worktree
 // repo (where the hook used to stay silent altogether) it is everything from
-// THIS checkout that isn't provably yours — another session's (#163), or one wt
-// can't attribute (#211; Inbox keeps only those still inside
+// THIS checkout that isn't yours — another session's (#163), or one wt can't
+// attribute (#211; Inbox keeps pre-upgrade ones only while younger than
 // coord.UnattributedHorizon) — PLUS every un-acked HOLD from another window: the
 // merge gate enforces those whether or not that window's worktree still exists
 // (a removed worktree's hold, a WT_WINDOW-pinned session in this very checkout,
 // a same-named clone sharing the log), so the hook never hides one. Plain
-// announcements from other windows stay out, as before. Entries come back
-// labelled (labelForContext). Pure.
-func hookInbox(box []coord.Record, self coord.Self, otherWorktrees bool) []coord.Record {
+// announcements from other windows stay out, as before. The picks are the
+// coord.Self views (SharesCheckout, Unattributed), never a raw window compare.
+// Entries come back labelled (labelForContext). Pure.
+func hookInbox(box []coord.Record, v coord.View, otherWorktrees bool) []coord.Record {
 	if !otherWorktrees {
 		var keep []coord.Record
 		for _, r := range box {
-			if r.Window == self.Window || len(r.Hold) > 0 {
+			if v.SharesCheckout(r) || v.Unattributed(r) || len(r.Hold) > 0 {
 				keep = append(keep, r)
 			}
 		}
 		box = keep
 	}
-	return labelForContext(box, self)
+	return labelForContext(box, v)
 }
 
 // labelForContext readies inbox entries for the per-turn context:
 // coordContextMessage shows each entry's Window as who posted it, and an entry
 // from another session in THIS checkout carries the reader's own window id — so
-// it is relabelled "same checkout, another session (…)" (#163). Returns copies.
-// Pure.
-func labelForContext(box []coord.Record, self coord.Self) []coord.Record {
+// it is relabelled "same checkout, another session (…)" (#163), or "can't tell
+// whose (…)" (#211). Returns copies. Pure.
+func labelForContext(box []coord.Record, v coord.View) []coord.Record {
 	out := make([]coord.Record, len(box))
 	for i, r := range box {
-		r.Window = postedBy(r, self)
+		r.Window = postedBy(r, v)
 		out[i] = r
 	}
 	return out
