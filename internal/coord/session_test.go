@@ -416,6 +416,63 @@ func TestHoldLimitCapsOnlyPreSessionHistory(t *testing.T) {
 	}
 }
 
+// A pre-upgrade ack of a pre-upgrade signal waives it only when the signal is
+// older than UnattributedHorizon: here the upgrade was 3h ago, and another
+// window's 5h-old session-less hold, acked 4h ago with no session, must gate
+// every session again (it can't be shown that this session acked it). The
+// 30h-old one acked the same way stays waived, so an upgraded inbox doesn't flood.
+func TestPreSessionAckOnlyWaivesOldSignals(t *testing.T) {
+	const w, other = "/work/repo", "/work/repo-worktrees/roll"
+	now := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) string { return now.Add(-d).Format(time.RFC3339) }
+	recs := []Record{
+		{ID: "old", Kind: KindAnnounce, Window: other, TS: at(30 * time.Hour), Hold: []string{"merge-main"}},
+		{ID: "young", Kind: KindAnnounce, Window: other, TS: at(5 * time.Hour), Hold: []string{"merge-main"}},
+		{ID: "k-old", Kind: KindAck, Window: w, TS: at(29 * time.Hour), AckOf: "old"},
+		{ID: "k-young", Kind: KindAck, Window: w, TS: at(4 * time.Hour), AckOf: "young"},
+		{ID: "first", Kind: KindAnnounce, Window: "/work/x", Session: "Z", TS: at(3 * time.Hour)},
+	}
+	self := Self{w, "A"}
+	fresh, stale := ActiveHoldsAt(recs, self, "merge-main", now, 0)
+	if strings.Join(ids(fresh), ",") != "young" || len(stale) != 0 {
+		t.Errorf("gate fresh=%v stale=%v, want only the young hold (its pre-upgrade ack can't be shown to be this session's)", ids(fresh), ids(stale))
+	}
+	if got := strings.Join(ids(Inbox(recs, self, now)), ","); got != "young,first" {
+		t.Errorf("inbox = [%s], want [young first]", got)
+	}
+}
+
+// The epoch is the FIRST session-stamped record, and a record with no session
+// dated exactly then is not history (#211 review): either reading the other way
+// would cap a still-running older wt's hold at 24h. Here "between" was written
+// after sessions began (at 28h) though before a later session record (at 1h),
+// and "same" in the very second the first session record was.
+func TestEpochIsTheFirstSessionRecord(t *testing.T) {
+	const w = "/work/repo"
+	now := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) string { return now.Add(-d).Format(time.RFC3339) }
+	recs := []Record{
+		{ID: "first", Kind: KindAnnounce, Window: "/work/x", Session: "Z", TS: at(28 * time.Hour)},
+		{ID: "same", Kind: KindAnnounce, Window: w, TS: at(28 * time.Hour), Hold: []string{"merge-main"}},
+		{ID: "between", Kind: KindAnnounce, Window: w, TS: at(26 * time.Hour), Hold: []string{"merge-main"}},
+		{ID: "late", Kind: KindAck, Window: "/work/y", Session: "Y", TS: at(time.Hour), AckOf: "first"},
+	}
+	self := Self{w, "A"}
+	if e, ok := SessionEpoch(recs); !ok || !e.Equal(now.Add(-28*time.Hour)) {
+		t.Fatalf("SessionEpoch = %v %v, want the first session record (28h ago)", e, ok)
+	}
+	v := ViewOf(recs, self)
+	for _, r := range recs[1:3] {
+		if v.PreSession(r) {
+			t.Errorf("%s is not history: it was written at or after the first session record", r.ID)
+		}
+	}
+	fresh, stale := ActiveHoldsAt(recs, self, "merge-main", now, 7*24*time.Hour)
+	if strings.Join(ids(fresh), ",") != "same,between" || len(stale) != 0 {
+		t.Errorf("hold_max_age=7d: fresh=%v stale=%v, want both still gating (no 24h cap)", ids(fresh), ids(stale))
+	}
+}
+
 // The horizon and the cap are both "older than 24h", exactly (M35/M36): at 24h a
 // pre-upgrade record still shows and its hold still gates; a second later it
 // doesn't.
@@ -470,7 +527,8 @@ func TestUnattributedCountsSkipResolved(t *testing.T) {
 	}
 	// GatingHolds agrees with the gate for merge-main.
 	recs = append(recs, Record{ID: "g", Kind: KindAnnounce, Window: w, Session: "B", TS: at(time.Hour), Hold: []string{"merge-main"}},
-		Record{ID: "f", Kind: KindAnnounce, Window: w, Session: "B", TS: at(time.Hour), Hold: []string{"flux"}})
+		Record{ID: "f", Kind: KindAnnounce, Window: w, Session: "B", TS: at(time.Hour), Hold: []string{"flux"}},
+		Record{ID: "s", Kind: KindAnnounce, Window: w, Session: "B", TS: at(72 * time.Hour), Hold: []string{"merge-main"}}) // past hold_max_age: stale, gates nothing
 	fresh, _ := ActiveHoldsAt(recs, self, "merge-main", now, 24*time.Hour)
 	gating := GatingHolds(recs, self, now, 24*time.Hour)
 	if strings.Join(ids(fresh), ",") != "g" || len(gating) != 2 || !gating["g"] || !gating["f"] {
@@ -495,7 +553,8 @@ func TestLegacyPrunable(t *testing.T) {
 		{ID: "undated", Kind: KindAnnounce, Window: w, TS: "garbage"},
 		{ID: "cleared", Kind: KindAnnounce, Window: w, TS: at(20 * 24 * time.Hour)},
 		{ID: "c", Kind: KindAllClear, Window: w, TS: at(19 * 24 * time.Hour), AckOf: "cleared"},
-		{ID: "first", Kind: KindAnnounce, Window: "/work/x", Session: "Z", TS: at(15 * time.Hour)},
+		{ID: "first", Kind: KindAnnounce, Window: "/work/x", Session: "Z", TS: at(60 * time.Hour)},
+		{ID: "liveold", Kind: KindAnnounce, Window: w, TS: at(48 * time.Hour)},              // after sessions began, 2 days old: a live older wt's, never pruned
 		{ID: "livelegacy", Kind: KindAnnounce, Window: w, TS: at(14 * time.Hour)},           // after sessions began: maybe live
 		{ID: "tagged", Kind: KindAnnounce, Window: w, Session: "B", TS: at(10 * time.Hour)}, // a session's: never legacy
 	}
