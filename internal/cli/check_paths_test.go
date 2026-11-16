@@ -254,10 +254,10 @@ func TestEditHooks_AskAboutTheEditedFileExactly(t *testing.T) {
 // 1 of pkg/svc/README.md and internal/foo.go, and a new docs/NEW.md), wc (line 1
 // of pkg/svc/README.md, and link.md retargeted to internal/foo.go) and wd (line
 // 1 of the root README.md), all committed. wa also holds ext, an untracked
-// symlink to a directory outside the repository, which holds x.md.
-// core.ignorecase is set as git sets it on a case-insensitive filesystem, so the
-// case rows run on any filesystem (on a case-sensitive one, only the index can
-// spell them).
+// symlink to a directory outside the repository, which holds x.md. The case
+// rows of the tests that use it run only where the filesystem folds case: on a
+// case-sensitive one readme.md is another file (#201 review), which
+// TestCheck_CaseSensitiveVolumeNeverMergesTwoFiles covers.
 func issue201Repo(t *testing.T) (wa, wb, outside string) {
 	t.Helper()
 	hermeticGitT(t)
@@ -273,7 +273,6 @@ func issue201Repo(t *testing.T) (wa, wb, outside string) {
 	gitT(t, root, "init", "-q", "-b", "main")
 	gitT(t, root, "config", "user.email", "t@t.test")
 	gitT(t, root, "config", "user.name", "t")
-	gitT(t, root, "config", "core.ignorecase", "true")
 	for _, f := range []string{"README.md", "pkg/svc/README.md", "internal/foo.go"} {
 		writeNested(t, root, f, numbered(f))
 	}
@@ -354,6 +353,49 @@ func TestCodexEdit_LinkFilesEnvDoesNotCostTheDeny(t *testing.T) {
 	}
 }
 
+// #201 re-review: a Codex move ACROSS the repo's edge through an in-repo link
+// to a directory outside it. Into the repo, it overwrites a file another window
+// edits; out of it, it removes one (modify/delete). Read lexically before #201,
+// both were in-repo moves and denied under WT_CODEX_HOOK_BLOCK; once the link
+// resolved outside, the whole patch went unpredicted and only warned.
+func TestCodexEdit_MoveAcrossTheRepoEdgeIsDenied(t *testing.T) {
+	hermeticGitT(t)
+	offlineGH(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("WT_SKIP_COLLISION", "")
+	t.Setenv("HOOK_DISABLE_MULTIWINDOW_CHECK", "")
+	t.Setenv("WT_CODEX_HOOK_BLOCK", "1")
+	t.Chdir(t.TempDir())
+
+	root := t.TempDir()
+	gitT(t, root, "init", "-q", "-b", "main")
+	gitT(t, root, "config", "user.email", "t@t.test")
+	gitT(t, root, "config", "user.name", "t")
+	writeNested(t, root, "pkg/svc/a.go", numbered("pkg/svc/a.go"))
+	gitT(t, root, "add", "-A")
+	gitT(t, root, "commit", "-qm", "base")
+	parent := t.TempDir()
+	wa, wb := filepath.Join(parent, "wa"), filepath.Join(parent, "wb")
+	for b, dir := range map[string]string{"wa": wa, "wb": wb} {
+		gitT(t, root, "branch", b)
+		gitT(t, root, "worktree", "add", "-q", dir, b)
+	}
+	outside := t.TempDir()
+	writeT(t, outside, "note.txt", "n1\nn2\n")
+	symlinkT(t, outside, filepath.Join(wa, "ext"))
+	writeT(t, wb, "pkg/svc/a.go", strings.Replace(readT(t, wb, "pkg/svc/a.go"), "pkg/svc/a.go l02\n", "B pkg/svc/a.go l02\n", 1))
+
+	for name, patch := range map[string]string{
+		"into the repo: overwrites wb's file": "*** Begin Patch\n*** Update File: ext/note.txt\n*** Move to: pkg/svc/a.go\n@@\n-n1\n+N1\n*** End Patch\n",
+		"out of the repo: removes wb's file":  "*** Begin Patch\n*** Update File: pkg/svc/a.go\n*** Move to: ext/moved.go\n@@\n-pkg/svc/a.go l05\n+X\n*** End Patch\n",
+	} {
+		p, _ := json.Marshal(map[string]any{"cwd": wa, "tool_name": "apply_patch", "tool_input": map[string]string{"command": patch}})
+		if v := hookVerdict(t, runHookCapture(t, hookCodexEdit, string(p))); v != "deny" {
+			t.Errorf("%s: codex-edit under WT_CODEX_HOOK_BLOCK=1 = %s, want deny", name, v)
+		}
+	}
+}
+
 // #201 review: in a `git clone --bare` layout, worktrees sit inside the bare
 // repository's own directory, which `git worktree list` lists first (marked
 // `bare`). It holds no repo paths, so `../HEAD` from a worktree inside it is
@@ -422,10 +464,20 @@ func caseSensitiveDir(t *testing.T) string {
 // core.ignorecase (false: exercises the probe, which must look at the worktree's
 // own `.git`, here under letterless names below the volume) and with it set
 // true by hand (exercises acceptFold: two existing different spellings are two
-// files).
+// files), and with it set by hand and README.md deleted in A (#201 re-review:
+// neither spelling on disk; core.ignorecase alone must not fold readme.md into
+// the index's README.md).
 func TestCheck_CaseSensitiveVolumeNeverMergesTwoFiles(t *testing.T) {
-	for _, ignorecase := range []string{"", "true"} {
-		t.Run("core.ignorecase="+ignorecase, func(t *testing.T) {
+	for _, v := range []struct {
+		name, ignorecase string
+		rmTracked        bool
+	}{
+		{"core.ignorecase as git leaves it", "", false},
+		{"core.ignorecase=true by hand", "true", false},
+		{"core.ignorecase=true by hand, README.md deleted here", "true", true},
+	} {
+		ignorecase := v.ignorecase
+		t.Run(v.name, func(t *testing.T) {
 			hermeticGitT(t)
 			offlineGH(t)
 			t.Setenv("HOME", t.TempDir())
@@ -448,6 +500,11 @@ func TestCheck_CaseSensitiveVolumeNeverMergesTwoFiles(t *testing.T) {
 			if ignorecase != "" { // set by hand afterwards: under it, B's add would have been refused
 				gitT(t, root, "config", "core.ignorecase", ignorecase)
 			}
+			if v.rmTracked { // deleted, not staged: still in A's index
+				if err := os.Remove(filepath.Join(wa, "README.md")); err != nil {
+					t.Fatal(err)
+				}
+			}
 
 			if code, got := checkJSON(t, wa, "readme.md"); code != 3 || !reflect.DeepEqual(got, []string{"readme.md←wb"}) {
 				t.Errorf("wt check readme.md = exit %d %v, want exit 3 [readme.md←wb]: B created that file", code, got)
@@ -464,6 +521,40 @@ func TestCheck_CaseSensitiveVolumeNeverMergesTwoFiles(t *testing.T) {
 				t.Errorf("codex-edit Add File readme.md must warn about wb's readme.md, got %q", out)
 			}
 		})
+	}
+}
+
+// #201 re-review, on a real case-sensitive filesystem with core.ignorecase set
+// by hand: a bare name that is nothing here stays the search it is (#181), not
+// a fold to the spelling another window touches. B created NOTES.md, C edits
+// other/notes.md; `wt check notes.md` finds C by basename, as before #201.
+// Folding to B's NOTES.md (a different file on this volume) dropped C.
+func TestCheck_CaseSensitiveVolumeKeepsTheSearch(t *testing.T) {
+	hermeticGitT(t)
+	offlineGH(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Chdir(t.TempDir())
+	base := caseSensitiveDir(t)
+	root := filepath.Join(base, "1")
+	gitT(t, base, "init", "-q", "-b", "main", "1")
+	gitT(t, root, "config", "user.email", "t@t.test")
+	gitT(t, root, "config", "user.name", "t")
+	writeNested(t, root, "base.md", "x\n")
+	gitT(t, root, "add", "-A")
+	gitT(t, root, "commit", "-qm", "base")
+	wa, wb, wc := filepath.Join(base, "2"), filepath.Join(base, "3"), filepath.Join(base, "4")
+	for b, dir := range map[string]string{"wa": wa, "wb": wb, "wc": wc} {
+		gitT(t, root, "worktree", "add", "-q", "-b", b, dir)
+	}
+	writeNested(t, wb, "NOTES.md", "B\n")
+	gitT(t, wb, "add", "-A")
+	gitT(t, wb, "commit", "-qm", "wb adds NOTES.md")
+	writeNested(t, wc, "other/notes.md", "C\n")
+	gitT(t, wc, "add", "-A")
+	gitT(t, wc, "commit", "-qm", "wc adds other/notes.md")
+	gitT(t, root, "config", "core.ignorecase", "true")
+	if code, got := checkJSON(t, wa, "notes.md"); code != 3 || !reflect.DeepEqual(got, []string{"notes.md←wc"}) {
+		t.Errorf("wt check notes.md = exit %d %v, want exit 3 [notes.md←wc]: a search, which reaches other/notes.md", code, got)
 	}
 }
 
@@ -522,10 +613,20 @@ func TestCheck_Issue201_ArgumentsResolveToTheRepoPath(t *testing.T) {
 		{"a file in another worktree, absolute", wa, filepath.Join(wb, "pkg", "svc", "README.md"), 3, svc},
 		{"a file in another worktree, relative", wa, filepath.Join(relToWb, "pkg", "svc", "README.md"), 3, svc},
 		{"another worktree's top level", wa, wb, 3, all},
-		// 4: case-insensitive names: the spelling git tracks / a window touches
-		{"a case variant of a tracked file", wa, "pkg/svc/readme.md", 3, svc},
-		{"a case variant of a directory", wa, "PKG/svc/README.md", 3, svc},
-		{"a case variant of a file only another window has", wa, "docs/new.md", 3, []string{"docs/NEW.md←wb"}},
+	}
+	folds := foldsCase(wa)
+	if folds {
+		cases = append(cases, []struct {
+			name, cwd string
+			arg       string
+			code      int
+			want      []string
+		}{
+			// 4: case-insensitive names: the spelling git tracks / a window touches
+			{"a case variant of a tracked file", wa, "pkg/svc/readme.md", 3, svc},
+			{"a case variant of a directory", wa, "PKG/svc/README.md", 3, svc},
+			{"a case variant of a file only another window has", wa, "docs/new.md", 3, []string{"docs/NEW.md←wb"}},
+		}...)
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -555,15 +656,15 @@ func TestCheck_Issue201_ArgumentsResolveToTheRepoPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, tc := range []struct {
-		paths []string
-		want  []string
-	}{
-		{[]string{"svclink/README.md"}, svc},
-		{[]string{"."}, all},
-		{[]string{filepath.Join(wb, "pkg", "svc", "README.md")}, svc},
-		{[]string{"pkg/svc/readme.md"}, svc},
-	} {
+	mcpCases := [][]string{{"svclink/README.md"}, {"."}, {filepath.Join(wb, "pkg", "svc", "README.md")}}
+	if folds {
+		mcpCases = append(mcpCases, []string{"pkg/svc/readme.md"})
+	}
+	for _, paths := range mcpCases {
+		tc := struct{ paths, want []string }{paths, svc}
+		if paths[0] == "." {
+			tc.want = all
+		}
 		text, isErr := mcpCheck(c, tc.paths, false, false)
 		if isErr {
 			t.Errorf("wt_check %v: tool error %s", tc.paths, text)
@@ -592,13 +693,18 @@ func TestCheck_Issue201_ArgumentsResolveToTheRepoPath(t *testing.T) {
 		return runHookCapture(t, hookClaudeEdit, string(p))
 	}
 	const svcLine = "pkg/svc/README.md l01"
-	for _, tc := range []struct{ name, out string }{
+	hookCases := []struct{ name, out string }{
 		{"codex patches svclink/README.md", codexOut(wa, "svclink/README.md", svcLine)},
 		{"codex in pkg/ patches ../svclink/README.md", codexOut(filepath.Join(wa, "pkg"), "../svclink/README.md", svcLine)},
-		{"codex patches pkg/svc/readme.md", codexOut(wa, "pkg/svc/readme.md", svcLine)},
 		{"claude edits through svclink", claudeOut(wa, filepath.Join(wa, "svclink", "README.md"), svcLine)},
-		{"claude edits pkg/svc/readme.md", claudeOut(wa, filepath.Join(wa, "pkg", "svc", "readme.md"), svcLine)},
-	} {
+	}
+	if folds {
+		hookCases = append(hookCases, []struct{ name, out string }{
+			{"codex patches pkg/svc/readme.md", codexOut(wa, "pkg/svc/readme.md", svcLine)},
+			{"claude edits pkg/svc/readme.md", claudeOut(wa, filepath.Join(wa, "pkg", "svc", "readme.md"), svcLine)},
+		}...)
+	}
+	for _, tc := range hookCases {
 		if v := hookVerdict(t, tc.out); v != "overlap" {
 			t.Errorf("%s: hook says %s, want overlap, as `wt check` grades it HIGH", tc.name, v)
 		}

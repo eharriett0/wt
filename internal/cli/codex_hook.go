@@ -706,8 +706,8 @@ type codexGradedEntry struct {
 // apply_patch has run (applyPatchOps on the on-disk files): repo-relative path →
 // content, "" for a file it deletes (`wt check` then reads every line deleted,
 // as it does an emptied file). ok=false when that can't be told: a patch
-// apply_patch would reject or fail on, or a move across the repo's edge; the
-// hook then keeps its file-level heads-up.
+// apply_patch would reject or fail on; the hook then keeps its file-level
+// heads-up for every path.
 //
 // An operation entirely OUTSIDE the repo is left out, not a reason to give up
 // on the rest (#201 review): it can't collide with another window's repo
@@ -715,6 +715,11 @@ type codexGradedEntry struct {
 // `link_files` `.env` (a link into the main checkout) is one. Giving up there
 // turned a confirmed overlap on a repo file in the same patch into a file-level
 // heads-up, and WT_CODEX_HOOK_BLOCK lost its deny where `wt check` blocks.
+// A move ACROSS the repo's edge is what it does to the repo (#201 re-review):
+// out of it, the source is removed (its chunks still have to apply, as for
+// apply_patch); into it, the destination is written with the source's content,
+// read through its own path, patched. If that read fails the destination is
+// left unpredicted (a file-level heads-up for it alone, never dropped).
 func predictCodexPatch(patch, root, prefix string) (map[string]string, bool) {
 	parsed, err := parseApplyPatch(patch)
 	if err != nil {
@@ -724,6 +729,7 @@ func predictCodexPatch(patch, root, prefix string) (map[string]string, bool) {
 	// resolved as repoRelativePatch resolves them: a removed path (a Delete, a
 	// move's source) is the entry, a symlink there the link itself (#201).
 	var ops []patchOp
+	unknown := map[string]bool{}
 	for _, op := range parsed {
 		rel := repoRelativePath
 		if op.kind == 'D' || (op.kind == 'U' && op.moveTo != "" && op.moveTo != op.path) {
@@ -737,8 +743,26 @@ func predictCodexPatch(patch, root, prefix string) (map[string]string, bool) {
 		switch {
 		case outPath && (op.moveTo == "" || outMove):
 			continue // entirely outside the repo
-		case outPath || outMove:
-			return nil, false // a move across the repo's edge: not modelled
+		case outMove: // out of the repo: the source's chunks apply, then it is gone
+			op.path, op.moveTo = path, ""
+			ops = append(ops, op, patchOp{kind: 'D', path: path})
+			continue
+		case outPath: // into the repo: the destination gets the source's content, patched
+			src := op.path
+			if !filepath.IsAbs(src) {
+				src = joinRaw(root, filepath.FromSlash(prefix), src)
+			}
+			b, err := os.ReadFile(src)
+			if err != nil {
+				unknown[moveTo] = true
+				continue
+			}
+			next, err := patchedContent(string(b), op.chunks)
+			if err != nil {
+				return nil, false // apply_patch would reject it
+			}
+			ops = append(ops, patchOp{kind: 'A', path: moveTo, content: next})
+			continue
 		}
 		op.path, op.moveTo = path, moveTo
 		ops = append(ops, op)
@@ -752,6 +776,9 @@ func predictCodexPatch(patch, root, prefix string) (map[string]string, bool) {
 	}
 	out := make(map[string]string, len(state))
 	for p, c := range state {
+		if unknown[p] {
+			continue
+		}
 		if c != nil {
 			out[p] = *c
 		} else {

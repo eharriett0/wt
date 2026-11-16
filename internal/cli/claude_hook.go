@@ -268,25 +268,32 @@ type placedPath struct{ root, rel string }
 
 // placePath places p (absolute, symlinks already resolved) in the worktree
 // among roots that holds it (locateIn) and spells it the way git names it
-// (#201). Where names are case-insensitive (caseInsensitive), the filesystem
+// (#201). Where names are case-insensitive (the worktree's filesystem folds
+// case, foldsCase, or core.ignorecase says so), the filesystem
 // opens `readme.md` for README.md, but git and every other window call the file
 // README.md, so each existing component is spelled as its directory lists it
 // (spellAsListed), and then as git's index spells the path when the index has
 // exactly one spelling for it (indexSpelling): a case-only rename on disk (mv,
 // not git mv) leaves the index's, which is the one status and diff report.
 // Either spelling replaces the typed one only when acceptFold says the two are
-// one file (or neither exists), so a misread probe or a hand-set
-// core.ignorecase never merges two files. A case-sensitive repository is left
-// exactly as typed. ok=false when no worktree holds p. I/O.
+// one file (or neither exists on a filesystem that itself folds case), so a
+// misread probe or a hand-set core.ignorecase never merges two files. A
+// case-sensitive repository is left exactly as typed. ok=false when no
+// worktree holds p. I/O.
 func placePath(p string, roots []string) (placedPath, bool) {
 	root, rel, ok := locateIn(p, roots, sameDir)
 	if !ok {
 		return placedPath{}, false
 	}
-	if rel != collide.RootPath && caseInsensitive(root) {
-		rel = spellAsListed(root, rel)
-		if s := indexSpelling(rel, gitx.TrackedFolded(root, rel)); s != rel && acceptFold(foldFacts(root, rel, s)) {
-			rel = s
+	if rel == collide.RootPath {
+		return placedPath{root, rel}, true
+	}
+	if fsFolds := foldsCase(root); fsFolds || ignoreCaseAt(root) {
+		rel = spellAsListed(root, rel, fsFolds)
+		if s := indexSpelling(rel, gitx.TrackedFolded(root, rel)); s != rel {
+			if te, fe, same := foldFacts(root, rel, s); acceptFold(te, fe, same, fsFolds) {
+				rel = s
+			}
 		}
 	}
 	return placedPath{root, rel}, true
@@ -364,15 +371,6 @@ func sameDir(a, b string) bool {
 	return err == nil && os.SameFile(fa, fb)
 }
 
-// caseInsensitive reports whether names in the worktree at root are
-// case-insensitive: the filesystem folds case there (foldsCase), or git was
-// told so (core.ignorecase, which git sets when it creates a repository on such
-// a filesystem). Nothing is folded anywhere else: on a case-sensitive
-// repository README.md and readme.md are two files. I/O.
-func caseInsensitive(root string) bool {
-	return foldsCase(root) || ignoreCaseAt(root)
-}
-
 // ignoreCaseMemo is core.ignorecase per worktree, read once per process (git
 // sets it when it creates the repository): the Codex hook resolves every path of
 // a patch twice.
@@ -418,23 +416,28 @@ func caseProbe(root string) (string, string) {
 // acceptFold decides whether a case-folded spelling (as a directory lists it,
 // or as the index tracks it) may stand for the typed one (#201 review): only
 // when the filesystem says they are ONE file (both exist and os.SameFile), or
-// when neither exists (nothing on disk tells them apart, so git's own reading
-// of the index under core.ignorecase decides). One existing without the other,
-// or two existing different files, are two names: folding them merged two
-// files, and a readme.md about to be created beside a tracked README.md on a
-// case-sensitive volume (an add/add conflict with a window that created
-// readme.md) read clear. So neither a wrong probe nor a core.ignorecase set by
-// hand on a case-sensitive volume can merge two files. Pure.
-func acceptFold(typedExists, foldedExists, same bool) bool {
+// when neither exists AND the worktree's filesystem itself folds case (fsFolds:
+// foldsCase), so the two names can only ever be one file there. One existing
+// without the other, or two existing different files, are two names: folding
+// them merged two files, and a readme.md about to be created beside a tracked
+// README.md on a case-sensitive volume (an add/add conflict with a window that
+// created readme.md) read clear. ⚠ Neither existing is not enough on its own:
+// with core.ignorecase set by hand on a case-sensitive volume and the tracked
+// README.md deleted, a readme.md about to be created was folded into the
+// index's README.md and the same add/add read clear. core.ignorecase alone
+// never folds a spelling that is not on disk. So neither a wrong probe nor a
+// hand-set core.ignorecase can merge two files. Pure.
+func acceptFold(typedExists, foldedExists, same, fsFolds bool) bool {
 	if typedExists && foldedExists {
 		return same
 	}
-	return !typedExists && !foldedExists
+	return !typedExists && !foldedExists && fsFolds
 }
 
 // foldFacts is what the filesystem says about a typed path and a folded
 // spelling of it, both relative to dir: whether each exists, and whether they
-// are one file. For acceptFold. I/O.
+// are one file. With fsFolds (foldsCase of the worktree), the facts acceptFold
+// decides on. I/O.
 func foldFacts(dir, typed, folded string) (typedExists, foldedExists, same bool) {
 	a, errA := os.Lstat(filepath.Join(dir, filepath.FromSlash(typed)))
 	b, errB := os.Lstat(filepath.Join(dir, filepath.FromSlash(folded)))
@@ -442,17 +445,20 @@ func foldFacts(dir, typed, folded string) (typedExists, foldedExists, same bool)
 }
 
 // spellAsListed spells each component of rel (relative to root) that exists
-// the way its directory lists it (listedName), when acceptFold allows it; the
-// first one that doesn't exist, and the rest, are kept as given. I/O.
-func spellAsListed(root, rel string) string {
+// the way its directory lists it (listedName), when acceptFold allows it
+// (fsFolds: foldsCase of the worktree); the first one that doesn't exist, and
+// the rest, are kept as given. I/O.
+func spellAsListed(root, rel string, fsFolds bool) string {
 	segs := strings.Split(rel, "/")
 	dir := root
 	for i, s := range segs {
 		if _, err := os.Lstat(filepath.Join(dir, s)); err != nil {
 			break
 		}
-		if n := listedName(dir, s); n != s && acceptFold(foldFacts(dir, s, n)) {
-			segs[i] = n
+		if n := listedName(dir, s); n != s {
+			if te, fe, same := foldFacts(dir, s, n); acceptFold(te, fe, same, fsFolds) {
+				segs[i] = n
+			}
 		}
 		dir = filepath.Join(dir, segs[i])
 	}

@@ -1132,10 +1132,11 @@ func (a checkArg) namesRealPath() bool {
 // argBase is the place a check's arguments are read from: prefix is its path
 // relative to the repo root (`git rev-parse --show-prefix`, "" = the root
 // itself); exists answers for an argument as typed, tracked for a repo path in
-// the worktree that holds it; fold says names are case-insensitive here
-// (caseInsensitive); bare lists the bare entries of `git worktree list`, which
-// hold no repo paths. Injected so the resolution is table-testable without a
-// repo (resolveCheckArgs).
+// the worktree that holds it; fold says the worktree's filesystem folds case
+// (foldsCase: core.ignorecase alone never folds a name that is on no disk
+// here, #201 review); bare lists the bare entries of `git worktree list`,
+// which hold no repo paths. Injected so the resolution is table-testable
+// without a repo (resolveCheckArgs).
 type argBase struct {
 	prefix  string
 	exists  func(arg string) bool       // present in the working tree
@@ -1157,7 +1158,7 @@ func cwdArgBase(root string) argBase {
 		prefix:  prefix,
 		exists:  func(a string) bool { _, err := os.Stat(a); return err == nil },
 		tracked: gitx.IsTrackedIn,
-		fold:    caseInsensitive(root),
+		fold:    foldsCase(root),
 		bare:    gitx.BareWorktreesIn(""),
 	}
 }
@@ -1177,7 +1178,7 @@ func rootArgBase(root string) argBase {
 	return argBase{
 		exists:  func(a string) bool { _, err := os.Stat(at(a)); return err == nil },
 		tracked: gitx.IsTrackedIn,
-		fold:    caseInsensitive(root),
+		fold:    foldsCase(root),
 		bare:    gitx.BareWorktreesIn(root),
 	}
 }

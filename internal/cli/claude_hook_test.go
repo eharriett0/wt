@@ -512,17 +512,23 @@ func TestFoldsCase_MatchesTheFilesystem(t *testing.T) {
 // filesystem says they are one file, or neither exists (#201 review).
 func TestAcceptFold(t *testing.T) {
 	for _, tc := range []struct {
-		name                            string
-		typedExists, foldedExists, same bool
-		want                            bool
+		name                                     string
+		typedExists, foldedExists, same, fsFolds bool
+		want                                     bool
 	}{
-		{"one file under two spellings (a folding filesystem)", true, true, true, true},
-		{"two existing files (a case-sensitive volume)", true, true, false, false},
-		{"a new readme.md beside a tracked README.md (the add/add case)", false, true, false, false},
-		{"the typed one exists, the folded one doesn't", true, false, false, false},
-		{"neither exists: git's index reading decides", false, false, false, true},
+		{"one file under two spellings (a folding filesystem)", true, true, true, true, true},
+		{"two existing files (a case-sensitive volume)", true, true, false, false, false},
+		{"two existing files, even if the probe misread", true, true, false, true, false},
+		{"a new readme.md beside a tracked README.md (the add/add case)", false, true, false, false, false},
+		{"the same, even if the probe misread", false, true, false, true, false},
+		{"the typed one exists, the folded one doesn't", true, false, false, false, false},
+		{"neither exists on a folding filesystem: one name there", false, false, false, true, true},
+		// #201 re-review: core.ignorecase set by hand on a case-sensitive volume,
+		// the tracked README.md deleted, readme.md about to be created beside
+		// another window's new readme.md: an add/add that folding read clear
+		{"neither exists, only core.ignorecase says fold: never", false, false, false, false, false},
 	} {
-		if got := acceptFold(tc.typedExists, tc.foldedExists, tc.same); got != tc.want {
+		if got := acceptFold(tc.typedExists, tc.foldedExists, tc.same, tc.fsFolds); got != tc.want {
 			t.Errorf("%s: acceptFold = %v, want %v", tc.name, got, tc.want)
 		}
 	}
@@ -581,7 +587,8 @@ func TestPlacePath_SpellsAsGitTracks(t *testing.T) {
 		"pkg/SVC":           pick("pkg/svc", "pkg/SVC"),
 		"pkg/svc/README.md": "pkg/svc/README.md",
 		"pkg/svc/other.md":  "pkg/svc/other.md", // nothing to spell it by
-		"pkg/svc/gone.md":   "pkg/svc/GONE.md",  // neither on disk: the index's reading decides
+		// neither on disk: one name only where the filesystem itself folds case
+		"pkg/svc/gone.md": pick("pkg/svc/GONE.md", "pkg/svc/gone.md"),
 	} {
 		if got := repoRelativePath(root, "", in); got != want {
 			t.Errorf("repoRelativePath(%q) = %q, want %q (folds case: %v)", in, got, want, folds)

@@ -66,8 +66,8 @@ symlink is checked as both the link and its target. A path inside another
 worktree of the same repository is checked as the same repo path, and
 `wt check .` at the top level checks the whole repository. On a
 case-insensitive filesystem (macOS by default), `readme.md` is checked as the
-`README.md` git tracks (only where the filesystem or `core.ignorecase` says
-names are case-insensitive, and only when both spellings are the same file). A
+`README.md` git tracks (only when both spellings are the same file there, and
+`core.ignorecase` alone never folds a name that is on no disk). A
 path outside every worktree of the repository is refused (exit 64) rather than
 reported clear, and that includes a path through a symlink in the repository
 that leads outside it (`ext/x.md` with `ext` linking to another directory),

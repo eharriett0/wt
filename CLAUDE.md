@@ -312,8 +312,15 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   entirely outside the repo out of its prediction (`predictCodexPatch`) instead
   of giving up on the whole patch: wt's own `link_files` `.env` is a link into
   the main checkout, and giving up there cost the deny for a repo file in the
-  same patch that `wt check` grades HIGH (#201 review). A move across the
-  repo's edge is still unpredictable (a file-level heads-up).
+  same patch that `wt check` grades HIGH (#201 review). ⚠ A move ACROSS the
+  repo's edge (through such a link) is predicted for what it does to the repo
+  (#201 re-review; read lexically before #201 it was an in-repo move and
+  denied, and giving up on it only warned): out of the repo, the source's
+  chunks apply and it is removed (a modify/delete with a window editing it);
+  into the repo, the destination is written with the source's content, read
+  through the source's own path and patched. A source that can't be read leaves
+  that destination (and any later operation on it) unpredicted: a file-level
+  heads-up for it alone, never the whole patch, never dropped.
   ⚠ **A symlink FILE is two paths.** `wt check link.md` asks about the link
   itself (`resolvePath(p, false)`, the entry: another window can retarget it)
   AND its target (whose content an edit through it changes), so it never reads
@@ -329,9 +336,9 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   does (#154). It used to match nothing and read clear while live HIGHs existed;
   `matchTouchedDir` still answers nothing for a blank path, so the zero Query
   can't become the whole repo, and `unknownCheckPaths` never calls it a typo.
-  ⚠ **Case is folded only where names are case-insensitive** (`caseInsensitive`:
-  the filesystem folds case AT THE WORKTREE, probed on its own `.git` vs `.GIT`
-  with `os.SameFile` (`foldsCase`/`caseProbe`), or `core.ignorecase`). ⚠ #201
+  ⚠ **Case is folded only where names are case-insensitive** (the filesystem
+  folds case AT THE WORKTREE, probed on its own `.git` vs `.GIT` with
+  `os.SameFile` (`foldsCase`/`caseProbe`), or `core.ignorecase`). ⚠ #201
   review: the first probe walked up to the nearest ancestor with a letter in its
   name, which for a case-sensitive volume mounted at a letterless path (`/2024/1`)
   is the PARENT filesystem: it read "folds", a new readme.md was checked as the
@@ -344,16 +351,24 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   and that is the name status, diff and every other window report; case twins
   keep the given one). ⚠ **Either folded spelling replaces the typed one only
   when `acceptFold` says they are one file** (both exist and `os.SameFile`), or
-  when neither exists (then git's own index reading decides): one existing
-  without the other, or two different files, are two names, so neither a wrong
-  probe nor a hand-set `core.ignorecase` on a case-sensitive volume can merge
-  two files (pure, table-tested with injected facts; `foldFacts` gathers them).
-  Shared with the hooks, so `wt check readme.md`, a Claude edit of
+  when neither exists AND the worktree's filesystem itself folds case
+  (`foldsCase`): one existing without the other, or two different files, are
+  two names, so neither a wrong probe nor a hand-set `core.ignorecase` on a
+  case-sensitive volume can merge two files (pure, table-tested with injected
+  facts; `foldFacts` gathers them). ⚠ **`core.ignorecase` alone never folds a
+  spelling that is on no disk** (#201 re-review): set by hand on a
+  case-sensitive volume, with the tracked README.md deleted in this window, a
+  readme.md about to be created was folded into the index's README.md and an
+  add/add with another window's new readme.md read clear in `wt check` and the
+  Claude hook. Shared with the hooks, so `wt check readme.md`, a Claude edit of
   `$PWD/readme.md` and a Codex patch of `readme.md` all ask about README.md.
-  `wt check` alone also matches a path that is nowhere under its own spelling
-  against the spellings windows touch (`collide.TouchedSpellings`, from
-  `checkArgQueries`): a file only another window created, the hooks' superset
-  again. ⚠ **That REPLACES the fuzzy search for that argument, on purpose**
+  `wt check` alone, and only where the filesystem folds case (`argBase.fold` =
+  `foldsCase`, the same rule), also matches a path that is nowhere under its
+  own spelling against the spellings windows touch (`collide.TouchedSpellings`,
+  from `checkArgQueries`): a file only another window created, the hooks'
+  superset again. Under `core.ignorecase` alone such a name stays a search
+  (`TestCheck_CaseSensitiveVolumeKeepsTheSearch`). ⚠ **Where it applies, that
+  REPLACES the fuzzy search for that argument, on purpose**
   (#181's rule: an argument that names a real place, here one touched under
   another case, is a question about THAT place). On macOS, with window B
   creating NOTES.md and window C editing docs/notes.md, `wt check notes.md` was
