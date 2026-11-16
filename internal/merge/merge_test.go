@@ -1,39 +1,62 @@
 package merge
 
 import (
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
 )
 
 func TestGuardVerdict(t *testing.T) {
+	files := func(n int) DiffRead { return DiffRead{Files: n} }
+	unread := DiffRead{Err: errors.New("GitHub's REST API rate limit for this account is used up")}
 	cases := []struct {
-		name      string
-		fileCount string
-		subjects  []string
-		want      Verdict
+		name     string
+		diff     DiffRead
+		subjects []string
+		want     Verdict
 	}{
-		{"empty: zero files", "0", nil, VerdictEmptyDiff},
-		{"empty: unparseable", "", nil, VerdictEmptyDiff},
-		{"empty: non-numeric", "abc", nil, VerdictEmptyDiff},
-		{"empty: negative", "-3", nil, VerdictEmptyDiff},
-		{"empty: zero files even with real commits", "0", []string{"feat: do the thing"}, VerdictEmptyDiff},
-		{"ok: one file one real commit", "1", []string{"feat: do the thing"}, VerdictOK},
-		{"ok: real + placeholder mixed", "3", []string{"WIP: claim #42 — foo", "feat: real work"}, VerdictOK},
-		{"placeholder-only: single placeholder, nonzero files", "2", []string{"WIP: claim #42 — foo"}, VerdictPlaceholderOnly},
-		{"placeholder-only: multiple placeholders", "5", []string{"WIP: claim #1 — a", "WIP: claim #2 — b"}, VerdictPlaceholderOnly},
-		{"ok: nonzero files, no commit subjects", "4", nil, VerdictOK},
-		{"ok: blank lines ignored, real present", "2", []string{"", "feat: x", ""}, VerdictOK},
-		{"placeholder-only: blank lines + placeholder", "2", []string{"", "WIP: claim #9 — z", ""}, VerdictPlaceholderOnly},
-		{"ok: whitespace-padded count", "  7 ", []string{"fix: y"}, VerdictOK},
-		{"ok: prefix-similar but not placeholder", "1", []string{"WIPfoo claim # not a placeholder"}, VerdictOK},
+		{"empty: zero files", files(0), nil, VerdictEmptyDiff},
+		{"empty: negative", files(-3), nil, VerdictEmptyDiff},
+		{"empty: zero files even with real commits", files(0), []string{"feat: do the thing"}, VerdictEmptyDiff},
+		// #217: a diff that could not be read is not an empty one.
+		{"unread: no count", unread, nil, VerdictDiffUnread},
+		{"unread: with real commits", unread, []string{"feat: do the thing"}, VerdictDiffUnread},
+		{"unread: outranks placeholder-only", unread, []string{"WIP: claim #42 — foo"}, VerdictDiffUnread},
+		{"unread: an error beside a count still counts as unread", DiffRead{Files: 6, Err: unread.Err}, nil, VerdictDiffUnread},
+		{"ok: one file one real commit", files(1), []string{"feat: do the thing"}, VerdictOK},
+		{"ok: real + placeholder mixed", files(3), []string{"WIP: claim #42 — foo", "feat: real work"}, VerdictOK},
+		{"placeholder-only: single placeholder, nonzero files", files(2), []string{"WIP: claim #42 — foo"}, VerdictPlaceholderOnly},
+		{"placeholder-only: multiple placeholders", files(5), []string{"WIP: claim #1 — a", "WIP: claim #2 — b"}, VerdictPlaceholderOnly},
+		{"ok: nonzero files, no commit subjects", files(4), nil, VerdictOK},
+		{"ok: blank lines ignored, real present", files(2), []string{"", "feat: x", ""}, VerdictOK},
+		{"placeholder-only: blank lines + placeholder", files(2), []string{"", "WIP: claim #9 — z", ""}, VerdictPlaceholderOnly},
+		{"ok: prefix-similar but not placeholder", files(1), []string{"WIPfoo claim # not a placeholder"}, VerdictOK},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := GuardVerdict(tc.fileCount, tc.subjects); got != tc.want {
-				t.Errorf("GuardVerdict(%q, %v) = %q, want %q", tc.fileCount, tc.subjects, got, tc.want)
+			if got := GuardVerdict(tc.diff, tc.subjects); got != tc.want {
+				t.Errorf("GuardVerdict(%+v, %v) = %q, want %q", tc.diff, tc.subjects, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestDiffReadField: the dry-run line says "unread" for a diff it could not
+// read, never a count (#217: the old "0" is what read as EMPTY).
+func TestDiffReadField(t *testing.T) {
+	for _, tc := range []struct {
+		d    DiffRead
+		want string
+	}{
+		{DiffRead{Files: 6}, "6"},
+		{DiffRead{Files: 0}, "0"},
+		{DiffRead{Err: errors.New("x")}, "unread"},
+		{DiffRead{Files: 6, Err: errors.New("x")}, "unread"},
+	} {
+		if got := tc.d.Field(); got != tc.want {
+			t.Errorf("%+v.Field() = %q, want %q", tc.d, got, tc.want)
+		}
 	}
 }
 

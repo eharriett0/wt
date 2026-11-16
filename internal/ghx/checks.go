@@ -76,8 +76,8 @@ type PRChecksRead struct {
 // gh fails or its answer is not a PR with a head commit, never a parsed
 // placeholder (#168): a PR that cannot be read is not a PR with no checks.
 func PRChecks(pr, repo string) (PRChecksRead, error) {
-	if !Present() || !Authed() {
-		return PRChecksRead{}, errors.New("gh is not available or not authenticated")
+	if !Present() || !SignedIn() {
+		return PRChecksRead{}, notSignedIn(RepoHost())
 	}
 	args := []string{"pr", "view", pr, "--json", "number,url", "--jq", `"\(.number) \(.url)"`}
 	if repo != "" {
@@ -600,8 +600,8 @@ func repoPath(repo string) (string, error) {
 // protection endpoint itself needs admin. An error when gh fails or the answer
 // does not say.
 func BranchProtectionChecks(host, repo, base string) (Required, error) {
-	if !Present() || !Authed() {
-		return Required{}, errors.New("gh is not available or not authenticated")
+	if !Present() || !SignedIn() {
+		return Required{}, notSignedIn(RepoHost())
 	}
 	path, err := repoPath(repo)
 	if err != nil {
@@ -609,7 +609,7 @@ func BranchProtectionChecks(host, repo, base string) (Required, error) {
 	}
 	out, err := run("api", "--hostname", host, path+"/branches/"+url.PathEscape(base))
 	if err != nil {
-		return Required{}, apiErr(out, err)
+		return Required{}, apiErr(host, out, err)
 	}
 	checks, err := parseBranchProtection(out)
 	return Required{Checks: checks}, err
@@ -681,8 +681,8 @@ var ErrRulesetsUnavailable = errors.New("rulesets are not available for this rep
 // run. Any reader may ask (the endpoint returns only active rules). An error
 // when gh fails, ErrRulesetsUnavailable when the server has none for this repo.
 func RulesetChecks(host, repo, base string) (Required, error) {
-	if !Present() || !Authed() {
-		return Required{}, errors.New("gh is not available or not authenticated")
+	if !Present() || !SignedIn() {
+		return Required{}, notSignedIn(RepoHost())
 	}
 	path, err := repoPath(repo)
 	if err != nil {
@@ -693,7 +693,7 @@ func RulesetChecks(host, repo, base string) (Required, error) {
 		if rulesetsUnavailable(out) {
 			return Required{}, ErrRulesetsUnavailable
 		}
-		return Required{}, apiErr(out, err)
+		return Required{}, apiErr(host, out, err)
 	}
 	return parseRulesets(out)
 }
@@ -788,12 +788,12 @@ func parseRulesets(out string) (Required, error) {
 // (#179): where a ruleset's required workflow lives. An error when gh fails or
 // prints no name.
 func RepoName(host string, id int64) (string, error) {
-	if !Present() || !Authed() {
-		return "", errors.New("gh is not available or not authenticated")
+	if !Present() || !SignedIn() {
+		return "", notSignedIn(RepoHost())
 	}
 	out, err := run("api", "--hostname", host, "repositories/"+strconv.FormatInt(id, 10), "--jq", ".full_name")
 	if err != nil {
-		return "", apiErr(out, err)
+		return "", apiErr(host, out, err)
 	}
 	if name := strings.TrimSpace(out); validRepo(name) {
 		return name, nil
@@ -843,32 +843,39 @@ func uniqueWorkflows(ws []RequiredWorkflow) []RequiredWorkflow {
 }
 
 // apiErr is a failed `gh api` read's error: the message and HTTP status of the
-// body gh printed, else what gh said on stderr.
-func apiErr(out string, err error) error {
+// body gh printed, else what gh said on stderr. A refusal for a rate limit is a
+// *RateLimitError (#217); host is where the call went.
+func apiErr(host, out string, err error) error {
 	var e struct {
 		Message string `json:"message"`
 		Status  string `json:"status"`
 	}
 	if json.Unmarshal([]byte(strings.TrimSpace(out)), &e) == nil && e.Message != "" {
+		if rl, ok := rateLimited(host, e.Message); ok {
+			return rl
+		}
 		if e.Status != "" {
 			return fmt.Errorf("%s (HTTP %s)", e.Message, e.Status)
 		}
 		return errors.New(e.Message)
 	}
-	return ghErr(err)
+	return ghErrAt(host, err)
 }
 
 // ghErr is a failed gh call's error with the first line gh printed to stderr,
 // which says why ("exit status 1" does not). run's cmd.Output keeps stderr on
-// the *exec.ExitError.
-func ghErr(err error) error {
+// the *exec.ExitError. A refusal for a rate limit is a *RateLimitError (#217),
+// for a call to this repo's host.
+func ghErr(err error) error { return ghErrAt(RepoHost(), err) }
+
+// ghErrAt is ghErr for a call to host ("" = the host gh picks).
+func ghErrAt(host string, err error) error {
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
-		msg := strings.TrimSpace(string(ee.Stderr))
-		if i := strings.IndexByte(msg, '\n'); i >= 0 {
-			msg = msg[:i]
+		if rl, ok := rateLimited(host, string(ee.Stderr)); ok {
+			return rl
 		}
-		if msg != "" {
+		if msg := firstLine(string(ee.Stderr)); msg != "" {
 			return errors.New(msg)
 		}
 	}

@@ -5,6 +5,7 @@ package ghx
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -102,11 +103,19 @@ const authTTL = time.Minute
 var (
 	authMu   sync.Mutex
 	authMemo = map[string]authAnswer{}
-	// authNoJSON: this gh rejected `auth status --json` (it predates 2.81), so the
-	// human form is asked directly from then on. Per process: a gh upgraded under
-	// a long-lived `wt mcp` is picked up when it restarts.
-	authNoJSON bool
+	// authNoJSON: these gh binaries (by resolved path) rejected `auth status
+	// --json` (they predate 2.81), so the human form is asked directly from then
+	// on. Per binary, not per process (#217): a process whose PATH resolves "gh"
+	// to another binary (a test's fake) asks it afresh, and a gh upgraded in
+	// place under a long-lived `wt mcp` is picked up when it restarts.
+	authNoJSON = map[string]bool{}
 )
+
+// ghPath is the gh binary a gh call runs: PATH's, resolved now ("" = none).
+func ghPath() string {
+	p, _ := exec.LookPath("gh")
+	return p
+}
 
 type authAnswer struct {
 	st AuthStatus // what that check said, per host (#183/#203)
@@ -142,7 +151,8 @@ func authCheck(host string) AuthStatus {
 // also spends one flag error (no network) to learn there is no JSON form.
 // Called with authMu held.
 func runAuthCheck(host string) AuthStatus {
-	if !authNoJSON {
+	bin := ghPath()
+	if !authNoJSON[bin] {
 		// Separate streams: the JSON is stdout, and gh writes notes to stderr even
 		// then ("You are not logged into any GitHub hosts", an update notice).
 		var stdout, stderr bytes.Buffer
@@ -154,7 +164,7 @@ func runAuthCheck(host string) AuthStatus {
 			return st
 		}
 		if noJSON {
-			authNoJSON = true
+			authNoJSON[bin] = true
 		}
 	}
 	// BOTH streams (#183): once any account fails, gh writes every host section to
@@ -190,6 +200,17 @@ func AuthedFor(host string) bool { return authCheck(host).OK }
 // #183). Even scoped, the exit code is not the answer (#203): it also fails for
 // an INACTIVE account on the host, so AuthedFor decides by the active one.
 func Authed() bool { return AuthedFor(RepoHost()) }
+
+// SignedInFor is AuthedFor, plus a host that refused the check only for a
+// rate limit (#217): GitHub named the account in the refusal, so the token
+// works, and a GraphQL read (its own quota) can still answer. For merge-pr's
+// reads, which report a failed read as one. ⚠ Never for liveness: there a gh
+// failure reads as "no PR", trusted only when AuthedFor (PRChecked), and the
+// tip lookup is REST (#168). Same memoized check.
+func SignedInFor(host string) bool { return signedIn(authCheck(host)) }
+
+// SignedIn is SignedInFor the host THIS repo uses (Authed's host).
+func SignedIn() bool { return SignedInFor(RepoHost()) }
 
 // CurrentUser returns the authenticated login.
 func CurrentUser() (string, error) { return run("api", "user", "--jq", ".login") }
@@ -285,20 +306,55 @@ func PRCreate(draft bool, head, base, title, body string) (string, error) {
 	return run(PRCreateArgs(draft, head, base, title, body)...)
 }
 
-// PRChangedFileCount returns the number of files in the PR diff vs base, as a
-// string (matches merge.GuardVerdict's input contract).
-func PRChangedFileCount(pr string) string {
+// PRChangedFileCount returns how many files PR pr changes vs its base, for
+// merge-pr's empty-diff guard. ⚠ An error when that can't be read, never a
+// count of 0 (#217): a failed read used to come back "0", and the guard called
+// a 6-line diff EMPTY and pointed at --bypass. It reads the REST diff (`gh pr
+// diff --name-only`), and when that fails (an exhausted REST quota, a diff too
+// large for GitHub to render) GraphQL's changedFiles, which has its own quota.
+func PRChangedFileCount(pr string) (int, error) {
 	out, err := run("pr", "diff", pr, "--name-only")
-	if err != nil {
-		return "0"
+	if err == nil {
+		return len(diffNames(out)), nil
 	}
-	n := 0
+	rerr := ghErr(err)
+	out, gerr := run("pr", "view", pr, "--json", "changedFiles", "--jq", ".changedFiles")
+	if gerr != nil {
+		return 0, bothFailed("diff", rerr, "file count", ghErr(gerr))
+	}
+	n, perr := parseFileCount(out)
+	if perr != nil {
+		return 0, bothFailed("diff", rerr, "file count", perr)
+	}
+	return n, nil
+}
+
+// parseFileCount reads GraphQL's changedFiles as gh prints it: a count, never
+// a placeholder (#168: "null" or "" is an unread answer, not 0). Pure.
+func parseFileCount(out string) (int, error) {
+	n, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("gh printed no file count (got %q)", strings.TrimSpace(out))
+	}
+	return n, nil
+}
+
+// bothFailed is the error of a read whose REST form and GraphQL fallback both
+// failed (#217), naming each. It wraps both, so IsRateLimit sees either.
+func bothFailed(rest string, rerr error, gql string, gerr error) error {
+	return fmt.Errorf("the REST %s read failed: %w; the GraphQL %s read failed too: %w", rest, rerr, gql, gerr)
+}
+
+// diffNames is the file names `gh pr diff --name-only` printed, git's quoting
+// undone (unquoteGitPath). Pure.
+func diffNames(out string) []string {
+	var files []string
 	for _, ln := range strings.Split(out, "\n") {
-		if strings.TrimSpace(ln) != "" {
-			n++
+		if s := strings.TrimSpace(ln); s != "" {
+			files = append(files, unquoteGitPath(s))
 		}
 	}
-	return fmt.Sprintf("%d", n)
+	return files
 }
 
 // PRChangedFiles returns the repo-relative paths changed in the PR diff vs base.
@@ -310,16 +366,80 @@ func PRChangedFileCount(pr string) string {
 // and prints it that way: `"caf\303\251.md"`, which no deploy glob matches
 // (#200). There is no -z to ask gh for, so the quoting is undone here
 // (unquoteGitPath).
+//
+// When the REST diff fails (#217) the list comes from GraphQL instead
+// (prFilesGraphQL), and only when it is the whole list.
 func PRChangedFiles(pr string) ([]string, error) {
 	out, err := run("pr", "diff", pr, "--name-only")
-	if err != nil {
-		return nil, err
+	if err == nil {
+		return diffNames(out), nil
 	}
-	var files []string
-	for _, ln := range strings.Split(out, "\n") {
-		if s := strings.TrimSpace(ln); s != "" {
-			files = append(files, unquoteGitPath(s))
+	rerr := ghErr(err)
+	files, gerr := prFilesGraphQL(pr)
+	if gerr != nil {
+		return nil, bothFailed("diff", rerr, "file list", gerr)
+	}
+	return files, nil
+}
+
+// prFilesQuery pages through a PR's changed files. ⚠ Not `gh pr view --json
+// files`: gh asks for the first 100 and stops (measured: 100 of a PR's 285),
+// and a deploy gate judging part of a PR is the silent direction.
+const prFilesQuery = `query($url:URI!,$endCursor:String){resource(url:$url){... on PullRequest{` +
+	`changedFiles files(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{path}}}}}`
+
+// prFilesGraphQL lists PR pr's changed files over GraphQL (#217), the REST
+// diff's fallback. GraphQL gives paths verbatim, never C-quoted. Renames list
+// the new path, as `gh pr diff --name-only` does.
+func prFilesGraphQL(pr string) ([]string, error) {
+	url, err := run("pr", "view", pr, "--json", "url", "--jq", ".url")
+	if err != nil {
+		return nil, ghErr(err)
+	}
+	if strings.TrimSpace(url) == "" {
+		return nil, fmt.Errorf("cannot resolve PR #%s's URL", pr)
+	}
+	out, err := run("api", "graphql", "--paginate", "-f", "query="+prFilesQuery, "-f", "url="+strings.TrimSpace(url),
+		"--jq", `.data.resource | {total: .changedFiles, paths: [.files.nodes[].path]}`)
+	if err != nil {
+		return nil, ghErr(err)
+	}
+	return parsePRFiles(out)
+}
+
+// parsePRFiles reads prFilesGraphQL's output, one object per page. Every page
+// must carry the total and its paths, and the pages together must list exactly
+// the total: a short list is an error, never the list (the deploy gate would
+// judge part of the PR). Pure.
+func parsePRFiles(out string) ([]string, error) {
+	dec := json.NewDecoder(strings.NewReader(out))
+	files, total := []string{}, -1
+	for {
+		var p struct {
+			Total *int     `json:"total"`
+			Paths []string `json:"paths"`
 		}
+		err := dec.Decode(&p)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("unreadable file list from gh: %w", err)
+		}
+		if p.Total == nil || p.Paths == nil {
+			return nil, errors.New("a page of gh's file list has no file count or no paths")
+		}
+		if total >= 0 && *p.Total != total {
+			return nil, fmt.Errorf("gh's file list changed while it was read (%d files, then %d)", total, *p.Total)
+		}
+		total = *p.Total
+		files = append(files, p.Paths...)
+	}
+	switch {
+	case total < 0:
+		return nil, errors.New("gh printed no file list")
+	case len(files) != total:
+		return nil, fmt.Errorf("GraphQL listed %d of the PR's %d changed files", len(files), total)
 	}
 	return files, nil
 }
@@ -595,7 +715,7 @@ func PRBody(pr string) (string, error) {
 // (NOT a `gh pr view --json` field), queried via resource(url:) so no owner/repo
 // split is needed. Best-effort: nil on error / gh unavailable. (#77)
 func PRClosingIssueNumbers(pr string) []int {
-	if !Present() || !Authed() {
+	if !Present() || !SignedIn() {
 		return nil
 	}
 	url, err := run("pr", "view", pr, "--json", "url", "--jq", ".url")
@@ -700,9 +820,12 @@ func PRURL(pr string) string {
 }
 
 // PRState returns the PR's state (OPEN / MERGED / CLOSED) for the merge-pr
-// precheck (#39). Empty on error / gh unavailable, so the caller fails open.
+// precheck (#39) and its post-merge confirm (#185). Empty on error / gh
+// unavailable, so the caller fails open. Gated on SignedIn, not Authed (#217):
+// it is a GraphQL read, and under an exhausted REST quota the confirm read ""
+// and kept the lane of a PR that had merged.
 func PRState(pr string) string {
-	if !Present() || !Authed() {
+	if !Present() || !SignedIn() {
 		return ""
 	}
 	out, err := run("pr", "view", pr, "--json", "state", "--jq", ".state")

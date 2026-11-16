@@ -191,7 +191,7 @@ func fakeGH(t *testing.T, jsonMode, jsonOut, text string) (runs func() []string)
 
 	authMu.Lock()
 	savedMemo, savedNoJSON := authMemo, authNoJSON
-	authMemo, authNoJSON = map[string]authAnswer{}, false
+	authMemo, authNoJSON = map[string]authAnswer{}, map[string]bool{}
 	authMu.Unlock()
 	t.Cleanup(func() {
 		authMu.Lock()
@@ -374,9 +374,9 @@ func TestParseAuthStatusJSON(t *testing.T) {
 		{"an invalid GH_TOKEN: gh's GraphQL read says 401 in its own words",
 			ghDoc(map[string][]ghEntry{"github.com": {{State: "error", Error: err401Env, Active: true, Host: "github.com", TokenSource: "GH_TOKEN", GitProtocol: "https"}}}),
 			[]HostAuth{with("github.com", HostAuthFailed, err401Env)}, true},
-		{"rate limited: the host answered, but not that the token is invalid",
+		{"rate limited (#217): the host took the token and refused the call for its quota",
 			ghDoc(map[string][]ghEntry{"github.com": {errAcct("github.com", "octo", true, "error", err403)}}),
-			[]HostAuth{with("github.com", HostAuthUnknown, err403)}, true},
+			[]HostAuth{with("github.com", HostAuthRateLimited, err403)}, true},
 		{"logged in nowhere, or not on the host asked about: definitively no host (gh's fixture)",
 			"{\"hosts\":{}}\n", nil, true},
 		{"gh's own all-valid fixture: hosts by name, the inactive account ignored",
@@ -428,7 +428,13 @@ func TestClassifyAuthError(t *testing.T) {
 		{"a network failure not wrapped as a URL error", "dial tcp: lookup ghe.example.com on 10.0.0.1:53: server misbehaving", HostAuthUnreachable},
 		{"surrounding space", "  " + errDNS + "\n", HostAuthUnreachable},
 		{"a proxy's 502 naming a refused connection: an HTTP answer, so unproven", "HTTP 502: connection refused (https://ghe.example.com/api/v3/)", HostAuthUnknown},
-		{"rate limited: the token may be fine", err403, HostAuthUnknown},
+		{"rate limited (#217): GitHub named the account, so the token works", err403, HostAuthRateLimited},
+		{"rate limited, GraphQL's 403 wording", `HTTP 403: API rate limit already exceeded for user ID 1. (https://api.github.com/graphql)`, HostAuthRateLimited},
+		{"rate limited by the secondary limit, a 429", `HTTP 429: You have exceeded a secondary rate limit. Please wait a few minutes before you try again. (https://api.github.com/)`, HostAuthRateLimited},
+		{"a 403 that is no rate limit (a suspended account)", `HTTP 403: Sorry. Your account was suspended. (https://api.github.com/)`, HostAuthUnknown},
+		{"a 401 that mentions a rate limit is still a 401", `HTTP 401: Bad credentials; API rate limit exceeded (https://api.github.com/)`, HostAuthFailed},
+		{"rate-limit words with no HTTP status prove nothing", `API rate limit exceeded for user ID 1.`, HostAuthUnknown},
+		{"a 500 mentioning a rate limit is not one", `HTTP 500: API rate limit exceeded (https://api.github.com/)`, HostAuthUnknown},
 		{"a 5xx", "HTTP 503: 503 Service Unavailable (https://ghe.example.com/api/v3/)", HostAuthUnknown},
 		{"gh's own 'bad token' fixture is a 400", "HTTP 400 (https://ghe.io/api/v3/)", HostAuthUnknown},
 		{"gh's own GraphQL fixture has no status", `non-200 OK status code:  body: "no bueno"`, HostAuthUnknown},

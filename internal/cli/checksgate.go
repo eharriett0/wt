@@ -42,6 +42,10 @@ var liveChecksReads = checksReads{
 // checksRetryWait is the pause before the one retry of a failed read.
 const checksRetryWait = 2 * time.Second
 
+// retryable reports whether a failed read gets its one retry: not one GitHub
+// refused for a rate limit (#217), which lifts in minutes, not seconds.
+func retryable(err error) bool { return err != nil && !ghx.IsRateLimit(err) }
+
 // checksOpts are merge-pr's flags and settings that steer the checks gate.
 type checksOpts struct {
 	dryRun       bool
@@ -150,7 +154,7 @@ func checksGate(pr string, o checksOpts, stdin io.Reader, tty bool, r checksRead
 func readChecks(pr string, o checksOpts, r checksReads) (ghx.PRChecksRead, merge.ChecksInput) {
 	in := merge.ChecksInput{MinChecks: o.minChecks, MinChecksBad: o.minChecksBad}
 	read, err := r.checks(pr, o.repo)
-	if err != nil {
+	if retryable(err) {
 		r.sleep(checksRetryWait)
 		read, err = r.checks(pr, o.repo)
 	}
@@ -161,7 +165,7 @@ func readChecks(pr string, o checksOpts, r checksReads) (ghx.PRChecksRead, merge
 	in.Checks = read.Checks
 	required := func(f func(host, repo, base string) (ghx.Required, error)) (ghx.Required, error) {
 		req, err := f(read.Host, read.Repo, read.Base)
-		if err != nil && !errors.Is(err, ghx.ErrRulesetsUnavailable) {
+		if retryable(err) && !errors.Is(err, ghx.ErrRulesetsUnavailable) {
 			r.sleep(checksRetryWait)
 			req, err = f(read.Host, read.Repo, read.Base)
 		}
@@ -186,7 +190,7 @@ func resolveWorkflows(read ghx.PRChecksRead, ws []ghx.RequiredWorkflow, r checks
 		name, known := names[w.RepoID]
 		if !known && failed[w.RepoID] == nil {
 			n, err := r.repoName(read.Host, w.RepoID)
-			if err != nil {
+			if retryable(err) {
 				r.sleep(checksRetryWait)
 				n, err = r.repoName(read.Host, w.RepoID)
 			}
