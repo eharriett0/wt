@@ -24,21 +24,40 @@ type Verdict string
 const (
 	VerdictOK              Verdict = "ok"
 	VerdictEmptyDiff       Verdict = "block:empty_diff"
+	VerdictDiffUnread      Verdict = "block:diff_unread" // #217: the diff could not be read, which is not an empty one
 	VerdictPlaceholderOnly Verdict = "block:placeholder_only"
 )
 
+// DiffRead is what merge-pr learned about the PR's diff (#217): how many files
+// it changes, or why that could not be read. A failed read is never a count:
+// it used to be "0", so an exhausted REST quota read as an EMPTY diff.
+type DiffRead struct {
+	Files int
+	Err   error
+}
+
+// Field is the dry-run line's file count: the number, or "unread". Pure.
+func (d DiffRead) Field() string {
+	if d.Err != nil {
+		return "unread"
+	}
+	return strconv.Itoa(d.Files)
+}
+
 // GuardVerdict is the pure decision function (testable without gh).
 //
-//	fileCount — number of files changed in the PR diff vs base, as a string
-//	            (matches the bash $1; unparseable or "0" → empty_diff).
-//	subjects  — commit subject lines (one messageHeadline per commit).
+//	diff     — the PR's changed-file count vs base, or the error reading it
+//	           (an error → diff_unread; 0 or fewer files → empty_diff).
+//	subjects — commit subject lines (one messageHeadline per commit).
 //
 // The empty-diff check is the load-bearing one; the placeholder-only check is
 // belt-and-braces for the case where a non-empty diff somehow pairs with
 // commits that are all claim-work placeholders.
-func GuardVerdict(fileCount string, subjects []string) Verdict {
-	n, err := strconv.Atoi(strings.TrimSpace(fileCount))
-	if err != nil || n <= 0 {
+func GuardVerdict(diff DiffRead, subjects []string) Verdict {
+	switch {
+	case diff.Err != nil:
+		return VerdictDiffUnread
+	case diff.Files <= 0:
 		return VerdictEmptyDiff
 	}
 
@@ -409,11 +428,26 @@ func (b ForwardedBody) RedirectToStdin(args []string) []string {
 // error from gh itself wraps ErrMergeCommand (#196); a guard's refusal does
 // not.
 func Run(pr string, dryRun, bypass, mergeForeign bool, worktreeBranches []string, extraArgs []string, ghStdin io.Reader, checks string) error {
-	fileCount := ghx.PRChangedFileCount(pr)
+	var diff DiffRead
+	diff.Files, diff.Err = ghx.PRChangedFileCount(pr)
 	subjects := ghx.PRCommitSubjects(pr)
-	v := GuardVerdict(fileCount, subjects)
+	v := GuardVerdict(diff, subjects)
 
 	switch v {
+	case VerdictDiffUnread:
+		// #217: not an empty diff, and not a reason to spend --bypass: an
+		// exhausted REST quota is the usual cause, and it lifts on its own.
+		fmt.Fprintf(os.Stderr, "REFUSING to merge PR #%s: its diff could not be read, so wt cannot tell whether it is empty.\n", pr)
+		fmt.Fprintf(os.Stderr, "Why: %v\n", diff.Err)
+		if ghx.IsRateLimit(diff.Err) {
+			fmt.Fprintln(os.Stderr, "Run the merge again once the rate limit lifts.")
+		} else {
+			fmt.Fprintf(os.Stderr, "Check that gh can read it (gh pr diff %s --name-only), then run the merge again.\n", pr)
+		}
+		if !bypass {
+			return fmt.Errorf("diff unread")
+		}
+		fmt.Fprintln(os.Stderr, "--bypass set: proceeding without the empty-diff check.")
 	case VerdictEmptyDiff:
 		fmt.Fprintf(os.Stderr, "REFUSING to merge PR #%s — diff vs base is EMPTY (no real content).\n", pr)
 		fmt.Fprintln(os.Stderr, "This is the claim-work placeholder bug class: a placeholder PR merging vacuously.")
@@ -452,7 +486,7 @@ func Run(pr string, dryRun, bypass, mergeForeign bool, worktreeBranches []string
 		if foreign {
 			note = " [FOREIGN: head has no wt worktree here — a real merge needs --merge-foreign]"
 		}
-		fmt.Printf("merge-pr: %s %s file_count=%s%s (dry-run, not merging)\n", label, VerdictField(v, checks), fileCount, note)
+		fmt.Printf("merge-pr: %s %s file_count=%s%s (dry-run, not merging)\n", label, VerdictField(v, checks), diff.Field(), note)
 		return nil
 	}
 
@@ -480,7 +514,11 @@ func Run(pr string, dryRun, bypass, mergeForeign bool, worktreeBranches []string
 		}
 	}
 
-	fmt.Printf("merge-pr: %s — %s changed file(s) — merging (squash).\n", label, fileCount)
+	files := diff.Field() + " changed file(s)"
+	if diff.Err != nil {
+		files = "changed files unread (--bypass)"
+	}
+	fmt.Printf("merge-pr: %s — %s — merging (squash).\n", label, files)
 	if err := ghx.MergePRSquash(pr, mergeArgs, ghStdin); err != nil {
 		return fmt.Errorf("%w: %w", ErrMergeCommand, err)
 	}

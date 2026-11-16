@@ -655,6 +655,16 @@ func ghLine(rep *Report) (warn bool, msg string) {
 		return false, msg
 	case rep.GHAuthed:
 		return false, "gh — authenticated"
+	case rep.GH && rep.GHAuthUnknown && onlyRateLimited(rep.GHHosts):
+		// #217: GitHub refused the check for a rate limit, which it does only
+		// after taking the token. Not "could not be verified": the login works.
+		var hs []string
+		for _, h := range rep.GHHosts {
+			if h.State == ghx.HostAuthRateLimited {
+				hs = append(hs, h.Host)
+			}
+		}
+		return true, "gh — logged in, but " + strings.Join(hs, ", ") + " refused the check for a rate limit: calls on that quota fail until it lifts (REST and GraphQL have separate quotas; merge-pr reads what it can and names what it can't)"
 	case rep.GH && rep.GHAuthUnknown && len(rep.GHHosts) > 0:
 		var hs []string
 		for _, h := range rep.GHHosts {
@@ -685,24 +695,26 @@ func failedUnconfirmed(hosts []ghx.HostAuth) bool {
 	return false
 }
 
-// hostAuthPhrase names a host and what gh said about it. Short: `wt doctor
-// --json` carries gh's own error for each host (gh 2.81+).
-func hostAuthPhrase(h ghx.HostAuth) string {
-	switch h.State {
-	case ghx.HostAuthOK:
-		return h.Host + " authenticated"
-	case ghx.HostAuthFailed:
-		return h.Host + " failed to log in"
-	case ghx.HostAuthTimeout:
-		return h.Host + " timed out"
-	case ghx.HostAuthUnreachable:
-		return "couldn't reach " + h.Host
+// onlyRateLimited reports whether every host is OK or refused the check only
+// for a rate limit, and at least one did (#217). Pure.
+func onlyRateLimited(hosts []ghx.HostAuth) bool {
+	limited := false
+	for _, h := range hosts {
+		switch h.State {
+		case ghx.HostAuthRateLimited:
+			limited = true
+		case ghx.HostAuthOK:
+		default:
+			return false
+		}
 	}
-	if h.Error != "" { // gh's error says nothing about the token (a 403, a 5xx): relay it
-		return h.Host + " could not be checked (gh: " + strings.TrimSpace(strings.SplitN(h.Error, "\n", 2)[0]) + ")"
-	}
-	return "wt could not read gh's answer for " + h.Host
+	return limited
 }
+
+// hostAuthPhrase names a host and what gh said about it. Short: `wt doctor
+// --json` carries gh's own error for each host (gh 2.81+). The wording lives
+// in ghx (HostAuth.Phrase), which merge-pr's reads use too (#217).
+func hostAuthPhrase(h ghx.HostAuth) string { return h.Phrase() }
 
 // sessionLine renders the doctor's "session" row (#163): the token, shortened
 // (coord.ShortToken; `doctor --json` keeps it whole), and the env var it came

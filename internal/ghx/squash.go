@@ -27,8 +27,8 @@ const prCommitsQuery = `query($url:URI!,$endCursor:String){resource(url:$url){..
 // squash commit (#196). An error when gh fails or names no commit: a PR always
 // has one, so none read means unread, never "no commits".
 func PRCommits(pr string) ([]PRCommit, error) {
-	if !Present() || !Authed() {
-		return nil, errors.New("gh is not available or not authenticated")
+	if !Present() || !SignedIn() {
+		return nil, notSignedIn(RepoHost())
 	}
 	url, err := run("pr", "view", pr, "--json", "url", "--jq", ".url")
 	if err != nil || strings.TrimSpace(url) == "" {
@@ -82,7 +82,7 @@ func parsePRCommits(out string) ([]PRCommit, error) {
 // GraphQL's squashMergeCommitTitle / squashMergeCommitMessage answer any reader.
 // {owner}/{repo} resolve the way the gh pr reads do.
 func RepoSquashSettings() (title, message string) {
-	if !Present() || !Authed() {
+	if !Present() || !SignedIn() {
 		return "", ""
 	}
 	out, err := run("api", "graphql",

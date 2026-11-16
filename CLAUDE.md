@@ -590,6 +590,72 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   (awesome-o's one workflow is path-filtered, so its PRs legitimately carry
   none), so the deterministic "CI never started" signals are a required check
   and `merge_min_checks`.
+- **A rate limit is named as one, and an unread diff is never EMPTY (#217).**
+  The account's REST quota (5,000/h) is shared by every session and tool on it.
+  Once it is used up, GitHub refuses every REST call with a 403 until it lifts,
+  while GraphQL (its own quota) keeps answering. merge-pr misread that three
+  ways: `gh auth status` validates over REST, so every gated read said "gh is
+  not available or not authenticated"; `gh pr diff` failed and the count came
+  back "0", so the guard called a 6-line diff EMPTY and pointed at `--bypass`;
+  and the post-merge state read was gated off, so a merged PR's lane was kept.
+  - `ghErrAt`/`apiErr` return a `*ghx.RateLimitError` (REST or GraphQL, primary
+    or secondary: `rateLimitKind`) whenever gh's text says so, with when it lifts
+    from a REFUSED call's headers (`gh api --include /`: Retry-After, else
+    X-RateLimit-Reset when Remaining is 0; pure `rateReset`), probed once per
+    host per authTTL (`probeRateReset` is the test seam). ⚠ Not the rate_limit
+    endpoint: during the incident it reported 5,000 remaining while every call
+    was refused. Only the REST primary quota is probed: a REST call's headers
+    don't carry GraphQL's clock, and a probe during a secondary limit adds to
+    the burst. ⚠ **Which API refused is read from the text first, then from the
+    caller** (`ghErrAt(host, called, err)`): measured with real gh (#217
+    review), `gh api graphql` refused for its quota prints only "gh: API rate
+    limit already exceeded for user ID N." (RATE_LIMITED is in the stdout
+    body), and a GraphQL 403 reads "… (https://…/graphql)". Text markers
+    (`graphQLErr`: `GraphQL:`, RATE_LIMITED, `/graphql`, gh's GraphQL client's
+    "non-200 OK status code") beat the caller's guess, since `gh pr diff` may
+    itself resolve the PR over GraphQL; a bare `ghErr` assumes REST.
+  - The auth check's 403/429 rate-limit refusal is `HostAuthRateLimited` (the
+    `--json` form only: gh before 2.81 prints "token invalid" for it, and
+    `authProblem` says it can't tell). GitHub refuses that way only after it took
+    the token, so the login works. ⚠ **`AuthedFor` stays strict:** liveness
+    trusts "no PR" only from it (`PRChecked`), and the tip lookup (#168) is REST,
+    so a rate-limited host counted as authed would let dormancy suppress a window
+    whose PR only that lookup finds. `SignedInFor`/`SignedIn` accept it too, and
+    gate ONLY merge-pr's own reads (`PRState`, `PRChecks` and the required-check
+    reads, the close check's `PRCommits`/`RepoSquashSettings`/
+    `PRClosingIssueNumbers`), whose failures are reported, never read as
+    "none". `signedIn` is a passed check, or a failed one that at least one
+    rate-limited host explains (every other host OK): the human form's
+    unexplained non-zero exit with every host it read OK stays a no. A refused
+    gate says why (`notSignedIn`), per host. Which quota refused the CHECK is
+    not known (gh checks a keyring token over REST, a GH_TOKEN over GraphQL),
+    so neither doctor nor `HostAuth.Phrase` names one.
+  - `PRChangedFileCount` is `(n, error)`: the REST diff, else GraphQL
+    `changedFiles`. `merge.DiffRead` → `VerdictDiffUnread`: "could not be
+    read", why, and NO `--bypass` pointer (a quota fault is no reason to spend
+    a safety flag); an explicit `--bypass` still proceeds and says what it
+    skipped. `PRChangedFiles` falls back to a paged GraphQL query
+    (`prFilesQuery`; ⚠ `gh pr view --json files` stops at 100, measured 100 of
+    285), taken only when it lists exactly `changedFiles` paths, below GitHub's
+    3,000-file cap (`maxListedFiles`): a partial list is an error, so the
+    deploy gate still fails closed. ⚠ It goes to the PR's own host
+    (`--hostname`, from the PR URL via `parsePRRef`, as `PRChecks` does): bare
+    `gh api graphql` asks github.com, which answers a GitHub Enterprise PR's URL
+    with a null resource when gh is logged in to both. `bothFailed` wraps both
+    errors (`%w`), so `ghx.IsRateLimit` sees either; the unread refusal's hint
+    says "once the rate limit lifts" only when one did. Renames list only the
+    new path, in both reads (measured), so a file moved OUT of a deploy path
+    still does not gate: an older gap, unchanged.
+  - The checks gate does not retry a read refused for a rate limit
+    (`retryable`): it lifts in minutes, not in the 2 s retry.
+  - doctor reads a rate-limited host as "logged in, but … refused the check for
+    a rate limit", not "could not be verified".
+  - `authNoJSON` is per gh binary (`ghPath`), not per process: a process whose
+    PATH resolves `gh` to another binary (a test's fake) asks it for the JSON
+    form afresh, instead of inheriting an earlier fake's "no JSON".
+  Pinned end to end by `TestCmdMergePR_restQuotaUsedUp` (its own host, so the
+  process-wide auth memo can't leak in), which fails on the pre-#217 code with
+  every symptom above.
 - **The deploy gate's GitHub status read only WARNS, and fails open (#178).**
   Inside the deploy confirm (draft refusal → prod banner → status → confirm),
   for a PR on github.com (`merge.GitHubStatusCovers`; the host is the checks
@@ -725,7 +791,8 @@ The formula supports `head "…", branch: "main"` for `--HEAD` builds.
   — use `gh api repos/OWNER/REPO/pulls/N -X PATCH -F body=@file`.
 - `gh issue create` has **no `--json`** — capture the printed URL, parse the
   number.
-- **Ask gh about auth only through `ghx.AuthedFor`/`Authed`** (#172). The answer
+- **Ask gh about auth only through `ghx.AuthedFor`/`Authed`** (#172), or, for
+  merge-pr's own reads only, `SignedInFor`/`SignedIn` (#217, above). The answer
   is memoized per host for `authTTL` (a minute: one command asks once, and a
   long-lived `wt mcp` still notices a `gh auth login`). In a repo with no forge
   host (a local-path origin, which is what a scratch-repo smoke uses) the check

@@ -2,6 +2,7 @@ package ghx
 
 import (
 	"encoding/json"
+	"errors"
 	"regexp"
 	"slices"
 	"sort"
@@ -28,7 +29,16 @@ const (
 	HostAuthFailed      = "failed"
 	HostAuthTimeout     = "timeout"     // the host never answered
 	HostAuthUnreachable = "unreachable" // no HTTP answer at all: DNS failure, connection refused, TLS (`--json` only, #203)
-	HostAuthUnknown     = "unknown"     // nothing wt can read as one of the above
+	// HostAuthRateLimited: the host refused the check for a rate limit (#217,
+	// `--json` only). GitHub refuses that way only after it has taken the
+	// token ("API rate limit exceeded for user ID N"), so the login works, but
+	// calls on that quota fail until it lifts. Which quota is not known: gh
+	// checks a keyring token over REST and a GH_TOKEN over GraphQL.
+	// Not OK for AuthedFor: liveness trusts "no PR" only from a host that
+	// answers every lookup, and the tip lookup is REST (#168). SignedInFor
+	// counts it.
+	HostAuthRateLimited = "rate_limited"
+	HostAuthUnknown     = "unknown" // nothing wt can read as one of the above
 )
 
 // AuthStatus is one `gh auth status` answer, broken down per host (#183).
@@ -74,6 +84,89 @@ func authOK(exitOK bool, hosts []HostAuth, parsed bool) bool {
 		}
 	}
 	return true
+}
+
+// signedIn decides SignedInFor from one check (#217). Pure. A check that
+// passed (st.OK), or one that failed only because a host refused it for a rate
+// limit: at least one host HostAuthRateLimited, and every other one OK. Not
+// "every host OK" alone: the human form's unexplained non-zero exit leaves OK
+// false with every host it read OK (a failure wt can't see, textAuthStatus),
+// and only a rate limit is an explained failure. Like authOK, unreadable
+// output or no host is a no.
+func signedIn(st AuthStatus) bool {
+	if st.OK {
+		return true
+	}
+	if !st.Parsed {
+		return false
+	}
+	limited := false
+	for _, h := range st.Hosts {
+		switch h.State {
+		case HostAuthRateLimited:
+			limited = true
+		case HostAuthOK:
+		default:
+			return false
+		}
+	}
+	return limited
+}
+
+// Phrase names the host and what gh said about it, for a message. Short: `wt
+// doctor --json` carries gh's own error for each host (gh 2.81+).
+func (h HostAuth) Phrase() string {
+	switch h.State {
+	case HostAuthOK:
+		return h.Host + " authenticated"
+	case HostAuthFailed:
+		return h.Host + " failed to log in"
+	case HostAuthTimeout:
+		return h.Host + " timed out"
+	case HostAuthUnreachable:
+		return "couldn't reach " + h.Host
+	case HostAuthRateLimited:
+		// Not which quota: with GH_TOKEN, gh's check is a GraphQL read (#217 review).
+		return h.Host + " refused the check for a rate limit (the token works; calls on that quota fail until it lifts)"
+	}
+	if h.Error != "" { // gh's error says nothing about the token (a 403, a 5xx): relay it
+		return h.Host + " could not be checked (gh: " + strings.TrimSpace(strings.SplitN(h.Error, "\n", 2)[0]) + ")"
+	}
+	return "wt could not read gh's answer for " + h.Host
+}
+
+// notSignedIn is the error a gh read returns instead of running when
+// SignedInFor(host) is false: why, from the same memoized check (#217). It
+// used to be "gh is not available or not authenticated" for every cause,
+// which is how an exhausted quota read as a dead login.
+func notSignedIn(host string) error {
+	if !Present() {
+		return errors.New("gh is not installed (not on PATH)")
+	}
+	return errors.New(authProblem(AuthStatusFor(host)))
+}
+
+// authProblem says why a check did not pass SignedInFor. Pure.
+func authProblem(st AuthStatus) string {
+	if !st.Parsed {
+		return "gh's login could not be verified: wt could not read `gh auth status` (run it to see why)"
+	}
+	if len(st.Hosts) == 0 {
+		return "gh is not logged in (`gh auth login`)"
+	}
+	var bad []string
+	for _, h := range st.Hosts {
+		switch {
+		case h.State == HostAuthOK || h.State == HostAuthRateLimited:
+		case h.State == HostAuthFailed && h.Error == "":
+			// gh's human output (#203): the same line for a dead token, a host it
+			// never reached, and a quota GitHub refused the check for (#217).
+			bad = append(bad, h.Host+" failed gh's login check, which gh before 2.81 also reports for a host it cannot reach or a used-up rate limit (gh 2.81+ says which)")
+		default:
+			bad = append(bad, h.Phrase())
+		}
+	}
+	return "gh cannot be used: " + strings.Join(bad, "; ")
 }
 
 // textAuthStatus reads the human form: the exit code plus the host sections. Pure.
@@ -295,15 +388,19 @@ var (
 )
 
 // classifyAuthError reads gh's error for an account in state "error" (#203).
-// Pure. Only an HTTP 401 says the token is invalid → HostAuthFailed. No HTTP
+// Pure. Only an HTTP 401 says the token is invalid → HostAuthFailed. A 403 or
+// 429 refusing the call for a rate limit → HostAuthRateLimited (#217). No HTTP
 // answer at all (DNS, refused, TLS, reset) → HostAuthUnreachable. Anything else,
-// another HTTP status included (a 403 rate limit or suspended account, a 5xx), or
-// an empty error → HostAuthUnknown: the host's verdict on the token is unproven.
+// another HTTP status included (a suspended account's 403, a 5xx), or an empty
+// error → HostAuthUnknown: the host's verdict on the token is unproven.
 func classifyAuthError(msg string) string {
 	m := strings.TrimSpace(msg)
 	if sm := httpStatusErr.FindStringSubmatch(m); sm != nil {
-		if sm[1] == "401" {
+		switch _, _, limited := rateLimitKind(m, ""); {
+		case sm[1] == "401":
 			return HostAuthFailed
+		case (sm[1] == "403" || sm[1] == "429") && limited:
+			return HostAuthRateLimited
 		}
 		return HostAuthUnknown
 	}

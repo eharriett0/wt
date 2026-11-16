@@ -85,6 +85,101 @@ func TestRunPutsWtFlagsBeforeThePassthrough(t *testing.T) {
 	}
 }
 
+// quotaGh is gh with the account's REST quota used up (#217): every REST read
+// refused the way GitHub refused them during the incident, `gh api --include`
+// included (the reset probe). GraphQL answers from "count" unless "count.fail"
+// exists. The merge records its argv.
+const quotaGh = `#!/bin/sh
+d=$(dirname "$0")
+limited() { echo "$1HTTP 403: API rate limit exceeded for user ID 1. If you reach out to GitHub Support for help, please include the request ID X." >&2; exit 1; }
+case "$*" in
+"api --include /"*) printf 'HTTP/2.0 403 Forbidden\r\nX-Ratelimit-Remaining: 0\r\nX-Ratelimit-Reset: 4102444800\r\n\r\n{}\n'; exit 1 ;;
+"pr diff"*) [ -e "$d/diff.fail" ] && { cat "$d/diff.fail" >&2; exit 1; }; limited "could not find pull request diff: " ;;
+*changedFiles*) [ -e "$d/count.fail" ] && { cat "$d/count.fail" >&2; exit 1; }; cat "$d/count" ;;
+*messageHeadline*) echo "Fix the widget" ;;
+*headRefName*) echo feat-x ;;
+*title*) echo "Fix the widget" ;;
+"pr merge"*) printf '%s\n' "$@" > "$d/argv" ;;
+esac
+`
+
+// TestRunUnreadDiffIsNotEmpty pins #217: with the REST quota used up, merge-pr
+// read the diff through GraphQL instead of calling it EMPTY; and when GraphQL
+// could not answer either, it refused as UNREAD, said why, and did not point
+// at --bypass (an exhausted quota is no reason to spend a safety flag). An
+// explicit --bypass still goes through, saying what it skipped.
+func TestRunUnreadDiffIsNotEmpty(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake gh is a shell script")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(quotaGh), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+"/usr/bin"+string(os.PathListSeparator)+"/bin")
+	if got, err := exec.LookPath("gh"); err != nil || got != filepath.Join(dir, "gh") {
+		t.Fatalf("gh resolves to %q (%v), not the fake", got, err)
+	}
+	write := func(name, s string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(s), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run := func(dryRun, bypass bool) (stdout, stderr string, err error) {
+		t.Helper()
+		_ = os.Remove(filepath.Join(dir, "argv"))
+		out, oerr := os.CreateTemp(dir, "stdout")
+		errF, eerr := os.CreateTemp(dir, "stderr")
+		if oerr != nil || eerr != nil {
+			t.Fatal(oerr, eerr)
+		}
+		saved, savedErr := os.Stdout, os.Stderr
+		os.Stdout, os.Stderr = out, errF
+		err = Run("99999", dryRun, bypass, false, []string{"feat-x"}, nil, nil, "")
+		os.Stdout, os.Stderr = saved, savedErr
+		o, _ := os.ReadFile(out.Name())
+		s, _ := os.ReadFile(errF.Name())
+		return string(o), string(s), err
+	}
+	merged := func() bool { _, err := os.Stat(filepath.Join(dir, "argv")); return err == nil }
+
+	write("count", "6\n")
+	if stdout, stderr, err := run(false, false); err != nil || !merged() || strings.Contains(stderr, "EMPTY") || !strings.Contains(stdout, "6 changed file(s)") {
+		t.Errorf("REST refused, GraphQL fine: err=%v merged=%v\nstdout: %s\nstderr: %s\nwant GraphQL's 6 files and a merge", err, merged(), stdout, stderr)
+	}
+
+	write("count.fail", "GraphQL: API rate limit exceeded for user ID 1.\n")
+	stdout, stderr, err := run(false, false)
+	if err == nil || merged() {
+		t.Fatalf("both reads refused: err=%v merged=%v, want a refusal and no merge", err, merged())
+	}
+	for _, want := range []string{"could not be read", "REST API rate limit", "it lifts at", "GraphQL API rate limit", "Run the merge again once the rate limit lifts."} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("both reads refused: stderr lacks %q:\n%s", want, stderr)
+		}
+	}
+	if strings.Contains(stderr, "EMPTY") || strings.Contains(stderr, "--bypass") {
+		t.Errorf("both reads refused: stderr calls the diff EMPTY or points at --bypass:\n%s", stderr)
+	}
+	// A dry run refuses at the guard too, as it does for an empty diff.
+	if _, stderr, err := run(true, false); err == nil || merged() || !strings.Contains(stderr, "could not be read") {
+		t.Errorf("dry run: err=%v merged=%v stderr=%q, want the same refusal", err, merged(), stderr)
+	}
+	if stdout, _, err := run(true, true); err != nil || merged() || !strings.Contains(stdout, "verdict=block:diff_unread file_count=unread") {
+		t.Errorf("dry run with --bypass: err=%v merged=%v stdout=%q, want the unread verdict and count, no merge", err, merged(), stdout)
+	}
+	if stdout, stderr, err = run(false, true); err != nil || !merged() || !strings.Contains(stderr, "--bypass set: proceeding without the empty-diff check") || !strings.Contains(stdout, "changed files unread") {
+		t.Errorf("--bypass: err=%v merged=%v\nstdout: %s\nstderr: %s\nwant the merge, saying what it skipped", err, merged(), stdout, stderr)
+	}
+	// A diff unread for some other reason does not promise a rate limit lifting.
+	write("diff.fail", "GraphQL: Could not resolve to a PullRequest with the number of 99999. (repository.pullRequest)\n")
+	write("count.fail", "GraphQL: Could not resolve to a PullRequest with the number of 99999. (repository.pullRequest)\n")
+	if _, stderr, err := run(false, false); err == nil || merged() || strings.Contains(stderr, "rate limit") || !strings.Contains(stderr, "Check that gh can read it (gh pr diff 99999 --name-only)") {
+		t.Errorf("unread, not rate limited: err=%v merged=%v stderr=%q, want a refusal that sends the operator to gh, not to a reset", err, merged(), stderr)
+	}
+}
+
 // TestRunMarksGhFailures: an error from `gh pr merge` itself wraps
 // ErrMergeCommand, so merge-pr reads the PR state before calling it "not
 // merged" (gh can fail AFTER merging: `-d` cannot delete a local branch a wt
