@@ -17,7 +17,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"unicode"
 
 	"github.com/eharriett0/wt/internal/collide"
 	"github.com/eharriett0/wt/internal/config"
@@ -51,32 +50,63 @@ func parseClaudeEdit(b []byte) (cwd, file string, relevant bool) {
 }
 
 // claudeDecision shapes the hook's stdout JSON from the collisions kept for the
-// edited file. No collision → ("", false). fileLevel=true means the overlap
-// couldn't be confirmed against the agent's PENDING edit (a Write, or the edit
-// region couldn't be located), so the wording is an honest FILE-LEVEL heads-up
-// that never claims hunk overlap — it can't then contradict `wt check` the way
-// the old always-"overlapping hunks" message did (#108). Advisory (default) →
-// additionalContext; block=true → permissionDecision "deny". Pure.
-func claudeDecision(file string, high []CheckEntry, block, fileLevel bool) (string, bool) {
-	if len(high) == 0 {
+// edited file (regradePending's). No collision → ("", false). An entry not
+// confirmed against the agent's PENDING edit (a Write, or the edit region
+// couldn't be located) is an honest FILE-LEVEL heads-up that never claims hunk
+// overlap, so it can't contradict `wt check` the way the old always-"overlapping
+// hunks" message did (#108). Advisory (default) → additionalContext; block=true
+// → permissionDecision "deny", for any kept entry, as before.
+//
+// Every window is named once, by identity (#201 review): deduplicated by its
+// worktree, else its label (a label is not an identity, #193; namesakes
+// collapsed into one name), each with its own liveness. All confirmed or all
+// file-level keep their wording; a mix tags each window with its own grade
+// instead of letting one file-level entry word them all. Pure.
+func claudeDecision(file string, graded []pendingGrade, block bool) (string, bool) {
+	if len(graded) == 0 {
 		return "", false
 	}
 	seen := map[string]bool{}
-	var who []string
-	for _, e := range high {
-		if seen[e.Window] {
+	var kept []pendingGrade
+	allConfirmed, anyConfirmed := true, false
+	for _, g := range graded {
+		id := g.entry.otherWorktree
+		if id == "" {
+			id = g.entry.Window
+		}
+		if seen[id] {
 			continue
 		}
-		seen[e.Window] = true
-		who = append(who, fmt.Sprintf("%s [%s]", e.Window, e.Liveness))
+		seen[id] = true
+		kept = append(kept, g)
+		allConfirmed = allConfirmed && g.confirmed
+		anyConfirmed = anyConfirmed || g.confirmed
+	}
+	mixed := anyConfirmed && !allConfirmed
+	var who []string
+	for _, g := range kept {
+		w := fmt.Sprintf("%s [%s]", g.entry.Window, g.entry.Liveness)
+		if mixed {
+			tag := "hunk overlap not computed"
+			if g.confirmed {
+				tag = "overlapping hunks"
+			}
+			w += " (" + tag + ")"
+		}
+		who = append(who, w)
 	}
 	var msg string
-	if fileLevel {
-		msg = fmt.Sprintf("wt: %s is also being edited by %s — file-level heads-up (hunk overlap not computed; run `wt check %s` for line-level detail). "+
+	switch {
+	case allConfirmed:
+		msg = fmt.Sprintf("wt collision: with this edit, your version of %s OVERLAPS a region that %s is also editing (`wt check %s` will grade it HIGH). "+
 			"Coordinate before editing to avoid a merge conflict / duplicate PR. If you've already coordinated, set WT_SKIP_COLLISION=1.",
 			file, strings.Join(who, ", "), file)
-	} else {
-		msg = fmt.Sprintf("wt collision: with this edit, your version of %s OVERLAPS a region that %s is also editing (`wt check %s` will grade it HIGH). "+
+	case mixed:
+		msg = fmt.Sprintf("wt: %s is also being edited by %s; run `wt check %s` for line-level detail. "+
+			"Coordinate before editing to avoid a merge conflict / duplicate PR. If you've already coordinated, set WT_SKIP_COLLISION=1.",
+			file, strings.Join(who, ", "), file)
+	default:
+		msg = fmt.Sprintf("wt: %s is also being edited by %s — file-level heads-up (hunk overlap not computed; run `wt check %s` for line-level detail). "+
 			"Coordinate before editing to avoid a merge conflict / duplicate PR. If you've already coordinated, set WT_SKIP_COLLISION=1.",
 			file, strings.Join(who, ", "), file)
 	}
@@ -243,9 +273,11 @@ type placedPath struct{ root, rel string }
 // README.md, so each existing component is spelled as its directory lists it
 // (spellAsListed), and then as git's index spells the path when the index has
 // exactly one spelling for it (indexSpelling): a case-only rename on disk (mv,
-// not git mv) leaves the index's, which is the one status and diff report. A
-// case-sensitive repository is left exactly as typed. ok=false when no worktree
-// holds p. I/O.
+// not git mv) leaves the index's, which is the one status and diff report.
+// Either spelling replaces the typed one only when acceptFold says the two are
+// one file (or neither exists), so a misread probe or a hand-set
+// core.ignorecase never merges two files. A case-sensitive repository is left
+// exactly as typed. ok=false when no worktree holds p. I/O.
 func placePath(p string, roots []string) (placedPath, bool) {
 	root, rel, ok := locateIn(p, roots, sameDir)
 	if !ok {
@@ -253,7 +285,9 @@ func placePath(p string, roots []string) (placedPath, bool) {
 	}
 	if rel != collide.RootPath && caseInsensitive(root) {
 		rel = spellAsListed(root, rel)
-		rel = indexSpelling(rel, gitx.TrackedFolded(root, rel))
+		if s := indexSpelling(rel, gitx.TrackedFolded(root, rel)); s != rel && acceptFold(foldFacts(root, rel, s)) {
+			rel = s
+		}
 	}
 	return placedPath{root, rel}, true
 }
@@ -262,51 +296,46 @@ func placePath(p string, roots []string) (placedPath, bool) {
 // deepest of roots that contains it, since a worktree can sit inside another's
 // directory (a worktree_root inside the main checkout). All worktrees of one
 // repository share its layout, so a path inside ANOTHER worktree is that
-// worktree's repo-relative path (#201). Compared as spelled first; failing that,
-// a root whose components equal p's but for case holds it when same confirms
-// the two name one directory (a case-insensitive filesystem reached through a
-// cwd typed as ~/Repo for ~/repo). rel is slash-separated, collide.RootPath for
-// the root itself. Pure given same.
+// worktree's repo-relative path (#201). A root holds p when its components are
+// p's leading ones as spelled, or equal but for case where same confirms the two
+// name one directory (a case-insensitive filesystem reached through a cwd typed
+// as ~/Repo for ~/repo). The deepest holder wins whichever way it matched (#201
+// review: stopping at the first as-spelled match let the main checkout claim
+// `.wt/feat/x` from a nested worktree `.wt/Feat`, and a HIGH there read clear);
+// as spelled wins only a tie. rel is slash-separated, collide.RootPath for the
+// root itself. Pure given same.
 func locateIn(p string, roots []string, same func(a, b string) bool) (root, rel string, ok bool) {
 	p = filepath.Clean(p)
+	pc := pathComponents(p)
+	depth, asSpelled := -1, false
 	for _, r := range roots {
 		if r == "" {
 			continue
 		}
 		r = filepath.Clean(r)
-		x, err := filepath.Rel(r, p)
-		if err != nil || x == ".." || strings.HasPrefix(x, ".."+string(filepath.Separator)) {
+		rc := pathComponents(r)
+		if len(rc) > len(pc) || len(rc) < depth {
 			continue
 		}
-		if !ok || len(r) > len(root) {
-			root, rel, ok = r, filepath.ToSlash(x), true
-		}
-	}
-	if ok {
-		return root, rel, true
-	}
-	pc := pathComponents(p)
-	depth := -1
-	for _, r := range roots {
-		if r == "" {
-			continue
-		}
-		rc := pathComponents(filepath.Clean(r))
-		if len(rc) > len(pc) || len(rc) <= depth {
-			continue
-		}
-		match := true
+		exact, folded := true, true
 		for i := range rc {
-			if !strings.EqualFold(rc[i], pc[i]) {
-				match = false
-				break
+			if rc[i] != pc[i] {
+				exact = false
+				if folded = strings.EqualFold(rc[i], pc[i]); !folded {
+					break
+				}
 			}
 		}
-		if !match || !same(r, filepath.VolumeName(p)+string(filepath.Separator)+filepath.Join(pc[:len(rc)]...)) {
+		switch {
+		case !folded:
+			continue
+		case len(rc) == depth && (asSpelled || !exact):
+			continue // a tie: the as-spelled match, or the first, stands
+		case !exact && !same(r, filepath.VolumeName(p)+string(filepath.Separator)+filepath.Join(pc[:len(rc)]...)):
 			continue
 		}
-		depth = len(rc)
-		root, rel, ok = filepath.Clean(r), collide.RootPath, true
+		depth, asSpelled = len(rc), exact
+		root, rel, ok = r, collide.RootPath, true
 		if len(pc) > len(rc) {
 			rel = strings.Join(pc[len(rc):], "/")
 		}
@@ -359,39 +388,62 @@ func ignoreCaseAt(root string) bool {
 	return v
 }
 
-// foldsCase reports whether the filesystem holding dir treats two names that
-// differ only in case as one (APFS and HFS+ by default): the nearest of dir and
-// its ancestors whose name has a letter, spelled with its case swapped, is the
-// same directory. A path with no letter anywhere can't tell, and reads as
-// case-sensitive (core.ignorecase still decides). I/O.
-func foldsCase(dir string) bool {
-	for d := filepath.Clean(dir); ; d = filepath.Dir(d) {
-		base := filepath.Base(d)
-		if sw := swapCase(base); sw != base {
-			return sameDir(d, filepath.Join(filepath.Dir(d), sw))
-		}
-		if filepath.Dir(d) == d {
-			return false
-		}
+// foldsCase reports whether the filesystem holding the worktree at root treats
+// two names that differ only in case as one (APFS and HFS+ by default). It
+// probes the worktree's OWN filesystem (caseProbe): every worktree top holds a
+// `.git` (a directory, or a file in a linked worktree), and where case folds,
+// `.GIT` opens that same entry. ⚠ #201 review: walking up to the nearest
+// ancestor whose name has a letter probed the PARENT filesystem for a
+// case-sensitive volume mounted at a path like /2024/1, read "folds", and a new
+// readme.md was checked as the tracked README.md, a different file there: an
+// add/add conflict read clear. No `.git` at root (not a worktree top) reads as
+// case-sensitive; core.ignorecase still decides. I/O.
+func foldsCase(root string) bool {
+	dot, swapped := caseProbe(root)
+	a, err := os.Lstat(dot)
+	if err != nil {
+		return false
 	}
+	b, err := os.Lstat(swapped)
+	return err == nil && os.SameFile(a, b)
 }
 
-// swapCase swaps the case of every letter in s. Pure.
-func swapCase(s string) string {
-	return strings.Map(func(r rune) rune {
-		if unicode.IsUpper(r) {
-			return unicode.ToLower(r)
-		}
-		if unicode.IsLower(r) {
-			return unicode.ToUpper(r)
-		}
-		return r
-	}, s)
+// caseProbe is the pair of entries foldsCase compares: the worktree's own `.git`
+// as spelled, and with its case swapped. Both inside root, never an ancestor.
+// Pure.
+func caseProbe(root string) (string, string) {
+	return filepath.Join(root, ".git"), filepath.Join(root, ".GIT")
+}
+
+// acceptFold decides whether a case-folded spelling (as a directory lists it,
+// or as the index tracks it) may stand for the typed one (#201 review): only
+// when the filesystem says they are ONE file (both exist and os.SameFile), or
+// when neither exists (nothing on disk tells them apart, so git's own reading
+// of the index under core.ignorecase decides). One existing without the other,
+// or two existing different files, are two names: folding them merged two
+// files, and a readme.md about to be created beside a tracked README.md on a
+// case-sensitive volume (an add/add conflict with a window that created
+// readme.md) read clear. So neither a wrong probe nor a core.ignorecase set by
+// hand on a case-sensitive volume can merge two files. Pure.
+func acceptFold(typedExists, foldedExists, same bool) bool {
+	if typedExists && foldedExists {
+		return same
+	}
+	return !typedExists && !foldedExists
+}
+
+// foldFacts is what the filesystem says about a typed path and a folded
+// spelling of it, both relative to dir: whether each exists, and whether they
+// are one file. For acceptFold. I/O.
+func foldFacts(dir, typed, folded string) (typedExists, foldedExists, same bool) {
+	a, errA := os.Lstat(filepath.Join(dir, filepath.FromSlash(typed)))
+	b, errB := os.Lstat(filepath.Join(dir, filepath.FromSlash(folded)))
+	return errA == nil, errB == nil, errA == nil && errB == nil && os.SameFile(a, b)
 }
 
 // spellAsListed spells each component of rel (relative to root) that exists
-// the way its directory lists it (listedName); the first one that doesn't exist,
-// and the rest, are kept as given. I/O.
+// the way its directory lists it (listedName), when acceptFold allows it; the
+// first one that doesn't exist, and the rest, are kept as given. I/O.
 func spellAsListed(root, rel string) string {
 	segs := strings.Split(rel, "/")
 	dir := root
@@ -399,7 +451,9 @@ func spellAsListed(root, rel string) string {
 		if _, err := os.Lstat(filepath.Join(dir, s)); err != nil {
 			break
 		}
-		segs[i] = listedName(dir, s)
+		if n := listedName(dir, s); n != s && acceptFold(foldFacts(dir, s, n)) {
+			segs[i] = n
+		}
 		dir = filepath.Join(dir, segs[i])
 	}
 	return strings.Join(segs, "/")
@@ -551,15 +605,7 @@ func hookClaudeEdit(r io.Reader) int {
 		return subsumedByBase(e.otherWorktree, c.Base, rel) // that window's, not a namesake's (#193)
 	})
 
-	var high []CheckEntry
-	fileLevel := false
-	for _, g := range graded {
-		high = append(high, g.entry)
-		if !g.confirmed {
-			fileLevel = true
-		}
-	}
-	if out, has := claudeDecision(rel, high, os.Getenv("WT_CLAUDE_HOOK_BLOCK") == "1", fileLevel); has {
+	if out, has := claudeDecision(rel, graded, os.Getenv("WT_CLAUDE_HOOK_BLOCK") == "1"); has {
 		fmt.Println(out)
 	}
 	return 0

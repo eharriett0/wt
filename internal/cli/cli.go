@@ -1133,13 +1133,15 @@ func (a checkArg) namesRealPath() bool {
 // relative to the repo root (`git rev-parse --show-prefix`, "" = the root
 // itself); exists answers for an argument as typed, tracked for a repo path in
 // the worktree that holds it; fold says names are case-insensitive here
-// (caseInsensitive). Injected so the resolution is table-testable without a
+// (caseInsensitive); bare lists the bare entries of `git worktree list`, which
+// hold no repo paths. Injected so the resolution is table-testable without a
 // repo (resolveCheckArgs).
 type argBase struct {
 	prefix  string
 	exists  func(arg string) bool       // present in the working tree
 	tracked func(root, rel string) bool // known to git there (a deleted-but-tracked path counts)
 	fold    bool
+	bare    []string
 }
 
 // cwdArgBase is `wt check`'s: arguments are read relative to the current
@@ -1156,6 +1158,7 @@ func cwdArgBase(root string) argBase {
 		exists:  func(a string) bool { _, err := os.Stat(a); return err == nil },
 		tracked: gitx.IsTrackedIn,
 		fold:    caseInsensitive(root),
+		bare:    gitx.BareWorktreesIn(""),
 	}
 }
 
@@ -1175,6 +1178,7 @@ func rootArgBase(root string) argBase {
 		exists:  func(a string) bool { _, err := os.Stat(at(a)); return err == nil },
 		tracked: gitx.IsTrackedIn,
 		fold:    caseInsensitive(root),
+		bare:    gitx.BareWorktreesIn(root),
 	}
 }
 
@@ -1196,7 +1200,7 @@ func rootArgBase(root string) argBase {
 // begin or end with a space, and the pre-push and pre-commit checks, which read
 // it from git verbatim (#200), ask about the name as it is.
 func resolveCheckArgs(args []string, root string, base argBase, ws []collide.Window) []checkArg {
-	roots := worktreeRoots(root, ws)
+	roots := worktreeRoots(root, ws, base.bare)
 	var out []checkArg
 	for _, a := range args {
 		t := strings.TrimSpace(a)
@@ -1213,10 +1217,19 @@ func resolveCheckArgs(args []string, root string, base argBase, ws []collide.Win
 }
 
 // worktreeRoots is every worktree's top level, resolved as placePath compares
-// them: this one (root) first, then each window's. I/O.
-func worktreeRoots(root string, ws []collide.Window) []string {
+// them: this one (root) first, then each window's. A bare entry (a bare
+// repository's own directory, `git clone --bare` with worktrees inside it) holds
+// no repo paths and is left out (#201 review): placed there, `wt check ../HEAD`
+// from a worktree inside it read as the repo path HEAD and clear, where a path
+// outside every worktree is refused. I/O.
+func worktreeRoots(root string, ws []collide.Window, bare []string) []string {
 	var out []string
 	seen := map[string]bool{}
+	for _, b := range bare {
+		if b != "" {
+			seen[resolveExisting(b)] = true
+		}
+	}
 	add := func(p string) {
 		if p == "" {
 			return

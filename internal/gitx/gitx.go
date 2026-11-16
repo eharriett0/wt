@@ -628,6 +628,27 @@ type WorktreeRef struct {
 	Branch string
 	Head   string // the commit HEAD is at, "" for a worktree whose HEAD is unborn (#177 review)
 	Locked bool   // `git worktree lock`ed: git refuses to remove it (#177)
+	// Bare: the repository's own directory in a bare layout (`git clone --bare`,
+	// worktrees beside or inside it): listed first, with no work tree (#201
+	// review).
+	Bare bool
+}
+
+// BareWorktreesIn lists the bare entries of `git worktree list` run in dir: a
+// bare repository's own directory, which holds no repo paths (#201 review).
+// nil when there is none or git can't say.
+func BareWorktreesIn(dir string) []string {
+	refs, err := WorktreeListIn(dir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, r := range refs {
+		if r.Bare {
+			out = append(out, r.Path)
+		}
+	}
+	return out
 }
 
 // WorktreeList returns every worktree of this repo with its checked-out branch.
@@ -663,6 +684,8 @@ func WorktreeListIn(dir string) ([]WorktreeRef, error) {
 			}
 		case ln == "locked" || strings.HasPrefix(ln, "locked "):
 			cur.Locked = true
+		case ln == "bare":
+			cur.Bare = true
 		}
 	}
 	flush()

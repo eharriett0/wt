@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode"
 )
 
 func TestParseClaudeEdit(t *testing.T) {
@@ -39,18 +40,28 @@ func TestParseClaudeEdit(t *testing.T) {
 	}
 }
 
+// graded wraps entries as regradePending's output, all confirmed or all not.
+func graded(confirmed bool, es ...CheckEntry) []pendingGrade {
+	var out []pendingGrade
+	for _, e := range es {
+		out = append(out, pendingGrade{entry: e, confirmed: confirmed})
+	}
+	return out
+}
+
 func TestClaudeDecision(t *testing.T) {
 	// no HIGH → nothing emitted
-	if out, has := claudeDecision("a.go", nil, false, false); has || out != "" {
+	if out, has := claudeDecision("a.go", nil, false); has || out != "" {
 		t.Errorf("empty: %q,%v", out, has)
 	}
-	high := []CheckEntry{
+	entries := []CheckEntry{
 		{Path: "a.go", Window: "#42", Liveness: "uncommitted edits"},
 		{Path: "a.go", Window: "#42", Liveness: "uncommitted edits"}, // dup window
 		{Path: "a.go", Window: "feat/x", Liveness: "open PR #7"},
 	}
+	high := graded(true, entries...)
 	// advisory (confirmed overlap) → additionalContext, no permissionDecision
-	out, has := claudeDecision("a.go", high, false, false)
+	out, has := claudeDecision("a.go", high, false)
 	if !has {
 		t.Fatal("advisory: expected output")
 	}
@@ -81,7 +92,7 @@ func TestClaudeDecision(t *testing.T) {
 		t.Errorf("confirmed-overlap message should say it overlaps: %q", adv.HSO.AdditionalContext)
 	}
 	// block → permissionDecision deny
-	out, _ = claudeDecision("a.go", high, true, false)
+	out, _ = claudeDecision("a.go", high, true)
 	var blk struct {
 		HSO struct {
 			PermissionDecision       string `json:"permissionDecision"`
@@ -96,7 +107,7 @@ func TestClaudeDecision(t *testing.T) {
 	}
 
 	// #108: file-level wording must NOT claim hunk overlap (would contradict wt check)
-	fl, _ := claudeDecision("a.go", high, false, true)
+	fl, _ := claudeDecision("a.go", graded(false, entries...), false)
 	var flOut struct {
 		HSO struct {
 			AdditionalContext string `json:"additionalContext"`
@@ -110,6 +121,63 @@ func TestClaudeDecision(t *testing.T) {
 	}
 	if !strings.Contains(flOut.HSO.AdditionalContext, "file-level") {
 		t.Errorf("file-level message should say file-level: %q", flOut.HSO.AdditionalContext)
+	}
+}
+
+// #201 review: claudeDecision names every window once by identity (worktree,
+// else label: namesakes are two windows, #193), each with its own grade when
+// the grades differ; the deny predicate is unchanged (any kept entry denies
+// under block).
+func TestClaudeDecision_NamesEveryWindowWithItsOwnGrade(t *testing.T) {
+	g := func(window, wt string, confirmed bool) pendingGrade {
+		return pendingGrade{entry: CheckEntry{Path: "a.go", Window: window, Liveness: "live", otherWorktree: wt}, confirmed: confirmed}
+	}
+	cases := []struct {
+		name    string
+		in      []pendingGrade
+		want    []string // substrings of the message, in order
+		notWant []string
+	}{
+		{"namesakes are two windows", []pendingGrade{g("#5", "/p1/x", true), g("#5", "/p2/x", true)},
+			[]string{"OVERLAPS a region that #5 [live], #5 [live] is"}, nil},
+		{"one worktree twice collapses", []pendingGrade{g("#5", "/p1/x", true), g("#5", "/p1/x", true)},
+			[]string{"that #5 [live] is"}, []string{"#5 [live], #5"}},
+		{"no worktree: the label identifies", []pendingGrade{g("w", "", false), g("w", "", false)},
+			[]string{"edited by w [live] — file-level"}, []string{"w [live], w"}},
+		{"mixed: each window its own tag, no OVERLAPS claim", []pendingGrade{g("b", "/w/b", true), g("c", "/w/c", false)},
+			[]string{"edited by b [live] (overlapping hunks), c [live] (hunk overlap not computed)"}, []string{"OVERLAPS", "file-level"}},
+		{"mixed namesakes keep both tags", []pendingGrade{g("#5", "/p1/x", false), g("#5", "/p2/x", true)},
+			[]string{"#5 [live] (hunk overlap not computed), #5 [live] (overlapping hunks)"}, nil},
+		{"all file-level keeps its wording", []pendingGrade{g("b", "/w/b", false), g("c", "/w/c", false)},
+			[]string{"edited by b [live], c [live] — file-level heads-up"}, []string{"OVERLAPS"}},
+	}
+	for _, tc := range cases {
+		for _, block := range []bool{false, true} {
+			out, has := claudeDecision("a.go", tc.in, block)
+			if !has {
+				t.Fatalf("%s: no output", tc.name)
+			}
+			ctx, dec, reason := decodeDecision(t, out)
+			msg := ctx
+			if block {
+				msg = reason
+				if dec != "deny" || ctx != "" {
+					t.Errorf("%s: block must deny (any kept entry, as before): decision=%q ctx=%q", tc.name, dec, ctx)
+				}
+			} else if dec != "" {
+				t.Errorf("%s: advisory must not deny, got %q", tc.name, dec)
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(msg, w) {
+					t.Errorf("%s (block=%v): message lacks %q:\n%s", tc.name, block, w, msg)
+				}
+			}
+			for _, w := range tc.notWant {
+				if strings.Contains(msg, w) {
+					t.Errorf("%s (block=%v): message has %q:\n%s", tc.name, block, w, msg)
+				}
+			}
+		}
 	}
 }
 
@@ -351,11 +419,21 @@ func TestLocateIn(t *testing.T) {
 		{"wrong case, the deepest confirmed root", "/w/REPO/.worktrees/Nested", always, "/w/repo/.worktrees/nested", ".", true},
 		{"wrong case, not one directory (a case-sensitive filesystem)", "/W/Repo/pkg/a.go", never, "", "", false},
 		{"as spelled beats a case-folded match", "/w/repo-b/x", always, "/w/repo-b", "x", true},
+		// #201 review: the deepest holder wins however it matched, so the main
+		// checkout can't claim a nested worktree's file named under another case
+		{"a deeper case-folded root beats a shallower as-spelled one", "/w/repo/.worktrees/NESTED/x.go", always, "/w/repo/.worktrees/nested", "x.go", true},
+		{"unless it isn't one directory", "/w/repo/.worktrees/NESTED/x.go", never, "/w/repo", ".worktrees/NESTED/x.go", true},
 	}
 	for _, tc := range cases {
 		root, rel, ok := locateIn(tc.p, roots, tc.same)
 		if root != tc.wantRoot || rel != tc.wantRel || ok != tc.ok {
 			t.Errorf("%s: locateIn(%q) = %q, %q, %v; want %q, %q, %v", tc.name, tc.p, root, rel, ok, tc.wantRoot, tc.wantRel, tc.ok)
+		}
+	}
+	// a tie at one depth: as spelled wins, in either order
+	for _, rs := range [][]string{{"/w/a/B", "/w/a/b"}, {"/w/a/b", "/w/a/B"}} {
+		if root, _, _ := locateIn("/w/a/b/x", rs, always); root != "/w/a/b" {
+			t.Errorf("locateIn(/w/a/b/x, %q) = %q, want the as-spelled /w/a/b", rs, root)
 		}
 	}
 }
@@ -400,22 +478,67 @@ func TestPickListedAndIndexSpelling(t *testing.T) {
 
 // foldsCase agrees with the filesystem it probes: measured here by creating a
 // file and opening it under the other case.
+//
+// #201 review: it probes the worktree's OWN `.git`, never an ancestor (an
+// ancestor can sit on another filesystem: a case-sensitive volume mounted at
+// /2024/1 under a folding parent read "folds"). A directory with no `.git` is
+// not a worktree top and reads case-sensitive whatever its parents do, so a
+// probe that walked up to a folding ancestor fails here.
 func TestFoldsCase_MatchesTheFilesystem(t *testing.T) {
 	dir, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	probe := filepath.Join(dir, "Probe")
-	if err := os.Mkdir(probe, 0o755); err != nil {
+	wt := filepath.Join(dir, "2024", "1") // no letter anywhere in its own names
+	if err := os.MkdirAll(filepath.Join(wt, ".git"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	_, statErr := os.Stat(filepath.Join(dir, "pROBE"))
-	if got, want := foldsCase(probe), statErr == nil; got != want {
-		t.Errorf("foldsCase(%q) = %v, but the filesystem opens pROBE: %v", probe, got, want)
+	a, _ := os.Stat(filepath.Join(wt, ".git"))
+	b, statErr := os.Stat(filepath.Join(wt, ".GIT"))
+	want := statErr == nil && os.SameFile(a, b)
+	if got := foldsCase(wt); got != want {
+		t.Errorf("foldsCase(%q) = %v, but the filesystem opens .GIT as .git: %v", wt, got, want)
 	}
-	if got := swapCase("aB-1é"); got != "Ab-1É" {
-		t.Errorf("swapCase = %q", got)
+	if foldsCase(dir) {
+		t.Errorf("foldsCase(%q) = true for a directory with no .git: it must probe the worktree's own entry", dir)
 	}
+	dot, swapped := caseProbe("/mnt/2024/1")
+	if dot != "/mnt/2024/1/.git" || swapped != "/mnt/2024/1/.GIT" {
+		t.Errorf("caseProbe = %q, %q: both must be inside the worktree", dot, swapped)
+	}
+}
+
+// acceptFold: a folded spelling stands for the typed one only when the
+// filesystem says they are one file, or neither exists (#201 review).
+func TestAcceptFold(t *testing.T) {
+	for _, tc := range []struct {
+		name                            string
+		typedExists, foldedExists, same bool
+		want                            bool
+	}{
+		{"one file under two spellings (a folding filesystem)", true, true, true, true},
+		{"two existing files (a case-sensitive volume)", true, true, false, false},
+		{"a new readme.md beside a tracked README.md (the add/add case)", false, true, false, false},
+		{"the typed one exists, the folded one doesn't", true, false, false, false},
+		{"neither exists: git's index reading decides", false, false, false, true},
+	} {
+		if got := acceptFold(tc.typedExists, tc.foldedExists, tc.same); got != tc.want {
+			t.Errorf("%s: acceptFold = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// swapCase swaps the case of every letter in s.
+func swapCase(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsUpper(r) {
+			return unicode.ToLower(r)
+		}
+		if unicode.IsLower(r) {
+			return unicode.ToUpper(r)
+		}
+		return r
+	}, s)
 }
 
 // #201 item 4: where names are case-insensitive, a path is checked under the
@@ -434,23 +557,39 @@ func TestPlacePath_SpellsAsGitTracks(t *testing.T) {
 	gitT(t, root, "config", "user.name", "t")
 	gitT(t, root, "config", "core.ignorecase", "true")
 	writeNested(t, root, "pkg/svc/README.md", "x\n")
+	writeNested(t, root, "pkg/svc/GONE.md", "x\n")
 	gitT(t, root, "add", "-A")
 	gitT(t, root, "commit", "-qm", "base")
 	writeNested(t, root, "docs/new.md", "untracked\n")
+	if err := os.Remove(filepath.Join(root, "pkg", "svc", "GONE.md")); err != nil {
+		t.Fatal(err)
+	}
+	// Where the filesystem folds case, a variant spelling IS the tracked file. On a
+	// case-sensitive one (core.ignorecase hand-set here), a variant that doesn't
+	// exist beside a tracked file that does is ANOTHER file (#201 review: folding it
+	// hid an add/add conflict), so it keeps the given spelling.
+	folds := foldsCase(root)
+	pick := func(folded, sensitive string) string {
+		if folds {
+			return folded
+		}
+		return sensitive
+	}
 	for in, want := range map[string]string{
-		"pkg/svc/readme.md": "pkg/svc/README.md",
-		"PKG/Svc/README.md": "pkg/svc/README.md",
-		"pkg/SVC":           "pkg/svc",
+		"pkg/svc/readme.md": pick("pkg/svc/README.md", "pkg/svc/readme.md"),
+		"PKG/Svc/README.md": pick("pkg/svc/README.md", "PKG/Svc/README.md"),
+		"pkg/SVC":           pick("pkg/svc", "pkg/SVC"),
 		"pkg/svc/README.md": "pkg/svc/README.md",
 		"pkg/svc/other.md":  "pkg/svc/other.md", // nothing to spell it by
+		"pkg/svc/gone.md":   "pkg/svc/GONE.md",  // neither on disk: the index's reading decides
 	} {
 		if got := repoRelativePath(root, "", in); got != want {
-			t.Errorf("repoRelativePath(%q) = %q, want %q (the index's spelling)", in, got, want)
+			t.Errorf("repoRelativePath(%q) = %q, want %q (folds case: %v)", in, got, want, folds)
 		}
 	}
 	// a case-only rename on disk (mv, not git mv): git still names the file by its
-	// index entry (status and diff report README.md), so that is the path asked
-	// about, whichever spelling is typed
+	// index entry (status and diff report README.md), so where the filesystem
+	// folds case that is the path asked about, whichever spelling is typed
 	svc := filepath.Join(root, "pkg", "svc")
 	if err := os.Rename(filepath.Join(svc, "README.md"), filepath.Join(svc, "tmp-name")); err != nil {
 		t.Fatal(err)
@@ -458,12 +597,15 @@ func TestPlacePath_SpellsAsGitTracks(t *testing.T) {
 	if err := os.Rename(filepath.Join(svc, "tmp-name"), filepath.Join(svc, "readme.md")); err != nil {
 		t.Fatal(err)
 	}
-	for _, in := range []string{"pkg/svc/readme.md", "pkg/svc/README.md"} {
-		if got := repoRelativePath(root, "", in); got != "pkg/svc/README.md" {
-			t.Errorf("after a case-only mv on disk: repoRelativePath(%q) = %q, want the index's pkg/svc/README.md", in, got)
+	for in, want := range map[string]string{
+		"pkg/svc/readme.md": pick("pkg/svc/README.md", "pkg/svc/readme.md"),
+		"pkg/svc/README.md": "pkg/svc/README.md",
+	} {
+		if got := repoRelativePath(root, "", in); got != want {
+			t.Errorf("after a case-only mv on disk: repoRelativePath(%q) = %q, want %q (folds case: %v)", in, got, want, folds)
 		}
 	}
-	if foldsCase(root) { // the untracked file is spelled as listed only where the filesystem folds case
+	if folds { // the untracked file is spelled as listed only where the filesystem folds case
 		if got := repoRelativePath(root, "", "DOCS/NEW.md"); got != "docs/new.md" {
 			t.Errorf("repoRelativePath(DOCS/NEW.md) = %q, want docs/new.md (as listed)", got)
 		}
@@ -471,6 +613,15 @@ func TestPlacePath_SpellsAsGitTracks(t *testing.T) {
 		wrong := filepath.Join(filepath.Dir(root), swapCase(filepath.Base(root)), "docs", "new.md")
 		if got := repoRelativePath(root, "", wrong); got != "docs/new.md" {
 			t.Errorf("repoRelativePath(%q) = %q, want docs/new.md: the same directory under another case", wrong, got)
+		}
+		// a nested worktree named under another case is still the deepest holder
+		nested := filepath.Join(root, ".wt", "Feat")
+		if err := os.MkdirAll(nested, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		p := resolveExisting(filepath.Join(root, ".wt", "feat", "pkg", "a.go"))
+		if pp, ok := placePath(p, []string{root, nested}); !ok || pp.root != nested || pp.rel != "pkg/a.go" {
+			t.Errorf("placePath(%q) = %+v, %v; want the nested %q, pkg/a.go", p, pp, ok, nested)
 		}
 	}
 	// a case-sensitive repository keeps the spelling it was given

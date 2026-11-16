@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/eharriett0/wt/internal/config"
+	"github.com/eharriett0/wt/internal/gitx"
 )
 
 // #181 end to end, against real worktrees: what each surface asks about when it
@@ -307,6 +308,163 @@ func issue201Repo(t *testing.T) (wa, wb, outside string) {
 	writeT(t, outside, "x.md", "x\n")
 	symlinkT(t, outside, filepath.Join(wa, "ext"))
 	return wa, wb, outside
+}
+
+// #201 review: a Codex patch that also touches wt's own `link_files` `.env` (an
+// absolute symlink into the main checkout, as `wt new` makes it) kept no
+// prediction at all once relative paths resolved through symlinks: the `.env`
+// operation resolved outside this worktree, the whole patch read as
+// unpredictable, and WT_CODEX_HOOK_BLOCK lost the deny for the repo file beside
+// it, which `wt check` grades HIGH.
+func TestCodexEdit_LinkFilesEnvDoesNotCostTheDeny(t *testing.T) {
+	hermeticGitT(t)
+	offlineGH(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("WT_SKIP_COLLISION", "")
+	t.Setenv("HOOK_DISABLE_MULTIWINDOW_CHECK", "")
+	t.Setenv("WT_CODEX_HOOK_BLOCK", "1")
+	t.Chdir(t.TempDir())
+
+	root := t.TempDir()
+	gitT(t, root, "init", "-q", "-b", "main")
+	gitT(t, root, "config", "user.email", "t@t.test")
+	gitT(t, root, "config", "user.name", "t")
+	writeNested(t, root, ".gitignore", ".env\n")
+	writeNested(t, root, "pkg/svc/a.go", numbered("pkg/svc/a.go"))
+	gitT(t, root, "add", "-A")
+	gitT(t, root, "commit", "-qm", "base")
+	writeNested(t, root, ".env", "KEY=1\n") // the main checkout's, ignored
+	parent := t.TempDir()
+	wa, wb := filepath.Join(parent, "wa"), filepath.Join(parent, "wb")
+	for b, dir := range map[string]string{"wa": wa, "wb": wb} {
+		gitT(t, root, "branch", b)
+		gitT(t, root, "worktree", "add", "-q", dir, b)
+	}
+	symlinkT(t, filepath.Join(root, ".env"), filepath.Join(wa, ".env")) // linkSharedFiles' shape
+	writeT(t, wb, "pkg/svc/a.go", strings.Replace(readT(t, wb, "pkg/svc/a.go"), "pkg/svc/a.go l02\n", "B pkg/svc/a.go l02\n", 1))
+
+	if code, got := checkJSON(t, wa, "pkg/svc/a.go"); code != 3 || !reflect.DeepEqual(got, []string{"pkg/svc/a.go←wb"}) {
+		t.Fatalf("wt check pkg/svc/a.go = exit %d %v, want exit 3 [pkg/svc/a.go←wb]", code, got)
+	}
+	patch := "*** Begin Patch\n*** Update File: pkg/svc/a.go\n@@\n-pkg/svc/a.go l02\n+A pkg/svc/a.go l02\n" +
+		"*** Update File: .env\n@@\n-KEY=1\n+KEY=2\n*** End Patch\n"
+	p, _ := json.Marshal(map[string]any{"cwd": wa, "tool_name": "apply_patch", "tool_input": map[string]string{"command": patch}})
+	if v := hookVerdict(t, runHookCapture(t, hookCodexEdit, string(p))); v != "deny" {
+		t.Errorf("codex-edit under WT_CODEX_HOOK_BLOCK=1 = %s, want deny: pkg/svc/a.go overlaps wb, as `wt check` says", v)
+	}
+}
+
+// #201 review: in a `git clone --bare` layout, worktrees sit inside the bare
+// repository's own directory, which `git worktree list` lists first (marked
+// `bare`). It holds no repo paths, so `../HEAD` from a worktree inside it is
+// outside every worktree and refused; placed in the bare directory it read as
+// the repo path HEAD, and clear. A path in a sibling worktree still maps.
+func TestCheck_BareLayoutIsNotAWorktree(t *testing.T) {
+	hermeticGitT(t)
+	offlineGH(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Chdir(t.TempDir())
+
+	src := t.TempDir()
+	gitT(t, src, "init", "-q", "-b", "main")
+	gitT(t, src, "config", "user.email", "t@t.test")
+	gitT(t, src, "config", "user.name", "t")
+	writeNested(t, src, "x.md", numbered("x.md"))
+	gitT(t, src, "add", "-A")
+	gitT(t, src, "commit", "-qm", "base")
+	parent := t.TempDir()
+	bare := filepath.Join(parent, "proj.git")
+	gitT(t, parent, "clone", "-q", "--bare", src, bare)
+	main, feat := filepath.Join(bare, "main"), filepath.Join(bare, "feat")
+	gitT(t, bare, "worktree", "add", "-q", main, "main")
+	gitT(t, bare, "worktree", "add", "-q", "-b", "feat", feat, "main")
+	editLine1(t, feat, "x.md")
+
+	if got := gitx.BareWorktreesIn(main); len(got) != 1 || resolveExisting(got[0]) != resolveExisting(bare) {
+		t.Fatalf("BareWorktreesIn = %q, want the bare directory %q", got, bare)
+	}
+	if code := checkExit(t, main, "../HEAD"); code != 64 {
+		t.Errorf("wt check ../HEAD in a worktree inside a bare repo = exit %d, want 64 (outside every worktree)", code)
+	}
+	if code, got := checkJSON(t, main, "../feat/x.md"); code != 3 || !reflect.DeepEqual(got, []string{"x.md←feat"}) {
+		t.Errorf("wt check ../feat/x.md = exit %d %v, want exit 3 [x.md←feat]", code, got)
+	}
+}
+
+// caseSensitiveDir is a directory on a case-sensitive filesystem: the test temp
+// dir when it is one (Linux), else WT_CASE_SENSITIVE_DIR (on macOS, a
+// case-sensitive APFS image mounted somewhere), else the test is skipped. The
+// returned directory is fresh, named by os.MkdirTemp with no letter in its name.
+func caseSensitiveDir(t *testing.T) string {
+	t.Helper()
+	probe := filepath.Join(t.TempDir(), "Probe")
+	if err := os.Mkdir(probe, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	base := filepath.Dir(probe)
+	if _, err := os.Stat(filepath.Join(base, "pROBE")); err == nil {
+		if base = os.Getenv("WT_CASE_SENSITIVE_DIR"); base == "" {
+			t.Skip("the temp dir folds case; set WT_CASE_SENSITIVE_DIR to a directory on a case-sensitive volume")
+		}
+	}
+	dir, err := os.MkdirTemp(base, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return dir
+}
+
+// #201 review, on a real case-sensitive filesystem: the index tracks README.md,
+// window B committed a NEW readme.md, and window A is about to create readme.md:
+// an add/add conflict (`git merge-tree` says so). Folding readme.md into the
+// tracked README.md read clear in `wt check` and both hooks. Run with git's own
+// core.ignorecase (false: exercises the probe, which must look at the worktree's
+// own `.git`, here under letterless names below the volume) and with it set
+// true by hand (exercises acceptFold: two existing different spellings are two
+// files).
+func TestCheck_CaseSensitiveVolumeNeverMergesTwoFiles(t *testing.T) {
+	for _, ignorecase := range []string{"", "true"} {
+		t.Run("core.ignorecase="+ignorecase, func(t *testing.T) {
+			hermeticGitT(t)
+			offlineGH(t)
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("WT_SKIP_COLLISION", "")
+			t.Setenv("HOOK_DISABLE_MULTIWINDOW_CHECK", "")
+			t.Chdir(t.TempDir())
+			base := caseSensitiveDir(t)
+			root, wa, wb := filepath.Join(base, "1"), filepath.Join(base, "2"), filepath.Join(base, "3")
+			gitT(t, base, "init", "-q", "-b", "main", "1")
+			gitT(t, root, "config", "user.email", "t@t.test")
+			gitT(t, root, "config", "user.name", "t")
+			writeNested(t, root, "README.md", numbered("README.md"))
+			gitT(t, root, "add", "-A")
+			gitT(t, root, "commit", "-qm", "base")
+			gitT(t, root, "worktree", "add", "-q", "-b", "wa", wa)
+			gitT(t, root, "worktree", "add", "-q", "-b", "wb", wb)
+			writeNested(t, wb, "readme.md", "B's new file\n")
+			gitT(t, wb, "add", "-A")
+			gitT(t, wb, "commit", "-qm", "wb adds readme.md")
+			if ignorecase != "" { // set by hand afterwards: under it, B's add would have been refused
+				gitT(t, root, "config", "core.ignorecase", ignorecase)
+			}
+
+			if code, got := checkJSON(t, wa, "readme.md"); code != 3 || !reflect.DeepEqual(got, []string{"readme.md←wb"}) {
+				t.Errorf("wt check readme.md = exit %d %v, want exit 3 [readme.md←wb]: B created that file", code, got)
+			}
+			t.Setenv("WT_CLAUDE_HOOK_BLOCK", "1")
+			p, _ := json.Marshal(map[string]any{"cwd": wa, "tool_name": "Write", "tool_input": map[string]string{
+				"file_path": filepath.Join(wa, "readme.md"), "content": "A's new file\n"}})
+			if v := hookVerdict(t, runHookCapture(t, hookClaudeEdit, string(p))); v != "deny" {
+				t.Errorf("claude-edit Write readme.md under WT_CLAUDE_HOOK_BLOCK=1 = %s, want deny", v)
+			}
+			p, _ = json.Marshal(map[string]any{"cwd": wa, "tool_name": "apply_patch", "tool_input": map[string]string{
+				"command": "*** Begin Patch\n*** Add File: readme.md\n+A's new file\n*** End Patch\n"}})
+			if out := runHookCapture(t, hookCodexEdit, string(p)); !strings.Contains(out, "readme.md") || !strings.Contains(out, "wb") {
+				t.Errorf("codex-edit Add File readme.md must warn about wb's readme.md, got %q", out)
+			}
+		})
+	}
 }
 
 func symlinkT(t *testing.T, target, link string) {

@@ -222,8 +222,9 @@ func TestSeekSequence(t *testing.T) {
 // predictCodexPatch is what the Codex hook grades: each file the patch touches,
 // repo-relative, as apply_patch leaves it ("" for a file it deletes, which `wt
 // check` then reads as every line deleted). A patch it can't vouch for (one
-// apply_patch rejects or fails on, a path outside the repo) is ok=false: the
-// hook keeps its file-level heads-up.
+// apply_patch rejects or fails on, a move across the repo's edge) is ok=false:
+// the hook keeps its file-level heads-up. An operation entirely outside the repo
+// is left out and the rest still predicted (#201 review).
 func TestPredictCodexPatch(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "pkg"), 0o755); err != nil {
@@ -241,13 +242,28 @@ func TestPredictCodexPatch(t *testing.T) {
 		t.Errorf("predictCodexPatch = %q, %v; want %q, true", got, ok, want)
 	}
 	for name, p := range map[string]string{
-		"rejected":         "*** Update File: a.txt\n@@\n-b\n+B\n",
-		"lines not found":  bounded("*** Update File: a.txt\n@@\n-zz\n+Z\n"),
-		"outside the repo": bounded("*** Update File: ../../x.txt\n@@\n+x\n"),
-		"missing file":     bounded("*** Update File: nope.txt\n@@\n+x\n"),
+		"rejected":                      "*** Update File: a.txt\n@@\n-b\n+B\n",
+		"lines not found":               bounded("*** Update File: a.txt\n@@\n-zz\n+Z\n"),
+		"missing file":                  bounded("*** Update File: nope.txt\n@@\n+x\n"),
+		"a move out of the repo":        bounded("*** Update File: a.txt\n*** Move to: ../../x.txt\n@@\n-b\n+B\n"),
+		"a move into the repo from out": bounded("*** Update File: ../../x.txt\n*** Move to: a2.txt\n@@\n+x\n"),
 	} {
 		if _, ok := predictCodexPatch(p, root, "pkg/"); ok {
 			t.Errorf("%s: ok=true, want the file-level fallback", name)
+		}
+	}
+	// outside the repo, entirely: left out; the repo file beside it is still predicted
+	for name, tc := range map[string]struct {
+		patch string
+		want  map[string]string
+	}{
+		"only outside":      {bounded("*** Update File: ../../x.txt\n@@\n+x\n"), map[string]string{}},
+		"outside + in repo": {bounded("*** Update File: ../../x.txt\n@@\n+x\n*** Update File: a.txt\n@@\n-b\n+B\n"), map[string]string{"pkg/a.txt": "a\nB\n"}},
+		"absolute outside":  {bounded("*** Add File: " + filepath.Join(t.TempDir(), "y.txt") + "\n+y\n*** Delete File: d.txt\n"), map[string]string{"pkg/d.txt": ""}},
+	} {
+		got, ok := predictCodexPatch(tc.patch, root, "pkg/")
+		if !ok || !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("%s: predictCodexPatch = %q, %v; want %q, true", name, got, ok, tc.want)
 		}
 	}
 }

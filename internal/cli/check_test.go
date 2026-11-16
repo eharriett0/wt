@@ -215,6 +215,16 @@ func TestResolveCheckArgs_TopLevelAndOtherWorktrees(t *testing.T) {
 			t.Errorf("resolveCheckArgs(%q, prefix %q) = %+v, want outside, no queries", tc.arg, tc.prefix, got)
 		}
 	}
+	// a bare repository's own directory holds no repo paths (#201 review)
+	bws := []collide.Window{{Branch: "HEAD", Worktree: "/proj.git"}, {Branch: "feat", Worktree: "/proj.git/feat", Touched: []string{"x.md"}}}
+	bb := fakeBase("", []string{"../HEAD"}, nil)
+	bb.bare = []string{"/proj.git"}
+	if got := resolveCheckArgs([]string{"../HEAD"}, "/proj.git/main", bb, bws); len(got) != 1 || !got[0].outside {
+		t.Errorf("../HEAD beside a worktree inside a bare repo = %+v, want outside", got)
+	}
+	if got := resolveCheckArgs([]string{"../feat/x.md"}, "/proj.git/main", bb, bws); len(got) != 1 || !reflect.DeepEqual(got[0].queries, []collide.Query{exact("x.md")}) {
+		t.Errorf("../feat/x.md = %+v, want exact x.md in the sibling worktree", got)
+	}
 }
 
 // checkArgQueries decides an argument's queries from the repo paths it names

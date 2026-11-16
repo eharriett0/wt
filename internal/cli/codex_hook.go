@@ -706,30 +706,42 @@ type codexGradedEntry struct {
 // apply_patch has run (applyPatchOps on the on-disk files): repo-relative path →
 // content, "" for a file it deletes (`wt check` then reads every line deleted,
 // as it does an emptied file). ok=false when that can't be told: a patch
-// apply_patch would reject or fail on, or a path outside the repo; the hook
-// then keeps its file-level heads-up.
+// apply_patch would reject or fail on, or a move across the repo's edge; the
+// hook then keeps its file-level heads-up.
+//
+// An operation entirely OUTSIDE the repo is left out, not a reason to give up
+// on the rest (#201 review): it can't collide with another window's repo
+// files, and since relative paths resolve through symlinks, wt's own
+// `link_files` `.env` (a link into the main checkout) is one. Giving up there
+// turned a confirmed overlap on a repo file in the same patch into a file-level
+// heads-up, and WT_CODEX_HOOK_BLOCK lost its deny where `wt check` blocks.
 func predictCodexPatch(patch, root, prefix string) (map[string]string, bool) {
-	ops, err := parseApplyPatch(patch)
+	parsed, err := parseApplyPatch(patch)
 	if err != nil {
 		return nil, false
 	}
 	// Keyed by repo-relative path, so two spellings of one file stay one file,
 	// resolved as repoRelativePatch resolves them: a removed path (a Delete, a
 	// move's source) is the entry, a symlink there the link itself (#201).
-	for i := range ops {
-		op := &ops[i]
+	var ops []patchOp
+	for _, op := range parsed {
 		rel := repoRelativePath
 		if op.kind == 'D' || (op.kind == 'U' && op.moveTo != "" && op.moveTo != op.path) {
 			rel = repoRelativeEntry
 		}
-		if op.path = rel(root, prefix, op.path); op.path == "" {
-			return nil, false
-		}
+		path, moveTo := rel(root, prefix, op.path), ""
 		if op.moveTo != "" {
-			if op.moveTo = repoRelativePath(root, prefix, op.moveTo); op.moveTo == "" {
-				return nil, false
-			}
+			moveTo = repoRelativePath(root, prefix, op.moveTo)
 		}
+		outPath, outMove := path == "", op.moveTo != "" && moveTo == ""
+		switch {
+		case outPath && (op.moveTo == "" || outMove):
+			continue // entirely outside the repo
+		case outPath || outMove:
+			return nil, false // a move across the repo's edge: not modelled
+		}
+		op.path, op.moveTo = path, moveTo
+		ops = append(ops, op)
 	}
 	state, err := applyPatchOps(ops, func(p string) (string, bool) {
 		b, err := os.ReadFile(filepath.Join(root, p))
