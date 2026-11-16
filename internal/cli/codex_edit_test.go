@@ -78,7 +78,8 @@ func TestParseCodexPatch(t *testing.T) {
 -gone
 *** End Patch`
 	got := parseCodexPatch(patch)
-	want := []codexPatchFile{{path: "internal/a.go"}, {path: "internal/b.go"}, {path: "internal/c.go"}, {path: "old/x.go", newPath: "new/x.go"}}
+	// a Delete and a move's source REMOVE their path (#201: a symlink there is the link)
+	want := []codexPatchFile{{path: "internal/a.go"}, {path: "internal/b.go"}, {path: "internal/c.go", removed: true}, {path: "old/x.go", newPath: "new/x.go", removed: true}}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("parseCodexPatch = %+v, want %+v", got, want)
 	}
@@ -196,5 +197,52 @@ func TestCodexEditDecision(t *testing.T) {
 	ctx, dec, reason = decodeDecision(t, out)
 	if dec != "deny" || reason == "" || ctx != "" {
 		t.Errorf("deny: decision=%q reason=%q ctx=%q", dec, reason, ctx)
+	}
+}
+
+// #201: every window editing a path is named on that path's line, each with
+// its own liveness and its own confirmed / not-computed tag. The line used to
+// stop at the first entry per path. Deduplicated by path + window (the
+// worktree, else the label, #193), in the order the entries came.
+func TestCodexEditDecision_NamesEveryWindowPerPath(t *testing.T) {
+	const (
+		hunks = "overlapping hunks"
+		file  = "hunk overlap not computed — run `wt check`"
+	)
+	ent := func(path, window, live, wt string, confirmed bool) codexGradedEntry {
+		return codexGradedEntry{entry: CheckEntry{Path: path, Window: window, Liveness: live, otherWorktree: wt}, confirmed: confirmed}
+	}
+	cases := []struct {
+		name  string
+		high  []codexGradedEntry
+		lines []string
+	}{
+		{"two windows on one path, each tagged",
+			[]codexGradedEntry{ent("a.go", "win-b", "live", "/w/b", true), ent("a.go", "win-c", "dormant", "/w/c", false)},
+			[]string{"  a.go — also being edited by win-b [live] (" + hunks + "), win-c [dormant] (" + file + ")"}},
+		{"the same window twice collapses",
+			[]codexGradedEntry{ent("a.go", "win-b", "live", "/w/b", true), ent("a.go", "win-b", "live", "/w/b", true)},
+			[]string{"  a.go — also being edited by win-b [live] (" + hunks + ")"}},
+		{"namesakes are two windows (#193)",
+			[]codexGradedEntry{ent("a.go", "#5", "live", "/p1/x", true), ent("a.go", "#5", "live", "/p2/x", false)},
+			[]string{"  a.go — also being edited by #5 [live] (" + hunks + "), #5 [live] (" + file + ")"}},
+		{"no worktree: the label identifies",
+			[]codexGradedEntry{ent("a.go", "win-b", "live", "", false), ent("a.go", "win-b", "live", "", false), ent("a.go", "win-c", "live", "", false)},
+			[]string{"  a.go — also being edited by win-b [live] (" + file + "), win-c [live] (" + file + ")"}},
+		{"paths and windows keep their order",
+			[]codexGradedEntry{ent("b.go", "win-c", "live", "/w/c", true), ent("a.go", "win-b", "live", "/w/b", true), ent("b.go", "win-b", "live", "/w/b", true)},
+			[]string{"  b.go — also being edited by win-c [live] (" + hunks + "), win-b [live] (" + hunks + ")",
+				"  a.go — also being edited by win-b [live] (" + hunks + ")"}},
+	}
+	for _, tc := range cases {
+		out, has := codexEditDecision(tc.high, false)
+		if !has {
+			t.Fatalf("%s: no output", tc.name)
+		}
+		ctx, _, _ := decodeDecision(t, out)
+		body := strings.Split(ctx, "\n")
+		if len(body) < 2+len(tc.lines) || !reflect.DeepEqual(body[1:1+len(tc.lines)], tc.lines) {
+			t.Errorf("%s: lines =\n%s\nwant\n%s", tc.name, strings.Join(body, "\n"), strings.Join(tc.lines, "\n"))
+		}
 	}
 }

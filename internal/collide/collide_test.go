@@ -269,6 +269,9 @@ func TestQueryFor(t *testing.T) {
 			"../../etc/hosts", "", true, Query{"../../etc/hosts", MatchFuzzy}},
 		{"surrounding whitespace is trimmed",
 			"  foo.go ", "", false, Query{"foo.go", MatchFuzzy}},
+		// #201: the top level is the whole repository, real whatever onDisk says
+		{"the top level is the whole repository", ".", RootPath, false, RootQuery()},
+		{"the top level typed as an absolute path", "/w/a", RootPath, true, RootQuery()},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -276,6 +279,11 @@ func TestQueryFor(t *testing.T) {
 				t.Errorf("QueryFor(%q, %q, %v) = %+v, want %+v", tc.arg, tc.rel, tc.onDisk, got, tc.want)
 			}
 		})
+	}
+	// #201: the top level is the whole repository by what it IS, not because some
+	// window happens to touch something under it (which also makes it exact)
+	if got := QueryFor("./", RootPath, false, nil); got != RootQuery() {
+		t.Errorf("QueryFor(./, %q) with nothing touched = %+v, want the root query", RootPath, got)
 	}
 }
 
@@ -311,6 +319,72 @@ func TestQueryFor_RealPathIsWhatTheHooksAsk(t *testing.T) {
 	for _, rel := range []string{"README.md", "pkg/svc/README.md", "go.mod"} {
 		if got, hook := QueryFor(rel, rel, true, nil), ExactQueries([]string{rel})[0]; got != hook {
 			t.Errorf("wt check %s = %+v, hooks ask %+v", rel, got, hook)
+		}
+	}
+}
+
+// #201: `wt check .` at the top level matched nothing and read "clear" while
+// another window had live HIGHs. The root query is a directory query for the
+// whole repository: every other window's touched file, one entry each, as any
+// other directory expands (#154). The zero Query (Path "") must still match
+// nothing, and only an EXACT "." is the root.
+func TestCheckPaths_RootQueryIsTheWholeRepo(t *testing.T) {
+	ws := []Window{
+		{Branch: "feat-b", Worktree: "/w/b", Touched: []string{"pkg/svc/README.md", "README.md"}},
+		{Branch: "feat-c", Worktree: "/w/c", Touched: []string{"internal/foo.go", "README.md"}},
+		{Branch: "feat-a", Worktree: "/w/a", Touched: []string{"mine.go"}},
+	}
+	var got []string
+	for _, cf := range CheckPaths(ws, "/w/a", []Query{RootQuery()}) {
+		got = append(got, cf.Path+"←"+cf.Window+"@"+cf.MatchedFile)
+	}
+	want := []string{"README.md←feat-b@README.md", "README.md←feat-c@README.md",
+		"internal/foo.go←feat-c@internal/foo.go", "pkg/svc/README.md←feat-b@pkg/svc/README.md"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("CheckPaths(root) = %v, want %v (every other window's file, never this window's)", got, want)
+	}
+	// with a file query beside it, each file is still reported once per window
+	if n := len(CheckPaths(ws, "/w/a", []Query{RootQuery(), {Path: "README.md"}})); n != len(want) {
+		t.Errorf("root + README.md = %d entries, want %d (deduped by window and file)", n, len(want))
+	}
+	for _, q := range []Query{{}, {Path: "", Mode: MatchExact}, {Path: "/"}, {Path: ".", Mode: MatchFuzzy}} {
+		if got := CheckPaths(ws, "/w/a", []Query{q}); len(got) != 0 {
+			t.Errorf("CheckPaths(%+v) = %v, want nothing: only an exact %q is the whole repository", q, got, RootPath)
+		}
+	}
+	if !PathTouchedByAny(RootQuery(), ws) {
+		t.Error("the root is touched when any window touches anything")
+	}
+	if PathTouchedByAny(RootQuery(), []Window{{Worktree: "/w/a"}}) {
+		t.Error("the root is not touched when no window touches anything")
+	}
+}
+
+// #201: where names are case-insensitive, a check argument that names nothing
+// under its own spelling is matched against the spellings windows touch.
+func TestTouchedSpellings(t *testing.T) {
+	ws := []Window{
+		{Worktree: "/w/b", Touched: []string{"pkg/svc/README.md", "docs/NEW.md", "pkg2/x.go", "Docs/Other.md"}},
+		{Worktree: "/w/c", Touched: []string{"pkg/svc/README.md", "readme.md"}},
+	}
+	cases := []struct {
+		rel  string
+		want []string
+	}{
+		{"pkg/svc/readme.md", []string{"pkg/svc/README.md"}},
+		{"PKG/svc", []string{"pkg/svc"}},
+		{"docs", []string{"Docs"}}, // the directory spelling above a touched file
+		{"docs/new.md", []string{"docs/NEW.md"}},
+		{"DOCS", []string{"Docs", "docs"}}, // two spellings: both, sorted
+		{"README.md", []string{"readme.md"}},
+		{"pkg", nil},                           // touched under its own spelling: nothing else to add
+		{"pk", nil},                            // a segment boundary, never a prefix of a name
+		{"pkg/svc/README.md/x", nil},           // deeper than any touched file
+		{"", nil}, {RootPath, nil}, {"/", nil}, // not a path to fold
+	}
+	for _, tc := range cases {
+		if got := TouchedSpellings(tc.rel, ws); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("TouchedSpellings(%q) = %q, want %q", tc.rel, got, tc.want)
 		}
 	}
 }

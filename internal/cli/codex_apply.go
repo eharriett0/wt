@@ -190,44 +190,93 @@ scan:
 // would fail on (an Update or Delete of a missing file, chunk lines it can't
 // find) is an error, as is any other the hook can't vouch for. Pure given read.
 func applyPatchOps(ops []patchOp, read func(path string) (string, bool)) (map[string]*string, error) {
+	state, _, err := applyPatchOpsKnown(ops, func(p string) (string, fileRead) {
+		if c, ok := read(p); ok {
+			return c, fileReadOK
+		}
+		return "", fileMissing
+	})
+	return state, err
+}
+
+// fileRead is what reading one file for a prediction found (#201 re-review):
+// its content, no such file, or a file that is there but was not read (not a
+// regular file, too large, an error), whose content is unknown.
+type fileRead int
+
+const (
+	fileReadOK fileRead = iota
+	fileMissing
+	fileUnread
+)
+
+// applyPatchOpsKnown is applyPatchOps that also carries what can't be known:
+// a file read as fileUnread, and whatever an operation makes from it (an
+// Update of it, a move of it, its destination), is listed in unknown and left
+// out of state, so its prediction is never made up; a Delete or Add makes the
+// path known again. A file that is there unread still exists: a Delete or an
+// Update of it is no error. Pure given read.
+func applyPatchOpsKnown(ops []patchOp, read func(path string) (string, fileRead)) (map[string]*string, map[string]bool, error) {
 	state := map[string]*string{}
-	current := func(p string) (string, bool) {
+	unknown := map[string]bool{}
+	current := func(p string) (string, fileRead) {
+		if unknown[p] {
+			return "", fileUnread
+		}
 		if c, seen := state[p]; seen {
 			if c == nil {
-				return "", false
+				return "", fileMissing
 			}
-			return *c, true
+			return *c, fileReadOK
 		}
 		return read(p)
+	}
+	set := func(p string, c *string) {
+		delete(unknown, p)
+		state[p] = c
+	}
+	setUnknown := func(p string) {
+		delete(state, p)
+		unknown[p] = true
 	}
 	for _, op := range ops {
 		switch op.kind {
 		case 'A':
 			c := op.content
-			state[op.path] = &c
+			set(op.path, &c)
 		case 'D':
-			if _, ok := current(op.path); !ok {
-				return nil, errPatch
+			if _, r := current(op.path); r == fileMissing {
+				return nil, nil, errPatch
 			}
-			state[op.path] = nil
+			set(op.path, nil)
 		case 'U':
-			cur, ok := current(op.path)
-			if !ok {
-				return nil, errPatch
+			cur, r := current(op.path)
+			if r == fileMissing {
+				return nil, nil, errPatch
+			}
+			moved := op.moveTo != "" && op.moveTo != op.path
+			if r == fileUnread {
+				if moved {
+					set(op.path, nil)
+					setUnknown(op.moveTo)
+				} else {
+					setUnknown(op.path)
+				}
+				continue
 			}
 			next, err := patchedContent(cur, op.chunks)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-			if op.moveTo != "" && op.moveTo != op.path {
-				state[op.path] = nil
-				state[op.moveTo] = &next
+			if moved {
+				set(op.path, nil)
+				set(op.moveTo, &next)
 			} else {
-				state[op.path] = &next
+				set(op.path, &next)
 			}
 		}
 	}
-	return state, nil
+	return state, unknown, nil
 }
 
 // patchedContent is content with chunks applied, as apply_patch computes it:

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"time"
 
@@ -1101,34 +1102,64 @@ func parseCheckArgs(args []string) (paths []string, includeStale, showDiff, asJS
 // matched (#181) and whether it is a typo (#93), gathered once so the two
 // decisions read the same facts.
 type checkArg struct {
-	arg     string        // as typed, trimmed unless it names a real path as typed
-	query   collide.Query // how it is matched against each window's touched files
-	exists  bool          // present in the working tree
-	tracked bool          // known to git (a deleted-but-tracked path counts)
+	arg string // as typed, trimmed unless it names a real path as typed
+	// queries is how it is matched against each window's touched files: one per
+	// repo path it names (#201: a symlink and the file it reaches; or, where names
+	// are case-insensitive, each spelling another window touches it by).
+	queries []collide.Query
+	exists  bool // present in the working tree
+	tracked bool // known to git (a deleted-but-tracked path counts)
+	// outside: it names no path in any worktree of this repository, so there is
+	// nothing to check, and "clear" would be a claim about nothing (#201).
+	outside  bool
+	resolved string // where it resolves to (absolute), for the outside notice
+}
+
+// namesRealPath reports whether the argument names real paths only, each
+// checked exactly (#181). Pure.
+func (a checkArg) namesRealPath() bool {
+	if a.outside || len(a.queries) == 0 {
+		return false
+	}
+	for _, q := range a.queries {
+		if q.Mode != collide.MatchExact {
+			return false
+		}
+	}
+	return true
 }
 
 // argBase is the place a check's arguments are read from: prefix is its path
 // relative to the repo root (`git rev-parse --show-prefix`, "" = the root
-// itself), exists and tracked answer for an argument as typed. Injected so the
-// resolution is table-testable without a repo (resolveCheckArgs).
+// itself); exists answers for an argument as typed, tracked for a repo path in
+// the worktree that holds it; fold says the worktree's filesystem folds case
+// (foldsCase: core.ignorecase alone never folds a name that is on no disk
+// here, #201 review); bare lists the bare entries of `git worktree list`,
+// which hold no repo paths. Injected so the resolution is table-testable
+// without a repo (resolveCheckArgs).
 type argBase struct {
 	prefix  string
-	exists  func(arg string) bool // present in the working tree
-	tracked func(arg string) bool // known to git (a deleted-but-tracked path counts)
+	exists  func(arg string) bool       // present in the working tree
+	tracked func(root, rel string) bool // known to git there (a deleted-but-tracked path counts)
+	fold    bool
+	bare    []string
 }
 
 // cwdArgBase is `wt check`'s: arguments are read relative to the current
 // directory, the way the operator typed them (README.md typed in pkg/svc/ is
 // pkg/svc/README.md). Asking git for the prefix avoids comparing os.Getwd, which
-// can return the logical /var/… path on macOS, with git's physical root.
-// IsTracked (git ls-files) is cwd-relative too, so the facts agree from a subdir
-// (#92 review). I/O.
-func cwdArgBase() argBase {
+// can return the logical /var/… path on macOS, with git's physical root. Whether
+// a path is tracked is asked of the worktree that holds it, about the repo path
+// the argument resolves to, so the facts agree from a subdir (#92 review) and
+// through a symlink (#201). I/O.
+func cwdArgBase(root string) argBase {
 	prefix, _ := gitx.ShowPrefix()
 	return argBase{
 		prefix:  prefix,
 		exists:  func(a string) bool { _, err := os.Stat(a); return err == nil },
-		tracked: gitx.IsTracked,
+		tracked: gitx.IsTrackedIn,
+		fold:    foldsCase(root),
+		bare:    gitx.BareWorktreesIn(""),
 	}
 }
 
@@ -1142,54 +1173,161 @@ func rootArgBase(root string) argBase {
 		if filepath.IsAbs(a) {
 			return a
 		}
-		return filepath.Join(root, a)
+		return joinRaw(root, a) // uncleaned: the OS reads `link/..` from the link's target (#201)
 	}
 	return argBase{
 		exists:  func(a string) bool { _, err := os.Stat(at(a)); return err == nil },
-		tracked: func(a string) bool { return gitx.IsTrackedIn(root, a) },
+		tracked: gitx.IsTrackedIn,
+		fold:    foldsCase(root),
+		bare:    gitx.BareWorktreesIn(root),
 	}
 }
 
-// resolveCheckArgs gathers each argument's facts from base and lets
-// collide.QueryFor decide its match mode: exact at the repo-relative path it
-// names when it names a real one, fuzzy as typed when it doesn't (#181). root is
-// the repo's top level, for an absolute argument. Shared by `wt check`
-// (cwdArgBase) and MCP wt_check (rootArgBase), so the two differ only in where a
-// relative path starts. Pure given base (an absolute argument also resolves
-// symlinks: repoRelativePath).
+// resolveCheckArgs gathers each argument's facts from base and decides its
+// queries (checkArgQueries): exact at each repo path it names when it names a
+// real one, fuzzy as typed when it doesn't (#181). root is the repo's top
+// level, which a relative argument is read from (below base.prefix). Shared by
+// `wt check` (cwdArgBase) and MCP wt_check (rootArgBase), so the two differ only
+// in where a relative path starts.
+//
+// Where an argument points is read the way the filesystem reads it, the same
+// for a relative argument as for an absolute one (#201, placeCheckPath), and
+// placed in whichever worktree of this repository holds it: this one, or
+// another (ws, from `git worktree list`), whose paths are this repository's
+// paths too. An argument no worktree holds is marked outside, for the caller to
+// refuse.
 //
 // An argument is trimmed unless, as typed, it names a real path: a file name can
 // begin or end with a space, and the pre-push and pre-commit checks, which read
 // it from git verbatim (#200), ask about the name as it is.
 func resolveCheckArgs(args []string, root string, base argBase, ws []collide.Window) []checkArg {
+	roots := worktreeRoots(root, ws, base.bare)
 	var out []checkArg
 	for _, a := range args {
 		t := strings.TrimSpace(a)
 		if t == "" {
 			continue
 		}
-		ca := resolveCheckArg(a, root, base, ws)
-		if ca.query.Mode != collide.MatchExact && t != a {
-			ca = resolveCheckArg(t, root, base, ws)
+		ca := resolveCheckArg(a, root, roots, base, ws)
+		if !ca.namesRealPath() && t != a {
+			ca = resolveCheckArg(t, root, roots, base, ws)
 		}
 		out = append(out, ca)
 	}
 	return out
 }
 
+// worktreeRoots is every worktree's top level, resolved as placePath compares
+// them: this one (root) first, then each window's. A bare entry (a bare
+// repository's own directory, `git clone --bare` with worktrees inside it) holds
+// no repo paths and is left out (#201 review): placed there, `wt check ../HEAD`
+// from a worktree inside it read as the repo path HEAD and clear, where a path
+// outside every worktree is refused. I/O.
+func worktreeRoots(root string, ws []collide.Window, bare []string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, b := range bare {
+		if b != "" {
+			seen[resolveExisting(b)] = true
+		}
+	}
+	add := func(p string) {
+		if p == "" {
+			return
+		}
+		if r := resolveExisting(p); !seen[r] {
+			seen[r] = true
+			out = append(out, r)
+		}
+	}
+	add(root)
+	for _, w := range ws {
+		add(w.Worktree)
+	}
+	return out
+}
+
 // resolveCheckArg is resolveCheckArgs for one argument, taken as given.
-func resolveCheckArg(a, root string, base argBase, ws []collide.Window) checkArg {
+func resolveCheckArg(a, root string, roots []string, base argBase, ws []collide.Window) checkArg {
 	ca := checkArg{arg: a, exists: base.exists(a)}
-	ca.tracked = !ca.exists && base.tracked(a)
-	ca.query = collide.QueryFor(a, repoRelativePath(root, base.prefix, a), ca.exists || ca.tracked, ws)
+	abs := a
+	if !filepath.IsAbs(a) {
+		abs = joinRaw(root, filepath.FromSlash(base.prefix), a)
+	}
+	places := placeCheckPath(abs, roots)
+	if len(places) == 0 {
+		ca.outside, ca.resolved = true, resolveExisting(abs)
+		return ca
+	}
+	var rels []string
+	for _, p := range places {
+		rels = append(rels, p.rel)
+		if !ca.exists && !ca.tracked && p.rel != collide.RootPath {
+			ca.tracked = base.tracked(p.root, p.rel)
+		}
+	}
+	ca.queries = checkArgQueries(a, rels, ca.exists || ca.tracked, ws, base.fold)
 	return ca
 }
 
-// checkQueries returns the resolved query of each argument, in order. Pure.
+// placeCheckPath is where the absolute path abs points for `wt check` /
+// wt_check (#201): the entry it names (a final symlink itself, which git tracks
+// at that path and another window can retarget) and the file or directory it
+// resolves to (whose content an edit through it changes), each placed in the
+// worktree of this repository that holds it (placePath). Asking about both is
+// what never reads "clear" for a symlink, whichever of the two the operator is
+// about to change. Distinct, entry first; nil when no worktree holds either.
+// I/O.
+func placeCheckPath(abs string, roots []string) []placedPath {
+	entry, target := resolvePath(abs, false), resolvePath(abs, true)
+	resolved := []string{entry}
+	if target != entry {
+		resolved = append(resolved, target)
+	}
+	var out []placedPath
+	for _, p := range resolved {
+		if pp, ok := placePath(p, roots); ok && !slices.Contains(out, pp) {
+			out = append(out, pp)
+		}
+	}
+	return out
+}
+
+// checkArgQueries decides how one argument is matched, given the repo paths it
+// names (rels: placeCheckPath's, RootPath for a worktree's top level) and
+// whether it is on disk or tracked: collide.QueryFor for each, so a real path
+// is exact and a name that is nothing here is a search. Where names are
+// case-insensitive (fold), a path that would be a search because nothing here or
+// in any window has it under its own spelling is first matched against the
+// spellings windows touch (collide.TouchedSpellings): on such a filesystem
+// another window's README.md IS readme.md (#201). Distinct, in order. Pure.
+func checkArgQueries(arg string, rels []string, onDisk bool, ws []collide.Window, fold bool) []collide.Query {
+	var qs []collide.Query
+	add := func(q collide.Query) {
+		if !slices.Contains(qs, q) {
+			qs = append(qs, q)
+		}
+	}
+	for _, rel := range rels {
+		q := collide.QueryFor(arg, rel, onDisk, ws)
+		if q.Mode == collide.MatchFuzzy && fold {
+			if vs := collide.TouchedSpellings(rel, ws); len(vs) > 0 {
+				for _, v := range vs {
+					add(collide.Query{Path: v, Mode: collide.MatchExact})
+				}
+				continue
+			}
+		}
+		add(q)
+	}
+	return qs
+}
+
+// checkQueries returns the resolved queries of every argument, in order. Pure.
 func checkQueries(args []checkArg) []collide.Query {
-	qs := make([]collide.Query, 0, len(args))
+	var qs []collide.Query
 	for _, a := range args {
-		qs = append(qs, a.query)
+		qs = append(qs, a.queries...)
 	}
 	return qs
 }
@@ -1199,20 +1337,49 @@ func checkQueries(args []checkArg) []collide.Query {
 // in the working tree, aren't tracked by git, and match no window's touched
 // files under the mode they will actually be checked with (#181). A bare name
 // (no '/' or whitespace) is never flagged: when it names no path here it is a
-// legitimate fuzzy basename search. Pure.
+// legitimate fuzzy basename search. A worktree's top level (`./`, `$PWD`) is
+// the whole repository, never a typo (#201); a path outside every worktree is
+// outsideCheckPaths', not this. Pure.
 func unknownCheckPaths(args []checkArg, ws []collide.Window) []string {
 	var out []string
 	for _, a := range args {
-		if a.arg == "" || !strings.ContainsAny(a.arg, "/ \t") {
+		if a.outside || a.arg == "" || !strings.ContainsAny(a.arg, "/ \t") {
 			continue // bare single-token name → exact if it exists, else a fuzzy search; exempt
 		}
 		if a.exists || a.tracked {
 			continue // exists in the working tree, or a deleted-but-tracked path (legit)
 		}
-		if collide.PathTouchedByAny(a.query, ws) {
-			continue // a window is genuinely touching it (collision / other-branch path)
+		touched := false
+		for _, q := range a.queries {
+			if q == collide.RootQuery() || collide.PathTouchedByAny(q, ws) {
+				touched = true // a window is genuinely touching it (collision / other-branch path)
+				break
+			}
 		}
-		out = append(out, a.arg)
+		if !touched {
+			out = append(out, a.arg)
+		}
+	}
+	return out
+}
+
+// outsideCheckPaths returns the requested paths that name no path in any
+// worktree of this repository (#201), each with where it resolves to when that
+// differs from the argument as typed: `/tmp/x`, `../elsewhere/x`, a path through
+// a symlink that leads out of the repository, or into a worktree that is no
+// longer one. They used to become fuzzy searches that matched nothing and read
+// "clear". Pure.
+func outsideCheckPaths(args []checkArg) []string {
+	var out []string
+	for _, a := range args {
+		if !a.outside {
+			continue
+		}
+		if a.resolved != "" && a.resolved != a.arg {
+			out = append(out, fmt.Sprintf("%s (resolves to %s)", a.arg, a.resolved))
+		} else {
+			out = append(out, a.arg)
+		}
 	}
 	return out
 }
@@ -1248,7 +1415,14 @@ func cmdCheck(args []string) int {
 		// #181: a path that names a real location (here, tracked, or touched at
 		// that exact path by a window) matches EXACTLY; only one that names
 		// nothing in the repo is a fuzzy basename/suffix search.
-		args := resolveCheckArgs(paths, root, cwdArgBase(), ws)
+		args := resolveCheckArgs(paths, root, cwdArgBase(root), ws)
+		// #201: a path no worktree of this repository holds has nothing to check;
+		// "clear" would be a claim about nothing. Not even --allow-missing makes it
+		// checkable.
+		if outside := outsideCheckPaths(args); len(outside) > 0 {
+			ui.Err("wt check: not in any worktree of this repository: %s. Refusing to report 'clear' for a path wt cannot check; name it inside this worktree, or inside another worktree of this repository (see `git worktree list`).", strings.Join(outside, ", "))
+			return 64
+		}
 		// #93: refuse a path that doesn't exist in the working tree, isn't tracked
 		// by git, and isn't touched by any window — a typo (or a zsh non-word-split
 		// single arg) that would otherwise falsely report '✓ clear'. Bare basenames

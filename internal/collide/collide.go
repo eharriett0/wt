@@ -238,6 +238,16 @@ func (q Query) cmpPath() string {
 	return q.Path
 }
 
+// RootPath is the Path of the query for the whole repository: `wt check .` at
+// a worktree's top level (#201). git never names a file ".", so it matches no
+// touched file by equality; as a directory (matchTouchedDir) it holds every
+// touched file. Only an EXACT "." is the root: the zero Query has Path "", and
+// still matches nothing.
+const RootPath = "."
+
+// RootQuery is the query for the whole repository (RootPath). Pure.
+func RootQuery() Query { return Query{Path: RootPath, Mode: MatchExact} }
+
 // ExactQueries wraps repo-relative paths that came from git or a hook payload,
 // which name real locations and are never search terms (#181). Pure.
 func ExactQueries(paths []string) []Query {
@@ -250,9 +260,9 @@ func ExactQueries(paths []string) []Query {
 
 // QueryFor decides how a `wt check` argument is matched (#181). arg is the
 // argument as typed. rel is the repo-relative path it names when read relative
-// to the current directory, or "" when it names no location inside the repo (it
-// leaves the repo, or is the root itself). onDisk reports that it exists in this
-// working tree or is tracked by git.
+// to the current directory, RootPath for the top level itself (the whole
+// repository, #201), or "" when it names no location inside the repo. onDisk
+// reports that it exists in this working tree or is tracked by git.
 //
 // An argument that names a real location is compared EXACTLY at its
 // repo-relative path: present here, or touched at exactly that path by some
@@ -267,6 +277,9 @@ func ExactQueries(paths []string) []Query {
 // of the same bug. Pure.
 func QueryFor(arg, rel string, onDisk bool, ws []Window) Query {
 	arg = strings.TrimSpace(arg)
+	if rel == RootPath {
+		return RootQuery() // the top level always exists: a question about every file
+	}
 	if rel != "" {
 		exact := Query{Path: rel, Mode: MatchExact}
 		if onDisk || PathTouchedByAny(exact, ws) {
@@ -383,6 +396,49 @@ func PathTouchedByAny(q Query, ws []Window) bool {
 	return false
 }
 
+// TouchedSpellings lists the spellings under which some window touches rel
+// when names are compared without case (#201): a touched file equal to rel but
+// for case, or the directory spelling of rel above a touched file. Sorted,
+// distinct, rel itself left out. Only for a repository whose names ARE
+// case-insensitive (the filesystem folds case, or core.ignorecase): there
+// `readme.md` and another window's `README.md` are one file, and an argument
+// that names nothing here under its own spelling would otherwise be a search
+// that misses it. Never used to widen an exact match where case matters.
+// Compared segment by segment, so `pkg` never reaches `pkg2/x`. Pure.
+func TouchedSpellings(rel string, ws []Window) []string {
+	rel = strings.Trim(rel, "/")
+	if rel == "" || rel == RootPath {
+		return nil
+	}
+	want := strings.Split(rel, "/")
+	seen := map[string]bool{}
+	var out []string
+	for _, w := range ws {
+		for _, f := range w.Touched {
+			segs := strings.Split(f, "/")
+			if len(segs) < len(want) {
+				continue
+			}
+			match := true
+			for i := range want {
+				if !strings.EqualFold(segs[i], want[i]) {
+					match = false
+					break
+				}
+			}
+			if !match {
+				continue
+			}
+			if s := strings.Join(segs[:len(want)], "/"); s != rel && !seen[s] {
+				seen[s] = true
+				out = append(out, s)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // matchTouched reports whether query q matches any touched file — by exact
 // repo-relative path, and for a MatchFuzzy query also by path suffix or
 // basename — and returns the actual matched touched file (repo-relative),
@@ -424,10 +480,21 @@ func matchTouched(q Query, touched []string) (string, bool) {
 // A trailing slash is accepted and stripped: it is how anyone types a directory,
 // and `wt check envs/app/` reporting differently from `wt check envs/app` would
 // be its own small trap.
+//
+// An exact RootPath is the whole repository (#201): every touched file is
+// beneath it. `wt check .` at the top level matched nothing and said "clear"
+// while another window had live HIGHs, though `.` in a subdirectory (that
+// subdirectory, #181) and any other directory (#154) already expanded. A blank
+// path still matches nothing: the zero Query must not be the whole repo.
 func matchTouchedDir(q Query, touched []string) []string {
 	p := strings.Trim(q.cmpPath(), "/")
+	if q.Mode == MatchExact && p == RootPath {
+		out := append([]string(nil), touched...)
+		sort.Strings(out)
+		return out
+	}
 	if strings.TrimSpace(p) == "" {
-		return nil // "/" or "" is the whole repo — not a question worth answering
+		return nil // a blank path names nothing (the whole repo is RootPath)
 	}
 	fuzzy := q.Mode == MatchFuzzy
 	var out []string

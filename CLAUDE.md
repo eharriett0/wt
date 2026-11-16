@@ -130,6 +130,14 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   grades low. Only when the file can't be predicted (an edit the tool refuses, a
   file mixing line endings, a patch apply_patch rejects, a new file, a git error)
   does an entry stay as a file-level heads-up, and then it is never dropped.
+  ⚠ **A hook reads a file only through `readForPrediction`** (#201 re-review):
+  opened non-blocking and read only if the OPENED file is regular.
+  `os.ReadFile` on a FIFO waited for a writer forever (a patch moving one in,
+  or any FIFO in the repo, hung both edit hooks, on main too) and on /dev/zero
+  read without end; a hook must always return promptly. Anything not read is a
+  file-level heads-up. ⚠ No size cap: a regular file ends, and an 8 MiB cap
+  (tried in review) cost an 11.7 MB tracked file its grade: a lost Codex deny
+  and a false Claude deny for a disjoint edit.
 - **Coordination ownership is ONE decision, and only a real session token
   PROVES a record is yours (#163, #211).** Two agent sessions started in one
   checkout resolve to the same window id, so each treated the other's
@@ -269,10 +277,11 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   query whose mode was never decided can't invent a collision. A `wt check`
   argument is read from the cwd (`git rev-parse --show-prefix`, `cwdArgBase`),
   a `wt_check` one from the repo ROOT (`rootArgBase`: its schema says
-  repo-relative, and the server may run in a subdirectory); absolute ones go
-  through `resolveExisting`, which handles `/var`→`/private/var` even for a file
-  that doesn't exist yet. ⚠ So the #92 equality holds for every path that
-  names something; for a name that names nothing yet (not on disk, not
+  repo-relative, and the server may run in a subdirectory); then every one, not
+  only an absolute one (#201, below), goes through `resolveExisting`, which
+  handles `/var`→`/private/var` even for a file that doesn't exist yet. ⚠ So the
+  #92 equality holds for every path that names something; for a name that
+  names nothing yet (not on disk, not
   tracked, not touched at that path), `wt check` runs a fuzzy SEARCH and is a
   superset of the edit hooks, which ask about the exact file being created and
   stay silent about namesakes. That direction is safe; don't "fix" it by making
@@ -284,6 +293,106 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   path in another window went unmatched. The fuzzy suffix tier used to hide that
   (README.md is a suffix of pkg/README.md); exact matching needs the old path
   listed, as the porcelain read already does for a staged move (#28).
+  ⚠ **An argument names the path the filesystem opens, in whichever worktree
+  holds it (#201).** Only an absolute argument used to be symlink-resolved, so
+  `wt check svclink/README.md` (svclink → pkg/svc) asked about a path no window
+  can touch (git never tracks a path beyond a symlink) and read clear while
+  `$PWD/svclink/README.md` was HIGH. Every argument and hook path is now joined
+  onto the directory it is read from WITHOUT cleaning (`joinRaw`) and read by
+  `resolvePath` as the OS reads it: each symlink replaced where it occurs, a
+  `..` stepping up from where the path has got to (`svclink/../x` is pkg/x, not
+  x), the first missing component and the rest kept as given. `placePath` then
+  places it in the worktree that holds it (`locateIn`: the DEEPEST of the
+  repository's worktrees, Scan's `git worktree list`, since one can sit inside
+  another, whether it matched as spelled or, confirmed by `os.SameFile`, equal
+  but for case; stopping at the first as-spelled match let the main checkout
+  claim `.wt/feat/x` from a nested worktree `.wt/Feat`, #201 review). A bare
+  entry (`git clone --bare` with worktrees inside it) holds no repo paths and is
+  never a root (`gitx.BareWorktreesIn`). So a path into ANOTHER worktree is that
+  repo path (they share the layout), for `wt check` and wt_check; the edit
+  hooks, given only their own root, stay silent about a file in another
+  window's tree, as before. A path no worktree holds (`/tmp/x`, `..` at the
+  top, `../HEAD` beside a worktree inside a bare repo, and ⚠ any path THROUGH an
+  in-repo symlink that leads out of the repository, read lexically as a repo
+  path before #201) is refused (`outsideCheckPaths`: exit 64 that `--allow-missing`
+  can't override; wt_check: isError), never a search that matches nothing and
+  reads clear. ⚠ **The Codex hook replays apply_patch over outside paths too**
+  (`predictCodexPatch`, #201 reviews): an outside path is keyed by where it
+  resolves (`patchKey`: `outsideKey`, a NUL no repo path holds, then the
+  resolved absolute path) and only repo paths are graded. Read lexically before
+  #201, a path through an in-repo link (wt's own `link_files` `.env` is a link
+  into the main checkout) was a repo path; once it resolved outside, giving up
+  on the whole patch cost the deny for a repo file beside it, giving up on a
+  move across the edge only warned, and reading a moved-in source as it lay on
+  disk ignored what the same patch had done to it (an outside file added,
+  moved in, moved again; one rewritten, then moved in), so a real HIGH read
+  SILENT. Now an outside Add/Update/Delete is tracked, a move out of the repo
+  removes its source (a modify/delete with a window editing it), and a move in
+  writes what the patch itself made of the source. ⚠ **What can't be read is
+  unknown, and unknown is carried** (`applyPatchOpsKnown`, the same replay
+  `applyPatchOps` is, plus a `fileUnread` state): an Update or move of an
+  unread file leaves its result, and anything later made from it, unpredicted
+  (a file-level heads-up, never dropped, never a deny); a missing file still
+  fails the patch, as apply_patch does.
+  ⚠ **A symlink FILE is two paths.** `wt check link.md` asks about the link
+  itself (`resolvePath(p, false)`, the entry: another window can retarget it)
+  AND its target (whose content an edit through it changes), so it never reads
+  clear for either. The edit hooks ask about the one the tool changes: the
+  target for a write (Claude's Edit/Write, apply_patch Update/Add, which write
+  through a link), the link for apply_patch's Delete and a move's source
+  (`repoRelativeEntry`, `codexPatchFile.removed`: apply_patch unlinks the link).
+  For a symlink argument `wt check` is therefore a superset of the hooks, the
+  same safe direction as the fuzzy search above.
+  ⚠ **`.` at a worktree's top level is the whole repository** (`./`, `$PWD`,
+  `..` from a subdirectory, another worktree's top): `collide.RootQuery`, Path
+  `.`, exact only, expands to every other window's touched file as any directory
+  does (#154). It used to match nothing and read clear while live HIGHs existed;
+  `matchTouchedDir` still answers nothing for a blank path, so the zero Query
+  can't become the whole repo, and `unknownCheckPaths` never calls it a typo.
+  ⚠ **Case is folded only where names are case-insensitive** (the filesystem
+  folds case AT THE WORKTREE, probed on its own `.git` vs `.GIT` with
+  `os.SameFile` (`foldsCase`/`caseProbe`), or `core.ignorecase`). ⚠ #201
+  review: the first probe walked up to the nearest ancestor with a letter in its
+  name, which for a case-sensitive volume mounted at a letterless path (`/2024/1`)
+  is the PARENT filesystem: it read "folds", a new readme.md was checked as the
+  tracked README.md, and an add/add conflict (another window created readme.md)
+  read clear in `wt check` and both hooks. There `placePath` spells each existing
+  component as its directory lists it (`pickListed`: only when the exact name is
+  NOT listed, i.e. the filesystem folded it to open it) and then as the index
+  spells the path (`gitx.TrackedFolded`, `:(literal,icase)`, used only when the
+  index has exactly one spelling: a case-only `mv` on disk leaves the index's,
+  and that is the name status, diff and every other window report; case twins
+  keep the given one). ⚠ **Either folded spelling replaces the typed one only
+  when `acceptFold` says they are one file** (both exist and `os.SameFile`), or
+  when neither exists AND the worktree's filesystem itself folds case
+  (`foldsCase`): one existing without the other, or two different files, are
+  two names, so neither a wrong probe nor a hand-set `core.ignorecase` on a
+  case-sensitive volume can merge two files (pure, table-tested with injected
+  facts; `foldFacts` gathers them). ⚠ **`core.ignorecase` alone never folds a
+  spelling that is on no disk** (#201 re-review): set by hand on a
+  case-sensitive volume, with the tracked README.md deleted in this window, a
+  readme.md about to be created was folded into the index's README.md and an
+  add/add with another window's new readme.md read clear in `wt check` and the
+  Claude hook. Shared with the hooks, so `wt check readme.md`, a Claude edit of
+  `$PWD/readme.md` and a Codex patch of `readme.md` all ask about README.md.
+  `wt check` alone, and only where the filesystem folds case (`argBase.fold` =
+  `foldsCase`, the same rule), also matches a path that is nowhere under its
+  own spelling against the spellings windows touch (`collide.TouchedSpellings`,
+  from `checkArgQueries`): a file only another window created, the hooks'
+  superset again. Under `core.ignorecase` alone such a name stays a search
+  (`TestCheck_CaseSensitiveVolumeKeepsTheSearch`). ⚠ **Where it applies, that
+  REPLACES the fuzzy search for that argument, on purpose**
+  (#181's rule: an argument that names a real place, here one touched under
+  another case, is a question about THAT place). On macOS, with window B
+  creating NOTES.md and window C editing docs/notes.md, `wt check notes.md` was
+  HIGH on main through C's basename and is now exact on NOTES.md: B only. The
+  dropped hit was a different file, exactly the root-vs-nested confusion #181
+  removed. A case-sensitive repository is never folded, and an exact match never
+  becomes case-blind. Not folded (left as gaps): the fuzzy basename search, and
+  Unicode normalization (APFS also opens an NFD name for its NFC spelling).
+  Measured on git 2.39: `--show-toplevel` and `--show-prefix` come back in the
+  on-disk case even from a cwd entered under another case, and `git worktree
+  list` records physical paths.
 - **Paths from git are read NUL-separated, never quoted (#200).** Read line by
   line, git C-quotes a path holding a byte it calls unusual: under the default
   `core.quotePath` every non-ASCII byte, plus `"`, `\` and control characters
@@ -727,7 +836,25 @@ exit 0** (advisory / fail-open; a coordination nicety must never break the sessi
   same `regradePending` as the Claude hook (#108/#184/#199). A disjoint patch to
   a shared file therefore stays silent. Emits `additionalContext` on overlap;
   `WT_CODEX_HOOK_BLOCK=1` upgrades a **confirmed** HIGH (a computed hunk overlap) to
-  `deny` — a file-level-only match never denies.
+  `deny` — a file-level-only match never denies. Each file's line names EVERY
+  window editing it, each with its own liveness and confirmed / not-computed tag
+  (`codexEditDecision`, deduplicated by path + window: the worktree, else the
+  label, #193). It used to keep only the first entry per path, so a second
+  window on the file went unmentioned (#201). The Claude hook's message does
+  the same (`claudeDecision`, #201 review): it deduplicated by label, so
+  namesakes collapsed, and one file-level entry worded every window; now each
+  window is named once by worktree with its own grade when the grades differ.
+  Its deny predicate is unchanged (any kept entry under WT_CLAUDE_HOOK_BLOCK).
+  ⚠ **Known gap: an `exec_command` workdir (#201).** The PreToolUse payload's
+  `cwd` is the SESSION's cwd, and `codex-edit` reads a patch's relative paths
+  from it. Codex can also run apply_patch through `exec_command` with a per-call
+  `workdir` (openai/codex#32360, openai/codex#50271); if such a call ever reaches
+  this hook, its relative paths resolve against the wrong directory (a file in
+  another directory, or outside the repo: silent). No per-call working-directory
+  field in the hook payload could be verified (no Codex binary to measure), so
+  none is read: guessing a field name would read nothing, or the wrong thing,
+  without a sign. Revisit once Codex documents one; `parseCodexEdit` is where it
+  would go.
 
 Key facts: `.codex/hooks.json` uses the **same nested shape** as Claude's
 `.claude/settings.json` (`{hooks:{UserPromptSubmit:[{hooks:[…]}],PreToolUse:[{matcher:"apply_patch",hooks:[…]}]}}`);

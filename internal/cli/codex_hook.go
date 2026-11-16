@@ -535,10 +535,13 @@ func parseCodexEdit(b []byte) (cwd, patch string, relevant bool) {
 
 // codexPatchFile is one file section of an apply_patch payload: its path (+
 // move destination), as written in the patch until repoRelativePatch makes it
-// repo-relative.
+// repo-relative. removed: the section removes the file at path (a Delete, or the
+// source of a move), so a symlink there is the link itself; apply_patch writes
+// through a link but unlinks the link (#201).
 type codexPatchFile struct {
 	path    string
 	newPath string
+	removed bool
 }
 
 // parseCodexPatch lists the files an apply_patch payload names, each section's
@@ -552,11 +555,12 @@ func parseCodexPatch(patch string) []codexPatchFile {
 		ln = strings.TrimSuffix(ln, "\r")
 		for _, prefix := range []string{"*** Update File: ", "*** Add File: ", "*** Delete File: ", "*** Move File: "} {
 			if p, ok := strings.CutPrefix(strings.TrimSpace(ln), prefix); ok {
-				files = append(files, codexPatchFile{path: strings.TrimSpace(p)})
+				files = append(files, codexPatchFile{path: strings.TrimSpace(p), removed: prefix == "*** Delete File: "})
 			}
 		}
 		if to, ok := strings.CutPrefix(strings.TrimSpace(ln), "*** Move to: "); ok && len(files) > 0 {
 			files[len(files)-1].newPath = strings.TrimSpace(to)
+			files[len(files)-1].removed = true
 		}
 	}
 	return files
@@ -569,11 +573,18 @@ func parseCodexPatch(patch string) []codexPatchFile {
 // Codex session started in pkg/ that patches "svc/README.md" must be checked as
 // pkg/svc/README.md; the old suffix match only reached it by accident, and the
 // pending-hunk read joined the wrong file onto root. A path outside the repo
-// becomes "", which patchPaths drops. Pure for relative paths.
+// becomes "", which patchPaths drops. A path is read as the filesystem reads it
+// (#201): through a symlinked directory to the file it reaches; a final symlink
+// is its target where the section writes it, the link itself where it removes
+// it (repoRelativeEntry). I/O (the filesystem).
 func repoRelativePatch(files []codexPatchFile, root, prefix string) []codexPatchFile {
 	out := make([]codexPatchFile, len(files))
 	for i, f := range files {
-		f.path = repoRelativePath(root, prefix, f.path)
+		if f.removed {
+			f.path = repoRelativeEntry(root, prefix, f.path)
+		} else {
+			f.path = repoRelativePath(root, prefix, f.path)
+		}
 		if f.newPath != "" {
 			f.newPath = repoRelativePath(root, prefix, f.newPath)
 		}
@@ -695,41 +706,90 @@ type codexGradedEntry struct {
 // apply_patch has run (applyPatchOps on the on-disk files): repo-relative path →
 // content, "" for a file it deletes (`wt check` then reads every line deleted,
 // as it does an emptied file). ok=false when that can't be told: a patch
-// apply_patch would reject or fail on, or a path outside the repo; the hook
-// then keeps its file-level heads-up.
+// apply_patch would reject or fail on; the hook then keeps its file-level
+// heads-up for every path.
+//
+// Paths OUTSIDE the repo are part of the replay too (#201 reviews), keyed by
+// where they resolve (patchKey), so that what the patch does to the repo is
+// what apply_patch does: an Add, Update, Delete or move of an outside file is
+// tracked, a later move of it INTO the repo writes the content the patch
+// itself produced (an outside file added, then moved in, then moved again
+// within the repo), and a move OUT of the repo removes its source. Only the
+// repo's paths are graded. Since relative paths resolve through symlinks,
+// wt's own `link_files` `.env` (a link into the main checkout) is such a path;
+// giving up on it, or reading a moved-in source as it lies on disk, let a
+// confirmed overlap in the same patch read silent or file-level where `wt
+// check` blocks.
+//
+// Every file is read with readForPrediction: a FIFO, a device or anything else
+// not a regular file is never read (a FIFO blocked the hook forever), and what it
+// would have produced (an Update of it, its move's destination, anything made
+// from that later) is left unpredicted: a file-level heads-up, never dropped
+// (applyPatchOpsKnown).
 func predictCodexPatch(patch, root, prefix string) (map[string]string, bool) {
-	ops, err := parseApplyPatch(patch)
+	parsed, err := parseApplyPatch(patch)
 	if err != nil {
 		return nil, false
 	}
-	// Keyed by repo-relative path, so two spellings of one file stay one file.
-	for i := range ops {
-		op := &ops[i]
-		if op.path = repoRelativePath(root, prefix, op.path); op.path == "" {
-			return nil, false
-		}
+	// Keyed by repo-relative path, so two spellings of one file stay one file,
+	// resolved as repoRelativePatch resolves them: a removed path (a Delete, a
+	// move's source) is the entry, a symlink there the link itself (#201).
+	ops := make([]patchOp, 0, len(parsed))
+	for _, op := range parsed {
+		removed := op.kind == 'D' || (op.kind == 'U' && op.moveTo != "" && op.moveTo != op.path)
+		op.path = patchKey(root, prefix, op.path, !removed)
 		if op.moveTo != "" {
-			if op.moveTo = repoRelativePath(root, prefix, op.moveTo); op.moveTo == "" {
-				return nil, false
-			}
+			op.moveTo = patchKey(root, prefix, op.moveTo, true)
 		}
+		ops = append(ops, op)
 	}
-	state, err := applyPatchOps(ops, func(p string) (string, bool) {
-		b, err := os.ReadFile(filepath.Join(root, p))
-		return string(b), err == nil
+	state, _, err := applyPatchOpsKnown(ops, func(k string) (string, fileRead) {
+		return readForPrediction(patchKeyPath(root, k))
 	})
 	if err != nil {
 		return nil, false
 	}
 	out := make(map[string]string, len(state))
-	for p, c := range state {
+	for k, c := range state {
+		if strings.HasPrefix(k, outsideKey) {
+			continue // not a repo path: nothing another window can touch
+		}
 		if c != nil {
-			out[p] = *c
+			out[k] = *c
 		} else {
-			out[p] = ""
+			out[k] = ""
 		}
 	}
 	return out, true
+}
+
+// outsideKey prefixes predictCodexPatch's key for a path outside the repo: a
+// NUL, which no path holds, so it can never equal a repo-relative path.
+const outsideKey = "\x00"
+
+// patchKey is predictCodexPatch's key for a path as apply_patch spells it: its
+// repo-relative path (repoRelativeAs), or, outside the repo, outsideKey and the
+// absolute path as the filesystem resolves it, so two spellings of one outside
+// file are one key too. followLast as resolvePath reads it. I/O (the
+// filesystem).
+func patchKey(root, prefix, p string, followLast bool) string {
+	if rel := repoRelativeAs(root, prefix, p, followLast); rel != "" {
+		return rel
+	}
+	abs := p
+	if !filepath.IsAbs(abs) {
+		abs = joinRaw(root, filepath.FromSlash(prefix), p)
+	}
+	return outsideKey + resolvePath(abs, followLast)
+}
+
+// patchKeyPath is the file a patchKey names: an outside key's absolute path,
+// else the repo path under root. Pure.
+func patchKeyPath(root, k string) string {
+	if strings.HasPrefix(k, outsideKey) {
+		return k[len(outsideKey):]
+	}
+	return filepath.Join(root, filepath.FromSlash(k))
 }
 
 // codexEditDecision shapes the PreToolUse stdout JSON. deny=true → permissionDecision
@@ -737,20 +797,33 @@ func predictCodexPatch(patch, root, prefix string) (map[string]string, bool) {
 // additionalContext. Each file is tagged per-entry — "overlapping hunks" (computed
 // confirmed) vs "hunk overlap not computed" (file-level heads-up) — so a mixed
 // multi-file patch never overstates hunk overlap on an unverified file (#117 review).
-// Pure.
+//
+// Every window editing a file is named on that file's line, each with its own
+// liveness and its own tag (#201): the line used to stop at the FIRST entry per
+// path, so a second window on the same file went unmentioned, and the first
+// one's tag spoke for both. Deduplicated by path + window (the window's
+// worktree, else its label: a label is not an identity, #193), paths and their
+// windows in the order the entries came. Pure.
 func codexEditDecision(high []codexGradedEntry, deny bool) (string, bool) {
 	if len(high) == 0 {
 		return "", false
 	}
-	seen := map[string]bool{}
-	var lines []string
+	type windowKey struct{ path, window string }
+	seen := map[windowKey]bool{}
+	who := map[string][]string{}
+	var paths []string
 	anyConfirmed, anyFileLevel := false, false
 	for _, g := range high {
 		e := g.entry
-		if seen[e.Path] {
+		id := e.otherWorktree
+		if id == "" {
+			id = e.Window
+		}
+		k := windowKey{e.Path, id}
+		if seen[k] {
 			continue
 		}
-		seen[e.Path] = true
+		seen[k] = true
 		tag := "hunk overlap not computed — run `wt check`"
 		if g.confirmed {
 			tag = "overlapping hunks"
@@ -758,7 +831,14 @@ func codexEditDecision(high []codexGradedEntry, deny bool) (string, bool) {
 		} else {
 			anyFileLevel = true
 		}
-		lines = append(lines, fmt.Sprintf("  %s — also being edited by %s [%s] (%s)", e.Path, e.Window, e.Liveness, tag))
+		if _, ok := who[e.Path]; !ok {
+			paths = append(paths, e.Path)
+		}
+		who[e.Path] = append(who[e.Path], fmt.Sprintf("%s [%s] (%s)", e.Window, e.Liveness, tag))
+	}
+	var lines []string
+	for _, p := range paths {
+		lines = append(lines, fmt.Sprintf("  %s — also being edited by %s", p, strings.Join(who[p], ", ")))
 	}
 	header := "wt: your apply_patch touches file(s) another live window is editing:"
 	if anyConfirmed && !anyFileLevel {
