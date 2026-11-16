@@ -311,6 +311,16 @@ The gates run in this order: the PR-state precheck, the checks, the
 merge==deploy confirm (below), another window's `merge-main` hold, the close
 check, then the empty-diff, placeholder and foreign-lane guards.
 
+When the account's GitHub REST quota is used up (it is shared by every session
+and tool on the account, and GitHub then refuses REST calls until it lifts),
+merge-pr says so and when it lifts, and reads what it can over GraphQL, which
+has its own quota: the PR's state, its checks, and the diff's file count and
+file list. The checks a branch requires can only be read over REST, so the
+checks gate refuses them as unread, naming the rate limit (`--checks-ok`
+merges anyway). A diff that can't be read at all is refused as unread, never
+as empty, and `--bypass` is not the fix: run the merge again once the limit
+lifts.
+
 Before the squash, merge-pr lists every issue the merge will close and refuses
 (`--close-ok` proceeds) when one is closed by text the PR's own closing
 references don't show, or by phrasing that says it isn't meant ("does not fix
@@ -554,7 +564,9 @@ Run `wt doctor` to check. It judges each gh host by the account gh uses there,
 and says "could not be verified", not "NOT authenticated", when a host timed out
 or could not be reached. Telling an unreachable host from a rejected token needs
 gh 2.81 or newer (`gh auth status --json`); older gh reports both as a failed
-login, and doctor says so.
+login, and doctor says so. With gh 2.81+ it also tells a host that refused the
+check for a rate limit (logged in, but its REST calls fail until the limit
+lifts) from one whose login is broken.
 
 ## License
 
