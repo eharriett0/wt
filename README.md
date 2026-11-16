@@ -60,6 +60,15 @@ new path. Names are matched exactly as git stores them, non-ASCII ones
 (`café.md`) and names with spaces, quotes, newlines or glob characters
 (`a[1].md`) included.
 
+A path means what your shell would open: `wt check svclink/README.md` through a
+symlinked directory checks the file it reaches, and a path that is itself a
+symlink is checked as both the link and its target. A path inside another
+worktree of the same repository is checked as the same repo path, and
+`wt check .` at the top level checks the whole repository. On a
+case-insensitive filesystem (macOS by default), `readme.md` is checked as the
+`README.md` git tracks. A path outside every worktree of the repository is
+refused rather than reported clear.
+
 In `wt check --json`, each entry's `path` is the repo-relative path that
 collides, not the argument as you typed it: `wt check ./svc/README.md` run in
 `pkg/` reports `pkg/svc/README.md`, and a directory argument lists one entry per
