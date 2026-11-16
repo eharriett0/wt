@@ -265,6 +265,42 @@ func TestAuthCheckJSONForm(t *testing.T) {
 	}
 }
 
+// TestAuthNoJSONIsPerBinary: "this gh has no JSON form" is remembered for the
+// gh binary that said so, not for the process (#217). A process whose PATH
+// later resolves gh to another binary asks THAT one for the JSON form: tests
+// swap fake gh binaries, and a JSON answer is the only one that can say a host
+// refused the check for a rate limit.
+func TestAuthNoJSONIsPerBinary(t *testing.T) {
+	fakeGH(t, "unsupported", "", ghTwoHosts) // resets the memos; restores them after
+	if st := AuthStatusFor(""); !st.Parsed {
+		t.Fatalf("old gh: AuthStatusFor = %+v, want the human form read", st)
+	}
+	dir := t.TempDir()
+	calls := filepath.Join(dir, "calls")
+	doc := ghDoc(map[string][]ghEntry{"github.com": {errAcct("github.com", "octo", true, "error", err403)}})
+	if err := os.WriteFile(filepath.Join(dir, "doc"), []byte(doc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\necho \"$*\" >> '" + calls + "'\ncat '" + filepath.Join(dir, "doc") + "'\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+"/usr/bin"+string(os.PathListSeparator)+"/bin")
+	if p, err := exec.LookPath("gh"); err != nil || p != filepath.Join(dir, "gh") {
+		t.Fatalf("gh resolves to %q (%v), not the second fake", p, err)
+	}
+	authMu.Lock()
+	authMemo = map[string]authAnswer{} // a new check, the no-JSON memo kept
+	authMu.Unlock()
+	st := AuthStatusFor("github.com")
+	if want := []HostAuth{{Host: "github.com", State: HostAuthRateLimited, Error: err403}}; !reflect.DeepEqual(st.Hosts, want) {
+		t.Errorf("new gh: AuthStatusFor = %+v, want the JSON form's rate-limited host", st)
+	}
+	if b, _ := os.ReadFile(calls); string(b) != "auth status --json hosts --active --hostname github.com\n" {
+		t.Errorf("new gh was asked %q, want the JSON form", b)
+	}
+}
+
 // TestAuthCheckFallsBackOnce: a gh failure that is not a refusal of the JSON
 // form (its config unreadable, say) falls back to the human form for that check
 // and is NOT remembered, so the next check tries the JSON form again.
