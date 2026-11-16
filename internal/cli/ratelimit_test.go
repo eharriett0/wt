@@ -33,6 +33,7 @@ case "$*" in
 "api --include /"*) printf 'HTTP/2.0 403 Forbidden\r\nX-Ratelimit-Remaining: 0\r\nX-Ratelimit-Reset: %s\r\n\r\n{}\n' $(( $(date +%s) + 1380 )); exit 1 ;;
 "pr diff"*) echo "could not find pull request diff: HTTP 403: $refusal" >&2; exit 1 ;;
 "api --hostname $H repos/"*) printf '{"message":"%s","status":"403"}' "$refusal"; echo "gh: $refusal (HTTP 403)" >&2; exit 1 ;;
+*"--json number,url,changedFiles"*) echo "$3 https://$H/o/r/pull/$3 2"; exit 0 ;;
 *"--json number,url"*) echo "$3 https://$H/o/r/pull/$3"; exit 0 ;;
 *statusCheckRollup*) cat "$d/rollup"; exit 0 ;;
 *"files(first:100"*) cat "$d/files"; exit 0 ;;
@@ -130,17 +131,17 @@ func TestCmdMergePR_restQuotaUsedUp(t *testing.T) {
 		{name: "a deploy-path repo: GraphQL's file list decides the gate (no deploy path)",
 			args: []string{"99999", "--keep", "--checks-ok"}, code: 0, merged: true,
 			env:   map[string]string{"WT_MERGE_IS_DEPLOY": "1", "WT_MERGE_IS_DEPLOY_PATHS": "infra/**"},
-			files: `{"total":2,"paths":["docs/a.md","README.md"]}`,
+			files: `{"total":2,"paths":["docs/a.md","README.md"],"renamed":[]}`,
 			out:   []string{"changes no deploy-path files"}},
 		{name: "a deploy-path repo: GraphQL's file list decides the gate (a deploy path)",
 			args: []string{"99999", "--keep", "--checks-ok"}, code: 1,
 			env:   map[string]string{"WT_MERGE_IS_DEPLOY": "1", "WT_MERGE_IS_DEPLOY_PATHS": "infra/**"},
-			files: `{"total":2,"paths":["docs/a.md","infra/x.yaml"]}`,
+			files: `{"total":2,"paths":["docs/a.md","infra/x.yaml"],"renamed":[]}`,
 			out:   []string{"prod deploy not confirmed"}},
 		{name: "a deploy-path repo: a partial GraphQL list gates, naming both failures",
 			args: []string{"99999", "--keep", "--checks-ok"}, code: 1,
 			env:   map[string]string{"WT_MERGE_IS_DEPLOY": "1", "WT_MERGE_IS_DEPLOY_PATHS": "infra/**"},
-			files: `{"total":285,"paths":["docs/a.md"]}`,
+			files: `{"total":285,"paths":["docs/a.md"],"renamed":[]}`,
 			out:   []string{"REST API rate limit", "GraphQL listed 1 of the PR's 285 changed files", "gating to be safe", "prod deploy not confirmed"}},
 	}
 	for _, tc := range cases {

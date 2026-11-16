@@ -375,7 +375,10 @@ reconcile on push), that squash is far higher-stakes than normal. Set
 what a real merge would do: refuse a draft, stop for the confirm, or proceed
 because `--confirm-deploy` was passed; it prints the same status-page lines.
 With `merge_is_deploy_paths` set, a PR that touches no deploy path says it
-would skip the gate.
+would skip the gate. A renamed file counts under both its old and its new
+path, so moving a file out of a deploy path (which deletes it there) still
+gates. If GitHub's REST API can't be read and its GraphQL file list shows a
+rename, the old path is unknown, so the PR is gated.
 
 ## Cross-repo epics
 

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -370,14 +371,137 @@ func diffNames(out string) []string {
 // When the REST diff fails (#217) the list comes from GraphQL instead
 // (prFilesGraphQL), and only when it is the whole list.
 func PRChangedFiles(pr string) ([]string, error) {
-	out, err := run("pr", "diff", pr, "--name-only")
-	if err == nil {
-		return diffNames(out), nil
+	ref, total, err := resolvePR(pr)
+	if err != nil {
+		return nil, err
 	}
-	rerr := ghErrAt(RepoHost(), apiREST, err)
-	files, gerr := prFilesGraphQL(pr)
+	files, rerr := prFilesREST(ref, total)
+	if rerr == nil {
+		return files, nil
+	}
+	files, gerr := prFilesGraphQL(ref)
 	if gerr != nil {
-		return nil, bothFailed("diff", rerr, "file list", gerr)
+		return nil, bothFailed("file list", rerr, "file list", gerr)
+	}
+	return files, nil
+}
+
+// resolvePR is PR pr's number, URL and host, as gh resolves pr here (a
+// number, a URL or a branch), and how many files it changes (GraphQL
+// changedFiles, in the same call): what the REST list must add up to.
+func resolvePR(pr string) (prRef, int, error) {
+	out, err := run("pr", "view", pr, "--json", "number,url,changedFiles", "--jq", `"\(.number) \(.url) \(.changedFiles)"`)
+	if err != nil {
+		return prRef{}, 0, fmt.Errorf("cannot resolve PR #%s: %w", pr, ghErrAt(RepoHost(), apiGraphQL, err))
+	}
+	ref, total, err := parsePRRefCount(out)
+	if err != nil {
+		return prRef{}, 0, fmt.Errorf("cannot resolve PR #%s: %w", pr, err)
+	}
+	return ref, total, nil
+}
+
+// parsePRRefCount reads resolvePR's "<number> <url> <changedFiles>" line: a
+// PR reference as parsePRRef reads one, and a file count, never a placeholder
+// (#168: "null" is an unread answer, not 0). Pure.
+func parsePRRefCount(out string) (prRef, int, error) {
+	head, count, ok := strings.Cut(strings.TrimSpace(out), " ")
+	link, count, ok2 := strings.Cut(count, " ")
+	if !ok || !ok2 {
+		return prRef{}, 0, fmt.Errorf("gh printed no PR number, URL and file count (got %q)", out)
+	}
+	ref, err := parsePRRef(head + " " + link)
+	if err != nil {
+		return prRef{}, 0, err
+	}
+	n, err := parseFileCount(count)
+	if err != nil {
+		return prRef{}, 0, err
+	}
+	return ref, n, nil
+}
+
+// prRepoPath is the REST path of the repository a PR URL belongs to
+// (`https://<host>/<owner>/<name>/pull/<n>` → `repos/<owner>/<name>`). Pure.
+func prRepoPath(ref prRef) (string, error) {
+	u, err := url.Parse(ref.url)
+	if err != nil {
+		return "", fmt.Errorf("unreadable PR URL %q: %w", ref.url, err)
+	}
+	seg := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(seg) != 4 || seg[2] != "pull" || seg[3] != strconv.Itoa(ref.number) {
+		return "", fmt.Errorf("PR URL %q is not <owner>/<name>/pull/<n>", ref.url)
+	}
+	return repoPath(seg[0] + "/" + seg[1])
+}
+
+// prFilesREST lists a PR's changed files from REST `pulls/{n}/files`, the deploy
+// gate's primary read (#221). ⚠ Not `gh pr diff --name-only`: it prints only the
+// new side of a rename, so a PR moving a file OUT of a deploy path
+// (`infra/x.yaml` → `docs/x.yaml`) never listed the deployed one and skipped
+// the gate. This endpoint gives each rename's `previous_filename`, and both
+// sides are listed. Names come verbatim (JSON), never C-quoted. ⚠ The list must
+// add up to total (the PR's changedFiles): a page the pagination lost would
+// otherwise read as a PR without that file (#221 review). 100 files a page,
+// GitHub's most, so a large PR costs a third of the REST calls (#217).
+func prFilesREST(ref prRef, total int) ([]string, error) {
+	path, err := prRepoPath(ref)
+	if err != nil {
+		return nil, err
+	}
+	out, err := run("api", "--hostname", ref.host, path+"/pulls/"+strconv.Itoa(ref.number)+"/files?per_page=100", "--paginate",
+		"--jq", `.[] | {f: .filename, p: .previous_filename, s: .status}`)
+	if err != nil {
+		return nil, apiErr(ref.host, out, err)
+	}
+	return parsePRFileList(out, total)
+}
+
+// parsePRFileList reads prFilesREST's output, one `{"f":…,"p":…,"s":…}`
+// object per file: its path, the path it was renamed from (null otherwise) and
+// its status. Both paths are listed, each once, in order. An error, never a
+// shorter list: a file without a path; a "renamed" file without the path it
+// left; a list that does not add up to total, the PR's file count; and a list
+// at GitHub's cap (maxListedFiles), which may not be all of them. Pure.
+func parsePRFileList(out string, total int) ([]string, error) {
+	dec := json.NewDecoder(strings.NewReader(out))
+	files, seen, n := []string{}, map[string]bool{}, 0
+	add := func(p string) {
+		if !seen[p] {
+			seen[p] = true
+			files = append(files, p)
+		}
+	}
+	for {
+		var e struct {
+			F *string `json:"f"`
+			P *string `json:"p"`
+			S *string `json:"s"`
+		}
+		err := dec.Decode(&e)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("unreadable file list from gh: %w", err)
+		}
+		if e.F == nil || *e.F == "" {
+			return nil, errors.New("a file in gh's file list has no path")
+		}
+		n++
+		add(*e.F)
+		switch {
+		case e.P != nil && *e.P != "":
+			add(*e.P)
+		case e.S != nil && *e.S == "renamed":
+			return nil, fmt.Errorf("gh lists %s as renamed, without the path it was renamed from", *e.F)
+		}
+	}
+	if n != total {
+		return nil, fmt.Errorf("REST listed %d of the PR's %d changed files", n, total)
+	}
+	if n >= maxListedFiles {
+		return nil, fmt.Errorf("the PR changes at least %d files, and GitHub lists at most %d, so the list may not be all of them", n, maxListedFiles)
 	}
 	return files, nil
 }
@@ -386,27 +510,21 @@ func PRChangedFiles(pr string) ([]string, error) {
 // files`: gh asks for the first 100 and stops (measured: 100 of a PR's 285),
 // and a deploy gate judging part of a PR is the silent direction.
 const prFilesQuery = `query($url:URI!,$endCursor:String){resource(url:$url){... on PullRequest{` +
-	`changedFiles files(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{path}}}}}`
+	`changedFiles files(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{path changeType}}}}}`
 
-// prFilesGraphQL lists PR pr's changed files over GraphQL (#217), the REST
-// diff's fallback. GraphQL gives paths verbatim, never C-quoted. Renames list
-// the new path, as `gh pr diff --name-only` does (measured on both).
+// prFilesGraphQL lists a PR's changed files over GraphQL (#217), the REST
+// list's fallback. GraphQL gives paths verbatim, never C-quoted. ⚠ A rename
+// lists only its new path, and GraphQL has no field for the old one (#221), so
+// a RENAMED file makes this an error: the deploy gate can't rule out a deploy
+// path the file left, so it gates.
 //
 // ⚠ The query goes to the PR's own host (`--hostname`, from its URL, as
 // PRChecks does): `gh api graphql` alone asks github.com, which answers a
 // GitHub Enterprise PR's URL with a null resource whenever gh is logged in to
 // both (#217 review).
-func prFilesGraphQL(pr string) ([]string, error) {
-	out, err := run("pr", "view", pr, "--json", "number,url", "--jq", `"\(.number) \(.url)"`)
-	if err != nil {
-		return nil, ghErrAt(RepoHost(), apiGraphQL, err)
-	}
-	ref, err := parsePRRef(out)
-	if err != nil {
-		return nil, fmt.Errorf("cannot resolve PR #%s's URL: %w", pr, err)
-	}
-	out, err = run("api", "graphql", "--hostname", ref.host, "--paginate", "-f", "query="+prFilesQuery, "-f", "url="+ref.url,
-		"--jq", `.data.resource | {total: .changedFiles, paths: [.files.nodes[].path]}`)
+func prFilesGraphQL(ref prRef) ([]string, error) {
+	out, err := run("api", "graphql", "--hostname", ref.host, "--paginate", "-f", "query="+prFilesQuery, "-f", "url="+ref.url,
+		"--jq", `.data.resource | {total: .changedFiles, paths: [.files.nodes[].path], renamed: [.files.nodes[] | select(.changeType == "RENAMED") | .path]}`)
 	if err != nil {
 		return nil, ghErrAt(ref.host, apiGraphQL, err)
 	}
@@ -419,16 +537,18 @@ func prFilesGraphQL(pr string) ([]string, error) {
 const maxListedFiles = 3000
 
 // parsePRFiles reads prFilesGraphQL's output, one object per page. Every page
-// must carry the total and its paths, and the pages together must list exactly
-// the total: a short list is an error, never the list (the deploy gate would
-// judge part of the PR). Pure.
+// must carry the total, its paths and its renamed paths, and the pages together
+// must list exactly the total: a short list is an error, never the list (the
+// deploy gate would judge part of the PR). So is any rename (#221): GraphQL
+// gives only its new path, and the old one may be a deploy path. Pure.
 func parsePRFiles(out string) ([]string, error) {
 	dec := json.NewDecoder(strings.NewReader(out))
-	files, total := []string{}, -1
+	files, renamed, total := []string{}, []string{}, -1
 	for {
 		var p struct {
-			Total *int     `json:"total"`
-			Paths []string `json:"paths"`
+			Total   *int     `json:"total"`
+			Paths   []string `json:"paths"`
+			Renamed []string `json:"renamed"`
 		}
 		err := dec.Decode(&p)
 		if err == io.EOF {
@@ -437,14 +557,15 @@ func parsePRFiles(out string) ([]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("unreadable file list from gh: %w", err)
 		}
-		if p.Total == nil || p.Paths == nil {
-			return nil, errors.New("a page of gh's file list has no file count or no paths")
+		if p.Total == nil || p.Paths == nil || p.Renamed == nil {
+			return nil, errors.New("a page of gh's file list has no file count, no paths or no renames")
 		}
 		if total >= 0 && *p.Total != total {
 			return nil, fmt.Errorf("gh's file list changed while it was read (%d files, then %d)", total, *p.Total)
 		}
 		total = *p.Total
 		files = append(files, p.Paths...)
+		renamed = append(renamed, p.Renamed...)
 	}
 	switch {
 	case total < 0:
@@ -453,6 +574,8 @@ func parsePRFiles(out string) ([]string, error) {
 		return nil, fmt.Errorf("GraphQL listed %d of the PR's %d changed files", len(files), total)
 	case total >= maxListedFiles:
 		return nil, fmt.Errorf("the PR changes %d files, and GitHub lists at most %d, so the list may not be all of them", total, maxListedFiles)
+	case len(renamed) > 0:
+		return nil, fmt.Errorf("GraphQL lists %d renamed file(s) (%s) without the path each was renamed from, so a deploy path a file left can't be ruled out", len(renamed), strings.Join(renamed, ", "))
 	}
 	return files, nil
 }

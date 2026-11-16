@@ -248,7 +248,7 @@ func TestParsePRFiles(t *testing.T) {
 		for i, p := range paths {
 			q[i] = fmt.Sprintf("%q", p)
 		}
-		return fmt.Sprintf(`{"total":%d,"paths":[%s]}`, total, strings.Join(q, ","))
+		return fmt.Sprintf(`{"total":%d,"paths":[%s],"renamed":[]}`, total, strings.Join(q, ","))
 	}
 	fs := func(n int) []string { return strings.Split(strings.Repeat("f ", n)[:2*n-1], " ") }
 	cases := []struct {
@@ -264,8 +264,12 @@ func TestParsePRFiles(t *testing.T) {
 		{"a list at GitHub's cap may not be all of it", strings.Repeat(page(3000, "f"), 3000), nil, "GitHub lists at most 3000"},
 		{"just under the cap is the list", strings.Repeat(page(2999, "f"), 2999), fs(2999), ""},
 		{"the total moved between pages", page(3, "a", "b") + page(4, "c"), nil, "changed while it was read"},
-		{"a page with no total", `{"paths":["a"]}`, nil, "no file count or no paths"},
-		{"a page with null paths (not a PR)", `{"total":null,"paths":null}`, nil, "no file count or no paths"},
+		{"a page with no total", `{"paths":["a"],"renamed":[]}`, nil, "no file count, no paths or no renames"},
+		{"a page with null paths (not a PR)", `{"total":null,"paths":null,"renamed":null}`, nil, "no file count, no paths or no renames"},
+		{"a page with no renames field", `{"total":1,"paths":["a"]}`, nil, "no file count, no paths or no renames"},
+		// #221: GraphQL has no old path for a rename; the deploy gate must gate.
+		{"a rename: its old path is unknown", `{"total":2,"paths":["a","docs/x.yaml"],"renamed":["docs/x.yaml"]}`, nil, "1 renamed file(s) (docs/x.yaml)"},
+		{"a rename on a later page", page(2, "a") + `{"total":2,"paths":["b"],"renamed":["b"]}`, nil, "renamed file(s) (b)"},
 		{"nothing printed", "", nil, "printed no file list"},
 		{"not JSON", "GraphQL: Something went wrong", nil, "unreadable file list"},
 	}
@@ -285,14 +289,16 @@ func TestParsePRFiles(t *testing.T) {
 
 // prReadsGh answers merge-pr's diff reads: the REST diff from "diff" (or
 // fails with "diff.fail"'s text), GraphQL's count from "count" (or fails with
-// "count.fail"'s), and the paged file list from "files" (or "files.fail"). It
-// logs each call's argv to "calls".
+// "count.fail"'s), the REST file list from "rest" (or "rest.fail"), and the
+// paged GraphQL file list from "files" (or "files.fail"). It logs each call's
+// argv to "calls".
 const prReadsGh = `echo "$*" >> "$d/calls"
 fail() { [ -e "$d/$1.fail" ] && { cat "$d/$1.fail" >&2; exit 1; }; }
 case "$*" in
 "pr diff 7 --name-only") fail diff; cat "$d/diff" ;;
 "pr view 7 --json changedFiles"*) fail count; cat "$d/count" ;;
-"pr view 7 --json number,url"*) echo "7 https://ghe.example.com/o/r/pull/7" ;;
+"pr view 7 --json number,url,changedFiles"*) echo "7 https://ghe.example.com/o/r/pull/7 2" ;;
+"api --hostname ghe.example.com repos/o/r/pulls/7/files?per_page=100 --paginate"*) fail rest; cat "$d/rest" ;;
 "api graphql --hostname ghe.example.com --paginate"*) fail files; cat "$d/files" ;;
 *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
@@ -319,14 +325,15 @@ func TestPRDiffReads(t *testing.T) {
 	}
 
 	set("diff", "a.md\ninfra/x.yaml\n")
+	set("rest", `{"f":"a.md","p":null}`+"\n"+`{"f":"infra/x.yaml","p":null}`+"\n")
 	if n, err := PRChangedFileCount("7"); n != 2 || err != nil {
 		t.Errorf("REST reads: PRChangedFileCount = (%d, %v), want 2", n, err)
 	}
 	if files, err := PRChangedFiles("7"); !reflect.DeepEqual(files, []string{"a.md", "infra/x.yaml"}) || err != nil {
 		t.Errorf("REST reads: PRChangedFiles = (%q, %v)", files, err)
 	}
-	if c := calls(); strings.Contains(c, "changedFiles") || strings.Contains(c, "graphql") {
-		t.Errorf("REST read fine, but GraphQL was asked: %q", c)
+	if c := calls(); strings.Contains(c, "--json changedFiles") || strings.Contains(c, "api graphql") {
+		t.Errorf("REST read fine, but a GraphQL fallback was asked: %q", c)
 	}
 	set("diff", "")
 	if n, err := PRChangedFileCount("7"); n != 0 || err != nil {
@@ -334,8 +341,9 @@ func TestPRDiffReads(t *testing.T) {
 	}
 
 	set("diff.fail", restLimitDiff)
+	set("rest.fail", restLimitAPI)
 	set("count", "6\n")
-	set("files", `{"total":2,"paths":["a.md"]}`+"\n"+`{"total":2,"paths":["infra/x.yaml"]}`+"\n")
+	set("files", `{"total":2,"paths":["a.md"],"renamed":[]}`+"\n"+`{"total":2,"paths":["infra/x.yaml"],"renamed":[]}`+"\n")
 	if n, err := PRChangedFileCount("7"); n != 6 || err != nil {
 		t.Errorf("REST refused: PRChangedFileCount = (%d, %v), want GraphQL's 6", n, err)
 	}
@@ -345,9 +353,15 @@ func TestPRDiffReads(t *testing.T) {
 	if c := calls(); !strings.Contains(c, "query="+prFilesQuery) || !strings.Contains(c, "url=https://ghe.example.com/o/r/pull/7") {
 		t.Errorf("GraphQL file list: calls = %q, want the paged query for the PR's URL, at the PR's host", c)
 	}
+	// #221: only GraphQL answers, and a file was renamed: its old path may have
+	// been a deploy path, so the list is an error and the gate gates.
+	set("files", `{"total":2,"paths":["a.md","docs/x.yaml"],"renamed":["docs/x.yaml"]}`+"\n")
+	if files, err := PRChangedFiles("7"); err == nil || files != nil || !strings.Contains(err.Error(), "renamed file(s) (docs/x.yaml)") || !IsRateLimit(err) {
+		t.Errorf("REST refused, GraphQL lists a rename: PRChangedFiles = (%q, %v), want an error naming both", files, err)
+	}
 
 	set("count", "null\n")
-	set("files", `{"total":285,"paths":["a.md"]}`)
+	set("files", `{"total":285,"paths":["a.md"],"renamed":[]}`)
 	n, err := PRChangedFileCount("7")
 	if err == nil || n != 0 || !IsRateLimit(err) || !strings.Contains(err.Error(), "REST API rate limit") || !strings.Contains(err.Error(), `got "null"`) {
 		t.Errorf("both reads fail: PRChangedFileCount = (%d, %v), want an error naming the rate limit and GraphQL's answer", n, err)
