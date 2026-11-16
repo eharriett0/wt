@@ -113,6 +113,46 @@ func TestRateLimitError(t *testing.T) {
 	}
 }
 
+// TestLiveProbeRateReset: the reset probe is one `gh api --include /` at the
+// host, read from the refused call's stdout (gh exits 1 for it); asked once
+// per host per authTTL, and asked again once that has passed, so a long-lived
+// `wt mcp` never keeps a reset that is over.
+func TestLiveProbeRateReset(t *testing.T) {
+	dir := fakeGh(t, `echo "$*" >> "$d/calls"
+printf 'HTTP/2.0 403 Forbidden\r\nX-Ratelimit-Remaining: 0\r\nX-Ratelimit-Reset: 4102444800\r\n\r\n{}\n'; exit 1
+`)
+	resetMu.Lock()
+	saved := resetMemo
+	resetMemo = map[string]resetAnswer{}
+	resetMu.Unlock()
+	t.Cleanup(func() { resetMu.Lock(); resetMemo = saved; resetMu.Unlock() })
+	calls := func() string {
+		b, _ := os.ReadFile(filepath.Join(dir, "calls"))
+		return string(b)
+	}
+	want := time.Unix(4102444800, 0)
+	for i := 0; i < 2; i++ {
+		if got := liveProbeRateReset("ghe.example.com"); !got.Equal(want) {
+			t.Fatalf("probe %d = %v, want %v", i, got, want)
+		}
+	}
+	if got := liveProbeRateReset(""); !got.Equal(want) {
+		t.Fatalf("probe of gh's own host = %v, want %v", got, want)
+	}
+	if c := calls(); c != "api --include / --hostname ghe.example.com\napi --include /\n" {
+		t.Errorf("calls = %q, want one probe per host", c)
+	}
+	resetMu.Lock()
+	a := resetMemo["ghe.example.com"]
+	a.at = a.at.Add(-authTTL)
+	resetMemo["ghe.example.com"] = a
+	resetMu.Unlock()
+	liveProbeRateReset("ghe.example.com")
+	if n := strings.Count(calls(), "--hostname ghe.example.com"); n != 2 {
+		t.Errorf("after authTTL the host was probed %d times in all, want 2", n)
+	}
+}
+
 // stubProbe swaps the reset probe for one answering reset, and returns the
 // hosts it was asked about.
 func stubProbe(t *testing.T, reset time.Time) *[]string {
