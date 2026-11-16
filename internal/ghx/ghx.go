@@ -371,11 +371,11 @@ func diffNames(out string) []string {
 // When the REST diff fails (#217) the list comes from GraphQL instead
 // (prFilesGraphQL), and only when it is the whole list.
 func PRChangedFiles(pr string) ([]string, error) {
-	ref, err := resolvePR(pr)
+	ref, total, err := resolvePR(pr)
 	if err != nil {
 		return nil, err
 	}
-	files, rerr := prFilesREST(ref)
+	files, rerr := prFilesREST(ref, total)
 	if rerr == nil {
 		return files, nil
 	}
@@ -387,17 +387,38 @@ func PRChangedFiles(pr string) ([]string, error) {
 }
 
 // resolvePR is PR pr's number, URL and host, as gh resolves pr here (a
-// number, a URL or a branch).
-func resolvePR(pr string) (prRef, error) {
-	out, err := run("pr", "view", pr, "--json", "number,url", "--jq", `"\(.number) \(.url)"`)
+// number, a URL or a branch), and how many files it changes (GraphQL
+// changedFiles, in the same call): what the REST list must add up to.
+func resolvePR(pr string) (prRef, int, error) {
+	out, err := run("pr", "view", pr, "--json", "number,url,changedFiles", "--jq", `"\(.number) \(.url) \(.changedFiles)"`)
 	if err != nil {
-		return prRef{}, fmt.Errorf("cannot resolve PR #%s: %w", pr, ghErrAt(RepoHost(), apiGraphQL, err))
+		return prRef{}, 0, fmt.Errorf("cannot resolve PR #%s: %w", pr, ghErrAt(RepoHost(), apiGraphQL, err))
 	}
-	ref, err := parsePRRef(out)
+	ref, total, err := parsePRRefCount(out)
 	if err != nil {
-		return prRef{}, fmt.Errorf("cannot resolve PR #%s's URL: %w", pr, err)
+		return prRef{}, 0, fmt.Errorf("cannot resolve PR #%s: %w", pr, err)
 	}
-	return ref, nil
+	return ref, total, nil
+}
+
+// parsePRRefCount reads resolvePR's "<number> <url> <changedFiles>" line: a
+// PR reference as parsePRRef reads one, and a file count, never a placeholder
+// (#168: "null" is an unread answer, not 0). Pure.
+func parsePRRefCount(out string) (prRef, int, error) {
+	head, count, ok := strings.Cut(strings.TrimSpace(out), " ")
+	link, count, ok2 := strings.Cut(count, " ")
+	if !ok || !ok2 {
+		return prRef{}, 0, fmt.Errorf("gh printed no PR number, URL and file count (got %q)", out)
+	}
+	ref, err := parsePRRef(head + " " + link)
+	if err != nil {
+		return prRef{}, 0, err
+	}
+	n, err := parseFileCount(count)
+	if err != nil {
+		return prRef{}, 0, err
+	}
+	return ref, n, nil
 }
 
 // prRepoPath is the REST path of the repository a PR URL belongs to
@@ -419,26 +440,30 @@ func prRepoPath(ref prRef) (string, error) {
 // new side of a rename, so a PR moving a file OUT of a deploy path
 // (`infra/x.yaml` → `docs/x.yaml`) never listed the deployed one and skipped
 // the gate. This endpoint gives each rename's `previous_filename`, and both
-// sides are listed. Names come verbatim (JSON), never C-quoted.
-func prFilesREST(ref prRef) ([]string, error) {
+// sides are listed. Names come verbatim (JSON), never C-quoted. ⚠ The list must
+// add up to total (the PR's changedFiles): a page the pagination lost would
+// otherwise read as a PR without that file (#221 review). 100 files a page,
+// GitHub's most, so a large PR costs a third of the REST calls (#217).
+func prFilesREST(ref prRef, total int) ([]string, error) {
 	path, err := prRepoPath(ref)
 	if err != nil {
 		return nil, err
 	}
-	out, err := run("api", "--hostname", ref.host, path+"/pulls/"+strconv.Itoa(ref.number)+"/files", "--paginate",
-		"--jq", `.[] | {f: .filename, p: .previous_filename}`)
+	out, err := run("api", "--hostname", ref.host, path+"/pulls/"+strconv.Itoa(ref.number)+"/files?per_page=100", "--paginate",
+		"--jq", `.[] | {f: .filename, p: .previous_filename, s: .status}`)
 	if err != nil {
 		return nil, apiErr(ref.host, out, err)
 	}
-	return parsePRFileList(out)
+	return parsePRFileList(out, total)
 }
 
-// parsePRFileList reads prFilesREST's output, one `{"f":…,"p":…}` object per
-// file: its path, and the path it was renamed from (null otherwise). Both are
-// listed, each once, in order. A file without a path is an error, never a
-// skipped entry, and so is a list at GitHub's cap (maxListedFiles): REST lists
-// at most that many, so it may not be all of them. Pure.
-func parsePRFileList(out string) ([]string, error) {
+// parsePRFileList reads prFilesREST's output, one `{"f":…,"p":…,"s":…}`
+// object per file: its path, the path it was renamed from (null otherwise) and
+// its status. Both paths are listed, each once, in order. An error, never a
+// shorter list: a file without a path; a "renamed" file without the path it
+// left; a list that does not add up to total, the PR's file count; and a list
+// at GitHub's cap (maxListedFiles), which may not be all of them. Pure.
+func parsePRFileList(out string, total int) ([]string, error) {
 	dec := json.NewDecoder(strings.NewReader(out))
 	files, seen, n := []string{}, map[string]bool{}, 0
 	add := func(p string) {
@@ -451,6 +476,7 @@ func parsePRFileList(out string) ([]string, error) {
 		var e struct {
 			F *string `json:"f"`
 			P *string `json:"p"`
+			S *string `json:"s"`
 		}
 		err := dec.Decode(&e)
 		if err == io.EOF {
@@ -464,9 +490,15 @@ func parsePRFileList(out string) ([]string, error) {
 		}
 		n++
 		add(*e.F)
-		if e.P != nil && *e.P != "" {
+		switch {
+		case e.P != nil && *e.P != "":
 			add(*e.P)
+		case e.S != nil && *e.S == "renamed":
+			return nil, fmt.Errorf("gh lists %s as renamed, without the path it was renamed from", *e.F)
 		}
+	}
+	if n != total {
+		return nil, fmt.Errorf("REST listed %d of the PR's %d changed files", n, total)
 	}
 	if n >= maxListedFiles {
 		return nil, fmt.Errorf("the PR changes at least %d files, and GitHub lists at most %d, so the list may not be all of them", n, maxListedFiles)

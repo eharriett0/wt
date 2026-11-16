@@ -759,9 +759,13 @@ docs live in [README.md](README.md); this file is for working *on* wt.
     `infra/x.yaml` to `docs/x.yaml`, which deletes a deployed object, never
     listed `infra/x.yaml` and merged without the typed confirm.
     `PRChangedFiles` now reads REST `pulls/{n}/files` (`prFilesREST`, at the
-    PR's own host and repository: `resolvePR` + `prRepoPath`) and lists each
-    file's `previous_filename` beside it (`parsePRFileList`: each path once, a
-    file without a path an error, a list at `maxListedFiles` an error). The
+    PR's own host and repository: `resolvePR` + `prRepoPath`, 100 a page) and
+    lists each file's `previous_filename` beside it (`parsePRFileList`: each
+    path once; an error for a file without a path, a `renamed` file without
+    the path it left, and a list at `maxListedFiles`). ⚠ The list must add up
+    to the PR's `changedFiles` (read in `resolvePR`'s same `gh pr view` call):
+    a page the pagination lost read as a PR without that file (#221 review,
+    measured against real gh with the Link header dropped). The
     GraphQL fallback has no field for the old path (`PullRequestChangedFile`
     has only `changeType`), so any `RENAMED` file there is an error, and the
     gate gates (`parsePRFiles`). The empty-diff count keeps `gh pr diff`: a

@@ -297,8 +297,8 @@ fail() { [ -e "$d/$1.fail" ] && { cat "$d/$1.fail" >&2; exit 1; }; }
 case "$*" in
 "pr diff 7 --name-only") fail diff; cat "$d/diff" ;;
 "pr view 7 --json changedFiles"*) fail count; cat "$d/count" ;;
-"pr view 7 --json number,url"*) echo "7 https://ghe.example.com/o/r/pull/7" ;;
-"api --hostname ghe.example.com repos/o/r/pulls/7/files --paginate"*) fail rest; cat "$d/rest" ;;
+"pr view 7 --json number,url,changedFiles"*) echo "7 https://ghe.example.com/o/r/pull/7 2" ;;
+"api --hostname ghe.example.com repos/o/r/pulls/7/files?per_page=100 --paginate"*) fail rest; cat "$d/rest" ;;
 "api graphql --hostname ghe.example.com --paginate"*) fail files; cat "$d/files" ;;
 *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
@@ -332,8 +332,8 @@ func TestPRDiffReads(t *testing.T) {
 	if files, err := PRChangedFiles("7"); !reflect.DeepEqual(files, []string{"a.md", "infra/x.yaml"}) || err != nil {
 		t.Errorf("REST reads: PRChangedFiles = (%q, %v)", files, err)
 	}
-	if c := calls(); strings.Contains(c, "changedFiles") || strings.Contains(c, "graphql") {
-		t.Errorf("REST read fine, but GraphQL was asked: %q", c)
+	if c := calls(); strings.Contains(c, "--json changedFiles") || strings.Contains(c, "api graphql") {
+		t.Errorf("REST read fine, but a GraphQL fallback was asked: %q", c)
 	}
 	set("diff", "")
 	if n, err := PRChangedFileCount("7"); n != 0 || err != nil {

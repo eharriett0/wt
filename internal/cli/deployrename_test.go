@@ -28,6 +28,7 @@ case "$*" in
 "api --include /"*) exit 1 ;;
 "api --hostname $H repos/o/r/branches/"*) echo '` + unprotected + `'; exit 0 ;;
 "api --hostname $H repos/o/r/rules/branches/"*) echo '[]'; exit 0 ;;
+*"--json number,url,changedFiles"*) echo "$3 https://$H/o/r/pull/$3 $(cat "$d/nfiles")"; exit 0 ;;
 *"--json number,url"*) echo "$3 https://$H/o/r/pull/$3"; exit 0 ;;
 *statusCheckRollup*) echo '` + greenRollup + `'; exit 0 ;;
 *"files(first:100"*) cat "$d/gql"; exit 0 ;;
@@ -103,29 +104,33 @@ func TestCmdMergePR_renameOutOfADeployPathGates(t *testing.T) {
 		stdinIsTTY = realTTY
 	})
 
-	const out = `{"f":"docs/x.yaml","p":"infra/x.yaml"}` + "\n" + `{"f":"README.md","p":null}` + "\n"
-	const within = `{"f":"docs/y.md","p":"docs/x.md"}` + "\n"
+	const out = `{"f":"docs/x.yaml","p":"infra/x.yaml","s":"renamed"}` + "\n" + `{"f":"README.md","p":null,"s":"modified"}` + "\n"
+	const within = `{"f":"docs/y.md","p":"docs/x.md","s":"renamed"}` + "\n"
 	cases := []struct {
-		name, diffnames, rest, gql string
-		restFail                   bool
-		code                       int
-		merged                     bool
-		want                       []string
+		name, diffnames, rest, gql, nfiles string
+		restFail                           bool
+		code                               int
+		merged                             bool
+		want                               []string
 	}{
 		{name: "renamed out of infra/: the gate sees infra/x.yaml",
-			diffnames: "docs/x.yaml\nREADME.md\n", rest: out, code: 1,
+			diffnames: "docs/x.yaml\nREADME.md\n", rest: out, nfiles: "2", code: 1,
 			want: []string{"prod deploy not confirmed"}},
 		{name: "renamed within docs/: no deploy path, no gate",
-			diffnames: "docs/y.md\n", rest: within, code: 0, merged: true,
+			diffnames: "docs/y.md\n", rest: within, nfiles: "1", code: 0, merged: true,
 			want: []string{"changes no deploy-path files"}},
+		// #221 review: a page the pagination lost must not read as a PR without its file
+		{name: "the REST list does not add up to the PR's count: it gates",
+			diffnames: "docs/y.md\n", rest: within, nfiles: "3", code: 1,
+			want: []string{"REST listed 1 of the PR's 3 changed files", "gating to be safe", "prod deploy not confirmed"}},
 		{name: "REST refused, GraphQL lists the rename: its old path is unknown, so it gates",
-			diffnames: "docs/x.yaml\nREADME.md\n", restFail: true, code: 1,
+			diffnames: "docs/x.yaml\nREADME.md\n", restFail: true, nfiles: "2", code: 1,
 			gql:  `{"total":2,"paths":["docs/x.yaml","README.md"],"renamed":["docs/x.yaml"]}`,
 			want: []string{"renamed file(s) (docs/x.yaml)", "gating to be safe", "prod deploy not confirmed"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			for name, text := range map[string]string{"diffnames": tc.diffnames, "rest": tc.rest, "gql": tc.gql} {
+			for name, text := range map[string]string{"diffnames": tc.diffnames, "rest": tc.rest, "gql": tc.gql, "nfiles": tc.nfiles} {
 				if err := os.WriteFile(filepath.Join(ghDir, name), []byte(text), 0o644); err != nil {
 					t.Fatal(err)
 				}

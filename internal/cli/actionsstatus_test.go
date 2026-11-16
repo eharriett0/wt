@@ -345,11 +345,12 @@ d=$(dirname "$0")
 h=$(cat "$d/host")
 printf '%s\n' "$*" >> "$d/calls"
 case "$*" in
+*"--json number,url,changedFiles"*) echo "$3 https://$h/o/r/pull/$3 1"; exit 0 ;;
 *"--json number,url"*) echo "$3 https://$h/o/r/pull/$3"; exit 0 ;;
 *statusCheckRollup*) [ -e "$d/rollup.fail" ] && { echo "gh: Something went wrong (HTTP 502)" >&2; exit 1; }; echo '` + greenRollup + `'; exit 0 ;;
 "api --hostname $h repos/o/r/branches/"*) echo '` + unprotected + `'; exit 0 ;;
 "api --hostname $h repos/o/r/rules/branches/"*) echo '[]'; exit 0 ;;
-"api --hostname $h repos/o/r/pulls/"*"/files"*) echo '{"f":"a.txt","p":null}'; exit 0 ;;
+"api --hostname $h repos/o/r/pulls/"*"/files"*) echo '{"f":"a.txt","p":null,"s":"modified"}'; exit 0 ;;
 esac
 case "$1 $2" in
 "pr view")
