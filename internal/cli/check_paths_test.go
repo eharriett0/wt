@@ -389,12 +389,8 @@ func TestCodexEdit_MoveAcrossTheRepoEdgeIsDenied(t *testing.T) {
 	outside := t.TempDir()
 	writeT(t, outside, "note.txt", "n1\nn2\n")
 	writeT(t, outside, "ten.txt", numbered("pkg/svc/a.go"))
-	if f, err := os.Create(filepath.Join(outside, "big.txt")); err != nil { // over maxPredictBytes
+	if err := os.Mkdir(filepath.Join(outside, "big.txt"), 0o755); err != nil { // not a regular file: never read
 		t.Fatal(err)
-	} else if err := f.Truncate(maxPredictBytes + 1); err != nil {
-		t.Fatal(err)
-	} else {
-		f.Close()
 	}
 	symlinkT(t, outside, filepath.Join(wa, "ext"))
 	writeT(t, wb, "pkg/svc/a.go", strings.Replace(readT(t, wb, "pkg/svc/a.go"), "pkg/svc/a.go l02\n", "B pkg/svc/a.go l02\n", 1))

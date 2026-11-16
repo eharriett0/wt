@@ -183,18 +183,15 @@ func repoRelativeAs(root, prefix, file string, followLast bool) string {
 	return pp.rel
 }
 
-// maxPredictBytes caps a file the edit hooks read to predict an edit: 8 MiB,
-// the largest input wt already holds in memory (`wt mcp`'s line buffer). A
-// larger file is left unpredicted (a file-level heads-up), never read.
-const maxPredictBytes = 8 << 20
-
 // readForPrediction reads path (following links) for a hook's prediction of
-// the file an edit will produce (#201 re-review), and only a regular file of at
-// most maxPredictBytes: os.ReadFile on a FIFO waited for a writer forever and
-// on /dev/zero read without end, and a hook must always return promptly. It
-// opens non-blocking and asks the OPENED file what it is, so a path swapped
-// for a FIFO after a check can't block either. Nothing there is fileMissing;
-// anything else not read is fileUnread (its content unknown). I/O.
+// the file an edit will produce (#201 re-review), and only a regular file:
+// os.ReadFile on a FIFO waited for a writer forever and on /dev/zero read
+// without end, and a hook must always return promptly. It opens non-blocking
+// and asks the OPENED file what it is, so a path swapped for a FIFO after a
+// check can't block either. Nothing there is fileMissing; anything else not
+// read is fileUnread (its content unknown). ⚠ No size cap: a regular file ends,
+// and a cap only cost large tracked files their grade (a lost Codex deny, a
+// false Claude deny for a disjoint edit, #201 review). I/O.
 func readForPrediction(path string) (string, fileRead) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
@@ -205,11 +202,11 @@ func readForPrediction(path string) (string, fileRead) {
 	}
 	defer f.Close()
 	fi, err := f.Stat()
-	if err != nil || !fi.Mode().IsRegular() || fi.Size() > maxPredictBytes {
+	if err != nil || !fi.Mode().IsRegular() {
 		return "", fileUnread
 	}
-	b, err := io.ReadAll(io.LimitReader(f, maxPredictBytes+1))
-	if err != nil || len(b) > maxPredictBytes {
+	b, err := io.ReadAll(f)
+	if err != nil {
 		return "", fileUnread
 	}
 	return string(b), fileReadOK

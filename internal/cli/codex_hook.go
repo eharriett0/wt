@@ -721,8 +721,8 @@ type codexGradedEntry struct {
 // confirmed overlap in the same patch read silent or file-level where `wt
 // check` blocks.
 //
-// Every file is read with readForPrediction: a FIFO, a device or a file over
-// maxPredictBytes is never read (a FIFO blocked the hook forever), and what it
+// Every file is read with readForPrediction: a FIFO, a device or anything else
+// not a regular file is never read (a FIFO blocked the hook forever), and what it
 // would have produced (an Update of it, its move's destination, anything made
 // from that later) is left unpredicted: a file-level heads-up, never dropped
 // (applyPatchOpsKnown).

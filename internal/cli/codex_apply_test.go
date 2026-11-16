@@ -250,13 +250,9 @@ func TestPredictCodexPatch(t *testing.T) {
 		}
 	}
 	note, ten, added := filepath.Join(outDir, "note.txt"), filepath.Join(outDir, "ten.txt"), filepath.Join(outDir, "new.txt")
-	big := filepath.Join(outDir, "big.txt") // over maxPredictBytes: never read
-	if f, err := os.Create(big); err != nil {
+	big := filepath.Join(outDir, "big.txt") // not a regular file: never read (and root reads a 000 file)
+	if err := os.Mkdir(big, 0o755); err != nil {
 		t.Fatal(err)
-	} else if err := f.Truncate(maxPredictBytes + 1); err != nil {
-		t.Fatal(err)
-	} else {
-		f.Close()
 	}
 	for name, p := range map[string]string{
 		"rejected":        "*** Update File: a.txt\n@@\n-b\n+B\n",
@@ -276,7 +272,7 @@ func TestPredictCodexPatch(t *testing.T) {
 	// What the patch does to the repo, outside files replayed with it (#201
 	// reviews): an outside operation counts only through what it later moves in;
 	// a move out removes the source; a move in writes what the patch itself made
-	// of the source; a source never read (over the cap, a FIFO) leaves what it
+	// of the source; a source never read (not a regular file) leaves what it
 	// produces unpredicted (absent here: a file-level heads-up), never the
 	// whole patch.
 	for name, tc := range map[string]struct {
@@ -294,8 +290,8 @@ func TestPredictCodexPatch(t *testing.T) {
 		// #201 re-review A2: an outside file rewritten, then moved in
 		"rewritten outside, then moved in": {bounded("*** Update File: " + ten + "\n@@\n-t1\n-t2\n+z1\n+z2\n*** Update File: " + ten + "\n*** Move to: b.txt\n@@\n z2\n+n4\n"),
 			map[string]string{"pkg/b.txt": "z1\nz2\nn4\n"}},
-		"a move in from an over-cap file": {bounded("*** Update File: " + big + "\n*** Move to: a.txt\n@@\n+x\n*** Delete File: d.txt\n"), map[string]string{"pkg/d.txt": ""}},
-		"unread, moved in, updated":       {bounded("*** Update File: " + big + "\n*** Move to: a.txt\n@@\n+x\n*** Update File: a.txt\n@@\n-b\n+B\n"), map[string]string{}},
+		"a move in from a source never read": {bounded("*** Update File: " + big + "\n*** Move to: a.txt\n@@\n+x\n*** Delete File: d.txt\n"), map[string]string{"pkg/d.txt": ""}},
+		"unread, moved in, updated":          {bounded("*** Update File: " + big + "\n*** Move to: a.txt\n@@\n+x\n*** Update File: a.txt\n@@\n-b\n+B\n"), map[string]string{}},
 		// unknown is carried through a later move of the destination
 		"unread, moved in, moved on": {bounded("*** Update File: " + big + "\n*** Move to: a.txt\n@@\n+x\n*** Update File: a.txt\n*** Move to: b.txt\n@@\n+y\n"), map[string]string{"pkg/a.txt": ""}},
 	} {

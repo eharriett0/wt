@@ -131,12 +131,13 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   file mixing line endings, a patch apply_patch rejects, a new file, a git error)
   does an entry stay as a file-level heads-up, and then it is never dropped.
   ⚠ **A hook reads a file only through `readForPrediction`** (#201 re-review):
-  opened non-blocking and read only if the OPENED file is regular and at most
-  `maxPredictBytes` (8 MiB, the largest input wt already holds: `wt mcp`'s line
-  buffer). `os.ReadFile` on a FIFO waited for a writer forever (a patch moving
-  one in, or any FIFO in the repo, hung both edit hooks, on main too) and on
-  /dev/zero read without end; a hook must always return promptly. Anything not
-  read is a file-level heads-up.
+  opened non-blocking and read only if the OPENED file is regular.
+  `os.ReadFile` on a FIFO waited for a writer forever (a patch moving one in,
+  or any FIFO in the repo, hung both edit hooks, on main too) and on /dev/zero
+  read without end; a hook must always return promptly. Anything not read is a
+  file-level heads-up. ⚠ No size cap: a regular file ends, and an 8 MiB cap
+  (tried in review) cost an 11.7 MB tracked file its grade: a lost Codex deny
+  and a false Claude deny for a disjoint edit.
 - **Coordination ownership is ONE decision, and only a real session token
   PROVES a record is yours (#163, #211).** Two agent sessions started in one
   checkout resolve to the same window id, so each treated the other's
