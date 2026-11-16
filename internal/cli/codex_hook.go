@@ -737,20 +737,33 @@ func predictCodexPatch(patch, root, prefix string) (map[string]string, bool) {
 // additionalContext. Each file is tagged per-entry — "overlapping hunks" (computed
 // confirmed) vs "hunk overlap not computed" (file-level heads-up) — so a mixed
 // multi-file patch never overstates hunk overlap on an unverified file (#117 review).
-// Pure.
+//
+// Every window editing a file is named on that file's line, each with its own
+// liveness and its own tag (#201): the line used to stop at the FIRST entry per
+// path, so a second window on the same file went unmentioned, and the first
+// one's tag spoke for both. Deduplicated by path + window (the window's
+// worktree, else its label: a label is not an identity, #193), paths and their
+// windows in the order the entries came. Pure.
 func codexEditDecision(high []codexGradedEntry, deny bool) (string, bool) {
 	if len(high) == 0 {
 		return "", false
 	}
-	seen := map[string]bool{}
-	var lines []string
+	type windowKey struct{ path, window string }
+	seen := map[windowKey]bool{}
+	who := map[string][]string{}
+	var paths []string
 	anyConfirmed, anyFileLevel := false, false
 	for _, g := range high {
 		e := g.entry
-		if seen[e.Path] {
+		id := e.otherWorktree
+		if id == "" {
+			id = e.Window
+		}
+		k := windowKey{e.Path, id}
+		if seen[k] {
 			continue
 		}
-		seen[e.Path] = true
+		seen[k] = true
 		tag := "hunk overlap not computed — run `wt check`"
 		if g.confirmed {
 			tag = "overlapping hunks"
@@ -758,7 +771,14 @@ func codexEditDecision(high []codexGradedEntry, deny bool) (string, bool) {
 		} else {
 			anyFileLevel = true
 		}
-		lines = append(lines, fmt.Sprintf("  %s — also being edited by %s [%s] (%s)", e.Path, e.Window, e.Liveness, tag))
+		if _, ok := who[e.Path]; !ok {
+			paths = append(paths, e.Path)
+		}
+		who[e.Path] = append(who[e.Path], fmt.Sprintf("%s [%s] (%s)", e.Window, e.Liveness, tag))
+	}
+	var lines []string
+	for _, p := range paths {
+		lines = append(lines, fmt.Sprintf("  %s — also being edited by %s", p, strings.Join(who[p], ", ")))
 	}
 	header := "wt: your apply_patch touches file(s) another live window is editing:"
 	if anyConfirmed && !anyFileLevel {
