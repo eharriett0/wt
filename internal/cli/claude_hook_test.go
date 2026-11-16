@@ -424,11 +424,12 @@ func TestFoldsCase_MatchesTheFilesystem(t *testing.T) {
 // on one that folds case, the on-disk spelling is read as well.
 func TestPlacePath_SpellsAsGitTracks(t *testing.T) {
 	hermeticGitT(t)
-	root, err := filepath.EvalSymlinks(t.TempDir())
+	tmp, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	gitT(t, root, "init", "-q", "-b", "main")
+	root := filepath.Join(tmp, "repo") // a name with letters, to reach it under another case
+	gitT(t, tmp, "init", "-q", "-b", "main", "repo")
 	gitT(t, root, "config", "user.email", "t@t.test")
 	gitT(t, root, "config", "user.name", "t")
 	gitT(t, root, "config", "core.ignorecase", "true")
@@ -447,9 +448,29 @@ func TestPlacePath_SpellsAsGitTracks(t *testing.T) {
 			t.Errorf("repoRelativePath(%q) = %q, want %q (the index's spelling)", in, got, want)
 		}
 	}
+	// a case-only rename on disk (mv, not git mv): git still names the file by its
+	// index entry (status and diff report README.md), so that is the path asked
+	// about, whichever spelling is typed
+	svc := filepath.Join(root, "pkg", "svc")
+	if err := os.Rename(filepath.Join(svc, "README.md"), filepath.Join(svc, "tmp-name")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(svc, "tmp-name"), filepath.Join(svc, "readme.md")); err != nil {
+		t.Fatal(err)
+	}
+	for _, in := range []string{"pkg/svc/readme.md", "pkg/svc/README.md"} {
+		if got := repoRelativePath(root, "", in); got != "pkg/svc/README.md" {
+			t.Errorf("after a case-only mv on disk: repoRelativePath(%q) = %q, want the index's pkg/svc/README.md", in, got)
+		}
+	}
 	if foldsCase(root) { // the untracked file is spelled as listed only where the filesystem folds case
 		if got := repoRelativePath(root, "", "DOCS/NEW.md"); got != "docs/new.md" {
 			t.Errorf("repoRelativePath(DOCS/NEW.md) = %q, want docs/new.md (as listed)", got)
+		}
+		// the worktree itself reached under another case (a cwd typed as ~/Repo)
+		wrong := filepath.Join(filepath.Dir(root), swapCase(filepath.Base(root)), "docs", "new.md")
+		if got := repoRelativePath(root, "", wrong); got != "docs/new.md" {
+			t.Errorf("repoRelativePath(%q) = %q, want docs/new.md: the same directory under another case", wrong, got)
 		}
 	}
 	// a case-sensitive repository keeps the spelling it was given

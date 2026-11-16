@@ -280,6 +280,11 @@ func TestQueryFor(t *testing.T) {
 			}
 		})
 	}
+	// #201: the top level is the whole repository by what it IS, not because some
+	// window happens to touch something under it (which also makes it exact)
+	if got := QueryFor("./", RootPath, false, nil); got != RootQuery() {
+		t.Errorf("QueryFor(./, %q) with nothing touched = %+v, want the root query", RootPath, got)
+	}
 }
 
 func TestQueryFor_IssueScenarioEndToEnd(t *testing.T) {
