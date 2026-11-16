@@ -294,15 +294,26 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   `resolvePath` as the OS reads it: each symlink replaced where it occurs, a
   `..` stepping up from where the path has got to (`svclink/../x` is pkg/x, not
   x), the first missing component and the rest kept as given. `placePath` then
-  places it in the worktree that holds it (`locateIn`: the deepest of the
+  places it in the worktree that holds it (`locateIn`: the DEEPEST of the
   repository's worktrees, Scan's `git worktree list`, since one can sit inside
-  another; a root equal but for case counts when `os.SameFile` says so). So a
-  path into ANOTHER worktree is that repo path (they share the layout), for
-  `wt check` and wt_check; the edit hooks, given only their own root, stay silent
-  about a file in another window's tree, as before. A path no worktree holds
-  (`/tmp/x`, `ext/x` through a link out of the repo, `..` at the top) is refused
-  (`outsideCheckPaths`: exit 64 that `--allow-missing` can't override; wt_check:
-  isError), never a search that matches nothing and reads clear.
+  another, whether it matched as spelled or, confirmed by `os.SameFile`, equal
+  but for case; stopping at the first as-spelled match let the main checkout
+  claim `.wt/feat/x` from a nested worktree `.wt/Feat`, #201 review). A bare
+  entry (`git clone --bare` with worktrees inside it) holds no repo paths and is
+  never a root (`gitx.BareWorktreesIn`). So a path into ANOTHER worktree is that
+  repo path (they share the layout), for `wt check` and wt_check; the edit
+  hooks, given only their own root, stay silent about a file in another
+  window's tree, as before. A path no worktree holds (`/tmp/x`, `..` at the
+  top, `../HEAD` beside a worktree inside a bare repo, and ⚠ any path THROUGH an
+  in-repo symlink that leads out of the repository, read lexically as a repo
+  path before #201) is refused (`outsideCheckPaths`: exit 64 that `--allow-missing`
+  can't override; wt_check: isError), never a search that matches nothing and
+  reads clear. ⚠ The Codex hook leaves an apply_patch operation that lies
+  entirely outside the repo out of its prediction (`predictCodexPatch`) instead
+  of giving up on the whole patch: wt's own `link_files` `.env` is a link into
+  the main checkout, and giving up there cost the deny for a repo file in the
+  same patch that `wt check` grades HIGH (#201 review). A move across the
+  repo's edge is still unpredictable (a file-level heads-up).
   ⚠ **A symlink FILE is two paths.** `wt check link.md` asks about the link
   itself (`resolvePath(p, false)`, the entry: another window can retarget it)
   AND its target (whose content an edit through it changes), so it never reads
@@ -319,20 +330,36 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   `matchTouchedDir` still answers nothing for a blank path, so the zero Query
   can't become the whole repo, and `unknownCheckPaths` never calls it a typo.
   ⚠ **Case is folded only where names are case-insensitive** (`caseInsensitive`:
-  the filesystem folds case at that worktree, probed with `os.SameFile` on an
-  ancestor spelled with its case swapped, or `core.ignorecase`). There
-  `placePath` spells each existing component as its directory lists it
-  (`pickListed`: only when the exact name is NOT listed, i.e. the filesystem
-  folded it to open it) and then as the index spells the path
-  (`gitx.TrackedFolded`, `:(literal,icase)`, used only when the index has exactly
-  one spelling: a case-only `mv` on disk leaves the index's, and that is the name
-  status, diff and every other window report; case twins keep the given one).
+  the filesystem folds case AT THE WORKTREE, probed on its own `.git` vs `.GIT`
+  with `os.SameFile` (`foldsCase`/`caseProbe`), or `core.ignorecase`). ⚠ #201
+  review: the first probe walked up to the nearest ancestor with a letter in its
+  name, which for a case-sensitive volume mounted at a letterless path (`/2024/1`)
+  is the PARENT filesystem: it read "folds", a new readme.md was checked as the
+  tracked README.md, and an add/add conflict (another window created readme.md)
+  read clear in `wt check` and both hooks. There `placePath` spells each existing
+  component as its directory lists it (`pickListed`: only when the exact name is
+  NOT listed, i.e. the filesystem folded it to open it) and then as the index
+  spells the path (`gitx.TrackedFolded`, `:(literal,icase)`, used only when the
+  index has exactly one spelling: a case-only `mv` on disk leaves the index's,
+  and that is the name status, diff and every other window report; case twins
+  keep the given one). ⚠ **Either folded spelling replaces the typed one only
+  when `acceptFold` says they are one file** (both exist and `os.SameFile`), or
+  when neither exists (then git's own index reading decides): one existing
+  without the other, or two different files, are two names, so neither a wrong
+  probe nor a hand-set `core.ignorecase` on a case-sensitive volume can merge
+  two files (pure, table-tested with injected facts; `foldFacts` gathers them).
   Shared with the hooks, so `wt check readme.md`, a Claude edit of
   `$PWD/readme.md` and a Codex patch of `readme.md` all ask about README.md.
   `wt check` alone also matches a path that is nowhere under its own spelling
   against the spellings windows touch (`collide.TouchedSpellings`, from
   `checkArgQueries`): a file only another window created, the hooks' superset
-  again. A case-sensitive repository is never folded, and an exact match never
+  again. ⚠ **That REPLACES the fuzzy search for that argument, on purpose**
+  (#181's rule: an argument that names a real place, here one touched under
+  another case, is a question about THAT place). On macOS, with window B
+  creating NOTES.md and window C editing docs/notes.md, `wt check notes.md` was
+  HIGH on main through C's basename and is now exact on NOTES.md: B only. The
+  dropped hit was a different file, exactly the root-vs-nested confusion #181
+  removed. A case-sensitive repository is never folded, and an exact match never
   becomes case-blind. Not folded (left as gaps): the fuzzy basename search, and
   Unicode normalization (APFS also opens an NFD name for its NFC spelling).
   Measured on git 2.39: `--show-toplevel` and `--show-prefix` come back in the
@@ -719,7 +746,11 @@ exit 0** (advisory / fail-open; a coordination nicety must never break the sessi
   window editing it, each with its own liveness and confirmed / not-computed tag
   (`codexEditDecision`, deduplicated by path + window: the worktree, else the
   label, #193). It used to keep only the first entry per path, so a second
-  window on the file went unmentioned (#201).
+  window on the file went unmentioned (#201). The Claude hook's message does
+  the same (`claudeDecision`, #201 review): it deduplicated by label, so
+  namesakes collapsed, and one file-level entry worded every window; now each
+  window is named once by worktree with its own grade when the grades differ.
+  Its deny predicate is unchanged (any kept entry under WT_CLAUDE_HOOK_BLOCK).
   ⚠ **Known gap: an `exec_command` workdir (#201).** The PreToolUse payload's
   `cwd` is the SESSION's cwd, and `codex-edit` reads a patch's relative paths
   from it. Codex can also run apply_patch through `exec_command` with a per-call
