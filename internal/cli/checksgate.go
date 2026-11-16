@@ -313,9 +313,14 @@ func noChecksNote(pr string, v merge.ChecksVerdict) string {
 // refuseHints say what to do about a refusal. Pure.
 func refuseHints(pr string, v merge.ChecksVerdict, o checksOpts) []string {
 	var out []string
-	if v.ReadErr != "" {
+	switch {
+	case v.ReadErr != "":
 		out = append(out, "re-run once gh can read them, or pass --checks-ok to merge without them")
-	} else {
+	case len(v.RequiredUnread) > 0 && len(v.Reasons()) == 1:
+		// Only the read failed, so CI has nothing to wait for (#217: an exhausted
+		// REST quota, the usual cause, lifts on its own).
+		out = append(out, "re-run once gh can read the required checks, or pass --checks-ok to merge without them")
+	default:
 		out = append(out, fmt.Sprintf("wait for CI (gh pr checks %s --watch) and re-run, or pass --checks-ok to merge anyway", pr))
 	}
 	if o.auto {

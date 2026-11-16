@@ -8,6 +8,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/eharriett0/wt/internal/ghx"
+	"github.com/eharriett0/wt/internal/merge"
 )
 
 // quotaGh is gh during #217's incident: the account's REST quota is used up.
@@ -107,7 +110,7 @@ func TestCmdMergePR_restQuotaUsedUp(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	never := []string{"not available or not authenticated", "EMPTY", "wt merge-pr 99999 --bypass", "state could not be read"}
+	never := []string{"not available or not authenticated", "EMPTY", "wt merge-pr 99999 --bypass", "state could not be read", "wait for CI"}
 	cases := []struct {
 		name   string
 		args   []string
@@ -119,7 +122,8 @@ func TestCmdMergePR_restQuotaUsedUp(t *testing.T) {
 	}{
 		{name: "checks: the required ones are REST, so unread, and the refusal names the quota",
 			args: []string{"99999", "--keep"}, code: 1,
-			out: []string{"required: could not be read", "REST API rate limit for this account is used up (it lifts at", "in 23m)", "pass --checks-ok"}},
+			out: []string{"required: could not be read", "REST API rate limit for this account is used up (it lifts at", "in 23m)",
+				"re-run once gh can read the required checks, or pass --checks-ok"}},
 		{name: "--checks-ok: the diff is read through GraphQL, the merge confirmed",
 			args: []string{"99999", "--keep", "--checks-ok"}, code: 0, merged: true,
 			out: []string{"6 changed file(s)"}},
@@ -179,5 +183,28 @@ func TestCmdMergePR_restQuotaUsedUp(t *testing.T) {
 				t.Errorf("the reset was probed %d times, want at most once", n)
 			}
 		})
+	}
+}
+
+// TestRefuseHintsForAnUnreadRequiredRead: when the one thing blocking is that
+// the required checks could not be read (#217: usually the REST quota), the
+// hint says to re-run once they can be, not to wait for CI; anything else
+// blocking still says wait for CI.
+func TestRefuseHintsForAnUnreadRequiredRead(t *testing.T) {
+	unread := []string{"branch protection: GitHub's REST API rate limit for this account is used up"}
+	pending := []ghx.Check{{Name: "test", State: "QUEUED"}}
+	for _, c := range []struct {
+		name string
+		v    merge.ChecksVerdict
+		want string
+	}{
+		{"the checks unread", merge.ChecksVerdict{ReadErr: "x"}, "re-run once gh can read them"},
+		{"only the required read failed", merge.ChecksVerdict{RequiredUnread: unread}, "re-run once gh can read the required checks"},
+		{"the required read failed, and a check is pending", merge.ChecksVerdict{RequiredUnread: unread, Pending: pending}, "wait for CI (gh pr checks 7 --watch)"},
+		{"a check pending", merge.ChecksVerdict{Pending: pending}, "wait for CI (gh pr checks 7 --watch)"},
+	} {
+		if got := refuseHints("7", c.v, checksOpts{}); len(got) == 0 || !strings.HasPrefix(got[0], c.want) {
+			t.Errorf("%s: refuseHints = %q, want it to start %q", c.name, got, c.want)
+		}
 	}
 }
