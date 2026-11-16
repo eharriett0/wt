@@ -412,8 +412,9 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   dirty counts read only status columns (one line per entry, a newline in a
   name is quoted), and `git worktree list --porcelain` prints paths unquoted
   (its `-z` needs git 2.36; Ubuntu 22.04 ships 2.34). gh has no `-z`: `gh pr
-  diff --name-only` relays GitHub's quoted names, so `ghx.PRChangedFiles`
-  unquotes them (`unquoteGitPath`) before the deploy-path globs see them.
+  diff --name-only` relays GitHub's quoted names, so `ghx.PRChangedFileCount`
+  unquotes them (`unquoteGitPath`, `diffNames`); the deploy gate's list
+  (`ghx.PRChangedFiles`) comes from REST JSON since #221, verbatim.
 - **A path handed to git means that one file, never a pattern (#204).** After
   `--` git reads a path as a pathspec: `a[1].md` also matched an untracked
   `a1.md`, so `IsUntracked` read a committed `a[1].md` as untracked and #113
@@ -752,9 +753,21 @@ docs live in [README.md](README.md); this file is for working *on* wt.
     `gh api graphql` asks github.com, which answers a GitHub Enterprise PR's URL
     with a null resource when gh is logged in to both. `bothFailed` wraps both
     errors (`%w`), so `ghx.IsRateLimit` sees either; the unread refusal's hint
-    says "once the rate limit lifts" only when one did. Renames list only the
-    new path, in both reads (measured), so a file moved OUT of a deploy path
-    still does not gate: an older gap, unchanged.
+    says "once the rate limit lifts" only when one did.
+  - ⚠ **A rename is both of its paths to the deploy gate (#221).** `gh pr diff
+    --name-only` prints only the new side (measured), so a PR moving
+    `infra/x.yaml` to `docs/x.yaml`, which deletes a deployed object, never
+    listed `infra/x.yaml` and merged without the typed confirm.
+    `PRChangedFiles` now reads REST `pulls/{n}/files` (`prFilesREST`, at the
+    PR's own host and repository: `resolvePR` + `prRepoPath`) and lists each
+    file's `previous_filename` beside it (`parsePRFileList`: each path once, a
+    file without a path an error, a list at `maxListedFiles` an error). The
+    GraphQL fallback has no field for the old path (`PullRequestChangedFile`
+    has only `changeType`), so any `RENAMED` file there is an error, and the
+    gate gates (`parsePRFiles`). The empty-diff count keeps `gh pr diff`: a
+    rename is one file either way. Pinned end to end by
+    `TestCmdMergePR_renameOutOfADeployPathGates`, which merges without the
+    confirm on the pre-#221 code.
   - The checks gate does not retry a read refused for a rate limit
     (`retryable`): it lifts in minutes, not in the 2 s retry.
   - doctor reads a rate-limited host as "logged in, but … refused the check for

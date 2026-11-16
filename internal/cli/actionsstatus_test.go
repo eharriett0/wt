@@ -349,6 +349,7 @@ case "$*" in
 *statusCheckRollup*) [ -e "$d/rollup.fail" ] && { echo "gh: Something went wrong (HTTP 502)" >&2; exit 1; }; echo '` + greenRollup + `'; exit 0 ;;
 "api --hostname $h repos/o/r/branches/"*) echo '` + unprotected + `'; exit 0 ;;
 "api --hostname $h repos/o/r/rules/branches/"*) echo '[]'; exit 0 ;;
+"api --hostname $h repos/o/r/pulls/"*"/files"*) echo '{"f":"a.txt","p":null}'; exit 0 ;;
 esac
 case "$1 $2" in
 "pr view")
