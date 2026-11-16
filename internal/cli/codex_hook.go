@@ -535,10 +535,13 @@ func parseCodexEdit(b []byte) (cwd, patch string, relevant bool) {
 
 // codexPatchFile is one file section of an apply_patch payload: its path (+
 // move destination), as written in the patch until repoRelativePatch makes it
-// repo-relative.
+// repo-relative. removed: the section removes the file at path (a Delete, or the
+// source of a move), so a symlink there is the link itself; apply_patch writes
+// through a link but unlinks the link (#201).
 type codexPatchFile struct {
 	path    string
 	newPath string
+	removed bool
 }
 
 // parseCodexPatch lists the files an apply_patch payload names, each section's
@@ -552,11 +555,12 @@ func parseCodexPatch(patch string) []codexPatchFile {
 		ln = strings.TrimSuffix(ln, "\r")
 		for _, prefix := range []string{"*** Update File: ", "*** Add File: ", "*** Delete File: ", "*** Move File: "} {
 			if p, ok := strings.CutPrefix(strings.TrimSpace(ln), prefix); ok {
-				files = append(files, codexPatchFile{path: strings.TrimSpace(p)})
+				files = append(files, codexPatchFile{path: strings.TrimSpace(p), removed: prefix == "*** Delete File: "})
 			}
 		}
 		if to, ok := strings.CutPrefix(strings.TrimSpace(ln), "*** Move to: "); ok && len(files) > 0 {
 			files[len(files)-1].newPath = strings.TrimSpace(to)
+			files[len(files)-1].removed = true
 		}
 	}
 	return files
@@ -569,11 +573,18 @@ func parseCodexPatch(patch string) []codexPatchFile {
 // Codex session started in pkg/ that patches "svc/README.md" must be checked as
 // pkg/svc/README.md; the old suffix match only reached it by accident, and the
 // pending-hunk read joined the wrong file onto root. A path outside the repo
-// becomes "", which patchPaths drops. Pure for relative paths.
+// becomes "", which patchPaths drops. A path is read as the filesystem reads it
+// (#201): through a symlinked directory to the file it reaches; a final symlink
+// is its target where the section writes it, the link itself where it removes
+// it (repoRelativeEntry). I/O (the filesystem).
 func repoRelativePatch(files []codexPatchFile, root, prefix string) []codexPatchFile {
 	out := make([]codexPatchFile, len(files))
 	for i, f := range files {
-		f.path = repoRelativePath(root, prefix, f.path)
+		if f.removed {
+			f.path = repoRelativeEntry(root, prefix, f.path)
+		} else {
+			f.path = repoRelativePath(root, prefix, f.path)
+		}
 		if f.newPath != "" {
 			f.newPath = repoRelativePath(root, prefix, f.newPath)
 		}
@@ -702,10 +713,16 @@ func predictCodexPatch(patch, root, prefix string) (map[string]string, bool) {
 	if err != nil {
 		return nil, false
 	}
-	// Keyed by repo-relative path, so two spellings of one file stay one file.
+	// Keyed by repo-relative path, so two spellings of one file stay one file,
+	// resolved as repoRelativePatch resolves them: a removed path (a Delete, a
+	// move's source) is the entry, a symlink there the link itself (#201).
 	for i := range ops {
 		op := &ops[i]
-		if op.path = repoRelativePath(root, prefix, op.path); op.path == "" {
+		rel := repoRelativePath
+		if op.kind == 'D' || (op.kind == 'U' && op.moveTo != "" && op.moveTo != op.path) {
+			rel = repoRelativeEntry
+		}
+		if op.path = rel(root, prefix, op.path); op.path == "" {
 			return nil, false
 		}
 		if op.moveTo != "" {

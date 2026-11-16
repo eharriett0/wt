@@ -16,6 +16,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"unicode"
 
 	"github.com/eharriett0/wt/internal/collide"
 	"github.com/eharriett0/wt/internal/config"
@@ -111,48 +113,370 @@ func claudeDecision(file string, high []CheckEntry, block, fileLevel bool) (stri
 // `README.md` typed in pkg/svc/ as the root README.md would check the wrong
 // file; the old suffix match used to paper over that by accident.
 //
-// An absolute file is made relative to root with symlinks resolved on both
-// sides, so a /var vs /private/var mismatch on macOS doesn't defeat the prefix
-// strip. That includes a file that doesn't exist yet (a Write creating it, a
-// path that exists only on another branch): its deepest existing ancestor is
-// resolved instead (resolveExisting).
+// Either way the file is read the way the filesystem reads it (#201): a
+// relative one is joined onto the directory it is read from and resolved
+// exactly like an absolute one (resolveExisting), with symlinks resolved on
+// both sides, so a /var vs /private/var mismatch on macOS doesn't defeat the
+// prefix strip, and `svclink/README.md` (svclink → pkg/svc) names
+// pkg/svc/README.md as `$PWD/svclink/README.md` always did. Only the absolute
+// spelling used to be resolved, so the relative one was checked at a path no
+// window can touch (git never tracks a path beyond a symlink) and read clear.
+// That includes a file that doesn't exist yet (a Write creating it, a path that
+// exists only on another branch): its existing part is resolved and the rest
+// re-appended. Then it is spelled the way git names it (placePath: on a
+// case-insensitive filesystem, `readme.md` is the README.md git tracks).
 func repoRelativePath(root, prefix, file string) string {
-	var rel string
-	if filepath.IsAbs(file) {
-		r, err := filepath.Rel(resolveExisting(root), resolveExisting(file))
-		if err != nil {
-			return ""
-		}
-		rel = r
-	} else {
-		rel = filepath.Clean(filepath.Join(filepath.FromSlash(prefix), file))
-	}
-	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return ""
-	}
-	return filepath.ToSlash(rel)
+	return repoRelativeAs(root, prefix, file, true)
 }
 
-// resolveExisting returns the absolute path p with symlinks resolved in its
-// deepest EXISTING ancestor and the rest re-appended. filepath.EvalSymlinks
-// fails outright for a path that doesn't exist, which left such a path on the
-// logical /var/… side of a comparison with git's physical /private/var/… root,
-// where it read as outside the repo and went unchecked. Falls back to the
-// cleaned p.
-func resolveExisting(p string) string {
-	p = filepath.Clean(p)
-	var rest []string
-	for cur := p; ; {
-		if r, err := filepath.EvalSymlinks(cur); err == nil {
-			return filepath.Join(append([]string{r}, rest...)...)
-		}
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			return p
-		}
-		rest = append([]string{filepath.Base(cur)}, rest...)
-		cur = parent
+// repoRelativeEntry is repoRelativePath for a file that is about to be REMOVED
+// rather than written (apply_patch's Delete, or a move's source): a symlink
+// that is its last component is the link itself, which is what goes, not the
+// file it points to (#201). A symlinked directory on the way is still followed.
+func repoRelativeEntry(root, prefix, file string) string {
+	return repoRelativeAs(root, prefix, file, false)
+}
+
+// repoRelativeAs is repoRelativePath, with followLast as resolvePath reads it.
+func repoRelativeAs(root, prefix, file string, followLast bool) string {
+	abs := file
+	if !filepath.IsAbs(file) {
+		abs = joinRaw(root, filepath.FromSlash(prefix), file)
 	}
+	pp, ok := placePath(resolvePath(abs, followLast), []string{resolveExisting(root)})
+	if !ok || pp.rel == collide.RootPath {
+		return ""
+	}
+	return pp.rel
+}
+
+// joinRaw joins path elements with the separator WITHOUT cleaning the result,
+// so a ".." after a symlink is left for resolvePath to read as the OS does
+// (from the link's target), not collapsed lexically as filepath.Join would.
+// Pure.
+func joinRaw(dir string, elems ...string) string {
+	sep := string(filepath.Separator)
+	s := dir
+	for _, e := range elems {
+		if e == "" {
+			continue
+		}
+		if !strings.HasSuffix(s, sep) {
+			s += sep
+		}
+		s += e
+	}
+	return s
+}
+
+// resolveExisting returns the absolute path p as the filesystem reads it, every
+// symlink in it followed (resolvePath). filepath.EvalSymlinks fails outright for
+// a path that doesn't exist, which left such a path on the logical /var/… side
+// of a comparison with git's physical /private/var/… root, where it read as
+// outside the repo and went unchecked; here the first missing component and the
+// rest are re-appended as given.
+func resolveExisting(p string) string { return resolvePath(p, true) }
+
+// maxSymlinkHops bounds the symlinks resolvePath follows for one path, as the
+// OS does (Linux gives up at 40), so a loop ends.
+const maxSymlinkHops = 40
+
+// resolvePath reads the absolute path p component by component, the way the
+// OS opens it (#201): a symlink is replaced by its target where it occurs, and a
+// ".." steps up from where the path has got to, which after a symlink is the
+// TARGET's parent. Cleaning p first read `svclink/../x` as x while the OS opens
+// pkg/x. followLast=false keeps a symlink that is the very last component as it
+// is: the ENTRY p names, which is what git tracks at that path (a trailing "/"
+// or "." still resolves it, as it does for the OS). The first component that
+// doesn't exist (or a dangling link, or a loop) ends the walk: it and the rest
+// are re-appended as given, cleaned. A relative p is only cleaned. I/O.
+func resolvePath(p string, followLast bool) string {
+	if !filepath.IsAbs(p) {
+		return filepath.Clean(p)
+	}
+	sep := string(filepath.Separator)
+	vol := filepath.VolumeName(p)
+	top := vol + sep
+	cur := top
+	parts := strings.Split(p[len(vol):], sep)
+	hops := 0
+	for len(parts) > 0 {
+		c := parts[0]
+		parts = parts[1:]
+		switch c {
+		case "", ".":
+			continue
+		case "..":
+			cur = filepath.Dir(cur)
+			continue
+		}
+		next := filepath.Join(cur, c)
+		fi, err := os.Lstat(next)
+		if err != nil {
+			return filepath.Join(append([]string{next}, parts...)...)
+		}
+		if fi.Mode()&os.ModeSymlink == 0 || (!followLast && len(parts) == 0) {
+			cur = next
+			continue
+		}
+		target, err := os.Readlink(next)
+		if hops++; err != nil || hops > maxSymlinkHops {
+			return filepath.Join(append([]string{next}, parts...)...)
+		}
+		if filepath.IsAbs(target) {
+			cur = top
+		}
+		parts = append(strings.Split(target, sep), parts...)
+	}
+	return cur
+}
+
+// placedPath is a path inside one of the repository's worktrees: that
+// worktree's top level, and the path relative to it, slash-separated
+// (collide.RootPath for the top level itself).
+type placedPath struct{ root, rel string }
+
+// placePath places p (absolute, symlinks already resolved) in the worktree
+// among roots that holds it (locateIn) and spells it the way git names it
+// (#201). Where names are case-insensitive (caseInsensitive), the filesystem
+// opens `readme.md` for README.md, but git and every other window call the file
+// README.md, so each existing component is spelled as its directory lists it
+// (spellAsListed), and then as git's index spells the path when the index has
+// exactly one spelling for it (indexSpelling): a case-only rename on disk (mv,
+// not git mv) leaves the index's, which is the one status and diff report. A
+// case-sensitive repository is left exactly as typed. ok=false when no worktree
+// holds p. I/O.
+func placePath(p string, roots []string) (placedPath, bool) {
+	root, rel, ok := locateIn(p, roots, sameDir)
+	if !ok {
+		return placedPath{}, false
+	}
+	if rel != collide.RootPath && caseInsensitive(root) {
+		rel = spellAsListed(root, rel)
+		rel = indexSpelling(rel, gitx.TrackedFolded(root, rel))
+	}
+	return placedPath{root, rel}, true
+}
+
+// locateIn finds the worktree that holds p (absolute, symlinks resolved): the
+// deepest of roots that contains it, since a worktree can sit inside another's
+// directory (a worktree_root inside the main checkout). All worktrees of one
+// repository share its layout, so a path inside ANOTHER worktree is that
+// worktree's repo-relative path (#201). Compared as spelled first; failing that,
+// a root whose components equal p's but for case holds it when same confirms
+// the two name one directory (a case-insensitive filesystem reached through a
+// cwd typed as ~/Repo for ~/repo). rel is slash-separated, collide.RootPath for
+// the root itself. Pure given same.
+func locateIn(p string, roots []string, same func(a, b string) bool) (root, rel string, ok bool) {
+	p = filepath.Clean(p)
+	for _, r := range roots {
+		if r == "" {
+			continue
+		}
+		r = filepath.Clean(r)
+		x, err := filepath.Rel(r, p)
+		if err != nil || x == ".." || strings.HasPrefix(x, ".."+string(filepath.Separator)) {
+			continue
+		}
+		if !ok || len(r) > len(root) {
+			root, rel, ok = r, filepath.ToSlash(x), true
+		}
+	}
+	if ok {
+		return root, rel, true
+	}
+	pc := pathComponents(p)
+	depth := -1
+	for _, r := range roots {
+		if r == "" {
+			continue
+		}
+		rc := pathComponents(filepath.Clean(r))
+		if len(rc) > len(pc) || len(rc) <= depth {
+			continue
+		}
+		match := true
+		for i := range rc {
+			if !strings.EqualFold(rc[i], pc[i]) {
+				match = false
+				break
+			}
+		}
+		if !match || !same(r, filepath.VolumeName(p)+string(filepath.Separator)+filepath.Join(pc[:len(rc)]...)) {
+			continue
+		}
+		depth = len(rc)
+		root, rel, ok = filepath.Clean(r), collide.RootPath, true
+		if len(pc) > len(rc) {
+			rel = strings.Join(pc[len(rc):], "/")
+		}
+	}
+	return root, rel, ok
+}
+
+// pathComponents splits a cleaned absolute path into its names. Pure.
+func pathComponents(p string) []string {
+	var out []string
+	for _, c := range strings.Split(p[len(filepath.VolumeName(p)):], string(filepath.Separator)) {
+		if c != "" {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// sameDir reports whether a and b name one existing file or directory. I/O.
+func sameDir(a, b string) bool {
+	fa, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	fb, err := os.Stat(b)
+	return err == nil && os.SameFile(fa, fb)
+}
+
+// caseInsensitive reports whether names in the worktree at root are
+// case-insensitive: the filesystem folds case there (foldsCase), or git was
+// told so (core.ignorecase, which git sets when it creates a repository on such
+// a filesystem). Nothing is folded anywhere else: on a case-sensitive
+// repository README.md and readme.md are two files. I/O.
+func caseInsensitive(root string) bool {
+	return foldsCase(root) || ignoreCaseAt(root)
+}
+
+// ignoreCaseMemo is core.ignorecase per worktree, read once per process (git
+// sets it when it creates the repository): the Codex hook resolves every path of
+// a patch twice.
+var ignoreCaseMemo sync.Map
+
+// ignoreCaseAt is gitx.IgnoreCaseIn(root), memoized. I/O.
+func ignoreCaseAt(root string) bool {
+	if v, ok := ignoreCaseMemo.Load(root); ok {
+		return v.(bool)
+	}
+	v := gitx.IgnoreCaseIn(root)
+	ignoreCaseMemo.Store(root, v)
+	return v
+}
+
+// foldsCase reports whether the filesystem holding dir treats two names that
+// differ only in case as one (APFS and HFS+ by default): the nearest of dir and
+// its ancestors whose name has a letter, spelled with its case swapped, is the
+// same directory. A path with no letter anywhere can't tell, and reads as
+// case-sensitive (core.ignorecase still decides). I/O.
+func foldsCase(dir string) bool {
+	for d := filepath.Clean(dir); ; d = filepath.Dir(d) {
+		base := filepath.Base(d)
+		if sw := swapCase(base); sw != base {
+			return sameDir(d, filepath.Join(filepath.Dir(d), sw))
+		}
+		if filepath.Dir(d) == d {
+			return false
+		}
+	}
+}
+
+// swapCase swaps the case of every letter in s. Pure.
+func swapCase(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsUpper(r) {
+			return unicode.ToLower(r)
+		}
+		if unicode.IsLower(r) {
+			return unicode.ToUpper(r)
+		}
+		return r
+	}, s)
+}
+
+// spellAsListed spells each component of rel (relative to root) that exists
+// the way its directory lists it (listedName); the first one that doesn't exist,
+// and the rest, are kept as given. I/O.
+func spellAsListed(root, rel string) string {
+	segs := strings.Split(rel, "/")
+	dir := root
+	for i, s := range segs {
+		if _, err := os.Lstat(filepath.Join(dir, s)); err != nil {
+			break
+		}
+		segs[i] = listedName(dir, s)
+		dir = filepath.Join(dir, segs[i])
+	}
+	return strings.Join(segs, "/")
+}
+
+// listedName is name as dir's listing spells it (pickListed); name when dir
+// can't be read. I/O.
+func listedName(dir, name string) string {
+	f, err := os.Open(dir)
+	if err != nil {
+		return name
+	}
+	defer f.Close()
+	names, _ := f.Readdirnames(-1)
+	return pickListed(name, names)
+}
+
+// pickListed is name as a directory listing spells it: name itself when it is
+// listed, else the ONE listed name equal to it but for case. The filesystem
+// opened name, so a listing without it means the filesystem folded case to find
+// it, and the listed spelling is the file's name. name when no listed name, or
+// more than one, folds to it. Pure.
+func pickListed(name string, listed []string) string {
+	match := ""
+	for _, l := range listed {
+		if l == name {
+			return name
+		}
+		if strings.EqualFold(l, name) {
+			if match != "" && match != l {
+				return name
+			}
+			match = l
+		}
+	}
+	if match == "" {
+		return name
+	}
+	return match
+}
+
+// indexSpelling is rel as git's index spells it, given what
+// gitx.TrackedFolded listed for it: rel itself when the index has it under that
+// spelling (a file, or a directory with a file under it), else the ONE spelling,
+// of the file or of the directory above the listed files, that differs from rel
+// only in case. rel when the index has nothing for it, or case twins (two
+// spellings: a case-insensitive checkout of a tree made elsewhere). Pure.
+func indexSpelling(rel string, listed []string) string {
+	want := strings.Split(rel, "/")
+	spellings := map[string]bool{}
+	for _, l := range listed {
+		segs := strings.Split(l, "/")
+		if len(segs) < len(want) {
+			continue
+		}
+		s := strings.Join(segs[:len(want)], "/")
+		if s == rel {
+			return rel
+		}
+		match := true
+		for i := range want {
+			if !strings.EqualFold(segs[i], want[i]) {
+				match = false
+				break
+			}
+		}
+		if match {
+			spellings[s] = true
+		}
+	}
+	if len(spellings) != 1 {
+		return rel
+	}
+	for s := range spellings {
+		return s
+	}
+	return rel
 }
 
 // hookClaudeEdit implements `wt _hook claude-edit`. Always exits 0 (the JSON

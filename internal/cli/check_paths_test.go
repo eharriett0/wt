@@ -246,3 +246,224 @@ func TestEditHooks_AskAboutTheEditedFileExactly(t *testing.T) {
 		t.Errorf("wt check README.md = exit %d, want 0, as the hooks say", code)
 	}
 }
+
+// issue201Repo builds main with README.md, pkg/svc/README.md and internal/foo.go
+// (40 lines each) plus two TRACKED symlinks, link.md → README.md and svclink →
+// pkg/svc, and four worktrees side by side: wa (this window, no edits), wb (line
+// 1 of pkg/svc/README.md and internal/foo.go, and a new docs/NEW.md), wc (line 1
+// of pkg/svc/README.md, and link.md retargeted to internal/foo.go) and wd (line
+// 1 of the root README.md), all committed. wa also holds ext, an untracked
+// symlink to a directory outside the repository, which holds x.md.
+// core.ignorecase is set as git sets it on a case-insensitive filesystem, so the
+// case rows run on any filesystem (on a case-sensitive one, only the index can
+// spell them).
+func issue201Repo(t *testing.T) (wa, wb, outside string) {
+	t.Helper()
+	hermeticGitT(t)
+	offlineGH(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("WT_SKIP_COLLISION", "")
+	t.Setenv("HOOK_DISABLE_MULTIWINDOW_CHECK", "")
+	t.Setenv("WT_CLAUDE_HOOK_BLOCK", "0")
+	t.Setenv("WT_CODEX_HOOK_BLOCK", "0")
+	t.Chdir(t.TempDir())
+
+	root := t.TempDir()
+	gitT(t, root, "init", "-q", "-b", "main")
+	gitT(t, root, "config", "user.email", "t@t.test")
+	gitT(t, root, "config", "user.name", "t")
+	gitT(t, root, "config", "core.ignorecase", "true")
+	for _, f := range []string{"README.md", "pkg/svc/README.md", "internal/foo.go"} {
+		writeNested(t, root, f, numbered(f))
+	}
+	symlinkT(t, "README.md", filepath.Join(root, "link.md"))
+	symlinkT(t, "pkg/svc", filepath.Join(root, "svclink"))
+	gitT(t, root, "add", "-A")
+	gitT(t, root, "commit", "-qm", "base")
+	parent := t.TempDir()
+	dirs := map[string]string{}
+	for _, b := range []string{"wa", "wb", "wc", "wd"} {
+		gitT(t, root, "branch", b)
+		dirs[b] = filepath.Join(parent, b)
+		gitT(t, root, "worktree", "add", "-q", dirs[b], b)
+	}
+	wa, wb = dirs["wa"], dirs["wb"]
+	editLine1(t, wb, "pkg/svc/README.md")
+	editLine1(t, wb, "internal/foo.go")
+	writeNested(t, wb, "docs/NEW.md", "new\n")
+	gitT(t, wb, "add", "-A")
+	gitT(t, wb, "commit", "-qm", "wb")
+	editLine1(t, dirs["wc"], "pkg/svc/README.md")
+	if err := os.Remove(filepath.Join(dirs["wc"], "link.md")); err != nil {
+		t.Fatal(err)
+	}
+	symlinkT(t, "internal/foo.go", filepath.Join(dirs["wc"], "link.md"))
+	gitT(t, dirs["wc"], "add", "-A")
+	gitT(t, dirs["wc"], "commit", "-qm", "wc")
+	editLine1(t, dirs["wd"], "README.md")
+	gitT(t, dirs["wd"], "commit", "-qam", "wd")
+
+	outside = t.TempDir()
+	writeT(t, outside, "x.md", "x\n")
+	symlinkT(t, outside, filepath.Join(wa, "ext"))
+	return wa, wb, outside
+}
+
+func symlinkT(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+}
+
+// checkExit runs `wt check --json args...` in cwd and returns only its exit
+// code (a refusal prints no payload).
+func checkExit(t *testing.T, cwd string, args ...string) int {
+	t.Helper()
+	t.Chdir(cwd)
+	stdout := os.Stdout
+	devnull, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer devnull.Close()
+	os.Stdout = devnull
+	defer func() { os.Stdout = stdout }()
+	return cmdCheck(append([]string{"--json"}, args...))
+}
+
+// #201 end to end: each gap in how an argument resolves to a repo path, read
+// against real worktrees, symlinks and an outside directory, for `wt check`,
+// MCP wt_check and both edit hooks.
+func TestCheck_Issue201_ArgumentsResolveToTheRepoPath(t *testing.T) {
+	wa, wb, outside := issue201Repo(t)
+	svc := []string{"pkg/svc/README.md←wb", "pkg/svc/README.md←wc"}
+	all := []string{"README.md←wd", "docs/NEW.md←wb", "internal/foo.go←wb", "link.md←wc", "pkg/svc/README.md←wb", "pkg/svc/README.md←wc"}
+	relToWb, err := filepath.Rel(wa, wb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name, cwd string
+		arg       string
+		code      int
+		want      []string
+	}{
+		// 1: a relative argument names what its absolute spelling does
+		{"through a symlinked directory, relative", wa, "svclink/README.md", 3, svc},
+		{"through a symlinked directory, absolute", wa, filepath.Join(wa, "svclink", "README.md"), 3, svc},
+		{"a tracked symlink file: the link AND its target", wa, "link.md", 3, []string{"README.md←wd", "link.md←wc"}},
+		{"a tracked symlink file, absolute", wa, filepath.Join(wa, "link.md"), 3, []string{"README.md←wd", "link.md←wc"}},
+		{"a symlink out of the repository, itself", wa, "ext", 0, nil},
+		// 2: the top level is the whole repository, from wherever it is named
+		{"`.` at the top", wa, ".", 3, all},
+		{"`./` at the top", wa, "./", 3, all},
+		{"$PWD at the top", wa, wa, 3, all},
+		{"`..` from a subdirectory", filepath.Join(wa, "pkg"), "..", 3, all},
+		// 3: a path in another worktree is that repo path
+		{"a file in another worktree, absolute", wa, filepath.Join(wb, "pkg", "svc", "README.md"), 3, svc},
+		{"a file in another worktree, relative", wa, filepath.Join(relToWb, "pkg", "svc", "README.md"), 3, svc},
+		{"another worktree's top level", wa, wb, 3, all},
+		// 4: case-insensitive names: the spelling git tracks / a window touches
+		{"a case variant of a tracked file", wa, "pkg/svc/readme.md", 3, svc},
+		{"a case variant of a directory", wa, "PKG/svc/README.md", 3, svc},
+		{"a case variant of a file only another window has", wa, "docs/new.md", 3, []string{"docs/NEW.md←wb"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, got := checkJSON(t, tc.cwd, tc.arg)
+			if code != tc.code || !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("wt check %s in %s = exit %d %v, want exit %d %v", tc.arg, tc.cwd, code, got, tc.code, tc.want)
+			}
+		})
+	}
+	// 3: a path outside every worktree is refused, never "clear"
+	for _, arg := range []string{filepath.Join(outside, "x.md"), "ext/x.md", filepath.Join(wa, "ext", "x.md"), "../../.."} {
+		if code := checkExit(t, wa, arg); code != 64 {
+			t.Errorf("wt check %s = exit %d, want 64 (outside the repository: refused)", arg, code)
+		}
+		if code := checkExit(t, wa, "--allow-missing", arg); code != 64 {
+			t.Errorf("wt check --allow-missing %s = exit %d, want 64 (nothing to check)", arg, code)
+		}
+	}
+	// the OS reads svclink/../README.md as pkg/README.md, which is nothing
+	if code := checkExit(t, wa, "svclink/../README.md"); code != 64 {
+		t.Errorf("wt check svclink/../README.md = exit %d, want 64: it is pkg/README.md, which doesn't exist", code)
+	}
+
+	// MCP wt_check: the same answers, absolute paths included
+	t.Chdir(filepath.Join(wa, "pkg"))
+	c, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		paths []string
+		want  []string
+	}{
+		{[]string{"svclink/README.md"}, svc},
+		{[]string{"."}, all},
+		{[]string{filepath.Join(wb, "pkg", "svc", "README.md")}, svc},
+		{[]string{"pkg/svc/readme.md"}, svc},
+	} {
+		text, isErr := mcpCheck(c, tc.paths, false, false)
+		if isErr {
+			t.Errorf("wt_check %v: tool error %s", tc.paths, text)
+			continue
+		}
+		if got := payloadEntries(t, text); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("wt_check %v = %v, want %v", tc.paths, got, tc.want)
+		}
+	}
+	for _, p := range []string{filepath.Join(outside, "x.md"), "ext/x.md"} {
+		if text, isErr := mcpCheck(c, []string{p}, false, true); !isErr || !strings.Contains(text, "not in any worktree") {
+			t.Errorf("wt_check %s (include_missing) = %v %s, want refused as outside", p, isErr, text)
+		}
+	}
+
+	// the edit hooks ask what `wt check` asks (#92), and the Codex hook names
+	// every window on the file (#201 item 6)
+	codexOut := func(cwd, patchPath, line string) string {
+		p, _ := json.Marshal(map[string]any{"cwd": cwd, "tool_name": "apply_patch", "tool_input": map[string]string{
+			"command": "*** Begin Patch\n*** Update File: " + patchPath + "\n@@\n-" + line + "\n+X " + line + "\n*** End Patch\n"}})
+		return runHookCapture(t, hookCodexEdit, string(p))
+	}
+	claudeOut := func(cwd, file, line string) string {
+		p, _ := json.Marshal(map[string]any{"cwd": cwd, "tool_name": "Edit", "tool_input": map[string]string{
+			"file_path": file, "old_string": line + "\n", "new_string": "X " + line + "\n"}})
+		return runHookCapture(t, hookClaudeEdit, string(p))
+	}
+	const svcLine = "pkg/svc/README.md l01"
+	for _, tc := range []struct{ name, out string }{
+		{"codex patches svclink/README.md", codexOut(wa, "svclink/README.md", svcLine)},
+		{"codex in pkg/ patches ../svclink/README.md", codexOut(filepath.Join(wa, "pkg"), "../svclink/README.md", svcLine)},
+		{"codex patches pkg/svc/readme.md", codexOut(wa, "pkg/svc/readme.md", svcLine)},
+		{"claude edits through svclink", claudeOut(wa, filepath.Join(wa, "svclink", "README.md"), svcLine)},
+		{"claude edits pkg/svc/readme.md", claudeOut(wa, filepath.Join(wa, "pkg", "svc", "readme.md"), svcLine)},
+	} {
+		if v := hookVerdict(t, tc.out); v != "overlap" {
+			t.Errorf("%s: hook says %s, want overlap, as `wt check` grades it HIGH", tc.name, v)
+		}
+	}
+	ctx, _, _ := decodeDecision(t, codexOut(wa, "svclink/README.md", svcLine))
+	if !strings.Contains(ctx, "pkg/svc/README.md — also being edited by wb [") || !strings.Contains(ctx, "), wc [") {
+		t.Errorf("the Codex hook must name both windows on pkg/svc/README.md:\n%s", ctx)
+	}
+	// a tracked symlink file: apply_patch writes THROUGH it (its target,
+	// README.md, which wd edits) but deletes the LINK (which wc retargeted).
+	// `wt check link.md` asks about both; each hook op asks about the one it
+	// changes.
+	ctx, _, _ = decodeDecision(t, codexOut(wa, "link.md", "README.md l01"))
+	if !strings.Contains(ctx, "README.md — also being edited by wd [") || strings.Contains(ctx, "link.md") {
+		t.Errorf("an Update through link.md changes README.md (wd's), not the link:\n%s", ctx)
+	}
+	del, _ := json.Marshal(map[string]any{"cwd": wa, "tool_name": "apply_patch", "tool_input": map[string]string{
+		"command": "*** Begin Patch\n*** Delete File: link.md\n*** End Patch\n"}})
+	delOut := runHookCapture(t, hookCodexEdit, string(del))
+	if v := hookVerdict(t, delOut); v != "overlap" {
+		t.Errorf("a Delete of link.md: hook says %s, want overlap with wc's retarget", v)
+	}
+	if ctx, _, _ = decodeDecision(t, delOut); !strings.Contains(ctx, "link.md — also being edited by wc [") || strings.Contains(ctx, "wd") {
+		t.Errorf("a Delete of link.md removes the link (wc's), not README.md:\n%s", ctx)
+	}
+}

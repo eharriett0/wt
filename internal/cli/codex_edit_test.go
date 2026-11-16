@@ -78,7 +78,8 @@ func TestParseCodexPatch(t *testing.T) {
 -gone
 *** End Patch`
 	got := parseCodexPatch(patch)
-	want := []codexPatchFile{{path: "internal/a.go"}, {path: "internal/b.go"}, {path: "internal/c.go"}, {path: "old/x.go", newPath: "new/x.go"}}
+	// a Delete and a move's source REMOVE their path (#201: a symlink there is the link)
+	want := []codexPatchFile{{path: "internal/a.go"}, {path: "internal/b.go"}, {path: "internal/c.go", removed: true}, {path: "old/x.go", newPath: "new/x.go", removed: true}}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("parseCodexPatch = %+v, want %+v", got, want)
 	}

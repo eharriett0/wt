@@ -151,7 +151,7 @@ func mcpToolDescriptors() []map[string]any {
 			"description": "Before editing: is any other live window touching these paths? Returns per-path " +
 				"grading (HIGH: hunks that overlap or touch, which git merges as one conflict; low: disjoint/advisory). Read-only.",
 			"inputSchema": obj(map[string]any{
-				"paths":           map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "repo-relative or absolute paths to check, matched exactly; a bare name that is no path in the repo (e.g. foo.go) matches any touched file with that basename"},
+				"paths":           map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "repo-relative or absolute paths to check, matched exactly; a bare name that is no path in the repo (e.g. foo.go) matches any touched file with that basename. \".\" is the whole repository; an absolute path inside another worktree of this repository is checked as the same repo path; one outside every worktree is refused"},
 				"include_stale":   map[string]any{"type": "boolean", "description": "include merged/dormant windows"},
 				"include_missing": map[string]any{"type": "boolean", "description": "check a path that doesn't exist yet (one you're about to create); otherwise a nonexistent path is refused, not reported clear"},
 			}, "paths"),
@@ -290,6 +290,14 @@ func mcpCheck(c *config.Config, paths []string, includeStale, allowMissing bool)
 	// client started the server.
 	root, _ := gitx.RepoRoot()
 	args := resolveCheckArgs(paths, root, rootArgBase(root), ws)
+	// #201: an absolute path (the schema invites them) that no worktree of this
+	// repository holds has nothing to check; "clear" would be a claim about
+	// nothing. A path in ANOTHER worktree is that repo path, and is checked.
+	if out := outsideCheckPaths(args); len(out) > 0 {
+		return "not in any worktree of this repository: " + strings.Join(out, ", ") +
+			" (refusing to report 'clear' for a path wt cannot check; pass a repo-relative path, " +
+			"or an absolute one inside a worktree of this repository).", true
+	}
 	// #93: refuse to report "clear" for a path that doesn't exist, isn't tracked,
 	// and no window touches — a typo must NOT read as a false all-clear (the exact
 	// failure this tool exists to prevent). Mirrors `wt check`'s guard so the MCP

@@ -231,6 +231,243 @@ func TestRepoRelativePath_SymlinkedPathThatDoesNotExistYet(t *testing.T) {
 	}
 }
 
+// #201: a path is read the way the OS opens it. Built with real symlinks: a
+// directory link, a file link, a link out of the tree, a dangling one, a loop,
+// and absolute and relative targets.
+func TestResolvePath_ReadsAPathAsTheOSDoes(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := filepath.Join(base, "repo")
+	out := filepath.Join(base, "outside")
+	for _, d := range []string{filepath.Join(repo, "pkg", "svc"), out} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range []string{filepath.Join(repo, "README.md"), filepath.Join(repo, "pkg", "svc", "README.md"), filepath.Join(out, "x.md")} {
+		if err := os.WriteFile(f, []byte("x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	links := map[string]string{
+		"svclink": "pkg/svc", "link.md": "README.md", "ext": out, "abslink": filepath.Join(repo, "pkg"),
+		"dangling": "pkg/nothere.md", "loop1": "loop2", "loop2": "loop1", "chain": "svclink",
+	}
+	for name, target := range links {
+		if err := os.Symlink(target, filepath.Join(repo, name)); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+	}
+	at := func(rel string) string { return filepath.Join(repo, filepath.FromSlash(rel)) }
+	cases := []struct {
+		name, p               string
+		wantTarget, wantEntry string
+	}{
+		{"a plain file", joinRaw(repo, "README.md"), at("README.md"), at("README.md")},
+		{"through a directory link", joinRaw(repo, "svclink/README.md"), at("pkg/svc/README.md"), at("pkg/svc/README.md")},
+		{"a directory link itself: entry is the link", joinRaw(repo, "svclink"), at("pkg/svc"), at("svclink")},
+		{"a trailing slash resolves it, as the OS does", joinRaw(repo, "svclink/"), at("pkg/svc"), at("pkg/svc")},
+		{"a file link: entry is the link, target its file", joinRaw(repo, "link.md"), at("README.md"), at("link.md")},
+		{"a chain of links", joinRaw(repo, "chain/README.md"), at("pkg/svc/README.md"), at("pkg/svc/README.md")},
+		{"an absolute target", joinRaw(repo, "abslink/svc"), at("pkg/svc"), at("pkg/svc")},
+		{".. after a link steps up from its target", joinRaw(repo, "svclink/../README.md"), at("pkg/README.md"), at("pkg/README.md")},
+		{"a missing tail is kept", joinRaw(repo, "svclink/new/x.md"), at("pkg/svc/new/x.md"), at("pkg/svc/new/x.md")},
+		{"a link out of the tree", joinRaw(repo, "ext/x.md"), filepath.Join(out, "x.md"), filepath.Join(out, "x.md")},
+		{"a dangling link: where it points", joinRaw(repo, "dangling"), at("pkg/nothere.md"), at("dangling")},
+		{"a relative path is only cleaned", "a/./b/../c", "a/c", "a/c"},
+	}
+	for _, tc := range cases {
+		if got := resolvePath(tc.p, true); got != tc.wantTarget {
+			t.Errorf("%s: resolvePath(%q, follow) = %q, want %q", tc.name, tc.p, got, tc.wantTarget)
+		}
+		if got := resolvePath(tc.p, false); got != tc.wantEntry {
+			t.Errorf("%s: resolvePath(%q, entry) = %q, want %q", tc.name, tc.p, got, tc.wantEntry)
+		}
+	}
+	// a loop ends (at one of its links, with the rest kept), inside the tree
+	for _, follow := range []bool{true, false} {
+		got := resolvePath(joinRaw(repo, "loop1/x"), follow)
+		if got != at("loop1/x") && got != at("loop2/x") {
+			t.Errorf("resolvePath(loop1/x, %v) = %q, want it to stop at a link of the loop", follow, got)
+		}
+	}
+	// #201 as reported: a relative path through a symlinked directory names
+	// what the absolute one does, from the root and from a subdirectory
+	for _, tc := range []struct{ prefix, file string }{
+		{"", "svclink/README.md"},
+		{"", filepath.Join(repo, "svclink", "README.md")},
+		{"pkg/", "../svclink/README.md"},
+		{"", "chain/README.md"},
+	} {
+		if got := repoRelativePath(repo, tc.prefix, tc.file); got != "pkg/svc/README.md" {
+			t.Errorf("repoRelativePath(prefix %q, %q) = %q, want pkg/svc/README.md", tc.prefix, tc.file, got)
+		}
+	}
+	if got := repoRelativePath(repo, "", "ext/x.md"); got != "" {
+		t.Errorf("a link out of the repo must leave it: repoRelativePath = %q", got)
+	}
+}
+
+// joinRaw must not clean: a ".." after a symlink is resolvePath's to read.
+func TestJoinRaw(t *testing.T) {
+	for _, tc := range []struct {
+		dir  string
+		el   []string
+		want string
+	}{
+		{"/r", []string{"pkg/", "a/../b"}, "/r/pkg/a/../b"},
+		{"/r", []string{"", "x"}, "/r/x"},
+		{"/", []string{"x"}, "/x"},
+		{"/r/", []string{"./x"}, "/r/./x"},
+	} {
+		if got := joinRaw(tc.dir, tc.el...); got != tc.want {
+			t.Errorf("joinRaw(%q, %q) = %q, want %q", tc.dir, tc.el, got, tc.want)
+		}
+	}
+}
+
+// locateIn places a resolved path in the worktree that holds it (#201): the
+// deepest root containing it as spelled, else one equal to it but for case when
+// the filesystem confirms they are one directory.
+func TestLocateIn(t *testing.T) {
+	roots := []string{"/w/repo", "/w/repo-b", "/w/repo/.worktrees/nested"}
+	never := func(a, b string) bool { return false }
+	always := func(a, b string) bool { return true }
+	cases := []struct {
+		name, p           string
+		same              func(a, b string) bool
+		wantRoot, wantRel string
+		ok                bool
+	}{
+		{"this worktree", "/w/repo/pkg/a.go", never, "/w/repo", "pkg/a.go", true},
+		{"its top level", "/w/repo", never, "/w/repo", ".", true},
+		{"another worktree", "/w/repo-b/pkg/a.go", never, "/w/repo-b", "pkg/a.go", true},
+		{"the deepest root wins", "/w/repo/.worktrees/nested/x.go", never, "/w/repo/.worktrees/nested", "x.go", true},
+		{"a sibling with a shared name prefix is not inside", "/w/repo-c/x.go", never, "", "", false},
+		{"outside", "/elsewhere/x.go", always, "", "", false},
+		{"wrong case, confirmed one directory", "/W/Repo/pkg/a.go", always, "/w/repo", "pkg/a.go", true},
+		{"wrong case, the deepest confirmed root", "/w/REPO/.worktrees/Nested", always, "/w/repo/.worktrees/nested", ".", true},
+		{"wrong case, not one directory (a case-sensitive filesystem)", "/W/Repo/pkg/a.go", never, "", "", false},
+		{"as spelled beats a case-folded match", "/w/repo-b/x", always, "/w/repo-b", "x", true},
+	}
+	for _, tc := range cases {
+		root, rel, ok := locateIn(tc.p, roots, tc.same)
+		if root != tc.wantRoot || rel != tc.wantRel || ok != tc.ok {
+			t.Errorf("%s: locateIn(%q) = %q, %q, %v; want %q, %q, %v", tc.name, tc.p, root, rel, ok, tc.wantRoot, tc.wantRel, tc.ok)
+		}
+	}
+}
+
+// pickListed and indexSpelling are the two spellings placePath reads where
+// names are case-insensitive (#201).
+func TestPickListedAndIndexSpelling(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		listed []string
+		want   string
+	}{
+		{"readme.md", []string{"README.md", "go.mod"}, "README.md"},
+		{"README.md", []string{"README.md", "readme.md"}, "README.md"}, // listed as is: kept
+		{"Readme.md", []string{"README.md", "readme.md"}, "Readme.md"}, // two fold to it: can't tell
+		{"x.md", []string{"README.md"}, "x.md"},
+		{"x.md", nil, "x.md"},
+	} {
+		if got := pickListed(tc.name, tc.listed); got != tc.want {
+			t.Errorf("pickListed(%q, %q) = %q, want %q", tc.name, tc.listed, got, tc.want)
+		}
+	}
+	for _, tc := range []struct {
+		rel    string
+		listed []string
+		want   string
+	}{
+		{"readme.md", []string{"README.md"}, "README.md"},                     // a case-only rename on disk: the index's
+		{"README.md", []string{"README.md"}, "README.md"},                     // as tracked
+		{"pkg/SVC", []string{"pkg/svc/README.md", "pkg/svc/a.go"}, "pkg/svc"}, // a directory
+		{"pkg/svc", []string{"pkg/svc/README.md"}, "pkg/svc"},
+		{"readme.md", []string{"README.md", "Readme.md"}, "readme.md"}, // case twins: as given
+		{"readme.md", []string{"README.md", "readme.md"}, "readme.md"}, // one of them is it
+		{"new.md", nil, "new.md"},                                      // untracked
+		{"pkg", []string{"pkg2/x.go"}, "pkg"},                          // a segment, never a name prefix
+	} {
+		if got := indexSpelling(tc.rel, tc.listed); got != tc.want {
+			t.Errorf("indexSpelling(%q, %q) = %q, want %q", tc.rel, tc.listed, got, tc.want)
+		}
+	}
+}
+
+// foldsCase agrees with the filesystem it probes: measured here by creating a
+// file and opening it under the other case.
+func TestFoldsCase_MatchesTheFilesystem(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe := filepath.Join(dir, "Probe")
+	if err := os.Mkdir(probe, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, statErr := os.Stat(filepath.Join(dir, "pROBE"))
+	if got, want := foldsCase(probe), statErr == nil; got != want {
+		t.Errorf("foldsCase(%q) = %v, but the filesystem opens pROBE: %v", probe, got, want)
+	}
+	if got := swapCase("aB-1é"); got != "Ab-1É" {
+		t.Errorf("swapCase = %q", got)
+	}
+}
+
+// #201 item 4: where names are case-insensitive, a path is checked under the
+// name git tracks. core.ignorecase is set by hand so this runs on a
+// case-sensitive filesystem too, where only the index can supply the spelling;
+// on one that folds case, the on-disk spelling is read as well.
+func TestPlacePath_SpellsAsGitTracks(t *testing.T) {
+	hermeticGitT(t)
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, root, "init", "-q", "-b", "main")
+	gitT(t, root, "config", "user.email", "t@t.test")
+	gitT(t, root, "config", "user.name", "t")
+	gitT(t, root, "config", "core.ignorecase", "true")
+	writeNested(t, root, "pkg/svc/README.md", "x\n")
+	gitT(t, root, "add", "-A")
+	gitT(t, root, "commit", "-qm", "base")
+	writeNested(t, root, "docs/new.md", "untracked\n")
+	for in, want := range map[string]string{
+		"pkg/svc/readme.md": "pkg/svc/README.md",
+		"PKG/Svc/README.md": "pkg/svc/README.md",
+		"pkg/SVC":           "pkg/svc",
+		"pkg/svc/README.md": "pkg/svc/README.md",
+		"pkg/svc/other.md":  "pkg/svc/other.md", // nothing to spell it by
+	} {
+		if got := repoRelativePath(root, "", in); got != want {
+			t.Errorf("repoRelativePath(%q) = %q, want %q (the index's spelling)", in, got, want)
+		}
+	}
+	if foldsCase(root) { // the untracked file is spelled as listed only where the filesystem folds case
+		if got := repoRelativePath(root, "", "DOCS/NEW.md"); got != "docs/new.md" {
+			t.Errorf("repoRelativePath(DOCS/NEW.md) = %q, want docs/new.md (as listed)", got)
+		}
+	}
+	// a case-sensitive repository keeps the spelling it was given
+	cs, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, cs, "init", "-q", "-b", "main")
+	gitT(t, cs, "config", "core.ignorecase", "false")
+	writeNested(t, cs, "README.md", "x\n")
+	gitT(t, cs, "add", "-A")
+	if !foldsCase(cs) {
+		if got := repoRelativePath(cs, "", "readme.md"); got != "readme.md" {
+			t.Errorf("case-sensitive: repoRelativePath(readme.md) = %q, want it as given", got)
+		}
+	}
+}
+
 func TestMergeClaudeHook_FreshAndIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/settings.json"

@@ -778,11 +778,30 @@ func IsTracked(path string) bool {
 
 // IsTrackedIn is IsTracked with path read relative to dir instead of the
 // current directory. MCP wt_check reads its paths from the repo root, whatever
-// directory the server was started in (#181 review).
+// directory the server was started in (#181 review); both it and `wt check` ask
+// the worktree that holds the repo path an argument resolves to (#201).
 func IsTrackedIn(dir, path string) bool {
 	_, err := RunDir(dir, "ls-files", "--error-unmatch", "--", literalPath(path))
 	return err == nil
 }
+
+// TrackedFolded lists the index entries of the worktree at dir that path names
+// when case is ignored (`:(literal,icase)`, #201): the file itself under any
+// spelling of its name, or every file under a directory so spelled. On a
+// case-insensitive filesystem a file renamed by case alone on disk (mv, not git
+// mv) is still the index's spelling to git: status and diff report that one, so
+// it is the name another window's edit is listed under. Read NUL-separated, never
+// quoted (#200). nil when git tracks nothing there or can't say.
+func TrackedFolded(dir, path string) []string {
+	out, err := runRaw(dir, "ls-files", "-z", "--", ":(literal,icase)"+path)
+	if err != nil {
+		return nil
+	}
+	return splitNUL(out)
+}
+
+// IgnoreCaseIn is IgnoreCase for the repository at dir.
+func IgnoreCaseIn(dir string) bool { return ignoreCaseIn(dir) }
 
 // CountUnshipped counts cherry "+" lines (commits with no patch-equivalent on
 // base). Zero means the branch is fully shipped (squash-merge safe).

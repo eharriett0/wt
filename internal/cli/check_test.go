@@ -2,6 +2,7 @@ package cli
 
 import (
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -14,7 +15,7 @@ import (
 func argFor(arg, rel string, exists, tracked bool, ws []collide.Window) checkArg {
 	return checkArg{
 		arg:     arg,
-		query:   collide.QueryFor(arg, rel, exists || tracked, ws),
+		queries: []collide.Query{collide.QueryFor(arg, rel, exists || tracked, ws)},
 		exists:  exists,
 		tracked: tracked,
 	}
@@ -110,19 +111,14 @@ func TestRepoRelativePatch(t *testing.T) {
 	}
 }
 
-// fakeBase is an argBase answering from fixed sets of arguments as typed.
+// fakeBase is an argBase answering from fixed sets: exists from arguments as
+// typed, tracked from repo paths.
 func fakeBase(prefix string, exists, tracked []string) argBase {
-	in := func(set []string) func(string) bool {
-		return func(a string) bool {
-			for _, s := range set {
-				if s == a {
-					return true
-				}
-			}
-			return false
-		}
+	return argBase{
+		prefix:  prefix,
+		exists:  func(a string) bool { return slices.Contains(exists, a) },
+		tracked: func(_, rel string) bool { return slices.Contains(tracked, rel) },
 	}
-	return argBase{prefix: prefix, exists: in(exists), tracked: in(tracked)}
 }
 
 // TestResolveCheckArgs pins how an argument becomes a query, given where it is
@@ -158,7 +154,7 @@ func TestResolveCheckArgs(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := resolveCheckArgs([]string{tc.arg}, "/repo", tc.base, ws)
-			if len(got) != 1 || got[0].query != tc.want {
+			if len(got) != 1 || !reflect.DeepEqual(got[0].queries, []collide.Query{tc.want}) {
 				t.Fatalf("resolveCheckArgs(%q, prefix %q) = %+v, want query %+v", tc.arg, tc.base.prefix, got, tc.want)
 			}
 			if got[0].arg != strings.TrimSpace(tc.arg) {
@@ -168,6 +164,110 @@ func TestResolveCheckArgs(t *testing.T) {
 	}
 	if got := resolveCheckArgs([]string{"", "  "}, "/repo", fakeBase("", nil, nil), ws); len(got) != 0 {
 		t.Errorf("blank arguments must be skipped, got %+v", got)
+	}
+}
+
+// #201 at the resolution layer: the top level is the whole repository from
+// wherever it is named, and a path inside ANOTHER worktree of the repository is
+// that worktree's repo path (they share the layout). The fixture paths exist
+// nowhere, so this pins the placement, not the filesystem (the real-file cases
+// are in check_paths_test.go).
+func TestResolveCheckArgs_TopLevelAndOtherWorktrees(t *testing.T) {
+	ws := []collide.Window{
+		{Branch: "feat-b", Worktree: "/repo-b", Touched: []string{"pkg/svc/README.md", "internal/foo.go"}},
+		{Branch: "nested", Worktree: "/repo/.worktrees/nested", Touched: []string{"x.go"}},
+	}
+	exact := func(p string) collide.Query { return collide.Query{Path: p, Mode: collide.MatchExact} }
+	root := collide.RootQuery()
+	cases := []struct {
+		name string
+		base argBase
+		arg  string
+		want []collide.Query
+	}{
+		{"`.` at the top", fakeBase("", nil, nil), ".", []collide.Query{root}},
+		{"`./` at the top", fakeBase("", nil, nil), "./", []collide.Query{root}},
+		{"$PWD at the top", fakeBase("", nil, nil), "/repo", []collide.Query{root}},
+		{"`..` from a subdirectory", fakeBase("pkg/", nil, nil), "..", []collide.Query{root}},
+		{"`.` in a subdirectory is that subdirectory (#181)", fakeBase("pkg/", nil, nil), ".", []collide.Query{exact("pkg")}},
+		{"another worktree's top level", fakeBase("", nil, nil), "/repo-b", []collide.Query{root}},
+		{"a file in another worktree, absolute", fakeBase("pkg/", nil, nil), "/repo-b/pkg/svc/README.md", []collide.Query{exact("pkg/svc/README.md")}},
+		{"a file in another worktree, relative", fakeBase("pkg/", nil, nil), "../../repo-b/internal/foo.go", []collide.Query{exact("internal/foo.go")}},
+		{"tracked in another worktree, touched by nobody", fakeBase("", nil, []string{"gone.go"}), "/repo-b/gone.go", []collide.Query{exact("gone.go")}},
+		{"a worktree nested in this one: its own path, not ours", fakeBase("", nil, nil), ".worktrees/nested/x.go", []collide.Query{exact("x.go")}},
+	}
+	for _, tc := range cases {
+		got := resolveCheckArgs([]string{tc.arg}, "/repo", tc.base, ws)
+		if len(got) != 1 || got[0].outside || !reflect.DeepEqual(got[0].queries, tc.want) {
+			t.Errorf("%s: resolveCheckArgs(%q, prefix %q) = %+v, want queries %+v", tc.name, tc.arg, tc.base.prefix, got, tc.want)
+		}
+	}
+	// outside every worktree: refused by the caller, never a search that reads clear
+	for _, tc := range []struct{ prefix, arg string }{
+		{"", "/elsewhere/x.go"},
+		{"", "../x.go"},
+		{"pkg/", "../../.."},
+		{"", "/repo-2/x.go"}, // a sibling sharing a name prefix is not inside /repo
+		{"", "/"},
+	} {
+		got := resolveCheckArgs([]string{tc.arg}, "/repo", fakeBase(tc.prefix, []string{tc.arg}, nil), ws)
+		if len(got) != 1 || !got[0].outside || got[0].queries != nil || got[0].namesRealPath() {
+			t.Errorf("resolveCheckArgs(%q, prefix %q) = %+v, want outside, no queries", tc.arg, tc.prefix, got)
+		}
+	}
+}
+
+// checkArgQueries decides an argument's queries from the repo paths it names
+// (#201): every one exact when real; one search when it names nothing; the
+// spellings windows touch it by only where names are case-insensitive.
+func TestCheckArgQueries(t *testing.T) {
+	ws := []collide.Window{{Worktree: "/repo-b", Touched: []string{"docs/NEW.md", "README.md"}}}
+	exact := func(p string) collide.Query { return collide.Query{Path: p, Mode: collide.MatchExact} }
+	fuzzy := func(p string) collide.Query { return collide.Query{Path: p, Mode: collide.MatchFuzzy} }
+	cases := []struct {
+		name   string
+		arg    string
+		rels   []string
+		onDisk bool
+		fold   bool
+		want   []collide.Query
+	}{
+		{"a symlink and its target: both", "link.md", []string{"link.md", "README.md"}, true, false, []collide.Query{exact("link.md"), exact("README.md")}},
+		{"one path", "README.md", []string{"README.md"}, true, false, []collide.Query{exact("README.md")}},
+		{"the top level", ".", []string{collide.RootPath}, false, false, []collide.Query{collide.RootQuery()}},
+		{"names nothing: one search, as typed", "x/new.md", []string{"x/new.md"}, false, false, []collide.Query{fuzzy("x/new.md")}},
+		{"a dangling link that names nothing: one search", "dl", []string{"dl", "gone"}, false, false, []collide.Query{fuzzy("dl")}},
+		{"case-insensitive: the spelling a window touches", "docs/new.md", []string{"docs/new.md"}, false, true, []collide.Query{exact("docs/NEW.md")}},
+		{"case-sensitive: no folding, a search", "docs/new.md", []string{"docs/new.md"}, false, false, []collide.Query{fuzzy("docs/new.md")}},
+		{"case-insensitive, nothing touched by any spelling: a search", "docs/zzz.md", []string{"docs/zzz.md"}, false, true, []collide.Query{fuzzy("docs/zzz.md")}},
+		// a real path is a question about THAT path: folding never widens it
+		{"case-insensitive, on disk: exact as placed", "readme.md", []string{"readme.md"}, true, true, []collide.Query{exact("readme.md")}},
+		{"duplicates collapse", "a.md", []string{"a.md", "a.md"}, true, false, []collide.Query{exact("a.md")}},
+	}
+	for _, tc := range cases {
+		if got := checkArgQueries(tc.arg, tc.rels, tc.onDisk, ws, tc.fold); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("%s: checkArgQueries(%q, %q) = %+v, want %+v", tc.name, tc.arg, tc.rels, got, tc.want)
+		}
+	}
+}
+
+// #201: the top level is never a typo, and a path outside every worktree is
+// refused by outsideCheckPaths (naming where it resolves), not by the typo
+// guard.
+func TestUnknownAndOutsideCheckPaths(t *testing.T) {
+	ws := []collide.Window{{Worktree: "/repo-b"}}
+	args := []checkArg{
+		{arg: "./", queries: []collide.Query{collide.RootQuery()}},
+		{arg: "/tmp/x.md", outside: true, resolved: "/private/tmp/x.md"},
+		{arg: "/elsewhere/y.md", outside: true, resolved: "/elsewhere/y.md"},
+		{arg: "docs/typo.md", queries: []collide.Query{{Path: "docs/typo.md", Mode: collide.MatchFuzzy}}},
+	}
+	if got := unknownCheckPaths(args, ws); !reflect.DeepEqual(got, []string{"docs/typo.md"}) {
+		t.Errorf("unknownCheckPaths = %q, want only the typo", got)
+	}
+	want := []string{"/tmp/x.md (resolves to /private/tmp/x.md)", "/elsewhere/y.md"}
+	if got := outsideCheckPaths(args); !reflect.DeepEqual(got, want) {
+		t.Errorf("outsideCheckPaths = %q, want %q", got, want)
 	}
 }
 
@@ -192,7 +292,7 @@ func TestResolveCheckArgs_SpacesInARealName(t *testing.T) {
 	}
 	for _, tc := range cases {
 		got := resolveCheckArgs([]string{tc.arg}, "/repo", tc.base, ws)
-		if len(got) != 1 || got[0].query != tc.want || got[0].arg != tc.wantArg {
+		if len(got) != 1 || !reflect.DeepEqual(got[0].queries, []collide.Query{tc.want}) || got[0].arg != tc.wantArg {
 			t.Errorf("%s: resolveCheckArgs(%q) = %+v, want query %+v, arg %q", tc.name, tc.arg, got, tc.want, tc.wantArg)
 		}
 	}
