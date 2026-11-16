@@ -664,7 +664,7 @@ func ghLine(rep *Report) (warn bool, msg string) {
 				hs = append(hs, h.Host)
 			}
 		}
-		return true, "gh — logged in, but " + strings.Join(hs, ", ") + " refused the check for a rate limit: the account's REST calls fail until it lifts (GraphQL has its own quota, so `gh pr view` and merge-pr's GraphQL reads still answer)"
+		return true, "gh — logged in, but " + strings.Join(hs, ", ") + " refused the check for a rate limit: calls on that quota fail until it lifts (REST and GraphQL have separate quotas; merge-pr reads what it can and names what it can't)"
 	case rep.GH && rep.GHAuthUnknown && len(rep.GHHosts) > 0:
 		var hs []string
 		for _, h := range rep.GHHosts {

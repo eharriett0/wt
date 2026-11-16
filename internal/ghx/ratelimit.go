@@ -69,23 +69,41 @@ var (
 	// secondaryLimit is its message for the burst limit ("You have exceeded a
 	// secondary rate limit…").
 	secondaryLimit = regexp.MustCompile(`(?i)\bsecondary rate limit\b`)
-	// graphQLErr marks the GraphQL API: gh prints its errors as "GraphQL: …",
-	// and GitHub types a rate-limited one RATE_LIMITED.
-	graphQLErr = regexp.MustCompile(`\bGraphQL:|\bRATE_LIMITED\b`)
+	// graphQLErr marks text from the GraphQL API: gh prints its errors as
+	// "GraphQL: …", GitHub types a rate-limited one RATE_LIMITED, an HTTP error
+	// names the endpoint ("… (https://api.github.com/graphql)"), and gh's GraphQL
+	// client (a GH_TOKEN login check) says "non-200 OK status code". Measured
+	// (#217 review): `gh api graphql` refused for its quota prints only "gh: API
+	// rate limit already exceeded for user ID N." on stderr, with no marker at
+	// all, so the caller's own knowledge of the API is the fallback.
+	graphQLErr = regexp.MustCompile(`\bGraphQL:|\bRATE_LIMITED\b|/graphql\b|non-200 OK status code`)
+)
+
+// The APIs a gh call can use, each with its own quota.
+const (
+	apiREST    = "REST"
+	apiGraphQL = "GraphQL"
 )
 
 // rateLimitKind reports whether gh's error text says GitHub refused the call
 // for a rate limit, on which API, and whether it is the secondary limit. Pure.
-func rateLimitKind(text string) (api string, secondary, ok bool) {
+// The text decides the API when it names one (graphQLErr); otherwise it is
+// called, the API the caller knows it used ("" = REST: what a bare `gh api`
+// path and `gh pr diff` use).
+func rateLimitKind(text, called string) (api string, secondary, ok bool) {
 	switch {
 	case secondaryLimit.MatchString(text):
 		secondary = true
 	case !primaryLimit.MatchString(text):
 		return "", false, false
 	}
-	api = "REST"
-	if graphQLErr.MatchString(text) {
-		api = "GraphQL"
+	switch {
+	case graphQLErr.MatchString(text):
+		api = apiGraphQL
+	case called != "":
+		api = called
+	default:
+		api = apiREST
 	}
 	return api, secondary, true
 }
@@ -167,15 +185,17 @@ func liveProbeRateReset(host string) time.Time {
 
 // rateLimited returns the RateLimitError for gh's error text when GitHub
 // refused the call for a rate limit. host is where the call went ("" = the
-// host gh picks). Only a REST limit is probed for its reset: GraphQL's quota
-// lifts on its own clock, which a REST call's headers do not carry.
-func rateLimited(host, text string) (*RateLimitError, bool) {
-	api, secondary, ok := rateLimitKind(text)
+// host gh picks), called the API the caller used (rateLimitKind). Only the
+// REST quota is probed for its reset: GraphQL's lifts on its own clock, which
+// a REST call's headers do not carry, and a probe during a secondary limit
+// only adds to the burst it is refusing.
+func rateLimited(host, called, text string) (*RateLimitError, bool) {
+	api, secondary, ok := rateLimitKind(text, called)
 	if !ok {
 		return nil, false
 	}
 	e := &RateLimitError{API: api, Secondary: secondary, Msg: firstLine(text), Now: time.Now()}
-	if api == "REST" {
+	if api == apiREST && !secondary {
 		e.Reset = probeRateReset(host)
 	}
 	return e, true

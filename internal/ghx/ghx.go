@@ -317,10 +317,10 @@ func PRChangedFileCount(pr string) (int, error) {
 	if err == nil {
 		return len(diffNames(out)), nil
 	}
-	rerr := ghErr(err)
+	rerr := ghErrAt(RepoHost(), apiREST, err)
 	out, gerr := run("pr", "view", pr, "--json", "changedFiles", "--jq", ".changedFiles")
 	if gerr != nil {
-		return 0, bothFailed("diff", rerr, "file count", ghErr(gerr))
+		return 0, bothFailed("diff", rerr, "file count", ghErrAt(RepoHost(), apiGraphQL, gerr))
 	}
 	n, perr := parseFileCount(out)
 	if perr != nil {
@@ -374,7 +374,7 @@ func PRChangedFiles(pr string) ([]string, error) {
 	if err == nil {
 		return diffNames(out), nil
 	}
-	rerr := ghErr(err)
+	rerr := ghErrAt(RepoHost(), apiREST, err)
 	files, gerr := prFilesGraphQL(pr)
 	if gerr != nil {
 		return nil, bothFailed("diff", rerr, "file list", gerr)
@@ -390,22 +390,33 @@ const prFilesQuery = `query($url:URI!,$endCursor:String){resource(url:$url){... 
 
 // prFilesGraphQL lists PR pr's changed files over GraphQL (#217), the REST
 // diff's fallback. GraphQL gives paths verbatim, never C-quoted. Renames list
-// the new path, as `gh pr diff --name-only` does.
+// the new path, as `gh pr diff --name-only` does (measured on both).
+//
+// ⚠ The query goes to the PR's own host (`--hostname`, from its URL, as
+// PRChecks does): `gh api graphql` alone asks github.com, which answers a
+// GitHub Enterprise PR's URL with a null resource whenever gh is logged in to
+// both (#217 review).
 func prFilesGraphQL(pr string) ([]string, error) {
-	url, err := run("pr", "view", pr, "--json", "url", "--jq", ".url")
+	out, err := run("pr", "view", pr, "--json", "number,url", "--jq", `"\(.number) \(.url)"`)
 	if err != nil {
-		return nil, ghErr(err)
+		return nil, ghErrAt(RepoHost(), apiGraphQL, err)
 	}
-	if strings.TrimSpace(url) == "" {
-		return nil, fmt.Errorf("cannot resolve PR #%s's URL", pr)
+	ref, err := parsePRRef(out)
+	if err != nil {
+		return nil, fmt.Errorf("cannot resolve PR #%s's URL: %w", pr, err)
 	}
-	out, err := run("api", "graphql", "--paginate", "-f", "query="+prFilesQuery, "-f", "url="+strings.TrimSpace(url),
+	out, err = run("api", "graphql", "--hostname", ref.host, "--paginate", "-f", "query="+prFilesQuery, "-f", "url="+ref.url,
 		"--jq", `.data.resource | {total: .changedFiles, paths: [.files.nodes[].path]}`)
 	if err != nil {
-		return nil, ghErr(err)
+		return nil, ghErrAt(ref.host, apiGraphQL, err)
 	}
 	return parsePRFiles(out)
 }
+
+// maxListedFiles is the most files GitHub lists for one PR (its REST and
+// GraphQL file lists both stop there). A PR at the cap may have more, so its
+// list is never taken as the whole PR.
+const maxListedFiles = 3000
 
 // parsePRFiles reads prFilesGraphQL's output, one object per page. Every page
 // must carry the total and its paths, and the pages together must list exactly
@@ -440,6 +451,8 @@ func parsePRFiles(out string) ([]string, error) {
 		return nil, errors.New("gh printed no file list")
 	case len(files) != total:
 		return nil, fmt.Errorf("GraphQL listed %d of the PR's %d changed files", len(files), total)
+	case total >= maxListedFiles:
+		return nil, fmt.Errorf("the PR changes %d files, and GitHub lists at most %d, so the list may not be all of them", total, maxListedFiles)
 	}
 	return files, nil
 }

@@ -604,8 +604,16 @@ docs live in [README.md](README.md); this file is for working *on* wt.
     X-RateLimit-Reset when Remaining is 0; pure `rateReset`), probed once per
     host per authTTL (`probeRateReset` is the test seam). ⚠ Not the rate_limit
     endpoint: during the incident it reported 5,000 remaining while every call
-    was refused. A GraphQL limit is not probed: a REST call's headers don't carry
-    its clock.
+    was refused. Only the REST primary quota is probed: a REST call's headers
+    don't carry GraphQL's clock, and a probe during a secondary limit adds to
+    the burst. ⚠ **Which API refused is read from the text first, then from the
+    caller** (`ghErrAt(host, called, err)`): measured with real gh (#217
+    review), `gh api graphql` refused for its quota prints only "gh: API rate
+    limit already exceeded for user ID N." (RATE_LIMITED is in the stdout
+    body), and a GraphQL 403 reads "… (https://…/graphql)". Text markers
+    (`graphQLErr`: `GraphQL:`, RATE_LIMITED, `/graphql`, gh's GraphQL client's
+    "non-200 OK status code") beat the caller's guess, since `gh pr diff` may
+    itself resolve the PR over GraphQL; a bare `ghErr` assumes REST.
   - The auth check's 403/429 rate-limit refusal is `HostAuthRateLimited` (the
     `--json` form only: gh before 2.81 prints "token invalid" for it, and
     `authProblem` says it can't tell). GitHub refuses that way only after it took
@@ -616,17 +624,28 @@ docs live in [README.md](README.md); this file is for working *on* wt.
     gate ONLY merge-pr's own reads (`PRState`, `PRChecks` and the required-check
     reads, the close check's `PRCommits`/`RepoSquashSettings`/
     `PRClosingIssueNumbers`), whose failures are reported, never read as
-    "none". A refused gate says why (`notSignedIn`), per host.
+    "none". `signedIn` is a passed check, or a failed one that at least one
+    rate-limited host explains (every other host OK): the human form's
+    unexplained non-zero exit with every host it read OK stays a no. A refused
+    gate says why (`notSignedIn`), per host. Which quota refused the CHECK is
+    not known (gh checks a keyring token over REST, a GH_TOKEN over GraphQL),
+    so neither doctor nor `HostAuth.Phrase` names one.
   - `PRChangedFileCount` is `(n, error)`: the REST diff, else GraphQL
     `changedFiles`. `merge.DiffRead` → `VerdictDiffUnread`: "could not be
     read", why, and NO `--bypass` pointer (a quota fault is no reason to spend
     a safety flag); an explicit `--bypass` still proceeds and says what it
     skipped. `PRChangedFiles` falls back to a paged GraphQL query
     (`prFilesQuery`; ⚠ `gh pr view --json files` stops at 100, measured 100 of
-    285), taken only when it lists exactly `changedFiles` paths: a partial list
-    is an error, so the deploy gate still fails closed. `bothFailed` wraps both
-    errors (`%w`), so `ghx.IsRateLimit` sees either. Renames list the new path,
-    as `gh pr diff --name-only` does.
+    285), taken only when it lists exactly `changedFiles` paths, below GitHub's
+    3,000-file cap (`maxListedFiles`): a partial list is an error, so the
+    deploy gate still fails closed. ⚠ It goes to the PR's own host
+    (`--hostname`, from the PR URL via `parsePRRef`, as `PRChecks` does): bare
+    `gh api graphql` asks github.com, which answers a GitHub Enterprise PR's URL
+    with a null resource when gh is logged in to both. `bothFailed` wraps both
+    errors (`%w`), so `ghx.IsRateLimit` sees either; the unread refusal's hint
+    says "once the rate limit lifts" only when one did. Renames list only the
+    new path, in both reads (measured), so a file moved OUT of a deploy path
+    still does not gate: an older gap, unchanged.
   - The checks gate does not retry a read refused for a rate limit
     (`retryable`): it lifts in minutes, not in the 2 s retry.
   - doctor reads a rate-limited host as "logged in, but … refused the check for

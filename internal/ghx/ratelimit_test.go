@@ -24,25 +24,33 @@ const (
 
 func TestRateLimitKind(t *testing.T) {
 	cases := []struct {
-		name, text, api string
-		secondary, ok   bool
+		name, text, called, api string
+		secondary, ok           bool
 	}{
-		{"gh api's stderr", restLimitAPI, "REST", false, true},
-		{"gh pr diff's stderr", restLimitDiff, "REST", false, true},
-		{"the body's message", "API rate limit exceeded for user ID 1.", "REST", false, true},
-		{"GraphQL, as gh prints it", "GraphQL: API rate limit exceeded for user ID 1.", "GraphQL", false, true},
-		{"GraphQL's 'already exceeded'", "GraphQL: API rate limit already exceeded for user ID 1.", "GraphQL", false, true},
-		{"GraphQL's error type", `{"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded for user ID 1."}]}`, "GraphQL", false, true},
-		{"the secondary limit", "gh: You have exceeded a secondary rate limit. Please wait a few minutes before you try again. (HTTP 403)", "REST", true, true},
-		{"the secondary limit over GraphQL", "GraphQL: You have exceeded a secondary rate limit.", "GraphQL", true, true},
-		{"case does not matter", "api RATE LIMIT exceeded", "REST", false, true},
-		{"a not-found", "gh: Not Found (HTTP 404)", "", false, false},
-		{"a suspended account's 403", "gh: Sorry. Your account was suspended. (HTTP 403)", "", false, false},
-		{"a 'rate' that is no limit", "gh: rate this repository (HTTP 422)", "", false, false},
-		{"no text", "", "", false, false},
+		{"gh api's stderr", restLimitAPI, "", "REST", false, true},
+		{"gh pr diff's stderr", restLimitDiff, apiREST, "REST", false, true},
+		{"the body's message", "API rate limit exceeded for user ID 1.", "", "REST", false, true},
+		{"GraphQL, as gh prints it", "GraphQL: API rate limit exceeded for user ID 1.", "", "GraphQL", false, true},
+		{"GraphQL's 'already exceeded'", "GraphQL: API rate limit already exceeded for user ID 1.", "", "GraphQL", false, true},
+		{"GraphQL's error type", `{"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded for user ID 1."}]}`, "", "GraphQL", false, true},
+		// The #217 review, from real gh 2.87.3 against a GraphQL quota used up:
+		{"gh api graphql, HTTP 200 + RATE_LIMITED: no marker on stderr, the caller knows", "gh: API rate limit already exceeded for user ID 1.", apiGraphQL, "GraphQL", false, true},
+		{"the same text from an unknown caller reads REST", "gh: API rate limit already exceeded for user ID 1.", "", "REST", false, true},
+		{"gh pr view's 403 names the endpoint", "HTTP 403: API rate limit exceeded for user ID 1. (https://api.github.com/graphql)", "", "GraphQL", false, true},
+		{"the endpoint beats a caller that guessed REST", "HTTP 403: API rate limit exceeded for user ID 1. (https://ghe.example.com/api/graphql)", apiREST, "GraphQL", false, true},
+		{"gh api graphql's 403", "gh: API rate limit exceeded for user ID 1. (HTTP 403)", apiGraphQL, "GraphQL", false, true},
+		{"a GH_TOKEN login check (gh's GraphQL client)", `non-200 OK status code: 403 Forbidden body: "{\"message\": \"API rate limit exceeded for user ID 1.\"}"`, "", "GraphQL", false, true},
+		{"the secondary limit", "gh: You have exceeded a secondary rate limit. Please wait a few minutes before you try again. (HTTP 403)", "", "REST", true, true},
+		{"the secondary limit over GraphQL", "GraphQL: You have exceeded a secondary rate limit.", "", "GraphQL", true, true},
+		{"case does not matter", "api RATE LIMIT exceeded", "", "REST", false, true},
+		{"a not-found", "gh: Not Found (HTTP 404)", apiREST, "", false, false},
+		{"a suspended account's 403", "gh: Sorry. Your account was suspended. (HTTP 403)", "", "", false, false},
+		{"a 'rate' that is no limit", "gh: rate this repository (HTTP 422)", "", "", false, false},
+		{"a GraphQL error that is no limit", "GraphQL: Could not resolve to a PullRequest (resource)", apiGraphQL, "", false, false},
+		{"no text", "", "", "", false, false},
 	}
 	for _, c := range cases {
-		api, secondary, ok := rateLimitKind(c.text)
+		api, secondary, ok := rateLimitKind(c.text, c.called)
 		if api != c.api || secondary != c.secondary || ok != c.ok {
 			t.Errorf("%s: rateLimitKind = (%q, %v, %v), want (%q, %v, %v)", c.name, api, secondary, ok, c.api, c.secondary, c.ok)
 		}
@@ -183,17 +191,24 @@ func TestRateLimitedErrors(t *testing.T) {
 	}
 
 	var rl *RateLimitError
-	if err := ghErrAt("ghe.example.com", exitErr(restLimitDiff+"\nsecond line\n")); !errors.As(err, &rl) || rl.API != "REST" || !rl.Reset.Equal(reset) {
+	if err := ghErrAt("ghe.example.com", apiREST, exitErr(restLimitDiff+"\nsecond line\n")); !errors.As(err, &rl) || rl.API != "REST" || !rl.Reset.Equal(reset) {
 		t.Errorf("gh pr diff refused: err = %v, want a REST *RateLimitError with the probed reset", err)
 	}
 	if !reflect.DeepEqual(*asked, []string{"ghe.example.com"}) {
 		t.Errorf("probed %q, want the call's host", *asked)
 	}
 	*asked = nil
-	if err := ghErrAt("", exitErr("GraphQL: API rate limit exceeded for user ID 1.")); !errors.As(err, &rl) || rl.API != "GraphQL" || !rl.Reset.IsZero() || len(*asked) != 0 {
+	if err := ghErrAt("", "", exitErr("GraphQL: API rate limit exceeded for user ID 1.")); !errors.As(err, &rl) || rl.API != "GraphQL" || !rl.Reset.IsZero() || len(*asked) != 0 {
 		t.Errorf("GraphQL refused: err = %v (probed %q), want a GraphQL *RateLimitError, no probe", err, *asked)
 	}
-	if err := ghErrAt("", exitErr("GraphQL: Could not resolve to a PullRequest\nmore\n")); IsRateLimit(err) || err.Error() != "GraphQL: Could not resolve to a PullRequest" {
+	// #217 review: `gh api graphql` refused for its quota names no API at all.
+	if err := ghErrAt("github.com", apiGraphQL, exitErr("gh: API rate limit already exceeded for user ID 1.")); !errors.As(err, &rl) || rl.API != "GraphQL" || len(*asked) != 0 {
+		t.Errorf("gh api graphql refused: err = %v (probed %q), want GraphQL from the caller, no probe", err, *asked)
+	}
+	if err := ghErrAt("github.com", apiREST, exitErr("gh: You have exceeded a secondary rate limit. (HTTP 403)")); !errors.As(err, &rl) || !rl.Secondary || len(*asked) != 0 {
+		t.Errorf("secondary limit: err = %v (probed %q), want it named, no probe adding to the burst", err, *asked)
+	}
+	if err := ghErrAt("", apiGraphQL, exitErr("GraphQL: Could not resolve to a PullRequest\nmore\n")); IsRateLimit(err) || err.Error() != "GraphQL: Could not resolve to a PullRequest" {
 		t.Errorf("another failure: err = %v, want gh's first line", err)
 	}
 
@@ -235,6 +250,7 @@ func TestParsePRFiles(t *testing.T) {
 		}
 		return fmt.Sprintf(`{"total":%d,"paths":[%s]}`, total, strings.Join(q, ","))
 	}
+	fs := func(n int) []string { return strings.Split(strings.Repeat("f ", n)[:2*n-1], " ") }
 	cases := []struct {
 		name string
 		out  string
@@ -245,6 +261,8 @@ func TestParsePRFiles(t *testing.T) {
 		{"three pages make the whole list", page(5, "a", "b") + page(5, "c", "d") + "\n" + page(5, "e"), []string{"a", "b", "c", "d", "e"}, ""},
 		{"an empty PR lists nothing, and says so", page(0), []string{}, ""},
 		{"a short list is not the list", page(285, "a", "b"), nil, "GraphQL listed 2 of the PR's 285 changed files"},
+		{"a list at GitHub's cap may not be all of it", strings.Repeat(page(3000, "f"), 3000), nil, "GitHub lists at most 3000"},
+		{"just under the cap is the list", strings.Repeat(page(2999, "f"), 2999), fs(2999), ""},
 		{"the total moved between pages", page(3, "a", "b") + page(4, "c"), nil, "changed while it was read"},
 		{"a page with no total", `{"paths":["a"]}`, nil, "no file count or no paths"},
 		{"a page with null paths (not a PR)", `{"total":null,"paths":null}`, nil, "no file count or no paths"},
@@ -274,8 +292,8 @@ fail() { [ -e "$d/$1.fail" ] && { cat "$d/$1.fail" >&2; exit 1; }; }
 case "$*" in
 "pr diff 7 --name-only") fail diff; cat "$d/diff" ;;
 "pr view 7 --json changedFiles"*) fail count; cat "$d/count" ;;
-"pr view 7 --json url"*) echo "https://github.com/o/r/pull/7" ;;
-"api graphql --paginate"*) fail files; cat "$d/files" ;;
+"pr view 7 --json number,url"*) echo "7 https://ghe.example.com/o/r/pull/7" ;;
+"api graphql --hostname ghe.example.com --paginate"*) fail files; cat "$d/files" ;;
 *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
 `
@@ -324,8 +342,8 @@ func TestPRDiffReads(t *testing.T) {
 	if files, err := PRChangedFiles("7"); !reflect.DeepEqual(files, []string{"a.md", "infra/x.yaml"}) || err != nil {
 		t.Errorf("REST refused: PRChangedFiles = (%q, %v), want GraphQL's two", files, err)
 	}
-	if c := calls(); !strings.Contains(c, "query="+prFilesQuery) || !strings.Contains(c, "url=https://github.com/o/r/pull/7") {
-		t.Errorf("GraphQL file list: calls = %q, want the paged query for the PR's URL", c)
+	if c := calls(); !strings.Contains(c, "query="+prFilesQuery) || !strings.Contains(c, "url=https://ghe.example.com/o/r/pull/7") {
+		t.Errorf("GraphQL file list: calls = %q, want the paged query for the PR's URL, at the PR's host", c)
 	}
 
 	set("count", "null\n")
@@ -341,6 +359,12 @@ func TestPRDiffReads(t *testing.T) {
 	set("count.fail", "GraphQL: API rate limit exceeded for user ID 1.")
 	if _, err := PRChangedFileCount("7"); err == nil || !strings.Contains(err.Error(), "GraphQL API rate limit") {
 		t.Errorf("both quotas used up: err = %v, want both named", err)
+	}
+	// #217 review: `gh api graphql` refused for its quota prints no API marker;
+	// the file list's refusal is still GraphQL's, with no REST reset beside it.
+	set("files.fail", "gh: API rate limit already exceeded for user ID 1.")
+	if _, err := PRChangedFiles("7"); err == nil || !strings.Contains(err.Error(), "the GraphQL file list read failed too: GitHub's GraphQL API rate limit") {
+		t.Errorf("both quotas used up: PRChangedFiles err = %v, want the file list's refusal named GraphQL", err)
 	}
 }
 
@@ -360,6 +384,8 @@ func TestSignedIn(t *testing.T) {
 		{"one host fine, one rate limited", AuthStatus{Parsed: true, Hosts: []HostAuth{gheLimited, ok}}, true},
 		{"rate limited beside a dead login", AuthStatus{Parsed: true, Hosts: []HostAuth{limited, failed}}, false},
 		{"unknown is never signed in", AuthStatus{Parsed: true, Hosts: []HostAuth{unknown}}, false},
+		// #217 review: the human form's unexplained failure, every host it read OK.
+		{"a failed check with every host OK is no rate limit", AuthStatus{Parsed: true, Hosts: []HostAuth{ok}}, false},
 		{"no host", AuthStatus{Parsed: true}, false},
 		{"unreadable", AuthStatus{Hosts: []HostAuth{limited}}, false},
 	}
@@ -368,8 +394,10 @@ func TestSignedIn(t *testing.T) {
 			t.Errorf("%s: signedIn = %v, want %v", c.name, got, c.want)
 		}
 		// ⚠ AuthedFor stays strict: liveness trusts "no PR" only from it.
-		if c.st.OK != authOK(false, c.st.Hosts, c.st.Parsed) && !c.st.OK {
-			t.Errorf("%s: a rate-limited host made authOK true", c.name)
+		for _, h := range c.st.Hosts {
+			if h.State == HostAuthRateLimited && authOK(false, c.st.Hosts, c.st.Parsed) {
+				t.Errorf("%s: a rate-limited host made authOK true", c.name)
+			}
 		}
 	}
 }

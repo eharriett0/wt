@@ -85,7 +85,7 @@ func PRChecks(pr, repo string) (PRChecksRead, error) {
 	}
 	out, err := run(args...)
 	if err != nil {
-		return PRChecksRead{}, fmt.Errorf("cannot resolve PR #%s's URL: %w", pr, ghErr(err))
+		return PRChecksRead{}, fmt.Errorf("cannot resolve PR #%s's URL: %w", pr, ghErrAt(RepoHost(), apiGraphQL, err))
 	}
 	ref, err := parsePRRef(out)
 	if err != nil {
@@ -94,7 +94,7 @@ func PRChecks(pr, repo string) (PRChecksRead, error) {
 	out, err = run("api", "graphql", "--hostname", ref.host, "--paginate", "-f", "query="+prChecksQuery,
 		"-f", "url="+ref.url, "-F", "number="+strconv.Itoa(ref.number))
 	if err != nil {
-		return PRChecksRead{}, ghErr(err)
+		return PRChecksRead{}, ghErrAt(ref.host, apiGraphQL, err)
 	}
 	read, err := parsePRChecks(out)
 	if err != nil {
@@ -851,7 +851,7 @@ func apiErr(host, out string, err error) error {
 		Status  string `json:"status"`
 	}
 	if json.Unmarshal([]byte(strings.TrimSpace(out)), &e) == nil && e.Message != "" {
-		if rl, ok := rateLimited(host, e.Message); ok {
+		if rl, ok := rateLimited(host, apiREST, e.Message); ok {
 			return rl
 		}
 		if e.Status != "" {
@@ -859,20 +859,22 @@ func apiErr(host, out string, err error) error {
 		}
 		return errors.New(e.Message)
 	}
-	return ghErrAt(host, err)
+	return ghErrAt(host, apiREST, err)
 }
 
 // ghErr is a failed gh call's error with the first line gh printed to stderr,
 // which says why ("exit status 1" does not). run's cmd.Output keeps stderr on
 // the *exec.ExitError. A refusal for a rate limit is a *RateLimitError (#217),
-// for a call to this repo's host.
-func ghErr(err error) error { return ghErrAt(RepoHost(), err) }
+// for a call to this repo's host whose API only the text can say.
+func ghErr(err error) error { return ghErrAt(RepoHost(), "", err) }
 
-// ghErrAt is ghErr for a call to host ("" = the host gh picks).
-func ghErrAt(host string, err error) error {
+// ghErrAt is ghErr for a call to host ("" = the host gh picks) on API called
+// (apiREST, apiGraphQL; "" = not known), which names a rate limit whose text
+// does not say which quota refused it.
+func ghErrAt(host, called string, err error) error {
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
-		if rl, ok := rateLimited(host, string(ee.Stderr)); ok {
+		if rl, ok := rateLimited(host, called, string(ee.Stderr)); ok {
 			return rl
 		}
 		if msg := firstLine(string(ee.Stderr)); msg != "" {

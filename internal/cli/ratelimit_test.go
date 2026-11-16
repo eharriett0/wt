@@ -182,6 +182,11 @@ func TestCmdMergePR_restQuotaUsedUp(t *testing.T) {
 			if n := strings.Count(string(calls), "api --include /"); n > 1 {
 				t.Errorf("the reset was probed %d times, want at most once", n)
 			}
+			// #217 review: the GraphQL file list goes to the PR's host, never
+			// github.com (the fake answers either, so the call is what's checked).
+			if strings.Contains(string(calls), "files(first:100") && !strings.Contains(string(calls), "api graphql --hostname quota.example.com --paginate") {
+				t.Errorf("the GraphQL file list was not asked of the PR's host:\n%s", calls)
+			}
 		})
 	}
 }

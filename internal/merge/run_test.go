@@ -94,8 +94,8 @@ d=$(dirname "$0")
 limited() { echo "$1HTTP 403: API rate limit exceeded for user ID 1. If you reach out to GitHub Support for help, please include the request ID X." >&2; exit 1; }
 case "$*" in
 "api --include /"*) printf 'HTTP/2.0 403 Forbidden\r\nX-Ratelimit-Remaining: 0\r\nX-Ratelimit-Reset: 4102444800\r\n\r\n{}\n'; exit 1 ;;
-"pr diff"*) limited "could not find pull request diff: " ;;
-*changedFiles*) [ -e "$d/count.fail" ] && { echo "GraphQL: API rate limit exceeded for user ID 1." >&2; exit 1; }; cat "$d/count" ;;
+"pr diff"*) [ -e "$d/diff.fail" ] && { cat "$d/diff.fail" >&2; exit 1; }; limited "could not find pull request diff: " ;;
+*changedFiles*) [ -e "$d/count.fail" ] && { cat "$d/count.fail" >&2; exit 1; }; cat "$d/count" ;;
 *messageHeadline*) echo "Fix the widget" ;;
 *headRefName*) echo feat-x ;;
 *title*) echo "Fix the widget" ;;
@@ -149,12 +149,12 @@ func TestRunUnreadDiffIsNotEmpty(t *testing.T) {
 		t.Errorf("REST refused, GraphQL fine: err=%v merged=%v\nstdout: %s\nstderr: %s\nwant GraphQL's 6 files and a merge", err, merged(), stdout, stderr)
 	}
 
-	write("count.fail", "")
+	write("count.fail", "GraphQL: API rate limit exceeded for user ID 1.\n")
 	stdout, stderr, err := run(false, false)
 	if err == nil || merged() {
 		t.Fatalf("both reads refused: err=%v merged=%v, want a refusal and no merge", err, merged())
 	}
-	for _, want := range []string{"could not be read", "REST API rate limit", "it lifts at", "GraphQL API rate limit"} {
+	for _, want := range []string{"could not be read", "REST API rate limit", "it lifts at", "GraphQL API rate limit", "Run the merge again once the rate limit lifts."} {
 		if !strings.Contains(stderr, want) {
 			t.Errorf("both reads refused: stderr lacks %q:\n%s", want, stderr)
 		}
@@ -171,6 +171,12 @@ func TestRunUnreadDiffIsNotEmpty(t *testing.T) {
 	}
 	if stdout, stderr, err = run(false, true); err != nil || !merged() || !strings.Contains(stderr, "--bypass set: proceeding without the empty-diff check") || !strings.Contains(stdout, "changed files unread") {
 		t.Errorf("--bypass: err=%v merged=%v\nstdout: %s\nstderr: %s\nwant the merge, saying what it skipped", err, merged(), stdout, stderr)
+	}
+	// A diff unread for some other reason does not promise a rate limit lifting.
+	write("diff.fail", "GraphQL: Could not resolve to a PullRequest with the number of 99999. (repository.pullRequest)\n")
+	write("count.fail", "GraphQL: Could not resolve to a PullRequest with the number of 99999. (repository.pullRequest)\n")
+	if _, stderr, err := run(false, false); err == nil || merged() || strings.Contains(stderr, "rate limit") || !strings.Contains(stderr, "Check that gh can read it (gh pr diff 99999 --name-only)") {
+		t.Errorf("unread, not rate limited: err=%v merged=%v stderr=%q, want a refusal that sends the operator to gh, not to a reset", err, merged(), stderr)
 	}
 }
 

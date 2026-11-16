@@ -439,7 +439,11 @@ func Run(pr string, dryRun, bypass, mergeForeign bool, worktreeBranches []string
 		// exhausted REST quota is the usual cause, and it lifts on its own.
 		fmt.Fprintf(os.Stderr, "REFUSING to merge PR #%s: its diff could not be read, so wt cannot tell whether it is empty.\n", pr)
 		fmt.Fprintf(os.Stderr, "Why: %v\n", diff.Err)
-		fmt.Fprintln(os.Stderr, "Run the merge again once GitHub answers (a rate limit lifts on its own).")
+		if ghx.IsRateLimit(diff.Err) {
+			fmt.Fprintln(os.Stderr, "Run the merge again once the rate limit lifts.")
+		} else {
+			fmt.Fprintf(os.Stderr, "Check that gh can read it (gh pr diff %s --name-only), then run the merge again.\n", pr)
+		}
 		if !bypass {
 			return fmt.Errorf("diff unread")
 		}

@@ -32,7 +32,8 @@ const (
 	// HostAuthRateLimited: the host refused the check for a rate limit (#217,
 	// `--json` only). GitHub refuses that way only after it has taken the
 	// token ("API rate limit exceeded for user ID N"), so the login works, but
-	// its REST calls fail until the quota lifts; GraphQL has its own quota.
+	// calls on that quota fail until it lifts. Which quota is not known: gh
+	// checks a keyring token over REST and a GH_TOKEN over GraphQL.
 	// Not OK for AuthedFor: liveness trusts "no PR" only from a host that
 	// answers every lookup, and the tip lookup is REST (#168). SignedInFor
 	// counts it.
@@ -85,23 +86,31 @@ func authOK(exitOK bool, hosts []HostAuth, parsed bool) bool {
 	return true
 }
 
-// signedIn decides SignedInFor from one check (#217). Pure. Everything authOK
-// accepts, plus hosts whose only problem is a rate limit: every host gh
-// reported is OK or HostAuthRateLimited. Like authOK, unreadable output or no
-// host is a no.
+// signedIn decides SignedInFor from one check (#217). Pure. A check that
+// passed (st.OK), or one that failed only because a host refused it for a rate
+// limit: at least one host HostAuthRateLimited, and every other one OK. Not
+// "every host OK" alone: the human form's unexplained non-zero exit leaves OK
+// false with every host it read OK (a failure wt can't see, textAuthStatus),
+// and only a rate limit is an explained failure. Like authOK, unreadable
+// output or no host is a no.
 func signedIn(st AuthStatus) bool {
 	if st.OK {
 		return true
 	}
-	if !st.Parsed || len(st.Hosts) == 0 {
+	if !st.Parsed {
 		return false
 	}
+	limited := false
 	for _, h := range st.Hosts {
-		if h.State != HostAuthOK && h.State != HostAuthRateLimited {
+		switch h.State {
+		case HostAuthRateLimited:
+			limited = true
+		case HostAuthOK:
+		default:
 			return false
 		}
 	}
-	return true
+	return limited
 }
 
 // Phrase names the host and what gh said about it, for a message. Short: `wt
@@ -117,7 +126,8 @@ func (h HostAuth) Phrase() string {
 	case HostAuthUnreachable:
 		return "couldn't reach " + h.Host
 	case HostAuthRateLimited:
-		return h.Host + " refused the check for a rate limit (the token works; REST calls fail until the limit lifts)"
+		// Not which quota: with GH_TOKEN, gh's check is a GraphQL read (#217 review).
+		return h.Host + " refused the check for a rate limit (the token works; calls on that quota fail until it lifts)"
 	}
 	if h.Error != "" { // gh's error says nothing about the token (a 403, a 5xx): relay it
 		return h.Host + " could not be checked (gh: " + strings.TrimSpace(strings.SplitN(h.Error, "\n", 2)[0]) + ")"
@@ -386,7 +396,7 @@ var (
 func classifyAuthError(msg string) string {
 	m := strings.TrimSpace(msg)
 	if sm := httpStatusErr.FindStringSubmatch(m); sm != nil {
-		switch _, _, limited := rateLimitKind(m); {
+		switch _, _, limited := rateLimitKind(m, ""); {
 		case sm[1] == "401":
 			return HostAuthFailed
 		case (sm[1] == "403" || sm[1] == "429") && limited:

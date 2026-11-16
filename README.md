@@ -565,7 +565,7 @@ and says "could not be verified", not "NOT authenticated", when a host timed out
 or could not be reached. Telling an unreachable host from a rejected token needs
 gh 2.81 or newer (`gh auth status --json`); older gh reports both as a failed
 login, and doctor says so. With gh 2.81+ it also tells a host that refused the
-check for a rate limit (logged in, but its REST calls fail until the limit
+check for a rate limit (logged in, but calls on that quota fail until it
 lifts) from one whose login is broken.
 
 ## License
