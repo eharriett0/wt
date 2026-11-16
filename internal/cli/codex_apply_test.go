@@ -1,12 +1,14 @@
 package cli
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // codexApplyCase is a patch over some files and what apply_patch leaves (nil
@@ -242,10 +244,20 @@ func TestPredictCodexPatch(t *testing.T) {
 		t.Errorf("predictCodexPatch = %q, %v; want %q, true", got, ok, want)
 	}
 	outDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(outDir, "note.txt"), []byte("n1\nn2\n"), 0o644); err != nil {
-		t.Fatal(err)
+	for name, content := range map[string]string{"note.txt": "n1\nn2\n", "ten.txt": "t1\nt2\n"} {
+		if err := os.WriteFile(filepath.Join(outDir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
-	note := filepath.Join(outDir, "note.txt")
+	note, ten, added := filepath.Join(outDir, "note.txt"), filepath.Join(outDir, "ten.txt"), filepath.Join(outDir, "new.txt")
+	big := filepath.Join(outDir, "big.txt") // over maxPredictBytes: never read
+	if f, err := os.Create(big); err != nil {
+		t.Fatal(err)
+	} else if err := f.Truncate(maxPredictBytes + 1); err != nil {
+		t.Fatal(err)
+	} else {
+		f.Close()
+	}
 	for name, p := range map[string]string{
 		"rejected":        "*** Update File: a.txt\n@@\n-b\n+B\n",
 		"lines not found": bounded("*** Update File: a.txt\n@@\n-zz\n+Z\n"),
@@ -253,32 +265,107 @@ func TestPredictCodexPatch(t *testing.T) {
 		// a move across the edge whose chunks don't apply: apply_patch rejects it
 		"out of the repo, chunks not found": bounded("*** Update File: a.txt\n*** Move to: ../../x.txt\n@@\n-zz\n+Z\n"),
 		"into the repo, chunks not found":   bounded("*** Update File: " + note + "\n*** Move to: a2.txt\n@@\n-zz\n+Z\n"),
+		// an outside file is replayed too: one that isn't there fails apply_patch
+		"an outside file that isn't there":  bounded("*** Update File: ../../x.txt\n@@\n+x\n*** Update File: a.txt\n@@\n-b\n+B\n"),
+		"a move in from a source not there": bounded("*** Update File: ../../nope.txt\n*** Move to: a.txt\n@@\n+x\n"),
 	} {
 		if _, ok := predictCodexPatch(p, root, "pkg/"); ok {
 			t.Errorf("%s: ok=true, want the file-level fallback", name)
 		}
 	}
-	// outside the repo, entirely: left out; the repo file beside it is still
-	// predicted. A move across the edge is what it does to the repo (#201
-	// re-review): out of it, the source is gone; into it, the destination holds
-	// the source's content, patched; a source that can't be read leaves the
-	// destination unpredicted (a heads-up), never the whole patch.
+	// What the patch does to the repo, outside files replayed with it (#201
+	// reviews): an outside operation counts only through what it later moves in;
+	// a move out removes the source; a move in writes what the patch itself made
+	// of the source; a source never read (over the cap, a FIFO) leaves what it
+	// produces unpredicted (absent here: a file-level heads-up), never the
+	// whole patch.
 	for name, tc := range map[string]struct {
 		patch string
 		want  map[string]string
 	}{
-		"only outside":                            {bounded("*** Update File: ../../x.txt\n@@\n+x\n"), map[string]string{}},
-		"outside + in repo":                       {bounded("*** Update File: ../../x.txt\n@@\n+x\n*** Update File: a.txt\n@@\n-b\n+B\n"), map[string]string{"pkg/a.txt": "a\nB\n"}},
-		"absolute outside":                        {bounded("*** Add File: " + filepath.Join(t.TempDir(), "y.txt") + "\n+y\n*** Delete File: d.txt\n"), map[string]string{"pkg/d.txt": ""}},
-		"a move out of the repo":                  {bounded("*** Update File: a.txt\n*** Move to: ../../x.txt\n@@\n-b\n+B\n"), map[string]string{"pkg/a.txt": ""}},
-		"a move into the repo":                    {bounded("*** Update File: " + note + "\n*** Move to: a.txt\n@@\n-n2\n+N2\n"), map[string]string{"pkg/a.txt": "n1\nN2\n"}},
-		"a move into the repo, source unreadable": {bounded("*** Update File: ../../nope.txt\n*** Move to: a.txt\n@@\n+x\n*** Delete File: d.txt\n"), map[string]string{"pkg/d.txt": ""}},
-		// a later operation on that destination can't be predicted either
-		"an unreadable move in, then an update of it": {bounded("*** Update File: ../../nope.txt\n*** Move to: a.txt\n@@\n+x\n*** Update File: a.txt\n@@\n-b\n+B\n"), map[string]string{}},
+		"only outside":           {bounded("*** Update File: " + note + "\n@@\n-n2\n+N2\n"), map[string]string{}},
+		"outside + in repo":      {bounded("*** Update File: " + note + "\n@@\n-n2\n+N2\n*** Update File: a.txt\n@@\n-b\n+B\n"), map[string]string{"pkg/a.txt": "a\nB\n"}},
+		"absolute outside":       {bounded("*** Add File: " + filepath.Join(t.TempDir(), "y.txt") + "\n+y\n*** Delete File: d.txt\n"), map[string]string{"pkg/d.txt": ""}},
+		"a move out of the repo": {bounded("*** Update File: a.txt\n*** Move to: ../../x.txt\n@@\n-b\n+B\n"), map[string]string{"pkg/a.txt": ""}},
+		"a move into the repo":   {bounded("*** Update File: " + note + "\n*** Move to: a.txt\n@@\n-n2\n+N2\n"), map[string]string{"pkg/a.txt": "n1\nN2\n"}},
+		// #201 re-review A1: an outside file added, moved in, moved again
+		"added outside, moved in, moved on": {bounded("*** Add File: " + added + "\n+n1\n+n2\n*** Update File: " + added + "\n*** Move to: a.txt\n@@\n n2\n+n3\n*** Update File: a.txt\n*** Move to: b.txt\n@@\n n3\n+n4\n"),
+			map[string]string{"pkg/a.txt": "", "pkg/b.txt": "n1\nn2\nn3\nn4\n"}},
+		// #201 re-review A2: an outside file rewritten, then moved in
+		"rewritten outside, then moved in": {bounded("*** Update File: " + ten + "\n@@\n-t1\n-t2\n+z1\n+z2\n*** Update File: " + ten + "\n*** Move to: b.txt\n@@\n z2\n+n4\n"),
+			map[string]string{"pkg/b.txt": "z1\nz2\nn4\n"}},
+		"a move in from an over-cap file": {bounded("*** Update File: " + big + "\n*** Move to: a.txt\n@@\n+x\n*** Delete File: d.txt\n"), map[string]string{"pkg/d.txt": ""}},
+		"unread, moved in, updated":       {bounded("*** Update File: " + big + "\n*** Move to: a.txt\n@@\n+x\n*** Update File: a.txt\n@@\n-b\n+B\n"), map[string]string{}},
+		// unknown is carried through a later move of the destination
+		"unread, moved in, moved on": {bounded("*** Update File: " + big + "\n*** Move to: a.txt\n@@\n+x\n*** Update File: a.txt\n*** Move to: b.txt\n@@\n+y\n"), map[string]string{"pkg/a.txt": ""}},
 	} {
 		got, ok := predictCodexPatch(tc.patch, root, "pkg/")
 		if !ok || !reflect.DeepEqual(got, tc.want) {
-			t.Errorf("%s: predictCodexPatch = %q, %v; want %q, true", name, got, ok, tc.want)
+			t.Errorf("%s: predictCodexPatch = %q, %v; want %q, true", name, brief(got), ok, tc.want)
 		}
+	}
+}
+
+// brief is m with each value cut to 40 bytes, for a readable failure.
+func brief(m map[string]string) map[string]string {
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		if len(v) > 40 {
+			v = fmt.Sprintf("%s... (%d bytes)", v[:40], len(v))
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// #201 re-review B: a FIFO is never read (os.ReadFile on one waits for a
+// writer forever), wherever it is: moved in from outside, or patched in the
+// repo. What it would produce is left unpredicted, and the prediction returns.
+func TestPredictCodexPatch_NeverReadsAFIFO(t *testing.T) {
+	root, outDir := t.TempDir(), t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeT(t, root, "pkg/d.txt", "d\n")
+	for _, p := range []string{filepath.Join(outDir, "fifo"), filepath.Join(root, "pkg", "fifo")} {
+		if out, err := exec.Command("mkfifo", p).CombinedOutput(); err != nil {
+			t.Skipf("mkfifo unavailable: %v %s", err, out)
+		}
+	}
+	for name, tc := range map[string]struct {
+		patch string
+		want  map[string]string
+	}{
+		"moved in from an outside FIFO": {bounded("*** Update File: " + filepath.Join(outDir, "fifo") + "\n*** Move to: a.txt\n@@\n+x\n*** Delete File: d.txt\n"), map[string]string{"pkg/d.txt": ""}},
+		"a FIFO in the repo, patched":   {bounded("*** Update File: fifo\n@@\n+x\n*** Delete File: d.txt\n"), map[string]string{"pkg/d.txt": ""}},
+	} {
+		type result struct {
+			got map[string]string
+			ok  bool
+		}
+		done := make(chan result, 1)
+		go func() {
+			got, ok := predictCodexPatch(tc.patch, root, "pkg/")
+			done <- result{got, ok}
+		}()
+		select {
+		case r := <-done:
+			if !r.ok || !reflect.DeepEqual(r.got, tc.want) {
+				t.Errorf("%s: predictCodexPatch = %q, %v; want %q, true", name, r.got, r.ok, tc.want)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s: predictCodexPatch still blocked after 10s: it read the FIFO", name)
+		}
+	}
+	// the Claude hook's read is the same one
+	done := make(chan fileRead, 1)
+	go func() { _, r := readForPrediction(filepath.Join(root, "pkg", "fifo")); done <- r }()
+	select {
+	case r := <-done:
+		if r != fileUnread {
+			t.Errorf("readForPrediction(FIFO) = %v, want fileUnread", r)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("readForPrediction blocked on a FIFO")
 	}
 }

@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/eharriett0/wt/internal/config"
 	"github.com/eharriett0/wt/internal/gitx"
@@ -372,6 +374,10 @@ func TestCodexEdit_MoveAcrossTheRepoEdgeIsDenied(t *testing.T) {
 	gitT(t, root, "config", "user.email", "t@t.test")
 	gitT(t, root, "config", "user.name", "t")
 	writeNested(t, root, "pkg/svc/a.go", numbered("pkg/svc/a.go"))
+	// mid.txt and the outside ten.txt start as a.go's twins: read as they lie on
+	// disk, a move of either onto a.go with an append was a pure append there,
+	// disjoint from wb's line 2, and read SILENT (#201 re-review)
+	writeNested(t, root, "pkg/mid.txt", numbered("pkg/svc/a.go"))
 	gitT(t, root, "add", "-A")
 	gitT(t, root, "commit", "-qm", "base")
 	parent := t.TempDir()
@@ -382,17 +388,89 @@ func TestCodexEdit_MoveAcrossTheRepoEdgeIsDenied(t *testing.T) {
 	}
 	outside := t.TempDir()
 	writeT(t, outside, "note.txt", "n1\nn2\n")
+	writeT(t, outside, "ten.txt", numbered("pkg/svc/a.go"))
+	if f, err := os.Create(filepath.Join(outside, "big.txt")); err != nil { // over maxPredictBytes
+		t.Fatal(err)
+	} else if err := f.Truncate(maxPredictBytes + 1); err != nil {
+		t.Fatal(err)
+	} else {
+		f.Close()
+	}
 	symlinkT(t, outside, filepath.Join(wa, "ext"))
 	writeT(t, wb, "pkg/svc/a.go", strings.Replace(readT(t, wb, "pkg/svc/a.go"), "pkg/svc/a.go l02\n", "B pkg/svc/a.go l02\n", 1))
 
-	for name, patch := range map[string]string{
-		"into the repo: overwrites wb's file": "*** Begin Patch\n*** Update File: ext/note.txt\n*** Move to: pkg/svc/a.go\n@@\n-n1\n+N1\n*** End Patch\n",
-		"out of the repo: removes wb's file":  "*** Begin Patch\n*** Update File: pkg/svc/a.go\n*** Move to: ext/moved.go\n@@\n-pkg/svc/a.go l05\n+X\n*** End Patch\n",
+	codex := func(patch string) string {
+		p, _ := json.Marshal(map[string]any{"cwd": wa, "tool_name": "apply_patch", "tool_input": map[string]string{"command": "*** Begin Patch\n" + patch + "*** End Patch\n"}})
+		return hookVerdict(t, runHookWithin(t, 20*time.Second, hookCodexEdit, string(p)))
+	}
+	for name, tc := range map[string]struct{ patch, want string }{
+		"into the repo: overwrites wb's file": {"*** Update File: ext/note.txt\n*** Move to: pkg/svc/a.go\n@@\n-n1\n+N1\n", "deny"},
+		"out of the repo: removes wb's file":  {"*** Update File: pkg/svc/a.go\n*** Move to: ext/moved.go\n@@\n-pkg/svc/a.go l05\n+X\n", "deny"},
+		// #201 re-review A1: what the patch made outside is what moves in
+		"added outside, moved in, moved onto wb's file": {"*** Add File: ext/new.txt\n+n1\n+n2\n*** Update File: ext/new.txt\n*** Move to: pkg/x.txt\n@@\n n2\n+n3\n" +
+			"*** Update File: pkg/x.txt\n*** Move to: pkg/svc/a.go\n@@\n n3\n+n4\n", "deny"},
+		// #201 re-review A2: an outside file rewritten (wb's line 2 too), then moved onto wb's file
+		"rewritten outside, moved onto wb's file": {"*** Update File: ext/ten.txt\n@@\n-pkg/svc/a.go l02\n+Z\n*** Update File: ext/ten.txt\n*** Move to: pkg/svc/a.go\n@@\n pkg/svc/a.go l40\n+n4\n", "deny"},
+		// the same with context-less (appending) chunks: these read SILENT while a
+		// moved-in source was read as it lay on disk
+		"added outside, moved in, moved on (appends)": {"*** Add File: ext/new.txt\n+n1\n+n2\n*** Update File: ext/new.txt\n*** Move to: pkg/mid.txt\n@@\n+n3\n" +
+			"*** Update File: pkg/mid.txt\n*** Move to: pkg/svc/a.go\n@@\n+n4\n", "deny"},
+		"rewritten outside, moved on (append)": {"*** Update File: ext/ten.txt\n@@\n-pkg/svc/a.go l02\n+Z\n*** Update File: ext/ten.txt\n*** Move to: pkg/svc/a.go\n@@\n+n4\n", "deny"},
+		// a source never read: what it produces is a heads-up, carried through a later move, never silent
+		"unread source, moved in, moved onto wb's file": {"*** Update File: ext/big.txt\n*** Move to: pkg/x.txt\n@@\n+x\n*** Update File: pkg/x.txt\n*** Move to: pkg/svc/a.go\n@@\n+y\n", "file-level"},
 	} {
-		p, _ := json.Marshal(map[string]any{"cwd": wa, "tool_name": "apply_patch", "tool_input": map[string]string{"command": patch}})
-		if v := hookVerdict(t, runHookCapture(t, hookCodexEdit, string(p))); v != "deny" {
-			t.Errorf("%s: codex-edit under WT_CODEX_HOOK_BLOCK=1 = %s, want deny", name, v)
+		if v := codex(tc.patch); v != tc.want {
+			t.Errorf("%s: codex-edit under WT_CODEX_HOOK_BLOCK=1 = %s, want %s", name, v, tc.want)
 		}
+	}
+	// #201 re-review B: a FIFO source must not block the hook
+	if out, err := exec.Command("mkfifo", filepath.Join(outside, "fifo")).CombinedOutput(); err != nil {
+		t.Logf("mkfifo unavailable, FIFO row skipped: %v %s", err, out)
+	} else if v := codex("*** Update File: ext/fifo\n*** Move to: pkg/svc/a.go\n@@\n+x\n"); v != "file-level" {
+		t.Errorf("a FIFO moved onto wb's file: codex-edit = %s, want a file-level heads-up", v)
+	} else {
+		// and a FIFO in the repo, edited by Claude, where a file wb edits was (the
+		// same read: it blocked the Claude hook before #201 too)
+		a := filepath.Join(wa, "pkg", "svc", "a.go")
+		if err := os.Remove(a); err != nil {
+			t.Fatal(err)
+		}
+		if out, err := exec.Command("mkfifo", a).CombinedOutput(); err != nil {
+			t.Fatalf("mkfifo: %v %s", err, out)
+		}
+		p, _ := json.Marshal(map[string]any{"cwd": wa, "tool_name": "Edit", "tool_input": map[string]string{
+			"file_path": a, "old_string": "pkg/svc/a.go l03\n", "new_string": "X\n"}})
+		if v := hookVerdict(t, runHookWithin(t, 20*time.Second, hookClaudeEdit, string(p))); v != "file-level" {
+			t.Errorf("claude-edit of a FIFO where wb edits = %s, want a file-level heads-up", v)
+		}
+	}
+}
+
+// runHookWithin is runHookCapture that fails the test, instead of hanging it,
+// when the hook doesn't return within d: a hook must always return promptly.
+func runHookWithin(t *testing.T, d time.Duration, hook func(io.Reader) int, payload string) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout := os.Stdout
+	os.Stdout = w
+	done := make(chan int, 1)
+	go func() { done <- hook(strings.NewReader(payload)) }()
+	select {
+	case code := <-done:
+		os.Stdout = stdout
+		w.Close()
+		out, _ := io.ReadAll(r)
+		if code != 0 {
+			t.Errorf("hook exit %d, want 0 (fail-open)", code)
+		}
+		return strings.TrimSpace(string(out))
+	case <-time.After(d):
+		os.Stdout = stdout
+		t.Fatalf("hook still running after %v", d)
+		return ""
 	}
 }
 

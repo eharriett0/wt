@@ -709,17 +709,23 @@ type codexGradedEntry struct {
 // apply_patch would reject or fail on; the hook then keeps its file-level
 // heads-up for every path.
 //
-// An operation entirely OUTSIDE the repo is left out, not a reason to give up
-// on the rest (#201 review): it can't collide with another window's repo
-// files, and since relative paths resolve through symlinks, wt's own
-// `link_files` `.env` (a link into the main checkout) is one. Giving up there
-// turned a confirmed overlap on a repo file in the same patch into a file-level
-// heads-up, and WT_CODEX_HOOK_BLOCK lost its deny where `wt check` blocks.
-// A move ACROSS the repo's edge is what it does to the repo (#201 re-review):
-// out of it, the source is removed (its chunks still have to apply, as for
-// apply_patch); into it, the destination is written with the source's content,
-// read through its own path, patched. If that read fails the destination is
-// left unpredicted (a file-level heads-up for it alone, never dropped).
+// Paths OUTSIDE the repo are part of the replay too (#201 reviews), keyed by
+// where they resolve (patchKey), so that what the patch does to the repo is
+// what apply_patch does: an Add, Update, Delete or move of an outside file is
+// tracked, a later move of it INTO the repo writes the content the patch
+// itself produced (an outside file added, then moved in, then moved again
+// within the repo), and a move OUT of the repo removes its source. Only the
+// repo's paths are graded. Since relative paths resolve through symlinks,
+// wt's own `link_files` `.env` (a link into the main checkout) is such a path;
+// giving up on it, or reading a moved-in source as it lies on disk, let a
+// confirmed overlap in the same patch read silent or file-level where `wt
+// check` blocks.
+//
+// Every file is read with readForPrediction: a FIFO, a device or a file over
+// maxPredictBytes is never read (a FIFO blocked the hook forever), and what it
+// would have produced (an Update of it, its move's destination, anything made
+// from that later) is left unpredicted: a file-level heads-up, never dropped
+// (applyPatchOpsKnown).
 func predictCodexPatch(patch, root, prefix string) (map[string]string, bool) {
 	parsed, err := parseApplyPatch(patch)
 	if err != nil {
@@ -728,64 +734,62 @@ func predictCodexPatch(patch, root, prefix string) (map[string]string, bool) {
 	// Keyed by repo-relative path, so two spellings of one file stay one file,
 	// resolved as repoRelativePatch resolves them: a removed path (a Delete, a
 	// move's source) is the entry, a symlink there the link itself (#201).
-	var ops []patchOp
-	unknown := map[string]bool{}
+	ops := make([]patchOp, 0, len(parsed))
 	for _, op := range parsed {
-		rel := repoRelativePath
-		if op.kind == 'D' || (op.kind == 'U' && op.moveTo != "" && op.moveTo != op.path) {
-			rel = repoRelativeEntry
-		}
-		path, moveTo := rel(root, prefix, op.path), ""
+		removed := op.kind == 'D' || (op.kind == 'U' && op.moveTo != "" && op.moveTo != op.path)
+		op.path = patchKey(root, prefix, op.path, !removed)
 		if op.moveTo != "" {
-			moveTo = repoRelativePath(root, prefix, op.moveTo)
+			op.moveTo = patchKey(root, prefix, op.moveTo, true)
 		}
-		outPath, outMove := path == "", op.moveTo != "" && moveTo == ""
-		switch {
-		case outPath && (op.moveTo == "" || outMove):
-			continue // entirely outside the repo
-		case outMove: // out of the repo: the source's chunks apply, then it is gone
-			op.path, op.moveTo = path, ""
-			ops = append(ops, op, patchOp{kind: 'D', path: path})
-			continue
-		case outPath: // into the repo: the destination gets the source's content, patched
-			src := op.path
-			if !filepath.IsAbs(src) {
-				src = joinRaw(root, filepath.FromSlash(prefix), src)
-			}
-			b, err := os.ReadFile(src)
-			if err != nil {
-				unknown[moveTo] = true
-				continue
-			}
-			next, err := patchedContent(string(b), op.chunks)
-			if err != nil {
-				return nil, false // apply_patch would reject it
-			}
-			ops = append(ops, patchOp{kind: 'A', path: moveTo, content: next})
-			continue
-		}
-		op.path, op.moveTo = path, moveTo
 		ops = append(ops, op)
 	}
-	state, err := applyPatchOps(ops, func(p string) (string, bool) {
-		b, err := os.ReadFile(filepath.Join(root, p))
-		return string(b), err == nil
+	state, _, err := applyPatchOpsKnown(ops, func(k string) (string, fileRead) {
+		return readForPrediction(patchKeyPath(root, k))
 	})
 	if err != nil {
 		return nil, false
 	}
 	out := make(map[string]string, len(state))
-	for p, c := range state {
-		if unknown[p] {
-			continue
+	for k, c := range state {
+		if strings.HasPrefix(k, outsideKey) {
+			continue // not a repo path: nothing another window can touch
 		}
 		if c != nil {
-			out[p] = *c
+			out[k] = *c
 		} else {
-			out[p] = ""
+			out[k] = ""
 		}
 	}
 	return out, true
+}
+
+// outsideKey prefixes predictCodexPatch's key for a path outside the repo: a
+// NUL, which no path holds, so it can never equal a repo-relative path.
+const outsideKey = "\x00"
+
+// patchKey is predictCodexPatch's key for a path as apply_patch spells it: its
+// repo-relative path (repoRelativeAs), or, outside the repo, outsideKey and the
+// absolute path as the filesystem resolves it, so two spellings of one outside
+// file are one key too. followLast as resolvePath reads it. I/O (the
+// filesystem).
+func patchKey(root, prefix, p string, followLast bool) string {
+	if rel := repoRelativeAs(root, prefix, p, followLast); rel != "" {
+		return rel
+	}
+	abs := p
+	if !filepath.IsAbs(abs) {
+		abs = joinRaw(root, filepath.FromSlash(prefix), p)
+	}
+	return outsideKey + resolvePath(abs, followLast)
+}
+
+// patchKeyPath is the file a patchKey names: an outside key's absolute path,
+// else the repo path under root. Pure.
+func patchKeyPath(root, k string) string {
+	if strings.HasPrefix(k, outsideKey) {
+		return k[len(outsideKey):]
+	}
+	return filepath.Join(root, filepath.FromSlash(k))
 }
 
 // codexEditDecision shapes the PreToolUse stdout JSON. deny=true → permissionDecision

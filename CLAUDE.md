@@ -130,6 +130,13 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   grades low. Only when the file can't be predicted (an edit the tool refuses, a
   file mixing line endings, a patch apply_patch rejects, a new file, a git error)
   does an entry stay as a file-level heads-up, and then it is never dropped.
+  ⚠ **A hook reads a file only through `readForPrediction`** (#201 re-review):
+  opened non-blocking and read only if the OPENED file is regular and at most
+  `maxPredictBytes` (8 MiB, the largest input wt already holds: `wt mcp`'s line
+  buffer). `os.ReadFile` on a FIFO waited for a writer forever (a patch moving
+  one in, or any FIFO in the repo, hung both edit hooks, on main too) and on
+  /dev/zero read without end; a hook must always return promptly. Anything not
+  read is a file-level heads-up.
 - **Coordination ownership is ONE decision, and only a real session token
   PROVES a record is yours (#163, #211).** Two agent sessions started in one
   checkout resolve to the same window id, so each treated the other's
@@ -308,19 +315,24 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   in-repo symlink that leads out of the repository, read lexically as a repo
   path before #201) is refused (`outsideCheckPaths`: exit 64 that `--allow-missing`
   can't override; wt_check: isError), never a search that matches nothing and
-  reads clear. ⚠ The Codex hook leaves an apply_patch operation that lies
-  entirely outside the repo out of its prediction (`predictCodexPatch`) instead
-  of giving up on the whole patch: wt's own `link_files` `.env` is a link into
-  the main checkout, and giving up there cost the deny for a repo file in the
-  same patch that `wt check` grades HIGH (#201 review). ⚠ A move ACROSS the
-  repo's edge (through such a link) is predicted for what it does to the repo
-  (#201 re-review; read lexically before #201 it was an in-repo move and
-  denied, and giving up on it only warned): out of the repo, the source's
-  chunks apply and it is removed (a modify/delete with a window editing it);
-  into the repo, the destination is written with the source's content, read
-  through the source's own path and patched. A source that can't be read leaves
-  that destination (and any later operation on it) unpredicted: a file-level
-  heads-up for it alone, never the whole patch, never dropped.
+  reads clear. ⚠ **The Codex hook replays apply_patch over outside paths too**
+  (`predictCodexPatch`, #201 reviews): an outside path is keyed by where it
+  resolves (`patchKey`: `outsideKey`, a NUL no repo path holds, then the
+  resolved absolute path) and only repo paths are graded. Read lexically before
+  #201, a path through an in-repo link (wt's own `link_files` `.env` is a link
+  into the main checkout) was a repo path; once it resolved outside, giving up
+  on the whole patch cost the deny for a repo file beside it, giving up on a
+  move across the edge only warned, and reading a moved-in source as it lay on
+  disk ignored what the same patch had done to it (an outside file added,
+  moved in, moved again; one rewritten, then moved in), so a real HIGH read
+  SILENT. Now an outside Add/Update/Delete is tracked, a move out of the repo
+  removes its source (a modify/delete with a window editing it), and a move in
+  writes what the patch itself made of the source. ⚠ **What can't be read is
+  unknown, and unknown is carried** (`applyPatchOpsKnown`, the same replay
+  `applyPatchOps` is, plus a `fileUnread` state): an Update or move of an
+  unread file leaves its result, and anything later made from it, unpredicted
+  (a file-level heads-up, never dropped, never a deny); a missing file still
+  fails the patch, as apply_patch does.
   ⚠ **A symlink FILE is two paths.** `wt check link.md` asks about the link
   itself (`resolvePath(p, false)`, the entry: another window can retarget it)
   AND its target (whose content an edit through it changes), so it never reads
