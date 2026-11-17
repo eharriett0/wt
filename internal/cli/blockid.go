@@ -214,6 +214,10 @@ func cmdBlockID(args []string) int {
 				case coord.KindBlockAbandoned:
 					ui.Err("you abandoned your reservation of block %d on %s, so it is not yours to mark written (nothing recorded)", *written, filepath.Base(absFile))
 					return 1
+				case coord.ClosedByLegacyMarker:
+					ui.Err("an older wt marked a block %d written on %s, which closed your reservation of it too: check that the file has only ONE block %d (nothing recorded)",
+						*written, filepath.Base(absFile), *written)
+					return 1
 				}
 				ui.Err("%s (nothing recorded)", notYourReservation(recs, self, absFile, *written, time.Now()))
 				return 1
@@ -246,7 +250,7 @@ func cmdBlockID(args []string) int {
 			}
 			if self.Attribute(res) == coord.AttrMineFallback && !*notMine {
 				why := "was reserved with no session token, like this shell: wt counts it as yours but can't prove it, " +
-					"since every token-less shell or agent in this checkout reads it the same way, and abandoning frees the id for the next reservation"
+					"since every token-less shell or agent in this window reads it the same way, and abandoning frees the id for the next reservation"
 				if interactive := confirmInteractive(); !interactive || !confirmAbandon(*abandon, why, os.Stdin) {
 					if interactive {
 						ui.Err("not abandoned: block %d.", *abandon)
@@ -360,12 +364,12 @@ func blockReservationBanner(c *config.Config) {
 	if len(res) == 0 {
 		return
 	}
-	ui.Banner(fmt.Sprintf("%d recent block-id reservation(s) not yours (any repo — reservations are per shared file) — a prepend may be imminent", len(res)))
+	ui.Banner(fmt.Sprintf("%d recent block-id reservation(s) from other windows, or other sessions in this one (any repo — reservations are per shared file) — a prepend may be imminent", len(res)))
 	for _, r := range res {
 		who := r.Window
 		switch {
 		case self.ProvablyWrote(r):
-			who += " (your session, another checkout: a subagent's?)"
+			who += " (your session, another window: a subagent's?)"
 		case r.Window == self.Window:
 			who += " (" + coord.ShortSession(r.Session) + ", this window)"
 		}

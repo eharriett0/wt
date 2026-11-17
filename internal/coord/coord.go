@@ -1205,7 +1205,7 @@ func NextBlock(recs []Record, file string, fileMax int, now time.Time, ttl time.
 		if r.Kind != KindBlockReserve || r.File != file || r.Block <= max {
 			continue
 		}
-		if abandoned[r.ID] {
+		if abandoned(r) {
 			continue // #160: THIS reservation was abandoned → free its id NOW (per-record)
 		}
 		// Count a reservation only if it's still live (younger than ttl) or has
@@ -1228,12 +1228,13 @@ func consumedBlocks(recs []Record) map[string]map[int]bool {
 }
 
 // openReservation returns whether a block reservation is still open: not
-// abandoned (#160, keyed by the reservation's id) and not written (#35). A
-// block-written marker names its reservation by AckOf (#197 review): keyed by
+// abandoned (#160) and not written (#35). A marker closes the reservation its
+// AckOf names AND whose file and block it carries (#197 review): keyed by
 // (file, block), one written marker also closed every LATER reservation that
 // reused the number, so a dead reservation's owner could mark another
-// session's live one. A marker with no AckOf (an older wt) still closes by
-// (file, block). Pure.
+// session's live one. A written marker with no AckOf (an older wt) still
+// closes by (file, block). NextBlock reads abandonment the same way
+// (abandonedReservationIDs). Pure.
 func openReservation(recs []Record) func(Record) bool {
 	type closer struct {
 		id, file string
@@ -1266,9 +1267,9 @@ func openReservation(recs []Record) func(Record) bool {
 }
 
 // OwnClosedReservation is how self's newest reservation of (file, block) was
-// closed when none of self's is open: KindBlockWritten, KindBlockAbandoned, or
-// "" when self has none (#197 re-review: a retried --written was told to
-// reserve a new id for a block already written). Pure.
+// closed when none of self's is open: KindBlockWritten, KindBlockAbandoned,
+// ClosedByLegacyMarker, or "" when self has none (#197 re-review: a retried
+// --written was told to reserve a new id for a block already written). Pure.
 func OwnClosedReservation(recs []Record, self Self, file string, block int) string {
 	var mine Record
 	ok := false
@@ -1287,10 +1288,16 @@ func OwnClosedReservation(recs []Record, self Self, file string, block int) stri
 		}
 	}
 	if state == "" && !openReservation(recs)(mine) {
-		state = KindBlockWritten // closed by an older wt's (file, block) marker
+		state = ClosedByLegacyMarker
 	}
 	return state
 }
+
+// ClosedByLegacyMarker is OwnClosedReservation's answer when self's
+// reservation was closed by an older wt's written marker for the same (file,
+// block), which names no reservation: someone else may have written a block
+// of the same number (#197 re-review).
+const ClosedByLegacyMarker = "closed-by-legacy-marker"
 
 // abandonedReservationIDs is the set of RESERVATION record IDs that have a
 // block-abandoned marker (#160). Keyed by the reservation's record ID (the abandon
@@ -1298,14 +1305,21 @@ func OwnClosedReservation(recs []Record, self Self, file string, block int) stri
 // id for reuse: a LATER reservation of the same number is a DIFFERENT record and
 // must stay live, not be silently masked by the old abandonment (which would
 // re-introduce the exact same-id collision block-id exists to prevent). Pure.
-func abandonedReservationIDs(recs []Record) map[string]bool {
-	out := map[string]bool{}
+func abandonedReservationIDs(recs []Record) func(Record) bool {
+	type key struct {
+		id, file string
+		block    int
+	}
+	out := map[key]bool{}
 	for _, r := range recs {
 		if r.Kind == KindBlockAbandoned && r.AckOf != "" {
-			out[r.AckOf] = true
+			out[key{r.AckOf, r.File, r.Block}] = true
 		}
 	}
-	return out
+	// #197 re-review: keyed by the reservation's id AND its file and block, as
+	// openReservation is, so NextBlock and the views agree when two
+	// reservations happen to share an id (NewID is stamped before the lock).
+	return func(r Record) bool { return out[key{r.ID, r.File, r.Block}] }
 }
 
 // blockMarkers indexes (file → block → true) for every record of the given

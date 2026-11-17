@@ -268,6 +268,53 @@ func TestOpenReservation_markerMustMatchFileAndBlock(t *testing.T) {
 	}
 }
 
+// #197 re-review: two reservations that share an id (NewID is stamped before
+// the lock) must not let one's abandon free the other's number in NextBlock
+// while every view still shows it open: the allocator and the views agree,
+// before and after a prune.
+func TestNextBlock_dupIDAgreesWithViews(t *testing.T) {
+	now := time.Now()
+	fresh := now.Add(-time.Minute).Format(time.RFC3339)
+	const f = "/x/log.md"
+	B := Self{Window: "co2", Session: "B"}
+	recs := []Record{
+		{ID: "dup", Kind: KindBlockReserve, Window: "co", Session: "A", File: f, Block: 5, TS: fresh},
+		{ID: "dup", Kind: KindBlockReserve, Window: "co2", Session: "B", File: f, Block: 6, TS: fresh},
+		{Kind: KindBlockAbandoned, Window: "co", Session: "A", File: f, Block: 5, AckOf: "dup", TS: fresh},
+	}
+	if _, open := FindOwnReservation(recs, B, f, 6); !open {
+		t.Fatal("B's 6 should be open")
+	}
+	if got := NextBlock(recs, f, 4, now, DefaultBlockReserveTTL); got != 7 {
+		t.Errorf("NextBlock = %d, want 7: B's 6 is open in every view", got)
+	}
+	kept, _ := PruneRecords(recs, now, 24*time.Hour)
+	if got := NextBlock(kept, f, 4, now, DefaultBlockReserveTTL); got != 7 {
+		t.Errorf("NextBlock after prune = %d, want 7 (unchanged by the prune)", got)
+	}
+}
+
+// #197 re-review: an older wt's written marker (no AckOf) closes every
+// reservation of its (file, block), yours included, so it is reported as
+// such, never as "already marked written" by you.
+func TestOwnClosedReservation_legacyMarker(t *testing.T) {
+	fresh := time.Now().Add(-time.Minute).Format(time.RFC3339)
+	const f = "/x/log.md"
+	A := Self{Window: "co", Session: "A"}
+	recs := []Record{
+		{ID: "old", Kind: KindBlockReserve, Window: "w0", File: f, Block: 5, TS: fresh},
+		{Kind: KindBlockWritten, Window: "w0", File: f, Block: 5, TS: fresh},
+		{ID: "a5", Kind: KindBlockReserve, Window: "co", Session: "A", File: f, Block: 5, TS: fresh},
+	}
+	if got := OwnClosedReservation(recs, A, f, 5); got != ClosedByLegacyMarker {
+		t.Errorf("OwnClosedReservation = %q, want %q", got, ClosedByLegacyMarker)
+	}
+	recs = append(recs, Record{Kind: KindBlockWritten, Window: "co", Session: "A", File: f, Block: 5, AckOf: "a5", TS: fresh})
+	if got := OwnClosedReservation(recs, A, f, 5); got != KindBlockWritten {
+		t.Errorf("with A's own marker: %q, want written", got)
+	}
+}
+
 func TestLoadBlockLedgers(t *testing.T) {
 	home := t.TempDir()
 	for i, f := range []string{"/a/x.md", "/b/y.md"} {
