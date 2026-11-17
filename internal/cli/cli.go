@@ -431,20 +431,43 @@ func cmdMergePR(args []string) int {
 		ui.Err("cannot resolve repo config (%v) — refusing merge; can't verify merge_is_deploy", err)
 		return 1
 	}
+	// #228: a forwarded -R/--repo merges THAT repository's PR, so every read
+	// merge-pr makes about the PR must be of it, never of this clone's PR of
+	// the same number. The PR is resolved there once; its URL is the selector
+	// every gh read and the merge itself take (gh reads a URL as that PR
+	// whatever -R or the cwd says). A PR given by its URL names its repository
+	// the same way (#228 review: the guard's own hints print that form), so it
+	// is resolved too, for the issue, squash-settings and auto-clean reads.
+	// Unresolvable: refuse, rather than read another PR.
+	repo := merge.ParseForwardedRepo(ghArgs)
+	prRef := pr
+	var at *ghx.PRAt
+	if repo != "" || ghx.IsPRURL(pr) {
+		a, err := resolvePRIn(pr, repo)
+		if err != nil {
+			if repo != "" {
+				ui.Err("%v: refusing, rather than read this clone's PR %s in its place", err, merge.PRLabel(pr))
+			} else {
+				ui.Err("%v: refusing to merge a PR whose repository wt could not read", err)
+			}
+			return 1
+		}
+		at, prRef = &a, a.URL
+	}
 	// #39: PR-state precheck. An already-merged PR shouldn't raise a confusing gh
 	// error AND orphan its worktree — skip the merge but still clean up. A
 	// closed-not-merged PR has nothing to merge. Unknown state → fall through
 	// (fail-open). Only on a real merge; dry-run still previews.
 	if !*dryRun {
-		switch merge.PreMergeVerdict(ghx.PRState(pr)) {
+		switch merge.PreMergeVerdict(ghx.PRState(prRef)) {
 		case merge.PreAlreadyMerged:
-			ui.Info("PR #%s is already merged — skipping the merge, cleaning up its worktree.", pr)
+			ui.Info("PR %s is already merged: skipping the merge.", merge.PRLabel(prRef))
 			if !*keep {
-				autoCleanMergedWorktree(pr)
+				autoCleanMergedWorktree(prRef, at)
 			}
 			return 0
 		case merge.PreClosed:
-			ui.Err("PR #%s is closed (not merged) — nothing to merge.", pr)
+			ui.Err("PR %s is closed (not merged): nothing to merge.", merge.PRLabel(prRef))
 			return 1
 		}
 	}
@@ -462,7 +485,6 @@ func cmdMergePR(args []string) int {
 	// PR could turn merge_is_deploy off, and a branch cut before the base added
 	// a deploy glob skipped the gate for a path that now deploys. A passthrough
 	// that merges nothing reads neither, and no gate below needs them.
-	repo := merge.ParseForwardedRepo(ghArgs)
 	nonMerging := merge.NonMerging(ghArgs)
 	gates := []gateSource{{from: "this checkout", gate: c.Gate()}}
 	if nonMerging == "" {
@@ -546,23 +568,24 @@ func cmdMergePR(args []string) int {
 	// prepareMerge has the rules. wt's own gh flags (--admin here, the WIP
 	// --subject in merge.Run) go IN FRONT of the passthrough, so a dangling
 	// passthrough flag fails in gh instead of taking one of them as its value.
-	prep, ok := prepareMerge(pr, ghArgs, closeOpts{dryRun: *dryRun, closeOK: *closeOK, skip: *noCloseCheck},
-		os.Stdin, stdinIsTTY(), liveCloseReads)
+	reads := closeReadsAt(at)
+	prep, ok := prepareMerge(prRef, ghArgs, closeOpts{dryRun: *dryRun, closeOK: *closeOK, skip: *noCloseCheck},
+		os.Stdin, stdinIsTTY(), reads)
 	if !ok {
 		return 1
 	}
-	if err := merge.Run(pr, *dryRun, *bypass, *mergeForeign, wtBranches, merge.WithMatchHead(pin, merge.WithAdmin(*admin, prep.args)), prep.stdin, checksLabel); err != nil {
+	if err := merge.Run(prRef, *dryRun, *bypass, *mergeForeign, wtBranches, merge.WithMatchHead(pin, merge.WithAdmin(*admin, prep.args)), prep.stdin, checksLabel); err != nil {
 		// ⚠ gh can fail AFTER merging (#196): `-- -d` merges, then cannot delete a
 		// local branch that a wt worktree has checked out, and exits non-zero. So a
 		// failed `gh pr merge` reads the PR state too, and only MERGED goes on to
 		// the verify and the auto-clean (#187's shipped-tip guard included); a
 		// guard's refusal, or any other state, exits 1 as before.
-		if !errors.Is(err, merge.ErrMergeCommand) || !mergedDespiteFailure(pr) {
+		if !errors.Is(err, merge.ErrMergeCommand) || !mergedDespiteFailure(prRef) {
 			return 1
 		}
-	} else if !*dryRun && !mergeConfirmed(pr) {
-		// ⚠ gh exits 0 WITHOUT merging for --help, --auto, --disable-auto, a merge
-		// queue or -R, so only a PR that now reads MERGED is verified and
+	} else if !*dryRun && !mergeConfirmed(prRef) {
+		// ⚠ gh exits 0 WITHOUT merging for --help, --auto, --disable-auto or a
+		// merge queue, so only a PR that now reads MERGED is verified and
 		// auto-cleaned (#185). Still exit 0: gh did what it was asked (printed help,
 		// armed auto-merge, queued the PR), and keeping the worktree loses nothing.
 		return 0
@@ -570,21 +593,71 @@ func cmdMergePR(args []string) int {
 	// Post-merge verification (#77): re-check the referenced issues + report any
 	// that changed state — catches a silent close (trap 2) in the same command.
 	if !*dryRun && !*noCloseCheck {
-		verifyClosings(prep.plan)
+		verifyClosings(prep.plan, reads)
 	}
 	// Auto-clean: the PR just shipped, so its worktree is done. Only on a real
 	// merge (not dry-run) and unless -keep. Best-effort — a cleanup miss must
 	// not fail the merge that already succeeded, so we warn and return 0.
 	if !*dryRun && !*keep {
-		autoCleanMergedWorktree(pr)
+		autoCleanMergedWorktree(prRef, at)
 	}
 	return 0
 }
 
+// resolvePRIn is ghx.ResolvePRIn; a var so a test can answer it.
+var resolvePRIn = ghx.ResolvePRIn
+
+// readyHint is the command that marks pr ready (prCommand). Pure.
+func readyHint(pr, repo string) string { return prCommand("ready", pr, repo) }
+
+// prCommand is the `gh pr <verb>` command line for pr that a hint prints: in
+// repo when one was forwarded (#228 review: bare, `gh pr ready <n>` names this
+// clone's PR of that number), and never with a "#" a shell would read as a
+// comment (merge.PRArg). Pure.
+func prCommand(verb, pr, repo string, extra ...string) string {
+	parts := append([]string{"gh", "pr", verb, merge.PRArg(pr)}, extra...)
+	if repo != "" {
+		parts = append(parts, "-R", repo)
+	}
+	return strings.Join(parts, " ")
+}
+
+// laneMayBeHere reports whether this clone, whose origin is owner/name, can
+// hold at's lane (#228 review): the PR is origin's, or its branch is (origin
+// a fork, -R naming upstream). A PR whose repository and branch are both
+// elsewhere has no worktree or claim here, and a branch of the same name here
+// is another lane. Owner and name compare case-insensitively; the host is
+// not compared, as an ssh alias names it differently. Unknown origin or head
+// counts as elsewhere. Pure.
+func laneMayBeHere(at ghx.PRAt, owner, name string) bool {
+	same := func(o, n string) bool {
+		return o != "" && n != "" && strings.EqualFold(o, owner) && strings.EqualFold(n, name)
+	}
+	return same(at.Owner, at.Name) || same(at.HeadOwner, at.HeadName)
+}
+
 // autoCleanMergedWorktree resolves the merged PR's head branch, finds the
 // matching worktree under the configured root, and removes it (+ local branch).
-// Every failure path is a soft warning: the merge is already done.
-func autoCleanMergedWorktree(pr string) {
+// Every failure path is a soft warning: the merge is already done. at is the
+// PR as a forwarded -R or its URL resolved it (#228), nil for a bare number:
+// a PR whose repository and branch are both outside this clone's origin
+// (laneMayBeHere) has no worktree here, and a branch of the same name here is
+// another branch, so nothing is touched.
+func autoCleanMergedWorktree(pr string, at *ghx.PRAt) {
+	if at != nil {
+		if _, owner, name := ghx.OriginRepo(); !laneMayBeHere(*at, owner, name) {
+			head := at.HeadRepo()
+			if head == "" {
+				head = "unknown, a deleted fork?"
+			}
+			origin := owner + "/" + name
+			if owner == "" {
+				origin = "not a repository wt can read as owner/name"
+			}
+			ui.Info("merged %s: neither its repository (%s) nor its branch's (%s) is this clone's origin (%s), so no worktree or claim here is its; nothing to clean (if origin names that repository by an old name, after a rename or transfer, `wt clean` removes the lane once it ships)", at.URL, at.Repo(), head, origin)
+			return
+		}
+	}
 	c, err := config.Load()
 	if err != nil {
 		return
@@ -738,21 +811,22 @@ func deployDryRunNote(pr string, draft, confirmed bool, unsure string) string {
 // "deploy" at an interactive prompt. The warning sits right before the
 // confirm, so whoever confirms has just read it; it never blocks.
 func deployGate(pr, repo string, confirmed bool, statusHost, unsure string) int {
+	name := merge.PRLabel(pr)
 	if draft, err := ghx.PRIsDraft(pr, repo); err == nil && draft {
 		if unsure != "" {
-			ui.Err("PR #%s is a DRAFT: refusing to merge, since merging it MAY auto-apply to prod (%s).", pr, unsure)
+			ui.Err("PR %s is a DRAFT: refusing to merge, since merging it MAY auto-apply to prod (%s).", name, unsure)
 		} else {
-			ui.Err("PR #%s is a DRAFT — refusing to merge in a merge==deploy repo (would auto-apply to prod).", pr)
+			ui.Err("PR %s is a DRAFT — refusing to merge in a merge==deploy repo (would auto-apply to prod).", name)
 		}
-		ui.Info("mark it ready first: gh pr ready %s", pr)
+		ui.Info("mark it ready first: %s", readyHint(pr, repo))
 		return 1
 	}
 	if unsure != "" {
 		// #223 review: nothing says this repo deploys, only that it can't be
 		// ruled out; the banner must not state a deploy as fact.
-		ui.Banner("⚠ merging PR #" + pr + " MAY auto-apply to prod: " + unsure)
+		ui.Banner("⚠ merging PR " + name + " MAY auto-apply to prod: " + unsure)
 	} else {
-		ui.Banner("⚠ merge_is_deploy — merging PR #" + pr + " AUTO-APPLIES to prod")
+		ui.Banner("⚠ merge_is_deploy — merging PR " + name + " AUTO-APPLIES to prod")
 	}
 	warnActionsStatus(statusHost)
 	if confirmed {
@@ -765,9 +839,9 @@ func deployGate(pr, repo string, confirmed bool, statusHost, unsure string) int 
 	}
 	if !stdinIsTTY() {
 		if unsure != "" {
-			ui.Err("deploy not confirmed (merging PR #%s may auto-apply to prod). Re-run with --confirm-deploy to merge it.", pr)
+			ui.Err("deploy not confirmed (merging PR %s may auto-apply to prod). Re-run with --confirm-deploy to merge it.", name)
 		} else {
-			ui.Err("prod deploy not confirmed. Re-run with --confirm-deploy to merge PR #%s.", pr)
+			ui.Err("prod deploy not confirmed. Re-run with --confirm-deploy to merge PR %s.", name)
 		}
 		return 1
 	}
@@ -775,8 +849,8 @@ func deployGate(pr, repo string, confirmed bool, statusHost, unsure string) int 
 	if unsure != "" {
 		target = "(it may auto-apply to prod)"
 	}
-	fmt.Fprintf(os.Stderr, "%s Type %s to merge PR #%s %s (anything else aborts): ",
-		ui.Yellow("→"), ui.Bold("deploy"), pr, target)
+	fmt.Fprintf(os.Stderr, "%s Type %s to merge PR %s %s (anything else aborts): ",
+		ui.Yellow("→"), ui.Bold("deploy"), name, target)
 	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 	if strings.TrimSpace(line) == "deploy" {
 		return 0
