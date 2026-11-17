@@ -9,6 +9,7 @@ package lock
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"syscall"
 	"time"
@@ -33,18 +34,31 @@ func SharedWithin(f *os.File, d time.Duration) error {
 // long as it stayed stopped. waiting, when set, runs once, when the file has
 // stayed held for noticeAfter, so the caller can say what it is waiting on
 // (another writer's append holds it for microseconds: no notice for that).
-// Past d: ErrTimeout. Any other flock error is returned as is.
+// Past d: ErrTimeout. Any other flock error is returned as is, except a
+// "can't lock here" error (Unsupported) after a try found the file held,
+// which is returned as a plain error.
 func ExclusiveWithin(f *os.File, d, noticeAfter time.Duration, waiting func()) error {
 	return within(f, syscall.LOCK_EX, d, noticeAfter, waiting)
 }
 
 func within(f *os.File, how int, d, noticeAfter time.Duration, waiting func()) error {
 	start := time.Now()
-	for told := false; ; {
-		err := syscall.Flock(int(f.Fd()), how|syscall.LOCK_NB)
-		if err == nil || !errors.Is(err, syscall.EWOULDBLOCK) {
+	for told, held := false, false; ; {
+		err := flock(int(f.Fd()), how|syscall.LOCK_NB)
+		switch {
+		case err == nil:
+			return nil
+		case held && Unsupported(err):
+			// #235 review: this machine's lock service failed (NFS lockd
+			// unreachable: ENOLCK) after a try found the file HELD, so locks
+			// do work here and someone holds this one. Not Unsupported (%v,
+			// not %w): a caller that writes unlocked on Unsupported would
+			// write into a prune's rewrite.
+			return fmt.Errorf("flock failed (%v) after another process was seen holding the lock", err)
+		case !errors.Is(err, syscall.EWOULDBLOCK):
 			return err
 		}
+		held = true
 		waited := time.Since(start)
 		if waiting != nil && !told && waited >= noticeAfter {
 			told = true
@@ -56,6 +70,10 @@ func within(f *os.File, how int, d, noticeAfter time.Duration, waiting func()) e
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// flock is syscall.Flock; a var so a test can make a try fail after another
+// found the file held (#235 review).
+var flock = syscall.Flock
 
 // Unsupported reports whether err says the filesystem can't lock at all (NFS
 // mounted nolocks, lockd unreachable, some FUSE and SMB mounts) rather than

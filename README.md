@@ -259,15 +259,19 @@ shell that shares a coordination log (or its mirror issue); after upgrading,
 `wt prune-coord --legacy` lists the pre-upgrade backlog nothing needs any more.
 
 **The log's lock.** Every write to a coordination log or block ledger takes the
-file's lock. If another wt process keeps it (a `wt prune-coord` stopped with
-Ctrl-Z, a `wt block-id` stuck on a network mount), the write says it is waiting
-after a second and gives up after 30s with the file's path. Find the holder
-with `lsof <path>` and resume it (`fg`, or `kill -CONT <pid>`); don't kill it,
-since a prune killed mid-rewrite leaves the log empty. On a filesystem that
-can't lock at all (an NFS mount with `nolocks`, some FUSE or SMB mounts),
-announce, ack, all-clear and `block-id --written`/`--abandon` write without the
-lock and warn once; block reservations and `wt prune-coord` need the lock and
-fail there.
+file's lock, and so does `wt append` on its doc. If another wt process keeps it
+(a `wt prune-coord` stopped with Ctrl-Z, a `wt block-id` stuck on a network
+mount), the write says it is waiting after a second and gives up after 30s
+with the file's path. A command that reads the log first (`ack`, `all-clear`,
+`block-id --written`/`--abandon`) waits up to 5s more for that read, without a
+word. Find the holder with `lsof <path>` and resume it (`fg`, or `kill -CONT
+<pid>`); don't kill it, since a prune killed mid-rewrite leaves the log empty.
+On a filesystem that can't lock at all (an NFS mount with `nolocks`, some FUSE
+or SMB mounts), announce, ack, all-clear and `block-id --written`/`--abandon`
+write without the lock and warn once; block reservations, `wt prune-coord` and
+`wt append` need the lock and fail there. The lock guards processes on one
+machine: machines sharing `~/.wt` over a network mount where only some of them
+can lock are not protected from each other.
 
 Structured shared docs (`structured_doc.<name>` in config) upgrade the blanket
 "shared doc — advisory" to **section-aware** grading: two windows editing the

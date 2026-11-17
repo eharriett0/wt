@@ -1017,8 +1017,15 @@ func TestPruneCoord_reportsALedgerItCouldntPrune(t *testing.T) {
 	if !strings.Contains(errOut, "block ledgers not all pruned") || !strings.Contains(errOut, "/x/ledger.jsonl stayed locked") {
 		t.Errorf("the ledger error was not reported:\n%s", errOut)
 	}
-	if !strings.Contains(out, "pruned 2 ") {
-		t.Errorf("what the ledgers did drop must count:\n%s", out)
+	if !strings.Contains(out, "pruned 2 ") || !strings.Contains(out, "were skipped") || strings.Contains(out, "already tidy") {
+		t.Errorf("what the ledgers did drop must count, and the summary must not call the log tidy:\n%s", out)
+	}
+	pruneBlockLedgers = func(string, time.Time, time.Duration) (int, error) {
+		return 0, errors.New("/x/ledger.jsonl stayed locked")
+	}
+	out, _ = captureOutputForTest(t, func() { code = cmdPruneCoord(nil) })
+	if strings.Contains(out, "already tidy") {
+		t.Errorf("#235 review: \"already tidy\" under a skipped ledger:\n%s", out)
 	}
 }
 

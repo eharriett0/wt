@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -42,13 +43,14 @@ func TestExclusiveWithin_givesUpOnAHeldLock(t *testing.T) {
 	path, _ := heldFile(t)
 	f := open(t, path)
 	calls := 0
+	const d = 500 * time.Millisecond
 	start := time.Now()
-	err := ExclusiveWithin(f, 200*time.Millisecond, 0, func() { calls++ })
+	err := ExclusiveWithin(f, d, 0, func() { calls++ })
 	if !errors.Is(err, ErrTimeout) {
 		t.Fatalf("err = %v, want ErrTimeout", err)
 	}
-	if took := time.Since(start); took < 200*time.Millisecond {
-		t.Errorf("gave up after %s, before the deadline", took)
+	if took := time.Since(start); took < d || took > d+400*time.Millisecond {
+		t.Errorf("gave up after %s, want at the %s deadline", took, d)
 	}
 	if calls != 1 {
 		t.Errorf("waiting ran %d times, want once", calls)
@@ -94,6 +96,38 @@ func TestExclusiveWithin_takesAFreeLockAndPassesOtherErrors(t *testing.T) {
 	}
 	if time.Since(start) > time.Second {
 		t.Error("a non-EWOULDBLOCK error was retried until the deadline")
+	}
+}
+
+// #235 review: a "can't lock here" error after a try found the file HELD
+// means this machine's lock service failed (NFS lockd unreachable), not that
+// the filesystem can't lock: someone holds it. It must not read as
+// Unsupported, or Append writes unlocked into a prune's rewrite. The same
+// error on the first try is Unsupported, as before.
+func TestExclusiveWithin_unsupportedAfterHeldFailsClosed(t *testing.T) {
+	path, _ := heldFile(t)
+	f := open(t, path)
+	orig := flock
+	t.Cleanup(func() { flock = orig })
+	tries := 0
+	flock = func(fd int, how int) error {
+		tries++
+		if tries == 1 {
+			return syscall.EWOULDBLOCK
+		}
+		return syscall.ENOLCK
+	}
+	err := ExclusiveWithin(f, time.Second, 0, nil)
+	if err == nil || Unsupported(err) || errors.Is(err, ErrTimeout) || !strings.Contains(err.Error(), "seen holding the lock") {
+		t.Fatalf("held, then ENOLCK: err = %v (Unsupported %v), want a plain error", err, Unsupported(err))
+	}
+	tries = 1 // the next try is the first to fail: ENOLCK straight away
+	if err := ExclusiveWithin(f, time.Second, 0, nil); !Unsupported(err) {
+		t.Errorf("ENOLCK on the first try: err = %v, want Unsupported", err)
+	}
+	tries = 0
+	if err := SharedWithin(f, time.Second); err == nil || Unsupported(err) {
+		t.Errorf("readers too: held, then ENOLCK: err = %v, want a plain error", err)
 	}
 }
 

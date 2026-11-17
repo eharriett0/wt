@@ -338,13 +338,27 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   ENOSYS; NFS `nolocks`, some FUSE/SMB mounts) made `Append` refuse after
   #229, which stopped announce, ack, all-clear and block-id
   `--written`/`--abandon`. `Append` alone writes unlocked there, `O_APPEND`
-  as before #229, warning once per process: every locker fails the same way
-  there, so no prune can rewrite under it. `ReserveBlock` (an id needs the
-  lock across its read and write) and `withLockedLog` (a rewrite without it
-  is #229) still fail. prune-coord reports a block ledger it couldn't prune
-  (it used to drop the error and the count). Not covered: a prune longer
-  than the readers' wait (measured 8.9s for a 1M-record log on Linux; a real
-  log is ~10k) lets a non-gate reader read unlocked mid-rewrite.
+  as before #229, warning once per process: every locker ON THIS MACHINE
+  fails the same way there, so no prune here can rewrite under it (machines
+  sharing `~/.wt` where only some can lock were never protected).
+  `ReserveBlock` (an id needs the lock across its read and write) and
+  `withLockedLog` (a rewrite without it is #229) still fail. ⚠ **Only a
+  failure on a try that never saw the file held is Unsupported** (#235
+  review): `within` returns ENOLCK after an EWOULDBLOCK as a plain error,
+  since the lock service failed (lockd unreachable) while someone held the
+  file, and writing unlocked then lost a hold to a prune's rewrite (measured
+  with a stubbed flock). `LoadForGate` likewise refuses on every lock error
+  but Unsupported, not only on the timeout. prune-coord reports a block
+  ledger it couldn't prune and prunes the rest (`PruneBlockLedgers` joins
+  the errors; it used to stop at the first and drop the error and the
+  count). `wt append`'s doc lock is bounded the same way (`appendLockWait`)
+  and still fails on a filesystem that can't lock. ⚠ Polling `LOCK_NB` gives
+  a writer no place in a queue: a near-continuous stream of readers (two in a
+  tight loop) can hold it off to the deadline, where a blocking `LOCK_EX`
+  mostly got in (measured on macOS; at per-turn hook rates neither waits).
+  Not covered: a prune longer than the readers' wait (measured 8.9s for a
+  1M-record log on Linux; a real log is ~10k) lets a non-gate reader read
+  unlocked mid-rewrite.
   Pinned by
   `TestAppend_waitsForAPruneRewrite` (a prune paused between its read and its
   rewrite; `lockedLogPause` is the seam),
@@ -355,7 +369,11 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   `TestReserveBlock_noSelfDeadlockAndAppendsLand`, and for #235
   `TestAppend_givesUpOnAStuckHolder`,
   `TestAppend_writesUnlockedWhereTheFilesystemCantLock` (`exclusiveWithin`
-  is the seam), `TestLockedWriters_sameDeadlineAndNoUnlockedFallback` and
+  is the seam), `TestLockedWriters_sameDeadlineAndNoUnlockedFallback`,
+  `TestExclusiveWithin_unsupportedAfterHeldFailsClosed` (`lock.flock` is the
+  seam), `TestLoadForGate_refusesOnLockErrorsButUnsupported`,
+  `TestPruneBlockLedgers_prunesPastAHeldLedger`, `TestWriteLockDefaults`,
+  `TestAppend_givesUpOnAStuckHolder` (cli) and
   `TestPruneCoord_reportsALedgerItCouldntPrune`. Off unix the lock is a
   no-op, as before.
 - **`ClassifyFacts` precedence:** open PR > merged PR > closed PR > dirty >

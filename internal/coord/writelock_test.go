@@ -229,3 +229,89 @@ func TestLockedWriters_sameDeadlineAndNoUnlockedFallback(t *testing.T) {
 		})
 	}
 }
+
+// The documented bounds (#235 review: no test asserted them): the notice after
+// a second, the give-up at 30s, and the notices on stderr, where a caller
+// capturing stdout (N=$(wt block-id file)) never takes them in.
+func TestWriteLockDefaults(t *testing.T) {
+	if writeLockWait != 30*time.Second || writeLockNotice != time.Second {
+		t.Errorf("writeLockWait %s, writeLockNotice %s; the docs say 30s and 1s", writeLockWait, writeLockNotice)
+	}
+	if lockNotices != os.Stderr {
+		t.Error("lock notices must go to stderr")
+	}
+	err := func() error {
+		path := filepath.Join(t.TempDir(), "log.jsonl")
+		shortWriteLock(t, 50*time.Millisecond, time.Hour)
+		holdLog(t, path)
+		return Append(path, lockRec("x"))
+	}()
+	if !errors.Is(err, lock.ErrTimeout) {
+		t.Errorf("the deadline error = %v, want it to wrap lock.ErrTimeout", err)
+	}
+}
+
+// #235 review: merge-pr's hold gate refused only on a timeout, so any other
+// lock failure (one after a try found the log held, say) read the log
+// unlocked, which may be a log stopped between a prune's truncate and its
+// rewrite. Only a filesystem that can't lock at all reads unlocked there.
+func TestLoadForGate_refusesOnLockErrorsButUnsupported(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "log.jsonl")
+	if err := Append(path, lockRec("hold")); err != nil {
+		t.Fatal(err)
+	}
+	orig := sharedWithin
+	t.Cleanup(func() { sharedWithin = orig })
+	for _, tc := range []struct {
+		name   string
+		err    error
+		refuse bool
+	}{
+		{"held, then the lock service failed", errors.New("flock failed (no locks available) after another process was seen holding the lock"), true},
+		{"EIO", syscall.EIO, true},
+		{"the filesystem can't lock", syscall.ENOLCK, false},
+		{"locked", nil, false},
+	} {
+		sharedWithin = func(*os.File, time.Duration) error { return tc.err }
+		recs, err := LoadForGate(path)
+		if tc.refuse != errors.Is(err, ErrLogLocked) {
+			t.Errorf("%s: LoadForGate err = %v, want refused=%v", tc.name, err, tc.refuse)
+		}
+		if !tc.refuse && len(recs) != 1 {
+			t.Errorf("%s: read %d record(s), want the hold", tc.name, len(recs))
+		}
+		if recs, err := Load(path); err != nil || len(recs) != 1 {
+			t.Errorf("%s: Load = %d record(s), %v; a non-gate read goes on", tc.name, len(recs), err)
+		}
+	}
+}
+
+// #235 review: one block ledger another process keeps locked stopped
+// PruneBlockLedgers, so every ledger after it went unpruned. Now the rest are
+// pruned and the failure comes back with what they dropped.
+func TestPruneBlockLedgers_prunesPastAHeldLedger(t *testing.T) {
+	home := t.TempDir()
+	shortWriteLock(t, 200*time.Millisecond, 0)
+	old := time.Now().Add(-72 * time.Hour).UTC().Format(time.RFC3339)
+	held := filepath.Join(BlocksDir(home), "a-held.jsonl")
+	free := filepath.Join(BlocksDir(home), "b-free.jsonl")
+	for _, p := range []string{held, free} {
+		for i, id := range []string{"r1", "r2"} {
+			r := Record{ID: id, Kind: KindBlockReserve, Window: "w", Session: "s", File: "/doc.md", Block: i + 1, TS: old}
+			if err := Append(p, r); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	holdLog(t, held)
+	dropped, err := PruneBlockLedgers(home, time.Now(), 24*time.Hour)
+	if err == nil || !strings.Contains(err.Error(), held) {
+		t.Errorf("err = %v, want the held ledger named", err)
+	}
+	if dropped != 2 {
+		t.Errorf("dropped %d, want the free ledger's 2", dropped)
+	}
+	if got := logIDs(t, free); len(got) != 0 {
+		t.Errorf("the ledger after the held one kept %v", got)
+	}
+}

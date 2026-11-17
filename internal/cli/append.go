@@ -6,12 +6,14 @@
 package cli
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/eharriett0/wt/internal/config"
 	"github.com/eharriett0/wt/internal/lock"
@@ -22,6 +24,11 @@ import (
 // defaultSectionDelimiter partitions by markdown headings when a doc has no
 // configured structured_doc pattern and none is given via --pattern.
 const defaultSectionDelimiter = `^#{1,6}\s`
+
+// appendLockWait bounds how long `wt append` waits for another append's lock
+// on the doc, and appendLockNotice how long before it says so (#235 review);
+// its read-modify-write takes milliseconds. Vars so a test can shorten them.
+var appendLockWait, appendLockNotice = 30 * time.Second, time.Second
 
 func cmdAppend(args []string) int {
 	if code, done := guardHelp(args, `usage: wt append <doc> --section "<heading>" "<text>"   (or --file <path>)`); done {
@@ -73,7 +80,15 @@ func cmdAppend(args []string) int {
 		defer f.Close()
 		// Serialize the read-modify-write against other windows' `wt append` to
 		// the same doc — without this, two parallel appends lose one update.
-		if lerr := lock.Exclusive(f); lerr != nil {
+		// Bounded, as the coordination log's writers are (#235 review): an
+		// append stopped with Ctrl-Z held every later one forever, silently.
+		if lerr := lock.ExclusiveWithin(f, appendLockWait, appendLockNotice, func() {
+			ui.Warn("waiting for the lock on %s (another wt append holds it)", doc)
+		}); lerr != nil {
+			if errors.Is(lerr, lock.ErrTimeout) {
+				ui.Err("%s stayed locked by another process for %s: find it with `lsof %s`, resume it if it was stopped (`fg`, or `kill -CONT <pid>`) and let it finish, then try again", doc, appendLockWait, absDoc)
+				return 1
+			}
 			ui.Err("lock %s: %v", doc, lerr)
 			return 1
 		}

@@ -942,8 +942,10 @@ func cmdPruneCoord(args []string) int {
 		}
 		// #152: block reservations live in per-file ledgers now — GC those too, or
 		// they'd grow append-only forever (the per-repo PruneLog never sees them).
+		var berr error
 		if home, herr := os.UserHomeDir(); herr == nil && home != "" {
-			bd, berr := pruneBlockLedgers(home, now, dur)
+			var bd int
+			bd, berr = pruneBlockLedgers(home, now, dur)
 			dropped += bd
 			if berr != nil {
 				// A ledger another process keeps locked fails after the
@@ -951,9 +953,13 @@ func cmdPruneCoord(args []string) int {
 				ui.Warn("block ledgers not all pruned: %v", berr)
 			}
 		}
-		if dropped == 0 {
+		switch {
+		case berr != nil:
+			// #235 review: "already tidy" under that warning contradicted it.
+			ui.Info("pruned %d resolved/expired record(s); the block ledgers named above were skipped (run it again once they are free)", dropped)
+		case dropped == 0:
 			ui.OK("coordination log already tidy — nothing to prune")
-		} else {
+		default:
 			ui.OK("pruned %d resolved/expired record(s) from the coordination log + block ledgers", dropped)
 		}
 		if recs, lerr := coord.Load(path); lerr == nil {
