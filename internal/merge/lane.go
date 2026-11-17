@@ -47,8 +47,21 @@ func PRLabel(pr string) string {
 // PRArg is pr as a command hint should spell it: "#5" loses its "#", which a
 // shell reads as the start of a comment (#228 review: the pasted `gh pr ready
 // #5 -R o/r` ran a bare `gh pr ready`, marking the current branch's PR ready).
-// Pure.
-func PRArg(pr string) string { return strings.TrimPrefix(pr, "#") }
+// Only a "#" before a number goes: gh reads "#hotfix" as that branch (#228
+// round-3 review). Pure.
+func PRArg(pr string) string {
+	if s := strings.TrimPrefix(pr, "#"); s != pr && isPRNumber(s) {
+		return s
+	}
+	return pr
+}
+
+// isPRNumber reports whether s is a PR number as gh reads one: digits, above
+// zero. Pure.
+func isPRNumber(s string) bool {
+	n, err := strconv.Atoi(s)
+	return err == nil && n > 0 && !strings.HasPrefix(s, "+") && !strings.HasPrefix(s, "-")
+}
 
 // UnshippedLane returns "" when tip, the local branch's tip as the caller read
 // it, shipped in merged PR pr (LocalTipVerdict), and otherwise the warning

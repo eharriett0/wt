@@ -2,6 +2,7 @@ package merge
 
 import (
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -227,5 +228,63 @@ esac
 		if got := errors.Is(err, ErrMergeCommand); got != tc.ghFail {
 			t.Errorf("files %q: errors.Is(%v, ErrMergeCommand) = %v, want %v", tc.files, err, got, tc.ghFail)
 		}
+	}
+}
+
+// hintGh is a fake gh for Run's refusals: an empty diff when "$d/empty"
+// exists, head branch feat-y.
+const hintGh = `#!/bin/sh
+d=$(dirname "$0")
+case "$1 $2" in
+"pr diff") [ -e "$d/empty" ] || echo a.txt ;;
+"pr view")
+	case "$*" in
+	*messageHeadline*) echo "Fix the widget" ;;
+	*headRefName*) echo feat-y ;;
+	*title*) echo "Fix the widget" ;;
+	esac ;;
+"pr merge") exit 1 ;;
+esac
+`
+
+// Run's refusals print commands to paste; a "#5" in them is a shell comment,
+// so they spell the PR without it (#228 review), and name it "#5".
+func TestRunHintsSpellThePRForAShell(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake gh is a shell script")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(hintGh), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+"/usr/bin"+string(os.PathListSeparator)+"/bin")
+	if got, err := exec.LookPath("gh"); err != nil || got != filepath.Join(dir, "gh") {
+		t.Fatalf("gh resolves to %q (%v), not the fake", got, err)
+	}
+	stderr := func(f func()) string {
+		t.Helper()
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		old := os.Stderr
+		os.Stderr = w
+		done := make(chan string)
+		go func() { b, _ := io.ReadAll(r); done <- string(b) }()
+		f()
+		os.Stderr = old
+		_ = w.Close()
+		return <-done
+	}
+	foreign := stderr(func() { _ = Run("#5", false, false, false, []string{"feat-x"}, nil, nil, "") })
+	if !strings.Contains(foreign, "If intended: wt merge-pr 5 --merge-foreign") || !strings.Contains(foreign, "REFUSING to merge PR #5") {
+		t.Errorf("foreign-branch refusal:\n%s", foreign)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "empty"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	empty := stderr(func() { _ = Run("#5", false, false, false, []string{"feat-y"}, nil, nil, "") })
+	if !strings.Contains(empty, "wt merge-pr 5 --bypass") || strings.Contains(empty, "#5 --bypass") {
+		t.Errorf("empty-diff refusal:\n%s", empty)
 	}
 }

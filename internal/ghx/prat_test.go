@@ -99,6 +99,7 @@ func TestResolveWhere(t *testing.T) {
 		{"#5", "o/r", "#5 in o/r"},
 		{"https://github.com/o/r/pull/5", "", "https://github.com/o/r/pull/5"},
 		{"https://github.com/o/r/pull/5", "x/y", "https://github.com/o/r/pull/5 in x/y"},
+		{"feat-x", "o/r", "feat-x in o/r"},
 	} {
 		if got := resolveWhere(tc.pr, tc.repo); got != tc.want {
 			t.Errorf("resolveWhere(%q, %q) = %q, want %q", tc.pr, tc.repo, got, tc.want)

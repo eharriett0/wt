@@ -45,11 +45,11 @@ func ResolvePRIn(pr, repo string) (PRAt, error) {
 	return parsePRAt(out)
 }
 
-// resolveWhere names what ResolvePRIn was asked for: "#5 in o/r", or a URL as
-// given, never "#<url>" (#228 review). Pure.
+// resolveWhere names what ResolvePRIn was asked for: "#5 in o/r", or a URL or
+// branch as given, never "#<url>" (#228 reviews). Pure.
 func resolveWhere(pr, repo string) string {
 	where := pr
-	if !IsPRURL(pr) {
+	if n, err := strconv.Atoi(strings.TrimPrefix(pr, "#")); err == nil && n > 0 {
 		where = "#" + strings.TrimPrefix(pr, "#")
 	}
 	if repo != "" {

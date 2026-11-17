@@ -650,7 +650,11 @@ func autoCleanMergedWorktree(pr string, at *ghx.PRAt) {
 			if head == "" {
 				head = "unknown, a deleted fork?"
 			}
-			ui.Info("merged %s: neither its repository (%s) nor its branch's (%s) is this clone's origin (%s/%s), so no worktree or claim here is its; nothing to clean (if origin names that repository by an old name, after a rename or transfer, `wt clean` removes the lane once it ships)", at.URL, at.Repo(), head, owner, name)
+			origin := owner + "/" + name
+			if owner == "" {
+				origin = "not a repository wt can read as owner/name"
+			}
+			ui.Info("merged %s: neither its repository (%s) nor its branch's (%s) is this clone's origin (%s), so no worktree or claim here is its; nothing to clean (if origin names that repository by an old name, after a rename or transfer, `wt clean` removes the lane once it ships)", at.URL, at.Repo(), head, origin)
 			return
 		}
 	}

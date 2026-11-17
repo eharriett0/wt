@@ -87,7 +87,10 @@ func TestPRLabel(t *testing.T) {
 
 // A hint's command never spells a PR "#5": a shell reads "#" as a comment.
 func TestPRArg(t *testing.T) {
-	for pr, want := range map[string]string{"#5": "5", "5": "5", "https://x/o/r/pull/5": "https://x/o/r/pull/5"} {
+	for pr, want := range map[string]string{
+		"#5": "5", "5": "5", "https://x/o/r/pull/5": "https://x/o/r/pull/5",
+		"#hotfix": "#hotfix", "#0": "#0", "#+5": "#+5", "feat-x": "feat-x",
+	} {
 		if got := PRArg(pr); got != want {
 			t.Errorf("PRArg(%q) = %q, want %q", pr, got, want)
 		}
