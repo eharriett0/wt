@@ -526,6 +526,16 @@ func IsSharedDoc(path string, shared []string) bool {
 // production callers pass gitx.ChangedRanges.
 type RangeFn func(worktree, base, path string) []gitx.LineRange
 
+// DocEditsFn resolves what a worktree changed in a structured doc, both sides
+// of its diff (#237); production callers pass gitx.ChangedDocEdits.
+type DocEditsFn func(worktree, base, path string) gitx.DocEdits
+
+// NewOnly is a DocEditsFn that knows only a RangeFn's new-frame ranges (no
+// deletions): for tests that grade sections with stub ranges.
+func NewOnly(ranges RangeFn) DocEditsFn {
+	return func(wt, base, path string) gitx.DocEdits { return gitx.DocEdits{New: ranges(wt, base, path)} }
+}
+
 // SharedSectionsAcross returns the section headings edited by ≥2 of the given
 // worktrees for the structured doc at repo-relative path rel (partitioned by the
 // delimiter regexp). Empty → every window touches DISJOINT sections (safe,
@@ -540,54 +550,89 @@ type RangeFn func(worktree, base, path string) []gitx.LineRange
 // section of a structured doc blocked in `wt check` and sailed through the
 // pre-push guard. Heading text is the stable cross-worktree identity: line
 // numbers drift between branches, headings do not.
-func SharedSectionsAcross(base string, worktrees []string, rel, delimiter string, ranges RangeFn) (shared []string, graded bool) {
-	return SharedSectionsAcrossWith(base, worktrees, rel, delimiter, ranges, nil)
+//
+// ⚠ A window's sections are the ones its edits touch in its OWN copy (new
+// frame, #123) AND the ones holding the lines it DELETED, read in the copy
+// it diffed from (#237: gitx.DocEdits). A deleted line has no line in the
+// window's copy, so deleting another window's section, or emptying or
+// deleting the file, read disjoint while git conflicts. A window whose doc
+// is gone counts its deletions too. A window whose measurement failed
+// (DocEdits.All) edits every section, never none.
+func SharedSectionsAcross(base string, worktrees []string, rel, delimiter string, edits DocEditsFn) (shared []string, graded bool) {
+	return SharedSectionsAcrossWith(base, worktrees, rel, delimiter, edits, nil)
 }
 
 // PendingDoc is one worktree's copy of a structured doc as a pending edit will
-// leave it, with that worktree's changed ranges in the copy's own (NEW-frame)
-// line numbers (#226).
+// leave it, with what that worktree changed: Edits.New in the copy's own
+// (NEW-frame) line numbers (#226), Edits.Deleted in the copy it is measured
+// from (#237).
 type PendingDoc struct {
 	Content string
-	Ranges  []gitx.LineRange
+	Edits   gitx.DocEdits
 }
 
 // SharedSectionsAcrossWith is SharedSectionsAcross with some worktrees' copies
 // given instead of read from disk (pending, keyed by worktree): the edit hooks
 // grade a structured doc's sections as they will read once the edit is made,
 // through the very computation `wt check` runs then (#226). Pure given ranges.
-func SharedSectionsAcrossWith(base string, worktrees []string, rel, delimiter string, ranges RangeFn, pending map[string]PendingDoc) (shared []string, graded bool) {
+func SharedSectionsAcrossWith(base string, worktrees []string, rel, delimiter string, edits DocEditsFn, pending map[string]PendingDoc) (shared []string, graded bool) {
 	re, err := section.Compile(delimiter)
 	if err != nil {
 		return nil, false
 	}
 	count := map[string]int{}
 	var order []string
+	seen := map[string]bool{}
+	note := func(h string) {
+		if !seen[h] {
+			seen[h] = true
+			order = append(order, h)
+		}
+	}
+	all := 0 // windows that edit every section (a failed measurement)
 	any := false
 	for _, wt := range worktrees {
-		var heads []string
+		var content string
+		var e gitx.DocEdits
 		if doc, ok := pending[wt]; ok {
-			heads = section.EditedHeadings(section.Parse(doc.Content, re), doc.Ranges)
+			content, e = doc.Content, doc.Edits
 		} else {
-			content, rerr := os.ReadFile(filepath.Join(wt, rel))
-			if rerr != nil {
-				continue // this worktree lacks the doc; others may still grade
+			b, rerr := os.ReadFile(filepath.Join(wt, rel))
+			if rerr != nil && !os.IsNotExist(rerr) {
+				continue // unreadable here; others may still grade
 			}
-			heads = section.EditedHeadings(section.Parse(string(content), re), ranges(wt, base, rel))
+			e = edits(wt, base, rel)
+			if rerr != nil && len(e.Deleted) == 0 && !e.All {
+				continue // this worktree lacks the doc and deleted nothing of it
+			}
+			content = string(b)
 		}
 		any = true
-		for _, h := range heads {
-			if count[h] == 0 {
-				order = append(order, h)
+		heads := section.EditedHeadings(section.Parse(content, re), e.New)
+		if len(e.Deleted) > 0 {
+			heads = append(heads, section.EditedHeadings(section.Parse(e.Old, re), e.Deleted)...)
+		}
+		if e.All {
+			all++
+			for _, s := range append(section.Parse(content, re), section.Parse(e.Old, re)...) {
+				note(s.Heading)
 			}
-			count[h]++
+			continue // counted for every heading by all, never twice
+		}
+		mine := map[string]bool{}
+		for _, h := range heads {
+			note(h)
+			if !mine[h] {
+				mine[h] = true
+				count[h]++
+			}
 		}
 	}
 	if !any {
 		return nil, false
 	}
 	for _, h := range order {
-		if count[h] >= 2 {
+		if count[h]+all >= 2 {
 			shared = append(shared, h)
 		}
 	}

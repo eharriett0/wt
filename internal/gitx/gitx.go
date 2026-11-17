@@ -1505,23 +1505,75 @@ var wholeFile = []LineRange{{Start: 1, End: math.MaxInt32}}
 // fails it falls back to the base diff (over-reports), and if git can't diff the
 // file at all it reports wholeFile.
 func ChangedRangesNew(dir, base, file string) []LineRange {
+	return ChangedDocEdits(dir, base, file).New
+}
+
+// DocEdits is what a window changed in a structured doc, for the section
+// grade (#237): New is ChangedRangesNew, its edits in its own copy's line
+// numbers; Deleted is every line the same diff removed or replaced, numbered
+// in Old, the copy it diffed from (the merge base's file for a branch behind
+// base, else base's). A line deleted has no line in the window's copy, so New
+// alone credited a deleted section to the section above it, or to nothing
+// once the file was emptied or deleted: deleting another window's section
+// read "disjoint" while git conflicts. All: count every section, the copy's
+// and Old's, because the measurement failed (a diff git couldn't run, or an
+// Old it couldn't read), never "no edits".
+type DocEdits struct {
+	New, Deleted []LineRange
+	Old          string
+	All          bool
+}
+
+// ChangedDocEdits is the section grade's measurement of file in the worktree
+// at dir: ChangedRangesNew's one diff, both of its sides (#237). Without a
+// base it is the uncommitted ranges alone (no shared frame to delete from).
+func ChangedDocEdits(dir, base, file string) DocEdits {
 	ref, sha, hasBase := resolveBaseRef(dir, base)
 	if !hasBase {
 		if r, ok := uncommittedRangesNew(dir, file); ok {
-			return r
+			return DocEdits{New: r}
 		}
-		return wholeFile
+		return DocEdits{New: wholeFile, All: true}
 	}
 	if mb := behindMergeBase(dir, ref, sha, file); mb != "" {
 		if out, err := runRaw(dir, gradeDiff([]string{mb}, file)...); err == nil {
-			return parseHunkRanges(out)
+			return docEditsFrom(dir, mb+":"+file, out)
 		}
 	}
 	out, err := runRaw(dir, gradeDiff([]string{ref}, file)...)
 	if err != nil {
-		return wholeFile
+		return DocEdits{New: wholeFile, All: true}
 	}
-	return parseHunkRanges(out)
+	return docEditsFrom(dir, ref+":"+file, out)
+}
+
+// docEditsFrom reads a -U0 diff from the blob old (a "<rev>:<path>") into
+// DocEdits. Old is read only when the diff deleted something: as stored
+// (cat-file, no filters), the frame the diff's old side counts in.
+func docEditsFrom(dir, old, diff string) DocEdits {
+	e := DocEdits{New: parseHunkRanges(diff), Deleted: parseDeletedRanges(diff)}
+	if len(e.Deleted) > 0 {
+		content, err := runRaw(dir, "cat-file", "blob", old)
+		if err != nil {
+			e.All = true
+		} else {
+			e.Old = content
+		}
+	}
+	return e
+}
+
+// parseDeletedRanges extracts the OLD-side lines each -U0 hunk removed or
+// replaced (#237): a hunk with an old count of zero is a pure insertion and
+// deletes nothing. Pure.
+func parseDeletedRanges(diff string) []LineRange {
+	var out []LineRange
+	for _, h := range parseHunks(diff) {
+		if h.oldCount > 0 {
+			out = append(out, LineRange{Start: h.oldStart, End: h.oldStart + h.oldCount - 1})
+		}
+	}
+	return out
 }
 
 // resolveBaseRef returns the ref every window's ranges are measured against —

@@ -17,7 +17,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -662,10 +661,11 @@ func hookClaudeEdit(r io.Reader) int {
 	return 0
 }
 
-// pendingRangesNew is gitx.ChangedRangesNewWith: this window's ranges in the
-// pending copy's own line numbers, the frame sections are read in (#226). A
+// pendingDocEdits is gitx.ChangedDocEditsWith: this window's edits in the
+// pending copy's own line numbers, the frame sections are read in (#226), and
+// the lines the copy no longer has, in the copy it is measured from (#237). A
 // var so a test can make the measurement fail.
-var pendingRangesNew = gitx.ChangedRangesNewWith
+var pendingDocEdits = gitx.ChangedDocEditsWith
 
 // regradeSections re-grades rel's structured-doc entries the way `wt check`
 // will once the pending edit is made (#226): the same SharedSections call
@@ -678,41 +678,27 @@ var pendingRangesNew = gitx.ChangedRangesNewWith
 // the copy can't be predicted or measured, `wt check` after the edit may say
 // HIGH, so every section-graded entry stays a file-level heads-up, an advisory
 // included (#226 review: dropping it was the one fail-open; regradePending
-// keeps a hunk-graded FYI the same way).
+// keeps a hunk-graded FYI the same way). An edit that deletes the other
+// window's section, or empties the doc, is graded by the lines it deletes
+// (#237): the stopgap that kept such a section HIGH as a heads-up is gone.
 func regradeSections(c *config.Config, root, rel string, content []byte, predicted bool, entries []CheckEntry) (graded []pendingGrade, rest []CheckEntry) {
 	delim, structured := c.StructuredDocs[filepath.Base(rel)]
 	if !structured || !collide.IsSharedDoc(rel, c.SharedDocs) {
 		return nil, entries
 	}
-	re, cerr := section.Compile(delim)
-	if cerr != nil {
+	if _, cerr := section.Compile(delim); cerr != nil {
 		// `wt check` can't section-grade it either (the blanket advisory),
 		// so the entries go on as they were (#226 re-review).
 		return nil, entries
 	}
-	var ranges []gitx.LineRange
+	var edits gitx.DocEdits
 	ok := false
 	if predicted {
-		ranges, ok = pendingRangesNew(root, c.Base, rel, content)
+		edits, ok = pendingDocEdits(root, c.Base, rel, content)
 	}
 	f := newGitGradeFacts(c.Base)
 	f.pendingPath = rel
-	f.pending = map[string]collide.PendingDoc{root: {Content: string(content), Ranges: ranges}}
-	// The headings are counted only when a section HIGH would be dropped, the
-	// one case headingGone decides (#226 re-review: the file was re-read on
-	// every edit).
-	var before, after map[string]int
-	counted := false
-	gone := func(sections []string) bool {
-		if !counted {
-			counted = true
-			if cur, read := readForPrediction(filepath.Join(root, rel)); read == fileReadOK {
-				before = headingCounts(cur, re)
-			}
-			after = headingCounts(string(content), re)
-		}
-		return headingGone(sections, before, after)
-	}
+	f.pending = map[string]collide.PendingDoc{root: {Content: string(content), Edits: edits}}
 	for _, e := range entries {
 		switch {
 		case !sectionGraded(e):
@@ -721,36 +707,12 @@ func regradeSections(c *config.Config, root, rel string, content []byte, predict
 			graded = append(graded, pendingGrade{entry: e})
 		default:
 			shared, sok := f.SharedSections([]string{root, e.otherWorktree}, rel, delim)
-			lost := sok && len(shared) == 0 && e.Category == CatBlocking && gone(e.SharedSections)
-			if g, keep := sectionGrade(e, shared, sok, lost); keep {
+			if g, keep := sectionGrade(e, shared, sok); keep {
 				graded = append(graded, g)
 			}
 		}
 	}
 	return graded, rest
-}
-
-// headingCounts counts each section heading in content. Pure.
-func headingCounts(content string, re *regexp.Regexp) map[string]int {
-	n := map[string]int{}
-	for _, s := range section.Parse(content, re) {
-		n[s.Heading]++
-	}
-	return n
-}
-
-// headingGone reports whether the edit deletes a section with one of sections'
-// headings: the copy (after) has fewer of it than the file has now (before),
-// or, when the file couldn't be read (before nil), none. Counted, not just
-// present (#226 re-review): sections are identified by heading text, so
-// deleting one of two "## Notes" left the heading present. Pure.
-func headingGone(sections []string, before, after map[string]int) bool {
-	for _, h := range sections {
-		if before != nil && after[h] < before[h] || before == nil && after[h] == 0 {
-			return true
-		}
-	}
-	return false
 }
 
 // sectionGraded reports whether e came out of gradeEntry's shared-doc branch
@@ -763,21 +725,17 @@ func sectionGraded(e CheckEntry) bool {
 
 // sectionGrade is one structured-doc entry once the pending edit is made
 // (#226): HIGH, confirmed, when this window's copy and the other window share
-// a section (what `wt check` will block on); dropped when they don't. When
-// the sections couldn't be graded (graded false: a bad delimiter, no copy to
-// read), `wt check` falls back to the blanket advisory, so an advisory is
-// dropped and a section HIGH stays as a file-level heads-up, never dropped on
-// an unknown. ⚠ A section HIGH whose heading the edit deletes (gone) stays a
-// heads-up too (#226 review): new-frame ranges can't show a deletion, so
-// deleting the shared section, or emptying or deleting the file, reads
-// disjoint in `wt check` while git conflicts; main kept the heads-up, and so
-// does this until the grader sees deletions (#237). Pure.
-func sectionGrade(e CheckEntry, shared []string, graded, gone bool) (pendingGrade, bool) {
+// a section (what `wt check` will block on), a section the edit deletes
+// included (#237); dropped when they don't. When the sections couldn't be
+// graded (graded false: a bad delimiter, no copy to read), `wt check` falls
+// back to the blanket advisory, so an advisory is dropped and a section HIGH
+// stays as a file-level heads-up, never dropped on an unknown. Pure.
+func sectionGrade(e CheckEntry, shared []string, graded bool) (pendingGrade, bool) {
 	switch {
 	case !graded:
 		return pendingGrade{entry: e}, e.Category == CatBlocking
 	case len(shared) == 0:
-		return pendingGrade{entry: e}, e.Category == CatBlocking && gone
+		return pendingGrade{entry: e}, false
 	}
 	e.Category, e.Severity, e.SharedSections = CatBlocking, "HIGH", shared
 	return pendingGrade{entry: e, confirmed: true}, true
