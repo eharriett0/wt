@@ -81,7 +81,7 @@ func TestPushCollisionBlocks_TouchingEdits(t *testing.T) {
 				t.Errorf("pushCollisionBlocks = %v, want %v", got, tc.blocks)
 			}
 			conflicts := pathConflicts(ws, repoRootOrEmpty(), []string{"data.txt"})
-			hard, _ := gradeConflicts(c, conflicts, repoRootOrEmpty(), ws, gitx.ChangedRanges, gitx.ChangedRangesNew)
+			hard, _ := gradeConflicts(c, conflicts, repoRootOrEmpty(), ws, gitx.ChangedRanges, gitx.ChangedDocEdits)
 			if got := len(hard) > 0; got != tc.blocks {
 				t.Errorf("pre-commit's gradeConflicts: hard=%v, want %v", got, tc.blocks)
 			}

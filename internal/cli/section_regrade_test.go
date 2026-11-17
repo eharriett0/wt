@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"io"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -93,9 +94,9 @@ func TestPreEditHooks_StructuredDocSections(t *testing.T) {
 // advisory included (#226 review: dropping the advisory failed open).
 func TestPreEditHooks_StructuredDocUnmeasurable(t *testing.T) {
 	wc := sectionHookRepo(t)
-	orig := pendingRangesNew
-	t.Cleanup(func() { pendingRangesNew = orig })
-	pendingRangesNew = func(dir, base, file string, content []byte) ([]gitx.LineRange, bool) { return nil, false }
+	orig := pendingDocEdits
+	t.Cleanup(func() { pendingDocEdits = orig })
+	pendingDocEdits = func(dir, base, file string, content []byte) (gitx.DocEdits, bool) { return gitx.DocEdits{}, false }
 	t.Setenv("WT_CLAUDE_HOOK_BLOCK", "0")
 	if got := hookVerdict(t, runHookCapture(t, hookClaudeEdit, sectionClaudePayload(wc, "b6\n", "Xb6\n"))); got != "file-level" {
 		t.Errorf("advisory, copy unmeasurable: claude says %s, want a file-level heads-up", got)
@@ -134,21 +135,18 @@ func TestSectionGrade(t *testing.T) {
 		e         CheckEntry
 		shared    []string
 		graded    bool
-		gone      bool // the edit deletes a shared heading
 		keep      bool
 		confirmed bool
 		sections  []string
 	}{
-		{"advisory, now a shared section", adv, []string{"## Alpha"}, true, false, true, true, []string{"## Alpha"}},
-		{"advisory, still disjoint", adv, nil, true, false, false, false, nil},
-		{"HIGH, still shared, by another section", high, []string{"## Alpha"}, true, false, true, true, []string{"## Alpha"}},
-		{"HIGH, now disjoint", high, nil, true, false, false, false, nil},
-		{"HIGH, its heading deleted: a heads-up (#237)", high, nil, true, true, true, false, []string{"## Beta"}},
-		{"advisory, a heading deleted: dropped, as wt check grades it", adv, nil, true, true, false, false, nil},
-		{"advisory, ungradable", adv, nil, false, false, false, false, nil},
-		{"HIGH, ungradable: a heads-up, never dropped", high, nil, false, false, true, false, []string{"## Beta"}},
+		{"advisory, now a shared section", adv, []string{"## Alpha"}, true, true, true, []string{"## Alpha"}},
+		{"advisory, still disjoint", adv, nil, true, false, false, nil},
+		{"HIGH, still shared, by another section", high, []string{"## Alpha"}, true, true, true, []string{"## Alpha"}},
+		{"HIGH, now disjoint", high, nil, true, false, false, nil},
+		{"advisory, ungradable", adv, nil, false, false, false, nil},
+		{"HIGH, ungradable: a heads-up, never dropped", high, nil, false, true, false, []string{"## Beta"}},
 	} {
-		g, keep := sectionGrade(tc.e, tc.shared, tc.graded, tc.gone)
+		g, keep := sectionGrade(tc.e, tc.shared, tc.graded)
 		if keep != tc.keep {
 			t.Errorf("%s: keep = %v, want %v", tc.name, keep, tc.keep)
 			continue
@@ -216,8 +214,17 @@ func sectionClaudePayload(wc, old, new string) string {
 }
 
 func sectionCodexPayload(wc, old, new string) string {
+	var hunk strings.Builder
+	for _, side := range []struct{ sign, text string }{{"-", old}, {"+", new}} {
+		if side.text == "" {
+			continue // a pure deletion has no + lines
+		}
+		for _, ln := range strings.Split(strings.TrimSuffix(side.text, "\n"), "\n") {
+			hunk.WriteString(side.sign + ln + "\n")
+		}
+	}
 	p, _ := json.Marshal(map[string]any{"cwd": wc, "tool_name": "apply_patch", "tool_input": map[string]string{
-		"command": "*** Begin Patch\n*** Update File: PLAN.md\n@@\n-" + strings.TrimSuffix(old, "\n") + "\n+" + strings.TrimSuffix(new, "\n") + "\n*** End Patch\n"}})
+		"command": "*** Begin Patch\n*** Update File: PLAN.md\n@@\n" + hunk.String() + "*** End Patch\n"}})
 	return string(p)
 }
 
@@ -266,33 +273,74 @@ func TestPreEditHooks_StructuredDocUnpredictedKeepsHeadsUp(t *testing.T) {
 	}
 }
 
-// Deleting the shared section, or emptying the file, reads disjoint in `wt
-// check` (its new-frame ranges can't show a deletion, #237) while git
-// conflicts. main kept a heads-up for the section HIGH, and so do the hooks
-// until the grader sees deletions (#226 review).
-func TestPreEditHooks_StructuredDocDeletionKeepsHeadsUp(t *testing.T) {
+// #237: an edit deleting the other window's section, or emptying or deleting
+// the doc, is graded by the lines it deletes: HIGH, naming the section, in
+// both hooks and in `wt check` after the edit, from an advisory start (wc
+// never edited Beta; before #237 every one of these was silent, main
+// included). Deleting lines of wc's own section stays silent.
+func TestPreEditHooks_StructuredDocDeletionsGradeHIGH(t *testing.T) {
 	wc := sectionHookRepo(t)
-	writeT(t, wc, "PLAN.md", strings.Replace(readT(t, wc, "PLAN.md"), "b6\n", "Wb6\n", 1))
-	gitT(t, wc, "commit", "-qam", "wc edits b6 too")
-	if e := sectionGradeOf(t, wc); e.Category != CatBlocking {
-		t.Fatalf("precondition: wc and wa both in Beta: wt check says %s, want HIGH", e.Category)
+	if e := sectionGradeOf(t, wc); e.Category != CatAdvisory {
+		t.Fatalf("precondition: wa in Beta, wc in Alpha: wt check says %s, want advisory", e.Category)
 	}
-	beta := readT(t, wc, "PLAN.md")[strings.Index(readT(t, wc, "PLAN.md"), "## Beta\n"):]
-	t.Setenv("WT_CLAUDE_HOOK_BLOCK", "1")
-	for _, tc := range []struct{ name, old, new string }{
-		{"the whole Beta section deleted", beta, ""},
-		{"the file emptied", readT(t, wc, "PLAN.md"), ""},
+	plan := readT(t, wc, "PLAN.md")
+	beta := plan[strings.Index(plan, "## Beta\n"):]
+	for _, tc := range []struct {
+		name, old, new string
+		high           bool
+	}{
+		{"the whole Beta section deleted", beta, "", true},
+		{"the doc emptied", plan, "", true},
+		{"lines of wc's own Alpha deleted", "a2\na3\n", "", false},
 	} {
-		if got := hookVerdict(t, runHookCapture(t, hookClaudeEdit, sectionClaudePayload(wc, tc.old, tc.new))); got != "deny" {
-			t.Errorf("%s, claude, block: hook says %s, want the file-level heads-up's deny (as on main)", tc.name, got)
+		post := postEditSectionGrade(t, wc, tc.old, tc.new)
+		if (post.Category == CatBlocking) != tc.high || tc.high && !reflect.DeepEqual(post.SharedSections, []string{"## Beta"}) {
+			t.Fatalf("%s: precondition: wt check after the edit says %s %v, want HIGH=%v on ## Beta", tc.name, post.Category, post.SharedSections, tc.high)
+		}
+		for _, h := range []struct {
+			kind    string
+			hook    func(io.Reader) int
+			payload string
+			blockEV string
+		}{
+			{"claude", hookClaudeEdit, sectionClaudePayload(wc, tc.old, tc.new), "WT_CLAUDE_HOOK_BLOCK"},
+			{"codex", hookCodexEdit, sectionCodexPayload(wc, tc.old, tc.new), "WT_CODEX_HOOK_BLOCK"},
+		} {
+			if h.kind == "codex" && tc.new == "" && tc.old == plan {
+				continue // an apply_patch hunk can't leave a file empty of lines; the delete below covers it
+			}
+			for _, block := range []bool{false, true} {
+				t.Setenv(h.blockEV, map[bool]string{false: "0", true: "1"}[block])
+				out := runHookCapture(t, h.hook, h.payload)
+				want := "silent"
+				if tc.high {
+					want = map[bool]string{false: "overlap", true: "deny"}[block]
+				}
+				if got := hookVerdict(t, out); got != want {
+					t.Errorf("%s %s block=%v: hook says %s, want %s, as wt check after the edit\n%s", tc.name, h.kind, block, got, want, out)
+				}
+				if tc.high && !strings.Contains(out, "## Beta") {
+					t.Errorf("%s %s block=%v: the warning doesn't name the section:\n%s", tc.name, h.kind, block, out)
+				}
+			}
 		}
 	}
-	// Codex: deleting the file.
+	// Codex: deleting the doc. `wt check` after it: HIGH on Beta too.
+	if err := os.Rename(filepath.Join(wc, "PLAN.md"), filepath.Join(wc, "PLAN.md.away")); err != nil {
+		t.Fatal(err)
+	}
+	post := sectionGradeOf(t, wc)
+	if err := os.Rename(filepath.Join(wc, "PLAN.md.away"), filepath.Join(wc, "PLAN.md")); err != nil {
+		t.Fatal(err)
+	}
+	if post.Category != CatBlocking || !reflect.DeepEqual(post.SharedSections, []string{"## Beta"}) {
+		t.Fatalf("precondition: wt check with PLAN.md deleted says %s %v, want HIGH on ## Beta", post.Category, post.SharedSections)
+	}
 	p, _ := json.Marshal(map[string]any{"cwd": wc, "tool_name": "apply_patch", "tool_input": map[string]string{
 		"command": "*** Begin Patch\n*** Delete File: PLAN.md\n*** End Patch\n"}})
-	t.Setenv("WT_CODEX_HOOK_BLOCK", "0")
-	if got := hookVerdict(t, runHookCapture(t, hookCodexEdit, string(p))); got != "file-level" {
-		t.Errorf("codex deletes PLAN.md: hook says %s, want a file-level heads-up", got)
+	t.Setenv("WT_CODEX_HOOK_BLOCK", "1")
+	if got := hookVerdict(t, runHookCapture(t, hookCodexEdit, string(p))); got != "deny" {
+		t.Errorf("codex deletes PLAN.md, block: hook says %s, want deny, as wt check after it", got)
 	}
 }
 
@@ -335,31 +383,9 @@ func TestPreEditHooks_StructuredDocNotInBase(t *testing.T) {
 	}
 }
 
-// headingGone counts headings (#226 re-review): sections are identified by
-// heading text, so deleting one of two "## Notes" leaves the heading present.
-func TestHeadingGone(t *testing.T) {
-	shared := []string{"## Notes"}
-	for _, tc := range []struct {
-		name          string
-		before, after map[string]int
-		want          bool
-	}{
-		{"still both", map[string]int{"## Notes": 2}, map[string]int{"## Notes": 2}, false},
-		{"one of two deleted", map[string]int{"## Notes": 2}, map[string]int{"## Notes": 1}, true},
-		{"the only one deleted", map[string]int{"## Notes": 1}, map[string]int{}, true},
-		{"one added", map[string]int{"## Notes": 1}, map[string]int{"## Notes": 2}, false},
-		{"file unread, still there", nil, map[string]int{"## Notes": 1}, false},
-		{"file unread, gone", nil, map[string]int{}, true},
-	} {
-		if got := headingGone(shared, tc.before, tc.after); got != tc.want {
-			t.Errorf("%s: headingGone = %v, want %v", tc.name, got, tc.want)
-		}
-	}
-}
-
-// Deleting one of two sections that share a heading reads disjoint in `wt
-// check` (#237) while git conflicts; the hook keeps main's heads-up (#226
-// re-review: a presence check let it through).
+// Deleting one of two sections that share a heading, the one the other window
+// edits: git conflicts, and `wt check` after the edit says HIGH (#237: its
+// deleted lines are read in the copy it diffed from), so the hook denies.
 func TestPreEditHooks_StructuredDocDuplicateHeadingDeleted(t *testing.T) {
 	const plan = "# Plan\n## Notes\nm1\n## Alpha\na1\n## Notes\nm2\nm3\nm4\nm5\n"
 	wc := sectionHookRepoWith(t, "shared_docs = PLAN.md\nstructured_doc.PLAN.md = ^##\\s\n", plan, "m2\n", "m4\n")
@@ -371,8 +397,11 @@ func TestPreEditHooks_StructuredDocDuplicateHeadingDeleted(t *testing.T) {
 		t.Fatalf("precondition: wc's PLAN.md:\n%s", readT(t, wc, "PLAN.md"))
 	}
 	t.Setenv("WT_CLAUDE_HOOK_BLOCK", "1")
+	if post := postEditSectionGrade(t, wc, second, ""); post.Category != CatBlocking {
+		t.Fatalf("precondition: wt check after the second Notes is deleted says %s, want HIGH", post.Category)
+	}
 	if got := hookVerdict(t, runHookCapture(t, hookClaudeEdit, sectionClaudePayload(wc, second, ""))); got != "deny" {
-		t.Errorf("the second Notes deleted: claude says %s, want the heads-up's deny (as on main)", got)
+		t.Errorf("the second Notes deleted: claude says %s, want deny, as wt check after the edit", got)
 	}
 }
 
