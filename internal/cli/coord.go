@@ -1065,10 +1065,22 @@ func cmdHolds(args []string) int {
 		}
 		if len(reserves) > 0 {
 			ui.Banner("your block-id reservations")
+			fallback := 0
 			for _, r := range reserves {
-				fmt.Printf("  block %s on %s  %s\n",
+				tag := ""
+				switch {
+				case v.Attribute(r) == coord.AttrMineFallback:
+					fallback++
+					tag = " " + ui.Dim("(no session token: see below)")
+				case r.Window != self.Window:
+					tag = " " + ui.Dim("(yours, placed from checkout "+r.Window+")")
+				}
+				fmt.Printf("  block %s on %s  %s%s\n",
 					ui.Bold(fmt.Sprintf("%d", r.Block)), filepath.Base(r.File),
-					ui.Dim(humanAge(coord.Age(r, now))))
+					ui.Dim(humanAge(coord.Age(r, now))), tag)
+			}
+			if fallback > 0 {
+				ui.Warn("%d of these reservations carry no session token, like this shell: wt counts them as yours but can't prove it, so `wt block-id --abandon` asks first (without a terminal it needs --not-mine). Set WT_SESSION to a value unique to each shell or agent.", fallback)
 			}
 		}
 		return 0

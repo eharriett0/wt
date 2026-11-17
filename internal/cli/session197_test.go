@@ -128,3 +128,95 @@ func TestStatusJSON_otherSessions(t *testing.T) {
 		}
 	}
 }
+
+// #197 review: a reservation is the session's from any checkout (a subagent in
+// its own worktree shares its parent's id), and the token-less directory
+// fallback, which wt can't prove, needs --not-mine to abandon, as all-clear
+// does. A reservation no session can be proven for says no one can mark it.
+func TestCmdBlockID_reviewCases(t *testing.T) {
+	repo := sessionTestRepo(t)
+	logFile := filepath.Join(repo, "log.md")
+	if err := os.WriteFile(logFile, []byte("## NEWEST-3\nolder\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) (int, string) {
+		var code int
+		out, errOut := captureT(t, func() { code = cmdBlockID(args) })
+		return code, out + errOut
+	}
+
+	// Own session, another checkout (WT_WINDOW stands in for the subagent's worktree).
+	t.Setenv("WT_SESSION", "parent")
+	t.Setenv("WT_WINDOW", "/wt/subagent")
+	if code, out := run("log.md"); code != 0 || !strings.HasPrefix(strings.TrimSpace(out), "4") {
+		t.Fatalf("reserve from the subagent's checkout: %d %s", code, out)
+	}
+	t.Setenv("WT_WINDOW", "")
+	if code, out := run("log.md", "--abandon", "4"); code != 0 {
+		t.Errorf("the same session, from its own checkout, abandoning its reservation: code %d\n%s", code, out)
+	}
+
+	// Token-less fallback: two token-less shells in one checkout are one party
+	// for listing, but abandoning frees the id, so it needs --not-mine.
+	t.Setenv("WT_SESSION", "")
+	if code, out := run("log.md"); code != 0 || !strings.HasPrefix(strings.TrimSpace(out), "4") {
+		t.Fatalf("token-less reserve: %d %s", code, out)
+	}
+	code, out := run("log.md", "--abandon", "4")
+	if code != 1 || !strings.Contains(out, "--not-mine") || !strings.Contains(out, "can't prove it") {
+		t.Errorf("token-less abandon without --not-mine: code %d (want 1)\n%s", code, out)
+	}
+	if code, out := run("log.md", "--abandon", "4", "--not-mine"); code != 0 {
+		t.Errorf("token-less abandon with --not-mine: code %d (want 0)\n%s", code, out)
+	}
+
+	// A reservation with no session at all (an older wt): nobody can mark it.
+	c, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, self := coordCtx(c)
+	home, _ := os.UserHomeDir()
+	ledger := coord.BlockLedgerPath(home, canonicalFilePath("log.md"))
+	old := coord.Record{ID: "legacy9", Kind: coord.KindBlockReserve, Window: self.Window, File: canonicalFilePath("log.md"), Block: 9,
+		TS: time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)}
+	if err := coord.Append(ledger, old); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WT_SESSION", "someone")
+	code, out = run("log.md", "--abandon", "9")
+	if code != 1 || !strings.Contains(out, "a wt without session support, so no session can mark it") {
+		t.Errorf("legacy reservation: code %d\n%s", code, out)
+	}
+}
+
+// #197 review: an unreadable coordination log is reported as such in the
+// status payload, never as "no other session".
+func TestStatusJSON_unreadableLog(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a mode-0 file")
+	}
+	sessionTestRepo(t)
+	c, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath, self := coordCtx(c)
+	if err := coord.Append(logPath, coord.Record{ID: "x", Kind: coord.KindAnnounce, Window: self.Window, Session: "B",
+		TS: time.Now().UTC().Format(time.RFC3339)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(logPath, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(logPath, 0o644) })
+	t.Setenv("WT_SESSION", "A")
+	text, _ := mcpStatus(c, false)
+	var p StatusPayload
+	if err := json.Unmarshal([]byte(text), &p); err != nil {
+		t.Fatal(err)
+	}
+	if p.SessionsUnread == "" || len(p.OtherSessions) != 0 {
+		t.Errorf("unreadable log: sessions_unread %q, other_sessions %v; want the read error and no sessions", p.SessionsUnread, p.OtherSessions)
+	}
+}

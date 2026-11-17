@@ -34,17 +34,19 @@ const (
 	KindAnnounce = "announce"
 	KindAck      = "ack"
 	KindAllClear = "all-clear"
-	// KindBlockReserve records a reserved append-log block id (#23): a window
+	// KindBlockReserve records a reserved append-log block id (#23): a session
 	// atomically claims the next NEWEST-N slot on a shared append-log doc so two
-	// windows never grab the same N.
+	// windows or sessions never grab the same N. It is that session's (#197:
+	// Self.ReservationIsMine): only it marks it written or abandoned.
 	KindBlockReserve = "block-reserve"
 	// KindBlockWritten is the terminal signal for a reservation (#35): the window
 	// actually wrote (prepended) block N to the file. It clears the "prepend
 	// imminent" banner + `wt holds` entry immediately, and marks the (file, N)
-	// pair resolved so prune-coord can GC the reservation. A reservation that is
+	// reservation resolved so prune-coord can GC it. A reservation that is
 	// never written ages out (DefaultBlockReserveTTL) and frees its id instead of
-	// permanently burning it. File/Block identify the pair; AckOf links back to
-	// the reservation record's ID (best-effort provenance).
+	// permanently burning it. AckOf names the reservation record it closes
+	// (#197 review: only that one; a marker without AckOf, from an older wt,
+	// closes its (file, block)).
 	KindBlockWritten = "block-written"
 	// KindBlockAbandoned is the OTHER terminal signal for a reservation (#160,
 	// follow-up to #35): the window reserved N but decided NOT to write it (e.g. a
@@ -240,6 +242,13 @@ func (s Self) Owns(r Record) bool {
 // share their parent's id, so the proof covers the session and its subagents.
 // Pure.
 func (s Self) ProvablyWrote(r Record) bool { return s.wroteBySession(r) }
+
+// ReservationIsMine reports whether a block-id reservation is self's to list,
+// mark written or abandon (#197): one self Owns (its token, or the token-less
+// directory fallback), or one self provably wrote from another checkout (its
+// own token there: a subagent in its own worktree shares its parent's id, #197
+// review). Pure.
+func (s Self) ReservationIsMine(r Record) bool { return s.Owns(r) || s.ProvablyWrote(r) }
 
 // SharesCheckout reports whether r was written from self's checkout by provably
 // ANOTHER session — the party #163 was about, whose records carry self's own
@@ -749,9 +758,8 @@ func ActiveHolds(recs []Record, self Self, op string, now time.Time) []Record {
 // operator all-clears those, they're not silently GC'd), its acks, and any
 // other record are kept. Pure. dropped = len(recs) - len(kept).
 func PruneRecords(recs []Record, now time.Time, blockMaxAge time.Duration) (kept []Record, dropped int) {
-	cl := cleared(recs)                        // announce ids that have an all-clear
-	consumed := consumedBlocks(recs)           // (file,block) with a block-written marker (#35)
-	abandoned := abandonedReservationIDs(recs) // reservation ids with a block-abandoned marker (#160)
+	cl := cleared(recs) // announce ids that have an all-clear
+	open := openReservation(recs)
 	for _, r := range recs {
 		drop := false
 		switch r.Kind {
@@ -763,7 +771,7 @@ func PruneRecords(recs []Record, now time.Time, blockMaxAge time.Duration) (kept
 			// A written (#35) or abandoned (#160) reservation is a completed
 			// handshake — drop it (and its marker below) regardless of age; else
 			// drop only when aged out.
-			drop = consumed[r.File][r.Block] || abandoned[r.ID] || (blockMaxAge > 0 && Age(r, now) > blockMaxAge)
+			drop = !open(r) || (blockMaxAge > 0 && Age(r, now) > blockMaxAge)
 		case KindBlockWritten, KindBlockAbandoned:
 			drop = true // the marker is only needed while its reservation lives
 		}
@@ -1152,17 +1160,15 @@ func InboxClearAmbiguous(recs []Record, self Self, now time.Time) bool {
 	return false
 }
 
-// OwnBlockReservations returns self's block-id reservations, newest first —
-// the ids you hold (and may not have written yet), for `wt holds` (#34). Owned
-// as everything else is (#197): self.Owns, so another session in this checkout
-// (#163) or a reservation no session can be proven for (#211) is not yours.
+// OwnBlockReservations returns self's open block-id reservations, newest
+// first: the ids you hold (and may not have written yet), for `wt holds` (#34).
+// Owned by session (#197, ReservationIsMine), so another session's in this
+// checkout (#163), or one no session can be proven for (#211), is not yours.
 func OwnBlockReservations(recs []Record, self Self) []Record {
-	consumed := consumedBlocks(recs)
-	abandoned := abandonedReservationIDs(recs)
+	open := openReservation(recs)
 	var out []Record
 	for _, r := range recs {
-		if r.Kind == KindBlockReserve && self.Owns(r) &&
-			!consumed[r.File][r.Block] && !abandoned[r.ID] {
+		if r.Kind == KindBlockReserve && self.ReservationIsMine(r) && open(r) {
 			out = append(out, r) // hide reservations you've written (#35) or abandoned (#160)
 		}
 	}
@@ -1221,6 +1227,38 @@ func consumedBlocks(recs []Record) map[string]map[int]bool {
 	return blockMarkers(recs, KindBlockWritten)
 }
 
+// openReservation returns whether a block reservation is still open: not
+// abandoned (#160, keyed by the reservation's id) and not written (#35). A
+// block-written marker names its reservation by AckOf (#197 review): keyed by
+// (file, block), one written marker also closed every LATER reservation that
+// reused the number, so a dead reservation's owner could mark another
+// session's live one. A marker with no AckOf (an older wt) still closes by
+// (file, block). Pure.
+func openReservation(recs []Record) func(Record) bool {
+	abandoned := abandonedReservationIDs(recs)
+	writtenIDs := map[string]bool{}
+	legacy := map[string]map[int]bool{}
+	for _, r := range recs {
+		if r.Kind != KindBlockWritten {
+			continue
+		}
+		if r.AckOf != "" {
+			writtenIDs[r.AckOf] = true
+			continue
+		}
+		if r.File == "" {
+			continue
+		}
+		if legacy[r.File] == nil {
+			legacy[r.File] = map[int]bool{}
+		}
+		legacy[r.File][r.Block] = true
+	}
+	return func(r Record) bool {
+		return !abandoned[r.ID] && !writtenIDs[r.ID] && !legacy[r.File][r.Block]
+	}
+}
+
 // abandonedReservationIDs is the set of RESERVATION record IDs that have a
 // block-abandoned marker (#160). Keyed by the reservation's record ID (the abandon
 // record's AckOf) — NOT (file, block) like consumed — because --abandon FREES the
@@ -1253,26 +1291,29 @@ func blockMarkers(recs []Record, kind string) map[string]map[int]bool {
 	return out
 }
 
-// FindOwnReservation returns self's newest block-reserve for (file, block),
-// for linking a block-written or block-abandoned record back to it. Only one
-// self.Owns (#197): marking another session's reservation abandoned freed its
-// id while that session was about to write it, and the next reservation handed
-// the same id out twice. Pure.
+// FindOwnReservation returns self's newest OPEN block-reserve for (file,
+// block), for linking a block-written or block-abandoned record back to it.
+// Only one self.ReservationIsMine (#197): marking another session's
+// reservation abandoned freed its id while that session was about to write
+// it, and the next reservation handed the same id out twice. And only an open
+// one (#197 review): a reservation already abandoned or written is no handle
+// on the same number re-reserved by someone else. Pure.
 func FindOwnReservation(recs []Record, self Self, file string, block int) (Record, bool) {
-	return findReservation(recs, file, block, self.Owns)
+	return findReservation(recs, file, block, self.ReservationIsMine)
 }
 
-// FindReservation returns the newest block-reserve for (file, block), whoever
-// made it: what the refusal names when it isn't self's (#197). Pure.
+// FindReservation returns the newest open block-reserve for (file, block),
+// whoever made it: what the refusal names when it isn't self's (#197). Pure.
 func FindReservation(recs []Record, file string, block int) (Record, bool) {
 	return findReservation(recs, file, block, func(Record) bool { return true })
 }
 
 func findReservation(recs []Record, file string, block int, keep func(Record) bool) (Record, bool) {
+	open := openReservation(recs)
 	var found Record
 	ok := false
 	for _, r := range recs {
-		if r.Kind == KindBlockReserve && r.File == file && r.Block == block && keep(r) {
+		if r.Kind == KindBlockReserve && r.File == file && r.Block == block && open(r) && keep(r) {
 			found = r // log is append-order; last match is newest
 			ok = true
 		}
@@ -1286,14 +1327,13 @@ func findReservation(recs []Record, file string, block int, keep func(Record) bo
 // know your own); another session's in this checkout is shown (#197). Newest
 // first. Pure.
 func RecentBlockReservations(recs []Record, self Self, now time.Time, maxAge time.Duration) []Record {
-	consumed := consumedBlocks(recs)
-	abandoned := abandonedReservationIDs(recs)
+	open := openReservation(recs)
 	var out []Record
 	for _, r := range recs {
-		if r.Kind != KindBlockReserve || self.Owns(r) {
+		if r.Kind != KindBlockReserve || self.ReservationIsMine(r) {
 			continue
 		}
-		if consumed[r.File][r.Block] || abandoned[r.ID] {
+		if !open(r) {
 			continue // written (#35) or abandoned (#160) → no longer imminent
 		}
 		if Age(r, now) <= maxAge {

@@ -738,6 +738,9 @@ type StatusPayload struct {
 	// (#197). ⚠ `wt mcp` reads its session once, when the client spawns it.
 	Session       string                  `json:"session,omitempty"`
 	OtherSessions []coord.SessionActivity `json:"other_sessions,omitempty"`
+	// SessionsUnread is why the coordination log could not be read: then
+	// other_sessions is unknown, not empty (#197 review).
+	SessionsUnread string `json:"sessions_unread,omitempty"`
 }
 
 // buildStatusPayload assembles the window list + graded overlaps + blocking
@@ -759,7 +762,7 @@ func buildStatusPayload(ws []collide.Window, graded []StatusOverlap, benignCount
 // shared-checkout signal (statusSessions).
 func renderStatusJSON(c *config.Config, ws []collide.Window, graded []StatusOverlap, benignCount int) int {
 	p := buildStatusPayload(ws, graded, benignCount)
-	p.Session, p.OtherSessions = statusSessions(c, time.Now())
+	p.Session, p.OtherSessions, p.SessionsUnread = statusSessions(c, time.Now())
 	b, _ := json.MarshalIndent(p, "", "  ")
 	fmt.Println(string(b))
 	return 0
@@ -768,15 +771,18 @@ func renderStatusJSON(c *config.Config, ws []collide.Window, graded []StatusOver
 // statusSessions is the shared-checkout signal for status's JSON and MCP's
 // wt_status (#197): the reader's session, and the other sessions that posted
 // from this checkout within coord.SharedCheckoutWindow, the same reading as
-// the `wt status` banner and `wt doctor --json`. An unreadable log reports no
-// other session, as the banner does (it is a hint, not a gate).
-func statusSessions(c *config.Config, now time.Time) (string, []coord.SessionActivity) {
+// the `wt status` banner and `wt doctor --json`. An unreadable log says so
+// (unread), so "no other session" is never a log nobody could read. ⚠ It sees
+// only sessions that wrote to the coordination log: a block reservation lives
+// in its file's ledger, and a session that never wrote is invisible (#197
+// item 2).
+func statusSessions(c *config.Config, now time.Time) (session string, others []coord.SessionActivity, unread string) {
 	path, self := coordCtx(c)
 	recs, err := coord.Load(path)
 	if err != nil {
-		return self.Session, nil
+		return self.Session, nil, err.Error()
 	}
-	return self.Session, coord.OtherSessions(recs, self, now, coord.SharedCheckoutWindow)
+	return self.Session, coord.OtherSessions(recs, self, now, coord.SharedCheckoutWindow), ""
 }
 
 // appendNewSpans appends the spans not already present (for the "overlap

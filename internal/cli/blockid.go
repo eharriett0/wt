@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -127,7 +128,7 @@ func canonicalFilePath(file string) string {
 
 // cmdBlockID implements `wt block-id <file> [--pattern P] [--format]`.
 func cmdBlockID(args []string) int {
-	if code, done := guardHelp(args, `usage: wt block-id <file> [--pattern "NEWEST-{n}"] [--format] [--written N | --abandon N]`); done {
+	if code, done := guardHelp(args, `usage: wt block-id <file> [--pattern "NEWEST-{n}"] [--format] [--written N | --abandon N [--not-mine]]`); done {
 		return code
 	}
 	fs := flag.NewFlagSet("block-id", flag.ContinueOnError)
@@ -139,6 +140,8 @@ func cmdBlockID(args []string) int {
 		"mark block N as WRITTEN (prepended) — clears the reservation instead of allocating a new id")
 	abandon := fs.Int("abandon", -1,
 		"abandon block N — a number you reserved but decided NOT to write: clears it from `wt holds`/the banner and frees the id (#160)")
+	notMine := fs.Bool("not-mine", false,
+		"with --abandon: free a reservation this session can't prove it made (written with no session token, like this shell): another token-less shell or agent may be about to write it (#197)")
 	pos, _, err := parseInterspersed(fs, args)
 	if err != nil {
 		return 64
@@ -168,9 +171,8 @@ func cmdBlockID(args []string) int {
 	return withConfig(func(c *config.Config) int {
 		path, self := coordCtx(c)
 		// Reservations are owned by session, as every coordination record is
-		// (#197, #211's self.Owns): another session in this checkout can neither
-		// mark yours written nor abandon it.
-		window := self.Window
+		// (#197, coord.Self.ReservationIsMine): another session in this checkout
+		// can neither mark yours written nor abandon it.
 		// block-id coordinates on the shared FILE, not the repo: use a per-file
 		// ledger so windows in ANY repo editing this append-log share one lock +
 		// reservation namespace (#152). Fall back to the per-repo log only if HOME
@@ -181,9 +183,10 @@ func cmdBlockID(args []string) int {
 		}
 
 		// --written N: terminal signal that reservation N was actually prepended
-		// (#35). REFUSE unless (a) the file really contains a block N AND (b) a
-		// reservation for N belongs to THIS window — otherwise the bookkeeping would
-		// record a completion that never happened, or that is another window's (#152).
+		// (#35). REFUSE unless (a) the file really contains a block N AND (b) an
+		// open reservation for N is this session's (#197) — otherwise the
+		// bookkeeping would record a completion that never happened, or that is
+		// another session's or window's (#152).
 		if *written >= 0 {
 			inFile, ferr := fileHasBlock(absFile, re, *written)
 			if ferr != nil {
@@ -214,15 +217,28 @@ func cmdBlockID(args []string) int {
 
 		// --abandon N: terminal signal that reservation N will NOT be written (#160).
 		// The symmetric exit to --written for a number you reserved but decided not to
-		// use (e.g. a bad scan handed out a stale id). REFUSE unless a reservation for
-		// N belongs to THIS window — but do NOT require the block to be in the file
-		// (the whole point is it isn't). Clears holds/banner and frees the id.
+		// use (e.g. a bad scan handed out a stale id). REFUSE unless an open
+		// reservation for N is this session's (#197) — but do NOT require the block
+		// to be in the file (the whole point is it isn't). Clears holds/banner and
+		// frees the id. ⚠ Freeing is where a wrong owner hurts (the next reservation
+		// hands the id out again), so the token-less directory fallback, which wt
+		// counts as yours but can't prove, asks first, or needs --not-mine, as
+		// `wt all-clear` does (#197 review).
 		if *abandon >= 0 {
 			recs, _ := coord.Load(ledger)
 			res, ok := coord.FindOwnReservation(recs, self, absFile, *abandon)
 			if !ok {
 				ui.Err("%s; nothing to abandon (`wt holds` lists yours)", notYourReservation(recs, self, absFile, *abandon, time.Now()))
 				return 1
+			}
+			if self.Attribute(res) == coord.AttrMineFallback && !*notMine {
+				why := "was reserved with no session token, like this shell: wt counts it as yours but can't prove it, " +
+					"since every token-less shell or agent in this checkout reads it the same way, and abandoning frees the id for the next reservation"
+				if !confirmInteractive() || !confirmAbandon(*abandon, why, os.Stdin) {
+					ui.Err("not abandoned: block %d %s.", *abandon, why)
+					ui.Info("abandon it anyway: wt block-id %s --abandon %d --not-mine   ·   set WT_SESSION to a value unique to each shell or agent, and wt can prove which reservations are yours", file, *abandon)
+					return 1
+				}
 			}
 			m := newRecord(c, self, coord.KindBlockAbandoned)
 			m.File, m.Block, m.AckOf = absFile, *abandon, res.ID
@@ -252,29 +268,47 @@ func cmdBlockID(args []string) int {
 			fmt.Println(out.Block)
 		}
 		fmt.Fprintln(os.Stderr, ui.Dim(fmt.Sprintf(
-			"reserved block %d for %s (window %s) — write your %s block now, then `wt block-id %s --written %d`",
-			out.Block, filepath.Base(absFile), window,
+			"reserved block %d for %s (%s) — write your %s block now, then `wt block-id %s --written %d`",
+			out.Block, filepath.Base(absFile), selfLabel(self),
 			strings.Replace(*pattern, "{n}", strconv.Itoa(out.Block), 1), file, out.Block)))
 		return 0
 	})
 }
 
 // notYourReservation says why block on file is not self's to mark (#197): no
-// reservation at all, or whose it is, with when a stale one frees itself. Pure.
+// open reservation at all, or whose it is, with when it frees itself. Pure.
 func notYourReservation(recs []coord.Record, self coord.Self, file string, block int, now time.Time) string {
 	r, ok := coord.FindReservation(recs, file, block)
 	if !ok {
-		return fmt.Sprintf("no reservation for block %d on %s is yours (%s)", block, filepath.Base(file), selfLabel(self))
+		return fmt.Sprintf("no open reservation for block %d on %s is yours (%s)", block, filepath.Base(file), selfLabel(self))
 	}
-	whose := "window " + r.Window
+	frees := fmt.Sprintf("an unwritten reservation frees its id by itself %s after it was made", blockReservationMaxAge)
+	age := humanAge(coord.Age(r, now))
 	switch self.Attribute(r) {
 	case coord.AttrAnotherSession:
-		whose = "another session in this checkout (" + coord.ShortSession(r.Session) + ")"
+		return fmt.Sprintf("block %d on %s was reserved %s by another session in this checkout (%s), not by you (%s): only its owner marks it, and %s "+
+			"(if this session ran /clear since reserving it, the reservation was yours before it)",
+			block, filepath.Base(file), age, coord.ShortSession(r.Session), selfLabel(self), frees)
 	case coord.AttrUnattributable:
-		whose = "this checkout, but no session can be proven for it (written by a wt without session support)"
+		return fmt.Sprintf("block %d on %s was reserved %s in this checkout by a wt without session support, so no session can mark it; %s",
+			block, filepath.Base(file), age, frees)
 	}
-	return fmt.Sprintf("block %d on %s was reserved by %s %s, not by you (%s): only its owner marks it; an unwritten reservation frees its id by itself after %s",
-		block, filepath.Base(file), whose, humanAge(coord.Age(r, now)), selfLabel(self), blockReservationMaxAge)
+	return fmt.Sprintf("block %d on %s was reserved %s from window %s (%s), not by you (%s): only its owner marks it, and %s",
+		block, filepath.Base(file), age, r.Window, coord.ShortSession(r.Session), selfLabel(self), frees)
+}
+
+// confirmAbandon asks, on stderr, whether to abandon a reservation this
+// session can't prove it made (#197 review); true only on y/yes. Enter, EOF
+// and anything else is no.
+func confirmAbandon(block int, why string, in io.Reader) bool {
+	ui.Warn("block %d %s.", block, why)
+	fmt.Fprintf(os.Stderr, "%s abandon block %d anyway? [y/N] ", ui.Yellow("→"), block)
+	line, _ := bufio.NewReader(in).ReadString('\n')
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return true
+	}
+	return false
 }
 
 // blockReservationBanner surfaces recent block-id reservations that are not

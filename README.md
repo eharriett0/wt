@@ -118,9 +118,11 @@ and `End`; `overlap_spans` gives the lines where two windows' edits meet (for
 edits that only touch, the line on each side). `wt status --json` also carries
 `session` (the reader's coordination session) and `other_sessions`: the other
 sessions that posted coordination records from this checkout in the last 24h,
-as `wt doctor --json` reports them. Two agents sharing one working tree look
-like one window to the collision engine, so this is the only sign of the
-second one.
+as `wt doctor --json` reports them (`sessions_unread` says the log could not
+be read, so the list is unknown rather than empty). Two agents sharing one
+working tree look like one window to the collision engine, so this is a sign
+of the second one, but only of one that has posted: a session that never
+wrote a coordination record, or only reserved block ids, does not show.
 
 ### Stale branches don't count
 
@@ -206,7 +208,7 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 | `wt all-clear <id>` | Release your hold — for EVERY window. A hold carrying this session's own token is released at once (also one placed from another checkout); anything else (another session's or window's, one with no session recorded, and a shell's own hold when it has no session token, which wt can't prove) asks first on a terminal, and otherwise refuses unless you pass `--not-mine` |
 | `wt holds` | YOUR outstanding announcements/holds + block reservations, with copy-pasteable all-clear lines (a token-less shell's own are marked: wt can't prove them); this checkout's records wt can't attribute to any session are listed apart, without them, every hold that still gates included. Reads the mirror like `inbox` `[--issue N]` |
 | `wt prune-coord` | GC the coordination log — drop resolved handshakes + aged block reservations `[--block-max-age D]`. `--legacy` lists the open announcements written before wt recorded sessions that gate or show nothing for anyone any more; `--legacy -y` drops them with their acks (a one-time cleanup after upgrading) |
-| `wt block-id <file>` | Atomically reserve the next append-log id so two windows never grab the same `NEWEST-N`. `--written N` marks a reservation done (clears the banner; frees it if never written), `--abandon N` frees one you won't write `[--pattern] [--format]`. A reservation is its session's: another session in the same checkout can't mark or abandon it (wt names whose it is), and sees it in its status banner instead |
+| `wt block-id <file>` | Atomically reserve the next append-log id so two windows never grab the same `NEWEST-N`. `--written N` marks a reservation done once block N is in the file (clears the banner), `--abandon N` frees one you won't write; a reservation never marked frees its id by itself after 30m `[--pattern] [--format]`. A reservation is its session's, from any checkout: another session can't mark or abandon it (wt names whose it is) and sees it in its status banner instead. One made with no session token (a plain shell) can be abandoned by any token-less shell in the checkout, so `--abandon` asks first, or needs `--not-mine`. After upgrading, a reservation made by an older wt has no session: no one can mark it, and it frees itself after 30m |
 | `wt append <doc> --section H "txt"` | Locked, section-scoped append to a structured shared doc (parallel adds can't clobber) |
 | `wt install-hooks` | Install pre-push (base guard + collision check + base-conflict warning) + pre-commit (collision notice) `[--force]` |
 | `wt install-claude-hook` | Wire Claude Code hooks (**PreToolUse** per-edit + **UserPromptSubmit** per-turn overlaps + coordination) `[--write]` (see [Agents](#agents-claude-code--codex)) |
@@ -571,8 +573,10 @@ else is in this file?" mid-conversation:
 
 - **`wt_status`** — every active window + graded cross-window overlaps, and
   the other sessions posting from this checkout (`other_sessions`). The server
-  reads its session once, when the client starts it: after a `/clear` (a new
-  session) it still answers as the old one, until the client restarts it.
+  reads its session from its environment once, when the client starts it:
+  after a `/clear` (a new session) it still answers as the old one, until the
+  client restarts it, and a client that doesn't pass its session id to the
+  server makes it answer as a token-less shell. `session` says which.
 - **`wt_check`** — before editing given paths: is another live window in them?
   Relative paths are read from the repo root, wherever the client started the
   server.
