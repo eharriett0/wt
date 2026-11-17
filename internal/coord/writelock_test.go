@@ -163,7 +163,7 @@ func TestAppend_writesUnlockedWhereTheFilesystemCantLock(t *testing.T) {
 			if got := logIDs(t, path); strings.Join(got, ",") != "a,b" {
 				t.Errorf("records = %v, want [a b]", got)
 			}
-			if n := strings.Count(notes.String(), "can't be locked"); n != 1 {
+			if n := strings.Count(notes.String(), "writing without the lock"); n != 1 || strings.Count(notes.String(), path) != 1 {
 				t.Errorf("warning printed %d times over two appends, want once:\n%s", n, notes)
 			}
 		})
@@ -353,5 +353,25 @@ func TestPruneBlockLedgers_reportsEveryFailure(t *testing.T) {
 	_, locked, err := PruneBlockLedgers(home, time.Now(), 24*time.Hour)
 	if len(locked) != 0 || err == nil || !strings.Contains(err.Error(), bad[0]) || !strings.Contains(err.Error(), bad[1]) {
 		t.Errorf("locked %v, err = %v; want both unreadable ledgers in err", locked, err)
+	}
+}
+
+// A ledger held for a moment (a block-id's normal write) within the shared
+// deadline is waited for and pruned, not listed as locked (#235 review: with
+// the deadline spent up front, every ledger got no wait at all, and no test
+// told).
+func TestPruneBlockLedgers_waitsWithinTheSharedDeadline(t *testing.T) {
+	home := t.TempDir()
+	shortWriteLock(t, 2*time.Second, time.Hour)
+	old := time.Now().Add(-72 * time.Hour).UTC().Format(time.RFC3339)
+	ledger := filepath.Join(BlocksDir(home), "a.jsonl")
+	if err := Append(ledger, Record{ID: "r1", Kind: KindBlockReserve, Window: "w", Session: "s", File: "/doc.md", Block: 1, TS: old}); err != nil {
+		t.Fatal(err)
+	}
+	release := holdLog(t, ledger)
+	go func() { time.Sleep(200 * time.Millisecond); release() }()
+	dropped, locked, err := PruneBlockLedgers(home, time.Now(), 24*time.Hour)
+	if dropped != 1 || len(locked) != 0 || err != nil {
+		t.Errorf("dropped %d, locked %v, err %v; want the briefly held ledger pruned", dropped, locked, err)
 	}
 }

@@ -516,7 +516,7 @@ func Append(path string, r Record) error {
 		defer lock.Release(f)
 	case lock.Unsupported(err):
 		noLockOnce.Do(func() {
-			fmt.Fprintf(lockNotices, "wt: warning: %s can't be locked (%v); writing without the lock\n", path, err)
+			fmt.Fprintf(lockNotices, "wt: warning: %v (this filesystem can't lock); writing without the lock\n", err) // err names the path
 		})
 	default:
 		return err

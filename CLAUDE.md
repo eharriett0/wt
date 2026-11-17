@@ -379,7 +379,9 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   is the seam), `TestLockedWriters_sameDeadlineAndNoUnlockedFallback`,
   `TestExclusiveWithin_unsupportedAfterHeldFailsClosed` (`lock.flock` is the
   seam), `TestLoadForGate_refusesOnLockErrorsButUnsupported`,
-  `TestPruneBlockLedgers_prunesPastAHeldLedger`, `TestWriteLockDefaults`,
+  `TestPruneBlockLedgers_prunesPastAHeldLedger`,
+  `TestPruneBlockLedgers_reportsEveryFailure`,
+  `TestPruneBlockLedgers_waitsWithinTheSharedDeadline`, `TestWriteLockDefaults`,
   `TestExclusiveWithin_retriesEINTR`, `TestAppend_givesUpOnAStuckHolder`
   and `TestAppend_lockDefaultsAndNoFallback` (cli) and
   `TestPruneCoord_reportsALedgerItCouldntPrune`. Off unix the lock is a
