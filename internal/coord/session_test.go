@@ -902,7 +902,7 @@ func TestCheckoutActivity(t *testing.T) {
 	if strings.Join(ids, ",") != "l1,a" {
 		t.Errorf("CheckoutActivity = %v, want [l1 a]", ids)
 	}
-	if len(log) != 1 || cap(log) != 1 {
-		t.Errorf("the log's slice changed: %v", log)
+	if len(log) != 1 || log[0].ID != "l1" {
+		t.Errorf("the log's records changed: %v", log)
 	}
 }
