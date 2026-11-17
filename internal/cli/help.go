@@ -55,6 +55,8 @@ func printHelp() {
 	fmt.Println("    " + d("on github.com it first warns (never blocks) when githubstatus.com reports an Actions incident."))
 	fmt.Println("    " + d("scope it with ") + c("merge_is_deploy_paths") + d(" (globs, ** ok) so the gate skips docs/CI/scripts-only PRs."))
 	fmt.Println("    " + d("prefix a glob with ") + c("!") + d(" to carve out a class that can't deploy inside one that can (e.g. a README beside the code it documents)."))
+	fmt.Println("    " + d("the list is derived state (your reconciler and apply workflows decide what deploys): assert in CI that it covers them;"))
+	fmt.Println("    " + d("a missing glob is silent, the gate just reports no deploy path (README)."))
 	fmt.Println("    " + d("these gate settings (and hold_max_age, coord_issue) are read from this checkout AND the PR's base branch"))
 	fmt.Println("    " + d("(from GitHub; else a fetched copy of the base; else it fails closed): the stricter applies. --dry-run names both."))
 	fmt.Println("    " + d("--admin forwards to gh pr merge to bypass a required-review branch (keeps the guard)."))

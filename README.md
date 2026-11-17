@@ -424,6 +424,25 @@ passthrough that merges nothing (`-- --disable-auto`, `-- --help`) reads
 nothing from the base and passes neither the deploy nor the checks gate; the
 hold gate still applies. `--dry-run` names both sources and what each one sets.
 
+**Assert `merge_is_deploy_paths` in CI; wt can't derive it.** Which paths
+deploy is derived state. Your reconciler's config (Flux Kustomizations, Argo
+Applications) decides it, and so do the workflows that apply on a push to the
+base branch. Both change as ordinary work, without touching `.wt.conf`. The
+two ways the list can be wrong are not alike:
+
+- a stale glob, matching something that no longer deploys, is loud: the gate
+  stops a harmless PR, and someone fixes the list;
+- a missing glob is silent: the gate reports that the PR changes no deploy
+  path, and a change to a tree that started deploying merges without the
+  typed confirm.
+
+So derive the deploying set in CI from the same sources (each reconciler
+entry that points into this repository; each workflow on a push to the base
+that runs an apply), and fail the build when `merge_is_deploy_paths` does not
+cover it. wt reads the list from the base branch, so a check that keeps the
+base's list right keeps it right for every PR. A comment above the list
+saying "keep this in step" is a note, not a control.
+
 ## Cross-repo epics
 
 A logical change often spans repos (a build PR in repo A gates a deploy PR in
