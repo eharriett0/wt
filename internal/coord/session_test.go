@@ -711,10 +711,10 @@ func TestSharedCheckoutWarning(t *testing.T) {
 		wantNone []string
 	}{
 		{"one tagged session", one, Self{"/w", "aaaaaaaa-1111-2222-3333-444444444444"},
-			[]string{"another session posted", "latest: session b0c1d2e3…, 5m ago", "you: session aaaaaaaa…", "wt new <branch>", "wt inbox"},
+			[]string{"another session was active", "latest: session b0c1d2e3…, 5m ago", "you: session aaaaaaaa…", "wt new <branch>", "wt inbox"},
 			[]string{"WT_SESSION"}},
 		{"two sessions, newest named", two, Self{"/w", "A"},
-			[]string{"2 other sessions posted", "latest: session b0c1d2e3…"}, nil},
+			[]string{"2 other sessions were active", "latest: session b0c1d2e3…"}, nil},
 		{"token-less self is told to set WT_SESSION", one, Self{"/w", SessionNone},
 			[]string{"you: no session token", "set WT_SESSION"}, nil},
 	}
@@ -885,5 +885,24 @@ func TestMirroredOwnHoldAcrossClones(t *testing.T) {
 	// Clone one reads its local raw copy first (MergeByID: local wins) — unchanged.
 	if got := ActiveHolds(MergeByID([]Record{hold}, remote), Self{pinned, a}, "merge-main", now); len(got) != 0 {
 		t.Errorf("creator blocked in the clone that placed the hold: %v", ids(got))
+	}
+}
+
+// CheckoutActivity adds this repository's ledger records only (#197 review:
+// with a pinned WT_WINDOW, another repository's reservation read as this
+// checkout's), and leaves the log's records as they were.
+func TestCheckoutActivity(t *testing.T) {
+	log := []Record{{ID: "l1", Repo: "wt"}}
+	ledger := []Record{{ID: "a", Repo: "wt"}, {ID: "b", Repo: "other"}, {ID: "c", Repo: ""}}
+	got := CheckoutActivity(log, ledger, "wt")
+	var ids []string
+	for _, r := range got {
+		ids = append(ids, r.ID)
+	}
+	if strings.Join(ids, ",") != "l1,a" {
+		t.Errorf("CheckoutActivity = %v, want [l1 a]", ids)
+	}
+	if len(log) != 1 || log[0].ID != "l1" {
+		t.Errorf("the log's records changed: %v", log)
 	}
 }

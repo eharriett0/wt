@@ -133,16 +133,22 @@ func authFresh(at, now time.Time) bool {
 
 // authCheck runs `gh auth status` for host, or reuses an answer younger than
 // authTTL. The lock is held across the gh call so that concurrent first callers
-// (ClassifyWindows runs 8) share one check (#172).
+// (ClassifyWindows runs 8) share one check (#172). The answer is one gh
+// binary's (keyed by its resolved path, as authNoJSON is): a process whose
+// PATH resolves `gh` to another binary asks it afresh (#197 review: a real
+// gh's "not logged in", asked by one test's doctor, was reused by a later
+// test's fake gh in the same process, keyed by host alone, and its merge
+// refused).
 func authCheck(host string) AuthStatus {
 	authMu.Lock()
 	defer authMu.Unlock()
 	now := time.Now()
-	if a, ok := authMemo[host]; ok && authFresh(a.at, now) {
+	key := ghPath() + "\x00" + host
+	if a, ok := authMemo[key]; ok && authFresh(a.at, now) {
 		return a.st
 	}
 	st := runAuthCheck(host)
-	authMemo[host] = authAnswer{st: st, at: now}
+	authMemo[key] = authAnswer{st: st, at: now}
 	return st
 }
 

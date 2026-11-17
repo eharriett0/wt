@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -378,5 +379,43 @@ func TestPruneBlockLedgers_waitsWithinTheSharedDeadline(t *testing.T) {
 	dropped, locked, err := PruneBlockLedgers(home, time.Now(), 24*time.Hour)
 	if dropped != 1 || len(locked) != 0 || err != nil {
 		t.Errorf("dropped %d, locked %v, err %v; want the briefly held ledger pruned", dropped, locked, err)
+	}
+}
+
+// The advisory shared-checkout read (#197 review): a ledger untouched for
+// longer than the window is skipped, and a ledger another process holds
+// locked is read at once, not after loadLockWait (every `wt status --json`
+// stalled 5s per stuck ledger).
+func TestRecentBlockLedgers(t *testing.T) {
+	home := t.TempDir()
+	now := time.Now()
+	fresh := filepath.Join(BlocksDir(home), "fresh.jsonl")
+	stale := filepath.Join(BlocksDir(home), "stale.jsonl")
+	locked := filepath.Join(BlocksDir(home), "locked.jsonl")
+	for _, p := range []string{fresh, stale, locked} {
+		if err := Append(p, lockRec(filepath.Base(p))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := now.Add(-25 * time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	holdLog(t, locked)
+	start := time.Now()
+	recs := RecentBlockLedgers(home, now, 24*time.Hour)
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("took %s with one ledger locked, want no wait", took)
+	}
+	var ids []string
+	for _, r := range recs {
+		ids = append(ids, r.ID)
+	}
+	sort.Strings(ids)
+	if strings.Join(ids, ",") != "fresh.jsonl,locked.jsonl" {
+		t.Errorf("read %v, want the fresh and the locked ledger, not the stale one", ids)
+	}
+	if RecentBlockLedgers("", now, 24*time.Hour) != nil {
+		t.Error("no home: want nothing")
 	}
 }

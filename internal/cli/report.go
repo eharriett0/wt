@@ -788,17 +788,24 @@ func renderStatusJSON(c *config.Config, ws []collide.Window, graded []StatusOver
 // wt_status (#197): the reader's session, and the other sessions that posted
 // from this checkout within coord.SharedCheckoutWindow, the same reading as
 // the `wt status` banner and `wt doctor --json`. An unreadable log says so
-// (unread), so "no other session" is never a log nobody could read. ⚠ It sees
-// only sessions that wrote to the coordination log: a block reservation lives
-// in its file's ledger, and a session that never wrote is invisible (#197
-// item 2).
+// (unread), so "no other session" is never a log nobody could read. It reads
+// this repository's block ledger records too (checkoutActivity, #197 item 2):
+// a session whose only records were block reservations was invisible. ⚠ A
+// session that never wrote anything is still invisible.
 func statusSessions(c *config.Config, now time.Time) (session string, others []coord.SessionActivity, unread string) {
 	path, self := coordCtx(c)
 	recs, err := coord.Load(path)
 	if err != nil {
 		return self.Session, nil, err.Error()
 	}
-	return self.Session, coord.OtherSessions(recs, self, now, coord.SharedCheckoutWindow), ""
+	return self.Session, coord.OtherSessions(checkoutActivity(c, recs, now), self, now, coord.SharedCheckoutWindow), ""
+}
+
+// checkoutActivity is the log's records plus this repository's recent block
+// ledger records, the shared-checkout evidence (coord.CheckoutActivity).
+func checkoutActivity(c *config.Config, recs []coord.Record, now time.Time) []coord.Record {
+	home, _ := os.UserHomeDir()
+	return coord.CheckoutActivity(recs, coord.RecentBlockLedgers(home, now, coord.SharedCheckoutWindow), mainRepoName(c))
 }
 
 // appendNewSpans appends the spans not already present (for the "overlap

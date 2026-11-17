@@ -944,7 +944,7 @@ func statusReport(c *config.Config, asJSON, blocking bool) int {
 	if !asJSON {
 		peerHoldBanner(c)
 		blockReservationBanner(c)
-		sharedCheckoutBanner(c) // #163: another session posting from THIS checkout
+		sharedCheckoutBanner(c) // #163/#197: another session active in THIS checkout
 	}
 	ws, err := collide.Scan(c)
 	if err != nil {

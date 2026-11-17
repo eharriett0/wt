@@ -117,12 +117,13 @@ pre-push hooks. A range with `"Gap": true` is an insertion between lines `Start`
 and `End`; `overlap_spans` gives the lines where two windows' edits meet (for
 edits that only touch, the line on each side). `wt status --json` also carries
 `session` (the reader's coordination session) and `other_sessions`: the other
-sessions that posted coordination records from this checkout in the last 24h,
-as `wt doctor --json` reports them (`sessions_unread` says the log could not
-be read, so the list is unknown rather than empty). Two agents sharing one
-working tree look like one window to the collision engine, so this is a sign
-of the second one, but only of one that has posted: a session that never
-wrote a coordination record, or only reserved block ids, does not show.
+sessions active in this checkout in the last 24h (coordination records, or
+block ids reserved from this repository), as `wt doctor --json` reports them
+(`sessions_unread` says the log could not be read, so the list is unknown
+rather than empty). Two agents sharing one working tree look like one window
+to the collision engine, so this is a sign of the second one, but only of one
+that has written something: a session that never ran a coordination command
+here does not show.
 
 ### Stale branches don't count
 
@@ -220,7 +221,8 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 **Window and session identity.** A *window* is a checkout: its worktree path,
 stable across branch switches (`WT_WINDOW` pins it across checkouts). Inside one
 checkout, each *session* is its own party: the Claude Code session
-(`CLAUDE_CODE_SESSION_ID`), the Codex session (`CODEX_SESSION_ID`), or the value
+(`CLAUDE_CODE_SESSION_ID`), the Codex session (`CODEX_SESSION_ID`, Codex 0.148.0
+or later; see the Codex section), or the value
 of `WT_SESSION` (the same value in several shells makes them one session; a
 distinct value per agent splits agents that export no session id of their own).
 So two agents started in the same checkout see each other's announcements in
@@ -604,6 +606,13 @@ hooks = false
 - Advisory by default. Set `WT_CODEX_HOOK_BLOCK=1` to have the edit hook `deny`
   a **confirmed** HIGH overlap (a heads-up-only file-level match never denies).
 - Fail-open; `WT_SKIP_COLLISION=1` to silence; ≤1-worktree repos skipped.
+- **Session identity needs Codex 0.148.0 or later**, the first release that
+  exports `CODEX_SESSION_ID` to the commands Codex runs (openai/codex#37848).
+  Under an older Codex your `wt` commands record no session, while the
+  per-turn hook reads the session id Codex sends it, so the banner lists this
+  session's own announcements as another session's (advisory, nothing
+  blocks). Upgrade Codex, or start it from a shell with its own `WT_SESSION`
+  set: both your commands and the hooks read that first.
 
 The awareness is proactive-but-coarse (per prompt, not per edit) because that's
 what Codex exposes — but the pre-push guard is the hard gate for both agents, so
@@ -617,7 +626,7 @@ server exposing wt's **read-only** surface as tools, so the agent can ask "who
 else is in this file?" mid-conversation:
 
 - **`wt_status`** — every active window + graded cross-window overlaps, and
-  the other sessions posting from this checkout (`other_sessions`). The server
+  the other sessions active in this checkout (`other_sessions`). The server
   reads its session from its environment once, when the client starts it:
   after a `/clear` (a new session) it still answers as the old one, until the
   client restarts it, and a client that doesn't pass its session id to the
