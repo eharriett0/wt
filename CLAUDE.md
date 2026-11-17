@@ -1300,9 +1300,10 @@ The formula supports `head "…", branch: "main"` for `--HEAD` builds.
   number.
 - **Ask gh about auth only through `ghx.AuthedFor`/`Authed`** (#172), or, for
   merge-pr's own reads only, `SignedInFor`/`SignedIn` (#217, above). The answer
-  is memoized per gh binary and host for `authTTL` (per binary since #197's
-  review: a test's real gh answer was reused for a later test's fake gh) (a minute: one command asks once, and a
-  long-lived `wt mcp` still notices a `gh auth login`). In a repo with no forge
+  is memoized per gh binary and host for `authTTL` (a minute: one command asks
+  once, and a long-lived `wt mcp` still notices a `gh auth login`); per binary
+  since #197's review, when a test's real gh answer was reused for a later
+  test's fake gh. In a repo with no forge
   host (a local-path origin, which is what a scratch-repo smoke uses) the check
   is a bare `gh auth status`, deliberately (#100), and that validates EVERY
   configured host: about 6 s with two. Uncached, it ran once per PR lookup and
