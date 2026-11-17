@@ -34,7 +34,7 @@ func TestGradeConflicts_NamesakesGradeAgainstTheirOwnWorktree(t *testing.T) {
 			ws = append(ws, collide.Window{Branch: "HEAD", Worktree: wt, Touched: []string{"big.txt"}})
 		}
 		conflicts := pathConflicts(ws, testRoot, []string{"big.txt"})
-		hard, soft := gradeConflicts(&config.Config{Base: "main"}, conflicts, testRoot, ws, ranges, ranges)
+		hard, soft := gradeConflicts(&config.Config{Base: "main"}, conflicts, testRoot, ws, ranges, collide.NewOnly(collide.RangeFn(ranges)))
 		if len(hard) != 1 || hard[0].Worktree != "/p1/x" || len(soft) != 1 || soft[0].Worktree != "/p2/x" {
 			t.Errorf("namesakes listed %v: hard %+v soft %+v, want p1/x hard and p2/x soft", order, hard, soft)
 		}

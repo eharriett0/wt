@@ -159,7 +159,7 @@ type gitGradeFacts struct {
 	untracked map[factKey]bool
 	subsumed  map[factKey]bool
 	ranges    map[factKey][]gitx.LineRange
-	rangesNew map[factKey][]gitx.LineRange
+	docEdits  map[factKey]gitx.DocEdits
 	// pending is a worktree's copy of pendingPath as an agent's pending edit
 	// will leave it (#226): the edit hooks grade a structured doc's sections
 	// with it, through the same SharedSections `wt check` uses.
@@ -174,7 +174,7 @@ type factSource struct {
 	untracked     func(worktree, path string) bool
 	subsumed      func(worktree, base, path string) bool
 	ranges        func(worktree, base, path string) []gitx.LineRange // base frame (#29/#108)
-	rangesNew     func(worktree, base, path string) []gitx.LineRange // new frame (#123)
+	docEdits      func(worktree, base, path string) gitx.DocEdits    // new frame (#123) + deletions (#237)
 }
 
 var gitFactSource = factSource{
@@ -182,7 +182,7 @@ var gitFactSource = factSource{
 	untracked:     untrackedInOther,
 	subsumed:      subsumedByBase,
 	ranges:        gitx.ChangedRanges,
-	rangesNew:     gitx.ChangedRangesNew,
+	docEdits:      gitx.ChangedDocEdits,
 }
 
 func newGitGradeFacts(base string) *gitGradeFacts {
@@ -197,7 +197,7 @@ func newMemoFacts(base string, src factSource) *gitGradeFacts {
 		untracked: map[factKey]bool{},
 		subsumed:  map[factKey]bool{},
 		ranges:    map[factKey][]gitx.LineRange{},
-		rangesNew: map[factKey][]gitx.LineRange{},
+		docEdits:  map[factKey]gitx.DocEdits{},
 	}
 }
 
@@ -236,10 +236,17 @@ func (g *gitGradeFacts) Ranges(wt, path string) []gitx.LineRange {
 }
 
 // SharedSections attributes each window's diff to its OWN current-content
-// sections, so it reads NEW-frame ranges (#123), memoized like the rest.
+// sections, so it reads NEW-frame ranges (#123), and the lines it deleted to
+// the sections of the copy it diffed from (#237), memoized like the rest.
 func (g *gitGradeFacts) SharedSections(worktrees []string, path, delimiter string) ([]string, bool) {
-	newFrame := func(wt, base, p string) []gitx.LineRange {
-		return memoRanges(g.rangesNew, factKey{wt, p}, func() []gitx.LineRange { return g.src.rangesNew(wt, base, p) })
+	newFrame := func(wt, base, p string) gitx.DocEdits {
+		k := factKey{wt, p}
+		if v, ok := g.docEdits[k]; ok {
+			return v
+		}
+		v := g.src.docEdits(wt, base, p)
+		g.docEdits[k] = v
+		return v
 	}
 	var pending map[string]collide.PendingDoc
 	if path == g.pendingPath {

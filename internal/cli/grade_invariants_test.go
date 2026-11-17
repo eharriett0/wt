@@ -278,7 +278,10 @@ func TestGitGradeFacts_MemoKeyedByWorktreeAndPath(t *testing.T) {
 		untracked:     func(wt, p string) bool { calls["untracked "+wt+" "+p]++; return wt == "/b" && p == "f" },
 		subsumed:      func(wt, _, p string) bool { calls["subsumed "+wt+" "+p]++; return wt == "/a" && p == "g" },
 		ranges:        func(wt, _, p string) []gitx.LineRange { calls["ranges "+wt+" "+p]++; return ranges[wt+" "+p] },
-		rangesNew:     func(wt, _, p string) []gitx.LineRange { calls["new "+wt+" "+p]++; return ranges[wt+" "+p] },
+		docEdits: func(wt, _, p string) gitx.DocEdits {
+			calls["new "+wt+" "+p]++
+			return gitx.DocEdits{New: ranges[wt+" "+p]}
+		},
 	}
 	g := newMemoFacts("main", src)
 	keys := []factKey{{"/a", "f"}, {"/b", "f"}, {"/a", "g"}, {"/a", "f"}, {"/b", "f"}}

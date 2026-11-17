@@ -23,13 +23,21 @@ import (
 // ok=false only when the copy can't be put in as a blob at all; the caller
 // then keeps a heads-up, never "no edits".
 func ChangedRangesNewWith(dir, base, file string, content []byte) ([]LineRange, bool) {
+	e, ok := ChangedDocEditsWith(dir, base, file, content)
+	return e.New, ok
+}
+
+// ChangedDocEditsWith is ChangedDocEdits for the copy a pending edit will
+// leave (#237): ChangedRangesNewWith's measurement, both sides of its diff,
+// so the edit hooks see the lines the edit deletes as `wt check` will.
+func ChangedDocEditsWith(dir, base, file string, content []byte) (DocEdits, bool) {
 	objects, err := run(dir, "rev-parse", "--path-format=absolute", "--git-path", "objects")
 	if err != nil || objects == "" || strings.ContainsAny(objects, ":\"") {
-		return nil, false
+		return DocEdits{}, false
 	}
 	tmp, err := os.MkdirTemp("", "wt-pending-")
 	if err != nil {
-		return nil, false
+		return DocEdits{}, false
 	}
 	defer os.RemoveAll(tmp)
 	env := []string{"GIT_OBJECT_DIRECTORY=" + tmp, "GIT_ALTERNATE_OBJECT_DIRECTORIES=" + objects}
@@ -46,14 +54,15 @@ func ChangedRangesNewWith(dir, base, file string, content []byte) ([]LineRange, 
 	// input, moved or lost every range).
 	blob, empty := hash(content, "--path", file), hash(nil, "--no-filters")
 	if blob == "" || empty == "" {
-		return nil, false
+		return DocEdits{}, false
 	}
-	diff := func(old, new string) ([]LineRange, error) {
+	failed := DocEdits{New: wholeFile, All: true}
+	diff := func(old, new string) (DocEdits, error) {
 		out, err := gitOutput(dir, env, nil, gradeDiff([]string{old, new}, "")...)
 		if err != nil {
-			return nil, err
+			return DocEdits{}, err
 		}
-		return parseHunkRanges(string(out)), nil
+		return docEditsFrom(dir, old, string(out), old == empty), nil
 	}
 	// The working tree's side of `git diff <rev> -- file`: the copy when the
 	// index tracks the file, else nothing.
@@ -70,29 +79,30 @@ func ChangedRangesNewWith(dir, base, file string, content []byte) ([]LineRange, 
 
 	ref, sha, hasBase := resolveBaseRef(dir, base)
 	if !hasBase {
-		// uncommittedRangesNew: index to working tree, plus HEAD to index.
+		// uncommittedRangesNew: index to working tree, plus HEAD to index;
+		// the new side only, as ChangedDocEdits reads it there.
 		var ranges []LineRange
 		if copySide == blob {
-			r, err := diff(revSide(":0"), blob)
+			e, err := diff(revSide(":0"), blob)
 			if err != nil {
-				return wholeFile, true
+				return failed, true
 			}
-			ranges = r
+			ranges = e.New
 		}
 		staged, err := runRaw(dir, gradeDiff([]string{"--cached"}, file)...)
 		if err != nil {
-			return wholeFile, true
+			return failed, true
 		}
-		return append(ranges, parseHunkRanges(staged)...), true
+		return DocEdits{New: append(ranges, parseHunkRanges(staged)...)}, true
 	}
 	if mb := behindMergeBase(dir, ref, sha, file); mb != "" {
-		if r, err := diff(revSide(mb), copySide); err == nil {
-			return r, true
+		if e, err := diff(revSide(mb), copySide); err == nil {
+			return e, true
 		}
 	}
-	r, err := diff(revSide(ref), copySide)
+	e, err := diff(revSide(ref), copySide)
 	if err != nil {
-		return wholeFile, true
+		return failed, true
 	}
-	return r, true
+	return e, true
 }

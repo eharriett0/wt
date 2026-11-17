@@ -137,7 +137,7 @@ func TestGitHooks_OddNamesCollide(t *testing.T) {
 	conflicts := pathConflicts(ws, root, got)
 	live := collide.ClassifyWindows(ws, c.Base, collide.ConflictWindowSet(conflicts), c.MaxAge)
 	active, _ := collide.PartitionConflicts(conflicts, live)
-	hard, soft := gradeConflicts(c, active, root, ws, gitx.ChangedRanges, gitx.ChangedRangesNew)
+	hard, soft := gradeConflicts(c, active, root, ws, gitx.ChangedRanges, gitx.ChangedDocEdits)
 	for _, g := range []struct {
 		name      string
 		got, want []string
