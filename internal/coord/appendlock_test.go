@@ -41,7 +41,11 @@ func TestAppend_waitsForAPruneRewrite(t *testing.T) {
 		_, err := PruneLog(path, now, 24*time.Hour)
 		pruned <- err
 	}()
-	<-paused
+	select {
+	case <-paused:
+	case err := <-pruned:
+		t.Fatalf("the prune returned (%v) without reaching the pause between its read and its rewrite", err)
+	}
 
 	hold := Record{ID: "h2", Kind: KindAnnounce, Window: "w2", Session: "t", Message: "rolling", Hold: []string{"merge-main"},
 		TS: now.UTC().Format(time.RFC3339)}
