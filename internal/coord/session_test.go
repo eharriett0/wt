@@ -711,12 +711,14 @@ func TestSharedCheckoutWarning(t *testing.T) {
 		wantNone []string
 	}{
 		{"one tagged session", one, Self{"/w", "aaaaaaaa-1111-2222-3333-444444444444"},
-			[]string{"another session was active", "latest: session b0c1d2e3…, 5m ago", "you: session aaaaaaaa…", "wt new <branch>", "wt inbox"},
+			[]string{"another session was active", "latest: session b0c1d2e3…, 5m ago", "you: session aaaaaaaa…", "wt new <branch>", "wt inbox", "or it was you, before a /clear"},
 			[]string{"WT_SESSION"}},
 		{"two sessions, newest named", two, Self{"/w", "A"},
-			[]string{"2 other sessions were active", "latest: session b0c1d2e3…"}, nil},
+			[]string{"2 other sessions were active", "latest: session b0c1d2e3…", "/clear"}, nil},
 		{"token-less self is told to set WT_SESSION", one, Self{"/w", SessionNone},
-			[]string{"you: no session token", "set WT_SESSION"}, nil},
+			[]string{"you: no session token", "set WT_SESSION"}, []string{"/clear"}},
+		{"a token-less latest session is no /clear of yours", []SessionActivity{{Session: SessionNone, Records: 1, Last: now.Add(-time.Minute)}}, Self{"/w", "A"},
+			[]string{"another session was active"}, []string{"/clear"}},
 	}
 	for _, tc := range cases {
 		msg := SharedCheckoutWarning(tc.others, tc.self, now)
@@ -993,7 +995,41 @@ func TestPresence_countsAsTheSessionsActivity(t *testing.T) {
 	if !InboxClearAmbiguous([]Record{other}, tokenless, now) {
 		t.Errorf("a token-less inbox doesn't hedge for another session's presence in this checkout")
 	}
-	if InboxClearAmbiguous([]Record{{ID: "q", Kind: KindPresence, Window: "/w", Session: "B", TS: at(25 * time.Hour)}}, tokenless, now) {
-		t.Errorf("a presence older than a day still hedges")
+	if InboxClearAmbiguous([]Record{{ID: "q", Kind: KindPresence, Window: "/w", Session: "B", TS: at(3 * time.Hour)}}, tokenless, now) {
+		t.Errorf("a presence mark past PresenceLive still hedges")
+	}
+}
+
+// #197 item 2 round-2 review: every hooked session leaves a mark, and the
+// session after a /clear (a new id) was told for a day that another shared
+// its checkout. A session whose only evidence is marks counts while its
+// latest is within PresenceLive; any other record keeps the day's window, and
+// its marks still date its activity.
+func TestOtherSessions_presenceAloneCountsWhileLive(t *testing.T) {
+	now := time.Now()
+	at := func(d time.Duration) string { return now.Add(-d).UTC().Format(time.RFC3339) }
+	self := Self{Window: "/w", Session: "new"}
+	recs := []Record{
+		{ID: "1", Kind: KindPresence, Window: "/w", Session: "cleared", TS: at(3 * time.Hour)},
+		{ID: "2", Kind: KindPresence, Window: "/w", Session: "cleared", TS: at(4 * time.Hour)},
+		{ID: "3", Kind: KindPresence, Window: "/w", Session: "prompting", TS: at(90 * time.Minute)},
+		{ID: "4", Kind: KindAnnounce, Window: "/w", Session: "announced", Message: "x", TS: at(10 * time.Hour)},
+		{ID: "5", Kind: KindPresence, Window: "/w", Session: "announced", TS: at(5 * time.Hour)},
+	}
+	got := map[string]SessionActivity{}
+	for _, s := range OtherSessions(recs, self, now, SharedCheckoutWindow) {
+		got[s.Session] = s
+	}
+	if _, ok := got["cleared"]; ok {
+		t.Errorf("a session whose latest mark is 3h old still shares the checkout")
+	}
+	if _, ok := got["prompting"]; !ok {
+		t.Errorf("a session that marked 90m ago doesn't share the checkout")
+	}
+	if a, ok := got["announced"]; !ok || a.Records != 2 || now.Sub(a.Last) > 5*time.Hour+time.Minute {
+		t.Errorf("an announcing session = %+v (listed %v), want both records, last 5h ago", a, ok)
+	}
+	if len(got) != 2 {
+		t.Errorf("listed %v, want prompting and announced", got)
 	}
 }

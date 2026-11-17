@@ -69,7 +69,7 @@ func printHelp() {
 	fmt.Printf("    %s           %s\n", c("wt ack <id>"), "acknowledge one  "+d("[--state \"what this window is touching\"] [--file <path>] [--all = clear the whole backlog]"))
 	fmt.Printf("    %s     %s\n", c("wt all-clear <id>"), "release your hold for EVERY window  "+d("(also: wt announce --clear <id>; not provably yours → asks, or --not-mine)"))
 	fmt.Printf("    %s               %s\n", c("wt holds"), "YOUR outstanding announcements/holds + block reservations (with all-clear lines; unattributable ones apart)  "+d("[--issue N]"))
-	fmt.Printf("    %s          %s\n", c("wt prune-coord"), "GC the coordination log (drop resolved handshakes + aged block reservations)  "+d("[--legacy [-y] = pre-upgrade records nothing needs]"))
+	fmt.Printf("    %s          %s\n", c("wt prune-coord"), "GC the coordination log (drop resolved handshakes, aged block reservations, day-old presence marks)  "+d("[--legacy [-y] = pre-upgrade records nothing needs]"))
 	fmt.Printf("    %s  %s\n", c("wt block-id <file>"), "reserve the next append-log id so two windows never grab the same NEWEST-N  "+d("[--pattern \"NEWEST-{n}\"] [--format] [--written N | --abandon N [--not-mine]]"))
 	fmt.Printf("    %s  %s\n", c("wt append <doc> --section H \"txt\""), "locked append under a section — parallel gotcha-adds can't clobber  "+d("[--file <path>]"))
 	fmt.Println("    " + d("Prose with backticks / $ / ! ? Pass ") + c("--file <path>") + d(" (or ") + c("--file -") + d(" for stdin) — a shell-quoted"))

@@ -393,11 +393,22 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   section). It does count as the session's
   activity elsewhere, on purpose: `OtherSessions`, the token-less inbox
   hedge (`InboxClearAmbiguous`) and `HoldLooksOrphaned`'s "silent for 4h"
-  (a prompting session's hold is not orphaned). A session with no wt hooks
-  that never runs a coordination command is still invisible. Pinned by
+  (a prompting session's hold is not orphaned). ⚠ **But a mark alone shows
+  its session at work only for `PresenceLive`** (two `PresenceEvery`;
+  `presenceStale`, round-2 review): counted for the whole day, every hooked
+  session's marks told the session after its /clear (a new id) that another
+  shared its checkout, for a day. A session with any other record keeps the
+  day's window, and its marks still date it; the warning adds "or it was
+  you, before a /clear" between two tagged sessions. ⚠ A mark also sets the
+  log's session epoch (#211 `SessionEpoch`, any kind), so a session-less
+  hold written after it reads as a still-running older wt's, not history:
+  the safe direction, and prune-coord's drop of the mark puts it back. A
+  session with no wt hooks that never runs a coordination command is still
+  invisible. Pinned by
   `TestHookPresence_marksASilentSession`, `TestPresenceDue`,
   `TestPruneRecords_presence`, `TestAppendIfFree`,
   `TestPresence_countsAsTheSessionsActivity`,
+  `TestOtherSessions_presenceAloneCountsWhileLive`,
   `TestHookPresence_neverStallsOnAHeldLog`,
   `TestDoctor_listsExpiredPresenceWithoutWarning`, and
   `TestOtherSessions_countBlockReservations`, `TestCheckoutActivity` and

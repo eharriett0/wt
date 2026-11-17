@@ -449,8 +449,11 @@ func coordHealth(c *config.Config) *CoordHealth {
 	h.Records = len(recs)
 	h.OwnOpen = len(coord.OwnOpenAnnouncements(recs, self))
 	h.OtherSessions = coord.OtherSessions(coord.CheckoutActivity(recs, ledger, repoName(c)), self, time.Now(), coord.SharedCheckoutWindow)
-	if _, p := coord.PruneRecords(recs, time.Now(), pruneBlockMaxAge); p > 0 {
-		h.PresenceExpired = coord.ExpiredPresence(recs, time.Now())
+	// One clock for both reads: a mark crossing the day between them made
+	// prunable one short (#197 item 2 review).
+	now := time.Now()
+	if _, p := coord.PruneRecords(recs, now, pruneBlockMaxAge); p > 0 {
+		h.PresenceExpired = coord.ExpiredPresence(recs, now)
 		h.Prunable += p - h.PresenceExpired
 	}
 	return h

@@ -72,8 +72,23 @@ const (
 
 // PresenceEvery bounds how often a session marks presence in a checkout: at
 // most one record per session per checkout per hour, so the log grows by at
-// most 24 a day a session, and prune-coord drops them after a day.
+// most 24 a day per window and session, and prune-coord drops them after a
+// day.
 const PresenceEvery = time.Hour
+
+// PresenceLive is how long a presence mark alone shows its session at work
+// (#197 item 2 review): a prompting session marks again within PresenceEvery,
+// so one whose latest mark is older than two of them has stopped prompting,
+// or became a new session id (/clear, --fork-session, a restart). Counted for
+// the whole SharedCheckoutWindow, a session's marks warned the session after
+// its /clear that another shared its checkout, for a day.
+const PresenceLive = 2 * PresenceEvery
+
+// presenceStale reports whether r, dated t, is a presence mark too old to
+// show its session at work now (PresenceLive). Pure.
+func presenceStale(r Record, t, now time.Time) bool {
+	return r.Kind == KindPresence && now.Sub(t) > PresenceLive
+}
 
 // PresenceDue reports whether self should mark presence in its checkout now
 // (#197 item 2): it has a real session token (a token-less shell names no
@@ -1302,13 +1317,16 @@ type SessionActivity struct {
 // self's window within `within` of now (within <= 0 → any age) — evidence that
 // another session shares this checkout (#163). A pre-#163 record carries no
 // session and names no party, so it is skipped; so is everything when self has
-// no session (a zero Self). One entry per session, most recent first. Pure.
+// no session (a zero Self). A session whose only evidence is presence marks
+// counts while its latest is within PresenceLive. One entry per session, most
+// recent first. Pure.
 func OtherSessions(recs []Record, self Self, now time.Time, within time.Duration) []SessionActivity {
 	if self.Session == "" {
 		return nil
 	}
 	idx := map[string]int{}
 	var out []SessionActivity
+	var live []bool
 	for _, r := range recs {
 		if !self.SharesCheckout(r) {
 			continue // another window, self's own session, or a pre-#163 record
@@ -1324,15 +1342,23 @@ func OtherSessions(recs []Record, self Self, now time.Time, within time.Duration
 		if !ok {
 			idx[r.Session] = len(out)
 			out = append(out, SessionActivity{Session: r.Session, Last: t})
+			live = append(live, false)
 			i = len(out) - 1
 		}
 		out[i].Records++
+		live[i] = live[i] || !presenceStale(r, t, now)
 		if t.After(out[i].Last) {
 			out[i].Last = t
 		}
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Last.After(out[j].Last) })
-	return out
+	kept := out[:0]
+	for i, s := range out {
+		if live[i] {
+			kept = append(kept, s)
+		}
+	}
+	sort.SliceStable(kept, func(i, j int) bool { return kept[i].Last.After(kept[j].Last) })
+	return kept
 }
 
 // CheckoutActivity is every record that can show a session at work in a
@@ -1403,9 +1429,16 @@ func SharedCheckoutWarning(others []SessionActivity, self Self, now time.Time) s
 	if self.Session == SessionNone {
 		you += " (set WT_SESSION)"
 	}
+	// #197 item 2 review: a /clear, --fork-session or restart mints a new id,
+	// so the session before it reads as another one. Said only between two
+	// tagged sessions, as the hold gate's hint is.
+	end := "."
+	if self.Session != SessionNone && latest.Session != SessionNone {
+		end = "; or it was you, before a /clear."
+	}
 	return fmt.Sprintf("checkout shared — %s active in THIS checkout in the last %dh (latest: %s, %s); you: %s.\n"+
-		"  One working tree, no file-level warning between you: give one session its own worktree (`wt new <branch>`); its holds: `wt inbox`.",
-		who, int(SharedCheckoutWindow.Hours()), ShortSession(latest.Session), ago(now.Sub(latest.Last)), you)
+		"  One working tree, no file-level warning between you: give one its own worktree (`wt new <branch>`); its holds: `wt inbox`%s",
+		who, int(SharedCheckoutWindow.Hours()), ShortSession(latest.Session), ago(now.Sub(latest.Last)), you, end)
 }
 
 // Thresholds for HoldLooksOrphaned (#163). A hold this old, or whose session has
@@ -1477,7 +1510,7 @@ func InboxClearAmbiguous(recs []Record, self Self, now time.Time) bool {
 		if !self.SharesCheckout(r) {
 			continue // another window, a token-less writer (indistinguishable), or pre-#163
 		}
-		if t, err := time.Parse(time.RFC3339, r.TS); err == nil && now.Sub(t) <= SharedCheckoutWindow {
+		if t, err := time.Parse(time.RFC3339, r.TS); err == nil && now.Sub(t) <= SharedCheckoutWindow && !presenceStale(r, t, now) {
 			return true
 		}
 	}
