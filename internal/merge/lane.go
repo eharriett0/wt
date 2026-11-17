@@ -29,6 +29,17 @@ func PRNumber(pr string) string {
 	return ""
 }
 
+// PRLabel is how a message names pr: "#5" for a number, the selector as given
+// otherwise (a URL, a branch), never "#https://…" (#228 review: a forwarded -R
+// hands merge-pr's reads the PR's URL). Pure.
+func PRLabel(pr string) string {
+	s := strings.TrimPrefix(pr, "#")
+	if n, err := strconv.Atoi(s); err == nil && n > 0 && !strings.HasPrefix(s, "+") {
+		return "#" + s
+	}
+	return pr
+}
+
 // UnshippedLane returns "" when tip, the local branch's tip as the caller read
 // it, shipped in merged PR pr (LocalTipVerdict), and otherwise the warning
 // that keeps the lane (#187). merge-pr's auto-clean and `wt clean` both ask it

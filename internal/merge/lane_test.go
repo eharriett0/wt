@@ -55,6 +55,24 @@ func TestUnshippedLane_FetchesThePRHeadByNumber(t *testing.T) {
 	}
 }
 
+// A message names a PR "#5", or by the selector given, never "#<url>" (#228
+// review).
+func TestPRLabel(t *testing.T) {
+	for pr, want := range map[string]string{
+		"5":                                   "#5",
+		"#5":                                  "#5",
+		"https://github.com/acme/repo/pull/5": "https://github.com/acme/repo/pull/5",
+		"feat-x":                              "feat-x",
+		"+5":                                  "+5",
+		"0":                                   "0",
+		"":                                    "",
+	} {
+		if got := PRLabel(pr); got != want {
+			t.Errorf("PRLabel(%q) = %q, want %q", pr, got, want)
+		}
+	}
+}
+
 // gh takes a PR as a number or a URL; the PR-head fetch needs the number
 // (#230 re-review: a URL got no fetch and a broken fetch command).
 func TestPRNumber(t *testing.T) {

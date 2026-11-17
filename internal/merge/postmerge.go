@@ -19,10 +19,11 @@ const (
 // PostMergeVerdict maps the PR state read back after `gh pr merge` exited 0 to
 // what merge-pr may do next (#185). An exit 0 is not a merge: gh exits 0
 // WITHOUT merging for --help/-h, --auto (armed until the checks pass),
-// --disable-auto, a merge queue (queued), a PR already in the queue, and -R
-// (it merged ANOTHER repo's PR). Only MERGED proves the merge, and a failed
-// read or a missing PR ("", or a placeholder like "null") never counts as one
-// (#168). Pure.
+// --disable-auto, a merge queue (queued) and a PR already in the queue. (A
+// forwarded -R used to read as one too: merge-pr read this clone's PR of that
+// number until #228.) Only MERGED proves the merge, and a failed read or a
+// missing PR ("", or a placeholder like "null") never counts as one (#168).
+// Pure.
 func PostMergeVerdict(state string) PostVerdict {
 	switch strings.ToUpper(strings.TrimSpace(state)) {
 	case "MERGED":
@@ -103,19 +104,20 @@ func KeptLaneMessage(v TipVerdict, branch, pr string, n int, tip, head string) s
 	// Unknown is not "unshipped" (#230 review): "push them" would recreate a
 	// branch the merge deleted, at a stale tip.
 	const unsure = "kept the worktree and branch (delete them yourself once you've checked nothing is missing)"
+	name := PRLabel(pr)
 	switch {
 	case v == TipUnshipped && n > 0:
-		return fmt.Sprintf("%s has %d commit(s) that were not in PR #%s; %s", branch, n, pr, kept)
+		return fmt.Sprintf("%s has %d commit(s) that were not in PR %s; %s", branch, n, name, kept)
 	case v == TipUnshipped:
-		return fmt.Sprintf("%s has commits that were not in PR #%s (wt could not count them); %s", branch, pr, kept)
+		return fmt.Sprintf("%s has commits that were not in PR %s (wt could not count them); %s", branch, name, kept)
 	case head == "":
-		return fmt.Sprintf("%s may have commits that were not in PR #%s: wt could not read the PR's head commit; %s", branch, pr, unsure)
+		return fmt.Sprintf("%s may have commits that were not in PR %s: wt could not read the PR's head commit; %s", branch, name, unsure)
 	case tip == "":
-		return fmt.Sprintf("%s may have commits that were not in PR #%s: wt could not read the branch's tip; %s", branch, pr, unsure)
+		return fmt.Sprintf("%s may have commits that were not in PR %s: wt could not read the branch's tip; %s", branch, name, unsure)
 	}
 	fetch := "fetch it into this clone"
 	if n := PRNumber(pr); n != "" {
 		fetch = "`git fetch origin refs/pull/" + n + "/head` brings it in"
 	}
-	return fmt.Sprintf("%s may have commits that were not in PR #%s: wt could not compare its tip with the PR's head %.12s, which is not in this clone (%s; then run it again); %s", branch, pr, head, fetch, unsure)
+	return fmt.Sprintf("%s may have commits that were not in PR %s: wt could not compare its tip with the PR's head %.12s, which is not in this clone (%s; then run it again); %s", branch, name, head, fetch, unsure)
 }

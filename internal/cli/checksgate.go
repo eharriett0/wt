@@ -131,18 +131,18 @@ func checksGate(pr string, o checksOpts, stdin io.Reader, tty bool, r checksRead
 		}
 		return read.Head, label, host, true
 	case gateOverride:
-		ui.Warn("--checks-ok set — merging PR #%s anyway: %s.%s", pr, why, adminTail(o.admin))
+		ui.Warn("--checks-ok set — merging PR %s anyway: %s.%s", merge.PRLabel(pr), why, adminTail(o.admin))
 		return read.Head, label, host, true
 	case gateAsk:
-		fmt.Fprintf(os.Stderr, "%s PR #%s: %s.%s Type %s to merge anyway (anything else aborts): ",
-			ui.Yellow("→"), pr, why, adminTail(o.admin), ui.Bold("merge"))
+		fmt.Fprintf(os.Stderr, "%s PR %s: %s.%s Type %s to merge anyway (anything else aborts): ",
+			ui.Yellow("→"), merge.PRLabel(pr), why, adminTail(o.admin), ui.Bold("merge"))
 		if strings.TrimSpace(readLine(stdin)) == "merge" {
 			return read.Head, label, host, true
 		}
-		ui.Err("aborted — PR #%s not merged.", pr)
+		ui.Err("aborted — PR %s not merged.", merge.PRLabel(pr))
 		return "", label, host, false
 	}
-	ui.Err("refusing to merge PR #%s — %s.", pr, why)
+	ui.Err("refusing to merge PR %s — %s.", merge.PRLabel(pr), why)
 	for _, h := range refuseHints(pr, v, o) {
 		ui.Info("%s", h)
 	}
@@ -241,7 +241,7 @@ func readLine(r io.Reader) string {
 //	merge-pr: PR #7 checks=green on 1a2b3c4d5e6f: 12 passed, 2 skipped; required: 3, all reported
 func checksLine(pr, head string, v merge.ChecksVerdict) string {
 	if v.ReadErr != "" {
-		return fmt.Sprintf("merge-pr: PR #%s checks=unread: %s", pr, v.ReadErr)
+		return fmt.Sprintf("merge-pr: PR %s checks=unread: %s", merge.PRLabel(pr), v.ReadErr)
 	}
 	var req string
 	notReported := len(v.Missing) + len(v.OtherApp) + len(v.MissingWorkflows) + len(v.Unverifiable)
@@ -255,13 +255,13 @@ func checksLine(pr, head string, v merge.ChecksVerdict) string {
 	default:
 		req = fmt.Sprintf("required: %d, %d never reported", v.Required, notReported)
 	}
-	return fmt.Sprintf("merge-pr: PR #%s checks=%s on %.12s: %s; %s", pr, v.Label(), head, v.CountsText(), req)
+	return fmt.Sprintf("merge-pr: PR %s checks=%s on %.12s: %s; %s", merge.PRLabel(pr), v.Label(), head, v.CountsText(), req)
 }
 
 // skippedChecksLine is the gate's line when the passthrough merges nothing
 // (merge.NonMerging): no checks are read, and nothing is pinned. Pure.
 func skippedChecksLine(pr, flag string) string {
-	return fmt.Sprintf("merge-pr: PR #%s checks=skipped: the forwarded %s merges nothing, so the checks gate does not apply", pr, flag)
+	return fmt.Sprintf("merge-pr: PR %s checks=skipped: the forwarded %s merges nothing, so the checks gate does not apply", merge.PRLabel(pr), flag)
 }
 
 // checksDetail lists what blocks a verdict, one line per kind, for the lines
@@ -314,9 +314,9 @@ func checksDetail(v merge.ChecksVerdict, head string) []string {
 // noChecksNote is the note for a PR on which no check ran and nothing requires
 // one: it merges, and says that nothing in CI verified it. Pure.
 func noChecksNote(pr string, v merge.ChecksVerdict) string {
-	return fmt.Sprintf("no check ran on PR #%s (%s): nothing in CI verified this merge. "+
+	return fmt.Sprintf("no check ran on PR %s (%s): nothing in CI verified this merge. "+
 		"If CI should run on this PR, it may not have started; set merge_min_checks, or require a check, to make merge-pr refuse this.",
-		pr, v.CountsText())
+		merge.PRLabel(pr), v.CountsText())
 }
 
 // refuseHints say what to do about a refusal. Pure.

@@ -153,10 +153,10 @@ var liveCloseReads = closeReads{
 	issueTitle:     ghx.IssueTitle,
 }
 
-// closeReadsAt is liveCloseReads for a PR a forwarded -R resolved in its
-// repository (#228): an issue is read by its URL there, and the squash
-// settings are that repository's. The PR reads already take the PR's URL. nil
-// at: the cwd's repository, liveCloseReads as is.
+// closeReadsAt is liveCloseReads for a PR resolved in its own repository, by
+// a forwarded -R or its URL (#228): an issue is read by its URL there, and the
+// squash settings are that repository's, on its host. The PR reads already
+// take the PR's URL. nil at: the cwd's repository, liveCloseReads as is.
 func closeReadsAt(at *ghx.PRAt) closeReads {
 	r := liveCloseReads
 	if at == nil {
@@ -165,7 +165,7 @@ func closeReadsAt(at *ghx.PRAt) closeReads {
 	r.issueState = func(n string) (string, error) { return ghx.IssueState(at.IssueURL(n)) }
 	r.issueTitle = func(n string) (string, error) { return ghx.IssueTitle(at.IssueURL(n)) }
 	r.squashSettings = func() merge.SquashSettings {
-		title, message := ghx.RepoSquashSettingsOf(at.Owner, at.Name)
+		title, message := ghx.RepoSquashSettingsOf(at.Host, at.Owner, at.Name)
 		return merge.SquashSettings{Title: title, Message: message}
 	}
 	return r
