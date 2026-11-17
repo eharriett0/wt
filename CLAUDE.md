@@ -114,7 +114,20 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   is HIGH iff those ranges conflict with the other window's
   (`collide.ConflictSeverity`); an edit that puts the file back to base's copy
   reads HIGH like `wt check`'s empty side, as a heads-up, not a confirmed
-  overlap. Claude (`claudePendingContent`): Claude Code's Edit replayed (refused
+  overlap. A STRUCTURED shared doc is graded by section, not hunk (#22), so
+  `regradeSections` re-grades its entries first (#226): the same
+  `SharedSections` call `gradeEntry` makes, with this window's copy as the edit
+  leaves it (`collide.PendingDoc`) and its ranges in that copy's OWN line
+  numbers (`gitx.ChangedRangesNewWith`; the base frame put an edit past an
+  insert in the wrong section). Advisory or section-HIGH: HIGH, naming the
+  section, iff the copy now shares one with the other window, else dropped.
+  Before #226 an advisory was never re-graded, so an edit moving INTO the other
+  window's section was silent while `wt check` then said HIGH, and one moving
+  OUT kept a heads-up (a deny under block). Copy unmeasurable: entries go to
+  `regradePending` as they were (an advisory dropped, a section HIGH a heads-up),
+  as before. Pinned by `TestPreEditHooks_StructuredDocSections` (into, staying
+  out of, past an insert into, and out of the other window's section, each held
+  to `wt check` after the edit, both hooks, both block modes). Claude (`claudePendingContent`): Claude Code's Edit replayed (refused
   for an absent `old_string`, or a repeated one without `replace_all`; an empty
   `new_string` takes the newline after it), MultiEdit's edits in turn, Write's
   content; a CRLF file is edited as LF (the edit's own CRLFs too) and written
@@ -971,8 +984,9 @@ exit 0** (advisory / fail-open; a coordination nicety must never break the sessi
   FYI) against this window's ranges as they will read once the patch is applied:
   `predictCodexPatch` replays apply_patch over the on-disk files
   (`codex_apply.go`) and `gitx.ChangedRangesWith` measures each result, with the
-  same `regradePending` as the Claude hook (#108/#184/#199). A disjoint patch to
-  a shared file therefore stays silent. Emits `additionalContext` on overlap;
+  same `regradePending` as the Claude hook (#108/#184/#199), after the same
+  `regradeSections` for a structured doc (#226). A disjoint patch to a shared
+  file therefore stays silent. Emits `additionalContext` on overlap;
   `WT_CODEX_HOOK_BLOCK=1` upgrades a **confirmed** HIGH (a computed hunk overlap) to
   `deny` — a file-level-only match never denies. Each file's line names EVERY
   window editing it, each with its own liveness and confirmed / not-computed tag

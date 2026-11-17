@@ -683,12 +683,16 @@ func hookCodexEdit(r io.Reader) int {
 	for _, path := range order {
 		var after []gitx.LineRange
 		afterOK := false
-		if content, touched := predicted[path]; predictable && touched {
+		content, touched := predicted[path]
+		if predictable && touched {
 			after, afterOK = pendingRanges(root, c.Base, path, []byte(content))
 		}
-		graded := regradePending(byEntryPath[path], after, afterOK, func(e CheckEntry) bool {
+		// #226: a structured doc's sections, graded with the copy the patch
+		// leaves, as the Claude hook does.
+		sections, rest := regradeSections(c, root, path, []byte(content), predictable && touched, byEntryPath[path])
+		graded := append(sections, regradePending(rest, after, afterOK, func(e CheckEntry) bool {
 			return subsumedByBase(e.otherWorktree, c.Base, path) // that window's, not a namesake's (#193)
-		})
+		})...)
 		for _, g := range graded {
 			high = append(high, codexGradedEntry{entry: g.entry, confirmed: g.confirmed})
 			anyConfirmed = anyConfirmed || g.confirmed
@@ -833,6 +837,9 @@ func codexEditDecision(high []codexGradedEntry, deny bool) (string, bool) {
 		tag := "hunk overlap not computed — run `wt check`"
 		if g.confirmed {
 			tag = "overlapping hunks"
+			if len(e.SharedSections) > 0 {
+				tag = sectionsString(e.SharedSections) // #226
+			}
 			anyConfirmed = true
 		} else {
 			anyFileLevel = true

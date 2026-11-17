@@ -160,6 +160,11 @@ type gitGradeFacts struct {
 	subsumed  map[factKey]bool
 	ranges    map[factKey][]gitx.LineRange
 	rangesNew map[factKey][]gitx.LineRange
+	// pending is a worktree's copy of pendingPath as an agent's pending edit
+	// will leave it (#226): the edit hooks grade a structured doc's sections
+	// with it, through the same SharedSections `wt check` uses.
+	pendingPath string
+	pending     map[string]collide.PendingDoc
 }
 
 // factSource is the uncached lookups behind gitGradeFacts: the gitx shell-outs
@@ -236,7 +241,11 @@ func (g *gitGradeFacts) SharedSections(worktrees []string, path, delimiter strin
 	newFrame := func(wt, base, p string) []gitx.LineRange {
 		return memoRanges(g.rangesNew, factKey{wt, p}, func() []gitx.LineRange { return g.src.rangesNew(wt, base, p) })
 	}
-	return collide.SharedSectionsAcross(g.base, worktrees, path, delimiter, newFrame)
+	var pending map[string]collide.PendingDoc
+	if path == g.pendingPath {
+		pending = g.pending
+	}
+	return collide.SharedSectionsAcrossWith(g.base, worktrees, path, delimiter, newFrame, pending)
 }
 
 // gradeEntry is THE `wt check` decision for one path × other window: how the

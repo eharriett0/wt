@@ -541,6 +541,22 @@ type RangeFn func(worktree, base, path string) []gitx.LineRange
 // pre-push guard. Heading text is the stable cross-worktree identity: line
 // numbers drift between branches, headings do not.
 func SharedSectionsAcross(base string, worktrees []string, rel, delimiter string, ranges RangeFn) (shared []string, graded bool) {
+	return SharedSectionsAcrossWith(base, worktrees, rel, delimiter, ranges, nil)
+}
+
+// PendingDoc is one worktree's copy of a structured doc as a pending edit will
+// leave it, with that worktree's changed ranges in the copy's own (NEW-frame)
+// line numbers (#226).
+type PendingDoc struct {
+	Content string
+	Ranges  []gitx.LineRange
+}
+
+// SharedSectionsAcrossWith is SharedSectionsAcross with some worktrees' copies
+// given instead of read from disk (pending, keyed by worktree): the edit hooks
+// grade a structured doc's sections as they will read once the edit is made,
+// through the very computation `wt check` runs then (#226). Pure given ranges.
+func SharedSectionsAcrossWith(base string, worktrees []string, rel, delimiter string, ranges RangeFn, pending map[string]PendingDoc) (shared []string, graded bool) {
 	re, err := section.Compile(delimiter)
 	if err != nil {
 		return nil, false
@@ -549,12 +565,17 @@ func SharedSectionsAcross(base string, worktrees []string, rel, delimiter string
 	var order []string
 	any := false
 	for _, wt := range worktrees {
-		content, rerr := os.ReadFile(filepath.Join(wt, rel))
-		if rerr != nil {
-			continue // this worktree lacks the doc; others may still grade
+		var heads []string
+		if doc, ok := pending[wt]; ok {
+			heads = section.EditedHeadings(section.Parse(doc.Content, re), doc.Ranges)
+		} else {
+			content, rerr := os.ReadFile(filepath.Join(wt, rel))
+			if rerr != nil {
+				continue // this worktree lacks the doc; others may still grade
+			}
+			heads = section.EditedHeadings(section.Parse(string(content), re), ranges(wt, base, rel))
 		}
 		any = true
-		heads := section.EditedHeadings(section.Parse(string(content), re), ranges(wt, base, rel))
 		for _, h := range heads {
 			if count[h] == 0 {
 				order = append(order, h)
