@@ -556,7 +556,7 @@ func LoadForGate(path string) ([]Record, error) { return load(path, true) }
 var loadLockWait = 5 * time.Second
 
 // ErrLogLocked is LoadForGate giving up on a log another process kept locked.
-var ErrLogLocked = errors.New("the coordination log stayed locked by another wt process (a prune or block reservation stopped mid-write?)")
+var ErrLogLocked = errors.New("the coordination log stayed locked by another wt process (a prune-coord or an append stopped mid-write?)")
 
 func load(path string, strict bool) ([]Record, error) {
 	f, err := os.Open(path)

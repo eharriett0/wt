@@ -108,17 +108,53 @@ func TestLoad_givesUpOnAStuckHolder(t *testing.T) {
 	}
 	defer lock.Release(holder)
 
-	start := time.Now()
-	recs, err := Load(path)
-	if took := time.Since(start); err != nil || len(recs) != 1 || took > 5*time.Second {
-		t.Errorf("Load under a stuck holder: %d record(s), %v, in %s; want the log read unlocked after the wait", len(recs), err, took)
+	type read struct {
+		recs []Record
+		err  error
 	}
-	if _, err := LoadForGate(path); !errors.Is(err, ErrLogLocked) {
-		t.Errorf("LoadForGate under a stuck holder: %v, want ErrLogLocked", err)
+	within := func(name string, fn func(string) ([]Record, error)) read {
+		t.Helper()
+		done := make(chan read, 1)
+		go func() {
+			recs, err := fn(path)
+			done <- read{recs, err}
+		}()
+		select {
+		case r := <-done:
+			return r
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s under a stuck holder never returned: the wait is unbounded", name)
+			return read{}
+		}
 	}
-	lock.Release(holder)
-	if recs, err := LoadForGate(path); err != nil || len(recs) != 1 {
-		t.Errorf("LoadForGate once the holder lets go: %d record(s), %v", len(recs), err)
+	if r := within("Load", Load); r.err != nil || len(r.recs) != 1 {
+		t.Errorf("Load under a stuck holder: %d record(s), %v; want the log read unlocked after the wait", len(r.recs), r.err)
+	}
+	if r := within("LoadForGate", LoadForGate); !errors.Is(r.err, ErrLogLocked) {
+		t.Errorf("LoadForGate under a stuck holder: %v, want ErrLogLocked", r.err)
+	}
+
+	// A holder that lets go INSIDE the wait is waited for, never refused
+	// (#234 review: a gate that refused on the first busy try passed every
+	// other test, and refused 3 of 5 reads under a stream of appends).
+	loadLockWait = 3 * time.Second
+	for _, tc := range []struct {
+		name string
+		fn   func(string) ([]Record, error)
+	}{{"Load", Load}, {"LoadForGate", LoadForGate}} {
+		released := make(chan struct{})
+		go func() {
+			time.Sleep(150 * time.Millisecond)
+			lock.Release(holder)
+			close(released)
+		}()
+		if r := within(tc.name, tc.fn); r.err != nil || len(r.recs) != 1 {
+			t.Errorf("%s with a holder letting go after 150ms: %d record(s), %v; want it waited for", tc.name, len(r.recs), r.err)
+		}
+		<-released
+		if err := lock.Exclusive(holder); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

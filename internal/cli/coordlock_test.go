@@ -1,25 +1,21 @@
 package cli
 
 import (
-	"os"
-	"runtime"
+	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/eharriett0/wt/internal/config"
 	"github.com/eharriett0/wt/internal/coord"
-	"github.com/eharriett0/wt/internal/lock"
 )
 
 // #234 review: while another process holds the coordination log's lock past
 // the wait (a prune stopped with Ctrl-Z), what an unlocked read would see may
 // be a log stopped between its truncate and its rewrite, holds gone. The
-// merge gate refuses instead of reading it, and passes once the lock is let go.
+// merge gate refuses instead of reading it, and its advice never says to kill
+// the holder (a prune killed mid-rewrite empties the log) or to --bypass
+// (which skips more than this gate). coord pins the wait itself.
 func TestMergeCoordGate_RefusesALogLockedByAnotherProcess(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("the advisory lock is a no-op off unix")
-	}
 	repo, home := t.TempDir(), t.TempDir()
 	gitInitForTest(t, repo)
 	t.Setenv("HOME", home)
@@ -31,26 +27,25 @@ func TestMergeCoordGate_RefusesALogLockedByAnotherProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	logPath, _ := coordCtx(c)
-	if err := coord.Append(logPath, coord.Record{ID: "note", Kind: coord.KindAnnounce, Repo: "repo", Window: "another",
-		Session: "s", Message: "no hold", TS: time.Now().UTC().Format(time.RFC3339)}); err != nil {
-		t.Fatal(err)
+	orig := loadForGate
+	t.Cleanup(func() { loadForGate = orig })
+	// The seam must be the refusing read, never Load (which reads unlocked
+	// after the wait): coord pins LoadForGate's behavior, this pins the wiring.
+	if reflect.ValueOf(orig).Pointer() != reflect.ValueOf(coord.LoadForGate).Pointer() {
+		t.Fatal("the merge gate does not read the log through coord.LoadForGate")
 	}
-	holder, err := os.OpenFile(logPath, os.O_RDWR, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer holder.Close()
-	if err := lock.Exclusive(holder); err != nil {
-		t.Fatal(err)
-	}
+	loadForGate = func(string) ([]coord.Record, error) { return nil, coord.ErrLogLocked }
+
 	var code int
 	_, errOut := captureOutputForTest(t, func() { code = mergeCoordGate(c) })
 	if code != 1 || !strings.Contains(errOut, "stayed locked by another wt process") {
 		t.Errorf("merge gate under a stuck holder = %d, want 1 with the locked-log refusal:\n%s", code, errOut)
 	}
-	lock.Release(holder)
+	if !strings.Contains(errOut, "kill -CONT") || strings.Contains(errOut, "--bypass") {
+		t.Errorf("the refusal must say to resume the holder, and not point at --bypass:\n%s", errOut)
+	}
+	loadForGate = func(string) ([]coord.Record, error) { return nil, nil }
 	if code := mergeCoordGate(c); code != 0 {
-		t.Errorf("merge gate once the holder let go = %d, want 0 (no hold)", code)
+		t.Errorf("merge gate once the log reads = %d, want 0 (no hold)", code)
 	}
 }

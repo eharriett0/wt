@@ -290,7 +290,12 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   included): then `Load` reads unlocked, as before #234, and `LoadForGate`
   returns `ErrLogLocked`, which merge-pr's hold gate refuses on (an unlocked
   read could be a log stopped between its truncate and its rewrite). A lock
-  that fails (no flock) reads unlocked, as before.
+  that fails (no flock) reads unlocked, as before. ⚠ The refusal says to
+  RESUME the holder (`kill -CONT`), never to kill it: a prune killed after its
+  truncate leaves the log empty for good. Not covered here: writers (`Append`,
+  `ReserveBlock`) still wait on a stopped holder without limit (#235), and a
+  prune longer than the wait (measured 8.9s for a 1M-record log on Linux; a
+  real log is ~10k) lets a non-gate reader read unlocked mid-rewrite.
   Pinned by
   `TestAppend_waitsForAPruneRewrite` (a prune paused between its read and its
   rewrite; `lockedLogPause` is the seam),
