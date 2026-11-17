@@ -19,8 +19,9 @@ type gateSource struct {
 	gate config.Gate
 	// unread is why the base branch's settings could not be read ("" = they
 	// were). Such a source FAILS CLOSED: merge_is_deploy on for the whole
-	// repository, and a checks floor nobody can apply, so the checks gate
-	// refuses without --checks-ok. It sets nothing for the hold gate.
+	// repository, a checks floor nobody can apply (the checks gate refuses, or
+	// asks at a terminal, without --checks-ok), and holds kept at least the
+	// default hold_max_age.
 	unread string
 }
 
@@ -66,7 +67,7 @@ func baseGateSource(fresh ghx.BaseConf, freshErr error, originIsBase bool, local
 	}
 	closed := func(why string) (gateSource, string) {
 		return gateSource{from: "the base branch's " + ghx.ConfFile + ", which could not be read",
-				gate: config.Gate{MergeIsDeploy: true}, unread: why},
+				gate: config.Gate{MergeIsDeploy: true, HoldMaxAge: config.DefaultHoldMaxAge}, unread: why},
 			fmt.Sprintf("couldn't read the base branch's %s: %s. merge-pr can't rule out that this merge deploys or "+
 				"that the base sets a checks floor, so the deploy gate gates and the checks gate refuses without --checks-ok", ghx.ConfFile, why)
 	}
@@ -126,20 +127,18 @@ func strictestFloor(srcs []gateSource) floorSpec {
 	return f
 }
 
-// strictestHolds is the hold gate's settings over every source that was read
-// (#223): hold_max_age 0 (never expire) when any says so, else the longest;
-// and every coord_issue mirror any names, so a PR can neither shorten a hold's
-// life nor drop the mirror that carries another machine's hold. An unread
-// source sets nothing here: holds are coordination, and the checkout's own
-// settings still apply. Pure.
+// strictestHolds is the hold gate's settings over every source (#223):
+// hold_max_age 0 (never expire) when any says so, else the longest; and every
+// coord_issue mirror any names, so a PR can neither shorten a hold's life nor
+// drop the mirror that carries another machine's hold. A base without a
+// .wt.conf holds at the default (24h), so the checkout's env or file can't
+// shorten it either; an unread base counts as that default too (#223
+// re-review: skipped, the PR's own hold_max_age decided), and names no mirror.
 func strictestHolds(srcs []gateSource) (time.Duration, []int) {
 	var age time.Duration
 	never, any := false, false
 	var issues []int
 	for _, s := range srcs {
-		if s.unread != "" {
-			continue
-		}
 		any = true
 		if s.gate.HoldMaxAge <= 0 {
 			never = true
@@ -274,8 +273,12 @@ func gatesDiffer(srcs []gateSource) bool {
 }
 
 // fetchBase fetches origin's <base> into refs/remotes/origin/<base>: the
-// fallback's first step. A variable so a test never reaches a network.
-var fetchBase = func(base string) error { return gitx.Fetch("origin", base) }
+// fallback's first step, never stopping at a credential prompt. A variable so
+// a test never reaches a network.
+var fetchBase = func(base string) error { return gitx.FetchNoPrompt("origin", base) }
+
+// readBaseConf is ghx.ReadBaseConf, a variable for tests.
+var readBaseConf = ghx.ReadBaseConf
 
 // mergeGates resolves the gate settings merge-pr's gates read (#223): this
 // checkout's (its .wt.conf and the WT_* environment) and the PR's base
@@ -285,7 +288,14 @@ var fetchBase = func(base string) error { return gitx.Fetch("origin", base) }
 // and only when the PR's repository is this clone's origin (owner and name,
 // case-insensitive: a host can be an ssh alias), never c.Base.
 func mergeGates(c *config.Config, pr, repo string, dryRun bool) []gateSource {
-	fresh, freshErr := ghx.ReadBaseConf(pr, repo)
+	fresh, freshErr := readBaseConf(pr, repo)
+	if retryable(freshErr) {
+		// One retry, as the checks gate's reads get (#223 re-review): a single
+		// 502 would otherwise fail closed. A rate limit lifts in minutes, not
+		// here.
+		liveChecksReads.sleep(checksRetryWait)
+		fresh, freshErr = readBaseConf(pr, repo)
+	}
 	var local localBaseConf
 	originIsBase := false
 	if freshErr != nil && fresh.Base != "" {

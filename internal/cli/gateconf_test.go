@@ -28,6 +28,7 @@ func TestBaseGateSource(t *testing.T) {
 	unread := errors.New("HTTP 502")
 	ref := "refs/remotes/origin/release"
 	defaults := config.GateFromConf("")
+	closedGate := config.Gate{MergeIsDeploy: true, HoldMaxAge: config.DefaultHoldMaxAge}
 	cases := []struct {
 		name         string
 		fresh        ghx.BaseConf
@@ -58,15 +59,15 @@ func TestBaseGateSource(t *testing.T) {
 			wantFrom: "origin/release fetched just now, which has no .wt.conf", want: defaults,
 			wantWarn: []string{"fetched just now"}},
 		{name: "the base branch was never resolved: fail closed, never a guess", freshErr: unread,
-			wantUnread: true, want: config.Gate{MergeIsDeploy: true},
+			wantUnread: true, want: closedGate,
 			wantWarn: []string{"the PR's base branch could not be resolved", "checks gate refuses without --checks-ok"}},
 		{name: "the PR's repository is not origin (-R, a URL, GH_REPO, a fork): fail closed", fresh: resolved, freshErr: unread,
 			local:      localBaseConf{ref: ref, found: true, text: "merge_is_deploy = false\n"},
-			wantUnread: true, want: config.Gate{MergeIsDeploy: true},
+			wantUnread: true, want: closedGate,
 			wantWarn: []string{"o/r is not this clone's origin"}},
 		{name: "this clone's copy can't be read (a symlink, an unfetched blob): fail closed", fresh: resolved, freshErr: unread, originIsBase: true,
 			local:      localBaseConf{ref: ref, err: errors.New(".wt.conf in refs/remotes/origin/release is a symlink")},
-			wantUnread: true, want: config.Gate{MergeIsDeploy: true},
+			wantUnread: true, want: closedGate,
 			wantWarn: []string{"is a symlink"}},
 	}
 	for _, tc := range cases {
@@ -127,6 +128,7 @@ func TestStrictestHolds(t *testing.T) {
 	src := func(age time.Duration, issue int) gateSource {
 		return gateSource{gate: config.Gate{HoldMaxAge: age, CoordIssue: issue}}
 	}
+	unreadSrc, _ := baseGateSource(ghx.BaseConf{}, errors.New("GitHub down"), false, localBaseConf{})
 	cases := []struct {
 		name   string
 		srcs   []gateSource
@@ -137,8 +139,10 @@ func TestStrictestHolds(t *testing.T) {
 		{"never expire beats any age", []gateSource{src(time.Hour, 0), src(0, 0)}, 0, nil},
 		{"the checkout drops coord_issue: the base's mirror still read", []gateSource{src(time.Hour, 0), src(time.Hour, 36)}, time.Hour, []int{36}},
 		{"two mirrors: both read, once each", []gateSource{src(time.Hour, 7), src(time.Hour, 36), src(time.Hour, 7)}, time.Hour, []int{7, 36}},
-		{"an unread base sets nothing", []gateSource{src(time.Minute, 0), {gate: config.Gate{MergeIsDeploy: true}, unread: "x"}}, time.Minute, nil},
-		{"no source read: the default", []gateSource{{unread: "x"}}, config.DefaultHoldMaxAge, nil},
+		// #223 re-review: an unread base still holds at least the default, so
+		// the PR's own short hold_max_age can't decide when GitHub is down.
+		{"an unread base: at least the default, no mirror", []gateSource{src(time.Minute, 0), unreadSrc}, config.DefaultHoldMaxAge, nil},
+		{"a base without a .wt.conf: the default outranks a shorter checkout", []gateSource{src(time.Minute, 0), {gate: config.GateFromConf("")}}, config.DefaultHoldMaxAge, nil},
 	}
 	for _, tc := range cases {
 		age, issues := strictestHolds(tc.srcs)
@@ -267,6 +271,7 @@ case "$*" in
 	echo "$3 https://$H/$R/pull/$3 $B"; exit 0 ;;
 *"expr=refs/heads/"*)
 	[ -e "$d/base.fail" ] && { echo "gh: Something went wrong (HTTP 502)" >&2; exit 1; }
+	[ -e "$d/base.fail.once" ] && { rm "$d/base.fail.once"; echo "gh: Something went wrong (HTTP 502)" >&2; exit 1; }
 	cat "$d/baseconf.json"; exit 0 ;;
 "api --hostname $H repos/"*"/pulls/99999/files"*) cat "$d/rest"; exit 0 ;;
 "api --include /"*) exit 1 ;;
@@ -280,7 +285,7 @@ case "$1 $2" in
 "pr view")
 	case "$*" in
 	*" state "*) if [ -e "$d/merged" ]; then echo MERGED; else echo OPEN; fi ;;
-	*isDraft*) echo false ;;
+	*isDraft*) if [ -e "$d/draft" ]; then echo true; else echo false; fi ;;
 	*messageHeadline*) echo "Change the widget" ;;
 	*headRefName*) echo feat-x ;;
 	*title*) echo "Change the widget" ;;
@@ -392,7 +397,7 @@ func (e *gateEnv) checkout(conf string) {
 // fake sets the fake gh's state: the PR changes file, and kv's files.
 func (e *gateEnv) fake(file string, kv map[string]string) {
 	e.t.Helper()
-	for _, name := range []string{"argv", "calls", "merged", "base.fail", "prview.fail", "basename", "prrepo", "baseconf.json"} {
+	for _, name := range []string{"argv", "calls", "merged", "base.fail", "base.fail.once", "prview.fail", "basename", "prrepo", "baseconf.json", "draft"} {
 		_ = os.Remove(filepath.Join(e.ghDir, name))
 	}
 	rest, _ := json.Marshal(map[string]any{"f": file, "p": nil, "s": "modified"})
@@ -506,6 +511,19 @@ func TestCmdMergePR_gateSettingsComeFromTheBaseToo(t *testing.T) {
 		{name: "the base's .wt.conf is a symlink: never read as a config with no keys",
 			kv: map[string]string{"baseconf.json": baseJSON("conf/wt.conf", true, 0o120000)}, file: "conf/wt.conf",
 			args: []string{"--checks-ok"}, code: 1, want: []string{"is a symlink", "prod deploy not confirmed"}},
+		// #223 re-review: a fork with the same name under another owner is
+		// another repository.
+		{name: "a PR in a same-named repository of another owner: fails closed",
+			kv: map[string]string{"base.fail": "", "prrepo": "fork/r"}, origin: "noConf", file: "infra/x.yaml",
+			args: []string{"--checks-ok"}, code: 1, want: []string{"fork/r is not this clone's origin", "MAY auto-apply"}},
+		// #223 re-review: one transient failure is retried, never failed closed.
+		{name: "a base read that fails once is retried",
+			checkout: "merge_is_deploy = false\n", kv: map[string]string{"base.fail.once": "", "baseconf.json": baseJSON(gateInfra, true)},
+			file: "infra/x.yaml", code: 1, want: []string{"main's .wt.conf on GitHub", "prod deploy not confirmed"}, not: []string{"could not be read"}},
+		// #223 re-review: a draft under an unread base says MAY too.
+		{name: "a draft under an unread base: refused, and it says MAY",
+			kv: map[string]string{"base.fail": "", "draft": ""}, file: "docs/a.md", args: []string{"--checks-ok"}, code: 1,
+			want: []string{"DRAFT", "MAY auto-apply"}, not: []string{"merge==deploy repo"}},
 		// #223 review: gh can't name the PR at all: never guess the base.
 		{name: "gh can't resolve the PR: fails closed",
 			kv: map[string]string{"prview.fail": ""}, origin: "gated", file: "docs/a.md", args: []string{"--checks-ok"}, code: 1,
@@ -515,7 +533,7 @@ func TestCmdMergePR_gateSettingsComeFromTheBaseToo(t *testing.T) {
 			kv: map[string]string{"base.fail": ""}, file: "docs/a.md", args: []string{"--", "--disable-auto"},
 			not: []string{"deploy not confirmed", "auto-apply", "AUTO-APPLIES"}},
 		{name: "--disable-auto in a repo that deploys: disarming auto-merge deploys nothing",
-			checkout: "merge_is_deploy = true\n", kv: map[string]string{"baseconf.json": baseJSON("merge_is_deploy = true\n", true)},
+			checkout: gateInfra, kv: map[string]string{"baseconf.json": baseJSON(gateInfra, true)},
 			file: "infra/x.yaml", args: []string{"--", "--disable-auto"},
 			not: []string{"deploy not confirmed", "AUTO-APPLIES", "gate settings"}},
 		{name: "--dry-run names both sources",
@@ -558,9 +576,10 @@ func TestCmdMergePR_gateSettingsComeFromTheBaseToo(t *testing.T) {
 				}
 			}
 			if strings.Contains(strings.Join(tc.args, " "), "--disable-auto") {
-				// A passthrough that merges nothing reads no gate settings at all.
-				if strings.Contains(e.calls(), "baseRefName") {
-					t.Errorf("--disable-auto read the base's settings:\n%s", e.calls())
+				// A passthrough that merges nothing reads no gate settings, and
+				// lists no files for a deploy gate it won't run (#223 re-review).
+				if calls := e.calls(); strings.Contains(calls, "baseRefName") || strings.Contains(calls, "changedFiles") {
+					t.Errorf("--disable-auto read the base's settings or the PR's files:\n%s", calls)
 				}
 				return // gh "merges" in the fake either way; only the gates matter here
 			}
@@ -575,9 +594,9 @@ func TestCmdMergePR_gateSettingsComeFromTheBaseToo(t *testing.T) {
 // read are of THAT repository's PR, not this clone's PR of the same number.
 func TestCmdMergePR_forwardedRepoReadsThatPRsFiles(t *testing.T) {
 	e := newGateEnv(t)
-	e.fake("docs/a.md", map[string]string{"prrepo": "other/repo", "baseconf.json": baseJSON(gateInfra, true)})
+	e.fake("infra/x.yaml", map[string]string{"prrepo": "other/repo", "baseconf.json": baseJSON(gateInfra, true)})
 	_, out, _ := e.merge("99999", "--keep", "--dry-run", "--", "-R", "other/repo")
-	var listed bool
+	var listed, draft bool
 	for _, ln := range strings.Split(e.calls(), "\n") {
 		if strings.Contains(ln, "number,url,changedFiles") {
 			listed = true
@@ -585,9 +604,15 @@ func TestCmdMergePR_forwardedRepoReadsThatPRsFiles(t *testing.T) {
 				t.Errorf("the deploy gate's file list read this clone's PR, not other/repo's: %q\n%s", ln, out)
 			}
 		}
+		if strings.Contains(ln, "isDraft") {
+			draft = true
+			if !strings.Contains(ln, "-R other/repo") {
+				t.Errorf("the draft read is this clone's PR, not other/repo's: %q", ln)
+			}
+		}
 	}
-	if !listed {
-		t.Errorf("the deploy gate never listed the PR's files\n%s", out)
+	if !listed || !draft {
+		t.Errorf("the deploy gate never listed the PR's files (%v) or read its draft state (%v)\n%s", listed, draft, out)
 	}
 }
 
@@ -612,14 +637,29 @@ func TestCmdMergePR_holdSettingsComeFromTheBaseToo(t *testing.T) {
 		checkout string
 		base     string
 		code     int
+		limit    string // the hold_max_age the stale warning must name
 	}{
-		{"the checkout shortens hold_max_age, the base keeps the default: the hold blocks", "hold_max_age = 1m\n", "", 1},
-		{"both short: the hold is stale and warns", "hold_max_age = 1m\n", "hold_max_age = 1m\n", 0},
+		{"the checkout shortens hold_max_age, the base keeps the default: the hold blocks", "hold_max_age = 1m\n", "", 1, ""},
+		{"both short: the hold is stale and warns", "hold_max_age = 1m\n", "hold_max_age = 1m\n", 0, "hold_max_age (1m"},
+		// #223 re-review: the warning named the checkout's limit, not the one applied.
+		{"the base's 1h applies over the checkout's 1m: the warning names 1h", "hold_max_age = 1m\n", "hold_max_age = 1h\n", 0, "hold_max_age (1h"},
+		// #223 re-review: GitHub unread and no copy here: the PR's own 1m must
+		// not decide; the unread base holds the default.
+		{"the base unread: the hold still blocks", "hold_max_age = 1m\nmerge_min_checks = off\n", "unread", 1, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e.checkout(tc.checkout)
-			e.fake("docs/a.md", map[string]string{"baseconf.json": baseJSON(tc.base, tc.base != "")})
-			code, out, _ := e.merge("99999", "--keep")
+			kv := map[string]string{"baseconf.json": baseJSON(tc.base, tc.base != "")}
+			args := []string{"99999", "--keep"}
+			if tc.base == "unread" {
+				kv = map[string]string{"base.fail": ""}
+				args = append(args, "--checks-ok", "--confirm-deploy")
+			}
+			e.fake("docs/a.md", kv)
+			code, out, _ := e.merge(args...)
+			if tc.limit != "" && !strings.Contains(out, tc.limit) {
+				t.Errorf("the stale-hold warning doesn't name the limit applied (%s):\n%s", tc.limit, out)
+			}
 			if code != tc.code {
 				t.Errorf("cmdMergePR = %d, want %d\n%s", code, tc.code, out)
 			}

@@ -43,8 +43,8 @@ func (b BaseConf) Repo() string {
 // missing file is a null object with no error (a missing branch nulls the ref
 // too); a directory there is an object that is not a Blob (a Tree).
 const baseConfQuery = `query($owner:String!,$name:String!,$ref:String!,$expr:String!){repository(owner:$owner,name:$name){` +
-	`ref(qualifiedName:$ref){target{oid ... on Commit{tree{entries{name mode}}}}} ` +
-	`object(expression:$expr){__typename ... on Blob{text isBinary isTruncated}}}}`
+	`ref(qualifiedName:$ref){target{oid ... on Commit{tree{entries{name mode oid}}}}} ` +
+	`object(expression:$expr){__typename ... on Blob{oid text isBinary isTruncated}}}}`
 
 // ReadBaseConf reads PR pr's base branch and the .wt.conf on it (#223): pr in
 // repo when repo is not "" (a forwarded -R/--repo), else as gh resolves it
@@ -81,7 +81,7 @@ func ReadBaseConf(pr, repo string) (BaseConf, error) {
 	known := BaseConf{Base: base, Owner: owner, Name: name, Host: ref.host}
 	out, err = run("api", "graphql", "--hostname", ref.host, "-f", "query="+baseConfQuery,
 		"-f", "owner="+owner, "-f", "name="+name, "-f", "ref=refs/heads/"+base, "-f", "expr=refs/heads/"+base+":"+ConfFile,
-		"--jq", `.data.repository | {oid: .ref.target.oid, mode: ([.ref.target.tree.entries[]? | select(.name == "`+ConfFile+`") | .mode] | first), conf: .object}`)
+		"--jq", `.data.repository | ([.ref.target.tree.entries[]? | select(.name == "`+ConfFile+`")] | first) as $e | {oid: .ref.target.oid, mode: $e.mode, eoid: $e.oid, conf: .object}`)
 	if err != nil {
 		return known, fmt.Errorf("cannot read %s's %s: %w", base, ConfFile, ghErrAt(ref.host, apiGraphQL, err))
 	}
@@ -153,8 +153,10 @@ func parseBaseConf(out string) (BaseConf, error) {
 	var v struct {
 		Oid  *string `json:"oid"`
 		Mode *int    `json:"mode"`
+		EOid string  `json:"eoid"` // the tree entry's object id
 		Conf *struct {
 			Typename    string  `json:"__typename"`
+			Oid         string  `json:"oid"`
 			Text        *string `json:"text"`
 			IsBinary    bool    `json:"isBinary"`
 			IsTruncated bool    `json:"isTruncated"`
@@ -178,6 +180,11 @@ func parseBaseConf(out string) (BaseConf, error) {
 		return BaseConf{}, fmt.Errorf("%s on the base branch is a %s, not a file", ConfFile, strings.ToLower(c.Typename))
 	case *v.Mode != modeFile && *v.Mode != modeExecutable:
 		return BaseConf{}, fmt.Errorf("%s on the base branch has mode %o, not a regular file", ConfFile, *v.Mode)
+	case v.EOid != "" && c.Oid != "" && v.EOid != c.Oid:
+		// The tree entry and the object are resolved separately in one query: a
+		// push in between could pair a regular file's mode with a symlink's blob
+		// (#223 re-review).
+		return BaseConf{}, fmt.Errorf("%s changed on the base branch while it was read", ConfFile)
 	case c.IsBinary || c.IsTruncated || c.Text == nil:
 		return BaseConf{}, fmt.Errorf("GitHub returned %s without its whole text (binary or truncated)", ConfFile)
 	}

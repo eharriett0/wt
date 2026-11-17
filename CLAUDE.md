@@ -801,8 +801,13 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   !` fails closed), the checks floor is the highest (`strictestFloor`; a value
   that is not a count, from either, refuses and names where it was set), and
   holds use the longer `hold_max_age` (0 wins) and every `coord_issue`
-  (`strictestHolds`, `mergeCoordGateWith`). `GateFromConf` starts from Load's
-  defaults (hold_max_age 24h), so an unset key never reads as the strictest.
+  (`strictestHolds`, `mergeCoordGateWith`, whose stale-hold warning names the
+  limit applied). `GateFromConf` starts from Load's defaults, so a base with no
+  `.wt.conf` holds at hold_max_age 24h: hold_max_age is the one key whose
+  default is not the loosest, so neither `WT_HOLD_MAX_AGE` nor an untracked
+  local `.wt.conf` can shorten a hold below that any more (#223 re-review,
+  accepted; `wt holds` and `prune-coord --legacy` still read only the
+  checkout's value, so they can disagree with merge-pr).
   ⚠ Measured: a missing file is a null object with NO error (and no tree
   entry), a missing branch nulls the ref too, so no tip is an error, never "no
   file" (`parseBaseConf`); `Commit.file(path:)` was not used because GitHub
@@ -816,23 +821,33 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   this clone's `origin/<base>` for the base GitHub NAMED for this PR, never
   `c.Base` (#223 review: the PR's own `base =` steered it, and a PR into
   `release` read `origin/main`), and only when the PR's repository is this
-  clone's origin (owner and name, case-insensitive; the host can be an ssh
-  alias), so `-R`, a PR URL, `GH_REPO` and a fork's default all fail closed. It
-  fetches first (`fetchBase`, the git transport, which a GraphQL quota doesn't
-  stop); a failed fetch reads the copy as last fetched, and says it may be
-  stale. ⚠ `ReadBaseConf` returns what it resolved WITH its error (base, owner,
+  clone's origin (owner and name, case-insensitive; the host is not compared,
+  since an ssh alias names it differently), so `-R`, a PR URL, `GH_REPO` or a
+  fork's default naming ANOTHER repository fail closed (a `-R` naming origin's
+  own repository takes the fallback). The read is retried once first, as the
+  checks gate's are (`retryable`: not for a rate limit). It fetches first
+  (`fetchBase` = `gitx.FetchNoPrompt`, the git transport, which a GraphQL quota
+  doesn't stop, with GIT_TERMINAL_PROMPT=0 so it never waits on a credential
+  prompt); a failed fetch reads the copy as last fetched, and says it may be
+  stale. ⚠ The tree entry and the object are resolved separately in one
+  query, so their object ids must match (a push between could pair a regular
+  file's mode with a symlink's blob). ⚠ `ReadBaseConf` returns what it resolved WITH its error (base, owner,
   name, host), or the fallback can't read the right branch. ⚠
   `gitx.RefFileText` decides presence by `git ls-tree -z --full-tree` (exact
   path, from the top, whatever the cwd) and reads the blob by id: a failed
   `cat-file -t` used to read as "no file", so in an offline blob:none partial
   clone a `.wt.conf` the base added after the clone was absent (#223 review).
   Any read failure is an error. ⚠ **Fail closed** (`gateSource.unread`): the
-  deploy gate gates the whole repository, its banner and dry-run note say the
-  merge MAY auto-apply (the reason, never "AUTO-APPLIES" as fact), and the
-  checks gate refuses (`ChecksInput.FloorUnread`) until `--checks-ok`; it sets
-  nothing for holds. A repo that never set merge_is_deploy can meet that
-  when GitHub is unreachable; accepted. ⚠ A passthrough that merges nothing
-  (`merge.NonMerging`) reads no settings and passes neither gate. ⚠ With `-R`,
+  deploy gate gates the whole repository, its banner, draft refusal, confirm
+  line and dry-run note say the merge MAY auto-apply (the reason, never
+  "AUTO-APPLIES" as fact), the checks gate refuses, or asks at a terminal
+  (`ChecksInput.FloorUnread`, with its own hint), until `--checks-ok`, and
+  holds keep at least the default hold_max_age (#223 re-review: skipped, the
+  PR's own hold_max_age decided while GitHub was down). A repo that never set
+  merge_is_deploy can meet that when GitHub is unreachable; accepted. ⚠ A
+  passthrough that merges nothing (`merge.NonMerging`) reads nothing from the
+  base and lists no files, and passes neither the deploy nor the checks gate;
+  the hold gate still applies to it, as before #223. ⚠ With `-R`,
   the deploy gate's file list and draft read are that repository's PR
   (`PRChangedFiles(pr, repo)`, `PRIsDraft(pr, repo)`); before, they read this
   clone's PR of the same number. The `WT_*` overlay is the checkout's side, so

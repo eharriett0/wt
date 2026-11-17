@@ -329,6 +329,9 @@ func refuseHints(pr string, v merge.ChecksVerdict, o checksOpts) []string {
 		// Only the read failed, so CI has nothing to wait for (#217: an exhausted
 		// REST quota, the usual cause, lifts on its own).
 		out = append(out, "re-run once gh can read the required checks, or pass --checks-ok to merge without them")
+	case v.FloorUnread != "" && len(v.Reasons()) == 1:
+		// Only the base's floor is unknown (#223): CI has nothing to wait for.
+		out = append(out, "re-run once the base branch's .wt.conf can be read, or pass --checks-ok to merge without its floor")
 	default:
 		out = append(out, fmt.Sprintf("wait for CI (gh pr checks %s --watch) and re-run, or pass --checks-ok to merge anyway", pr))
 	}

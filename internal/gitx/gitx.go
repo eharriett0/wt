@@ -351,6 +351,23 @@ func Fetch(remote, branch string) error {
 	return err
 }
 
+// FetchNoPrompt is Fetch for a read nobody is watching (#223: merge-pr's
+// fallback for the base branch's .wt.conf): GIT_TERMINAL_PROMPT=0, so a
+// credential git can't find fails the fetch instead of waiting on a prompt.
+func FetchNoPrompt(remote, branch string) error {
+	cmd := exec.Command("git", "fetch", remote, "+refs/heads/"+branch+":refs/remotes/"+remote+"/"+branch)
+	cmd.Env = append(scopedEnv(), "GIT_TERMINAL_PROMPT=0")
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if _, err := cmd.Output(); err != nil {
+		if msg := gitStderr(stderr.String()); msg != "" {
+			return fmt.Errorf("%w: %s", err, msg)
+		}
+		return err
+	}
+	return nil
+}
+
 // WorktreeAddNewBranch creates a new worktree at path on a NEW branch cut from
 // base. git refuses when the branch already exists, so it can never re-attach
 // one: `wt new` decides that itself, after checking the branch against

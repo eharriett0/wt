@@ -395,22 +395,27 @@ from GitHub at merge time. The stricter of the two applies:
 
 So a PR that turns the gate off, narrows the paths, lowers the floor or
 shortens `hold_max_age` is still held to the base's settings, and a branch cut
-before the base added a deploy glob is gated for it. The environment can only
-tighten these settings, never loosen the base's: `--confirm-deploy` and
-`--checks-ok` are the ways past them.
+before the base added a deploy glob is gated for it. A base branch without a
+`.wt.conf` counts as the defaults, so `hold_max_age` stays at least 24h there
+too. The environment can only tighten these settings, never loosen the base's:
+`--confirm-deploy` and `--checks-ok` are the ways past them. (`wt holds` and
+`wt prune-coord` still read only this checkout's `hold_max_age`.)
 
-When GitHub can't be read, `merge-pr` fetches the PR's base branch into this
-clone and reads that copy (with a warning; if the fetch fails too, the copy as
-last fetched, which may be stale), but only when the PR's repository is this
-clone's `origin`. In every other case (gh could not name the PR's base, the PR
-is in another repository through `-R`, a URL, `GH_REPO` or a fork's default,
-or this clone's copy can't be read, a symlinked or unfetched `.wt.conf`
-included) it fails closed: the deploy gate gates, saying the merge **may**
-auto-apply rather than that it does, and the checks gate refuses without
-`--checks-ok`, since the base's floor is unknown. That can happen in a repository
-that never set `merge_is_deploy`, when GitHub is unreachable. A passthrough
-that merges nothing (`-- --disable-auto`, `-- --help`) reads no gate settings
-and passes no gate. `--dry-run` names both sources and what each one sets.
+When GitHub can't be read (after one retry), `merge-pr` fetches the PR's base
+branch into this clone and reads that copy (with a warning; if the fetch fails
+too, the copy as last fetched, which may be stale), but only when the PR's
+repository is this clone's `origin` (owner and name; the host is not compared,
+since an ssh alias names it differently). In every other case (gh could not
+name the PR's base, the PR is in another repository through `-R`, a URL,
+`GH_REPO` or a fork's default, or this clone's copy can't be read, a symlinked
+or unfetched `.wt.conf` included) it fails closed: the deploy gate gates,
+saying the merge **may** auto-apply rather than that it does, the checks gate
+refuses (at a terminal, asks) without `--checks-ok`, since the base's floor is
+unknown, and holds keep at least the default `hold_max_age`. That can happen in
+a repository that never set `merge_is_deploy`, when GitHub is unreachable. A
+passthrough that merges nothing (`-- --disable-auto`, `-- --help`) reads
+nothing from the base and passes neither the deploy nor the checks gate; the
+hold gate still applies. `--dry-run` names both sources and what each one sets.
 
 ## Cross-repo epics
 

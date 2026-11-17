@@ -69,6 +69,9 @@ func TestParseBaseConf(t *testing.T) {
 	if read, err := parseBaseConf(`{` + tip + `,"conf":null}`); err != nil || read.Found {
 		t.Errorf("no file, mode omitted: %+v, %v; want not found, no error", read, err)
 	}
+	if read, err := parseBaseConf(`{` + tip + `,"mode":33188,"eoid":"aaa","conf":{"__typename":"Blob","oid":"aaa","text":"y","isBinary":false,"isTruncated":false}}`); err != nil || read.Text != "y" {
+		t.Errorf("matching entry and object ids: %+v, %v", read, err)
+	}
 	if read, err := parseBaseConf(`{` + tip + `,"mode":33188,"conf":` + blob("") + `}`); err != nil || !read.Found {
 		t.Errorf("an empty file is a file: %+v, %v", read, err)
 	}
@@ -81,11 +84,12 @@ func TestParseBaseConf(t *testing.T) {
 		"an entry but no object":               `{` + tip + `,"mode":33188,"conf":null}`,
 		"an object but no entry":               `{` + tip + `,"mode":null,"conf":` + blob("x") + `}`,
 		"an odd mode":                          `{` + tip + `,"mode":420,"conf":` + blob("x") + `}`,
-		"binary":                               `{` + tip + `,"mode":33188,"conf":{"__typename":"Blob","text":null,"isBinary":true,"isTruncated":false}}`,
-		"truncated":                            `{` + tip + `,"mode":33188,"conf":{"__typename":"Blob","text":"merge_is","isBinary":false,"isTruncated":true}}`,
-		"a Blob without text":                  `{` + tip + `,"mode":33188,"conf":{"__typename":"Blob","isBinary":false,"isTruncated":false}}`,
-		"not JSON":                             `7`,
-		"nothing":                              ``,
+		"the entry and the object are two blobs (#223 re-review: a push between)": `{` + tip + `,"mode":33188,"eoid":"aaa","conf":{"__typename":"Blob","oid":"bbb","text":"x","isBinary":false,"isTruncated":false}}`,
+		"binary":              `{` + tip + `,"mode":33188,"conf":{"__typename":"Blob","text":null,"isBinary":true,"isTruncated":false}}`,
+		"truncated":           `{` + tip + `,"mode":33188,"conf":{"__typename":"Blob","text":"merge_is","isBinary":false,"isTruncated":true}}`,
+		"a Blob without text": `{` + tip + `,"mode":33188,"conf":{"__typename":"Blob","isBinary":false,"isTruncated":false}}`,
+		"not JSON":            `7`,
+		"nothing":             ``,
 	} {
 		if read, err := parseBaseConf(out); err == nil {
 			t.Errorf("%s: parseBaseConf = %+v, want an error", name, read)

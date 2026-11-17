@@ -490,7 +490,11 @@ func cmdMergePR(args []string) int {
 	// lines, and like the real gate reads nothing for a draft it would refuse.
 	// A passthrough that merges nothing (--disable-auto, --help) deploys
 	// nothing either, so it skips the deploy gate as it skips the checks gate.
-	if fires, unsure := deployGateApplies(gates, pr, repo); fires && nonMerging == "" {
+	fires, unsure := false, ""
+	if nonMerging == "" {
+		fires, unsure = deployGateApplies(gates, pr, repo)
+	}
+	if fires {
 		statusHost := deployStatusHost(prHost)
 		if *dryRun {
 			draft, derr := ghx.PRIsDraft(pr, repo)
@@ -724,6 +728,8 @@ func deployDryRunNote(pr string, draft, confirmed bool, unsure string) string {
 		applies = "MAY auto-apply to prod: " + unsure
 	}
 	switch {
+	case draft && unsure != "":
+		return "--dry-run: a real merge would REFUSE here: PR #" + pr + " is a DRAFT, and merging it MAY auto-apply to prod: " + unsure + ". Mark it ready first."
 	case draft:
 		return "--dry-run: a real merge would REFUSE here: PR #" + pr + " is a DRAFT in a merge==deploy repo. Mark it ready first."
 	case confirmed:
@@ -741,7 +747,11 @@ func deployDryRunNote(pr string, draft, confirmed bool, unsure string) string {
 // confirm, so whoever confirms has just read it; it never blocks.
 func deployGate(pr, repo string, confirmed bool, statusHost, unsure string) int {
 	if draft, err := ghx.PRIsDraft(pr, repo); err == nil && draft {
-		ui.Err("PR #%s is a DRAFT — refusing to merge in a merge==deploy repo (would auto-apply to prod).", pr)
+		if unsure != "" {
+			ui.Err("PR #%s is a DRAFT: refusing to merge, since merging it MAY auto-apply to prod (%s).", pr, unsure)
+		} else {
+			ui.Err("PR #%s is a DRAFT — refusing to merge in a merge==deploy repo (would auto-apply to prod).", pr)
+		}
 		ui.Info("mark it ready first: gh pr ready %s", pr)
 		return 1
 	}
@@ -754,7 +764,11 @@ func deployGate(pr, repo string, confirmed bool, statusHost, unsure string) int 
 	}
 	warnActionsStatus(statusHost)
 	if confirmed {
-		ui.Info("--confirm-deploy set — proceeding with the prod deploy.")
+		if unsure != "" {
+			ui.Info("--confirm-deploy set: merging, though it may auto-apply to prod.")
+		} else {
+			ui.Info("--confirm-deploy set — proceeding with the prod deploy.")
+		}
 		return 0
 	}
 	if !stdinIsTTY() {

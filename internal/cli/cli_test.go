@@ -358,10 +358,12 @@ func TestDeployDryRunNote(t *testing.T) {
 		// says MAY, never that the merge deploys.
 		{"unsure → stops, and says it may deploy", false, false, "the base was unread",
 			[]string{"a real merge stops at the deploy gate", "MAY auto-apply to prod: the base was unread"}},
+		{"unsure draft → refused, and says it may deploy", true, false, "the base was unread",
+			[]string{"would REFUSE", "DRAFT", "MAY auto-apply to prod: the base was unread"}},
 	}
 	for _, c := range cases {
 		got := deployDryRunNote("2602", c.draft, c.confirmed, c.unsure)
-		if c.unsure != "" && strings.Contains(got, "AUTO-APPLIES") {
+		if c.unsure != "" && (strings.Contains(got, "AUTO-APPLIES") || strings.Contains(got, "merge==deploy repo")) {
 			t.Errorf("%s: %q states a deploy as fact", c.name, got)
 		}
 		if !strings.HasPrefix(got, "--dry-run: ") || !strings.Contains(got, "#2602") {

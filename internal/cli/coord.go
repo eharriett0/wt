@@ -675,7 +675,7 @@ func mergeCoordGateWith(c *config.Config, holdMaxAge time.Duration, issues []int
 	// records wt can't attribute) WARN but never block, so a dead window can't
 	// wedge merge forever (#32).
 	if len(stale) > 0 {
-		warnStaleHolds(stale, v, now, c.HoldMaxAge)
+		warnStaleHolds(stale, v, now, holdMaxAge)
 	}
 	if len(fresh) == 0 {
 		return 0
