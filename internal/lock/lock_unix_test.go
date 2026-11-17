@@ -133,6 +133,20 @@ func TestExclusiveWithin_unsupportedAfterHeldFailsClosed(t *testing.T) {
 	if err := ExclusiveWithin(f, time.Second, 0, nil); Unsupported(err) || !errors.Is(err, syscall.ENOLCK) {
 		t.Errorf("ENOLCK on the first try: err = %v, want ENOLCK, never Unsupported", err)
 	}
+	// Any failure after a held try names the holder, ENOLCK and EIO too, so
+	// the gate's refusal says to resume it.
+	for _, errno := range []syscall.Errno{syscall.ENOLCK, syscall.EIO} {
+		tries = 0
+		flock = func(int, int) error {
+			if tries++; tries == 1 {
+				return syscall.EWOULDBLOCK
+			}
+			return errno
+		}
+		if err := ExclusiveWithin(f, time.Second, 0, nil); !errors.Is(err, ErrSeenHeld) {
+			t.Errorf("held, then %v: err = %v, want ErrSeenHeld", errno, err)
+		}
+	}
 }
 
 // #235 review: a signal can interrupt an NFS lock call (EINTR); that is no
