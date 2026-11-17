@@ -554,6 +554,14 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   on the BASE branch** (`ReapableBranch`): "patch-equivalent on base" is
   trivially true for the base itself, so every downstream verdict says shipped
   and the printed command becomes `git branch -D main` (#101).
+  ⚠ **A merged PR reaps only a tip that shipped in it (#230 review).** It
+  proves only the commits it had: clean reaped a merged PR's lane without
+  asking, and a commit made there after the merge went with the branch.
+  `merge.UnshippedLane` (merge-pr's #187 check, one function for both) must
+  find the tip at the PR's `headRefOid` or an ancestor of it; otherwise the
+  merged PR proves nothing and only the cherry proof can reap. Every proof is
+  about the tip read at decision time, and the branch is deleted only there.
+  `prLookup` is the test seam (gh's auth answer is memoized process-wide).
   ⚠ **Untracked files count whatever `status.showUntrackedFiles` says (#208).**
   A repo set to `no` hid them from a plain porcelain status AND from `git
   worktree remove`'s own check, so `clean -y`, merge-pr's auto-clean and
@@ -758,6 +766,51 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   `merge.LocalTipVerdict` needs the tip to BE the PR's `headRefOid` or an
   ancestor of it; otherwise, or when it can't tell (no head, not fetched here),
   the worktree and branch stay and the warning counts the commits not in the PR.
+  ⚠ **The removal's git runs from the main checkout (#230).** merge-pr usually
+  runs INSIDE the worktree it removes; `git branch -D` then ran in the removed
+  directory, exited 128, and the merged branch stayed, while the hint said to
+  cd into that same directory (`c.Root` is the cwd's worktree). `worktree.remove`
+  resolves `gitx.MainCheckout()` (the shared `.git`'s parent; in a bare
+  repository, the repository itself) before removing, runs the removal and the
+  delete there, and prints the cd hint itself (`holdsCwd`, read before, so a
+  symlinked or differently-cased cwd still gets it). ⚠⚠ **That fix made the
+  delete WORK where it used to fail, which armed guards that failure had been
+  hiding (#230 review; "scope-widening" below):** every remover now
+  (1) makes the path absolute from the cwd first, since the guards read it
+  there and git, run from the main checkout, read a relative one there (`release
+  --clean` from a subdirectory checked one lane and removed another);
+  (2) deletes the branch only at the tip its caller CHECKED
+  (`gitx.DeleteBranchAt`, as discard does; `Remove(c, path, branch, tip,
+  force)`, no tip keeps the branch), since `git branch -D` deleted a commit that
+  landed after the check;
+  (3) keeps a case twin of the base (`sameBranch`, `Main` under
+  `core.ignorecase` is main's loose ref).
+  `release --clean` reads its placeholder tip first and origin from the main
+  checkout (read from the removed lane it failed, read as "gone", and origin's
+  placeholder stayed), removes only a lane still ON the claim's branch, and
+  deletes origin's placeholder with a lease on that tip
+  (`DeleteRemoteBranch(dir, b, tip)`: `--force-with-lease`, which git applies
+  to a delete). `wt clean` removes the cwd's lane last (`cwdLast`). ⚠ The #187
+  check fetches `refs/pull/<n>/head` once when the PR's head is not in this
+  clone (updated on GitHub, then deleted with the merge: no plain fetch brings
+  it, and the lane was kept forever), and an UNKNOWN verdict never advises
+  "push them" (that recreates the deleted branch at a stale tip). A PR given
+  as a URL is fetched by its number (`merge.PRNumber`). ⚠ **A no-prompt
+  fetch has a deadline** (`fetchTimeout` 30s for the PR head,
+  `baseFetchTimeout` 120s for #223's base fetch; ssh `ConnectTimeout=10`,
+  HTTPS `lowSpeedTime=15`): an origin that took the connection and never
+  answered hung merge-pr's cleanup. ⚠ The fetch runs in its own process group
+  and the deadline SIGTERMs the GROUP (`stopGroupOnCancel`, unix): Apple's git
+  runs the fetch as a child of a wrapper, and killing only the started process
+  left the real fetch and git-remote-http running (pinned: the test pgreps for
+  them while the silent origin still holds the connection). `cmd.WaitDelay`
+  then stops waiting on a helper holding the pipe and SIGKILLs the leader
+  (measured: Wait waited 15s past a 2s deadline without it). `release --clean` compares the lane's FULL HEAD ref
+  (`gitx.SymbolicHead`): a tag of the branch's name made `--abbrev-ref` say
+  `heads/<b>`. A lease refusal says origin moved. A relative
+  `worktree_root` still means a different directory from each cwd (#238).
+  Pinned by `remove_review_test.go`, `TestRelease_CleanFromInsideTheLane` and
+  `TestCmdMergePR_keepsAnUnshippedLaneFromInsideIt`.
 - **merge-pr's checks gate never reads a failed read, or `--admin`, as green
   (#179).** It reads the head commit's statusCheckRollup (one GraphQL query,
   paged: `ghx.PRChecks`) and what the base branch requires, from the PR's own

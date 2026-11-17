@@ -177,7 +177,7 @@ func DeleteBranchAt(dir, branch, tip string) error {
 	} else if where != "" {
 		return fmt.Errorf("%s is %s", branch, where)
 	}
-	if _, err := runReporting(dir, "update-ref", "-m", "wt discard", "-d", "refs/heads/"+branch, tip); err != nil {
+	if _, err := runReporting(dir, "update-ref", "-m", "wt: delete branch", "-d", "refs/heads/"+branch, tip); err != nil {
 		return err
 	}
 	_, _ = runReporting(dir, "config", "--remove-section", "branch."+branch)

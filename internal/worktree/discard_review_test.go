@@ -308,7 +308,7 @@ func TestRemove_RefusesWhatGitStatusDoesNotShow(t *testing.T) {
 	dep := filepath.Join(lane, "vendor", "dep")
 	gitW(t, f.repo, "init", "-q", dep)
 	f.commitHere(dep, "unpushed")
-	if err := Remove(f.c, lane, "lane", false); err == nil || !strings.Contains(err.Error(), "git repository in its ignored files (vendor/dep)") {
+	if err := Remove(f.c, lane, "lane", f.tip(lane, "refs/heads/lane"), false); err == nil || !strings.Contains(err.Error(), "git repository in its ignored files (vendor/dep)") {
 		t.Errorf("Remove = %v, want the nested repository named", err)
 	}
 	if !dirExists(filepath.Join(dep, ".git")) || !f.has("refs/heads/lane") {
@@ -321,7 +321,7 @@ func TestRemove_RefusesWhatGitStatusDoesNotShow(t *testing.T) {
 	sm := f.worktreeOn("sm", f.base)
 	gitW(t, sm, "-c", "protocol.file.allow=always", "submodule", "add", "-q", sub, "sub")
 	f.commitHere(sm, "add a submodule")
-	if err := Remove(f.c, sm, "sm", false); err == nil || !strings.Contains(err.Error(), "checked-out submodules (sub") {
+	if err := Remove(f.c, sm, "sm", f.tip(sm, "refs/heads/sm"), false); err == nil || !strings.Contains(err.Error(), "checked-out submodules (sub") {
 		t.Errorf("Remove = %v, want the submodule named before git refuses", err)
 	}
 }

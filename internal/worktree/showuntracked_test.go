@@ -126,7 +126,7 @@ func TestRemove_RefusesUntrackedFilesTheConfigHides(t *testing.T) {
 	if err := os.WriteFile(file, []byte("not committed\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	err := Remove(f.c, dir, "lane", false)
+	err := Remove(f.c, dir, "lane", f.tip(dir, "refs/heads/lane"), false)
 	if err == nil || !strings.Contains(err.Error(), "has uncommitted changes") {
 		t.Fatalf("Remove = %v, want its own refusal of uncommitted changes", err)
 	}

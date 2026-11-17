@@ -100,15 +100,22 @@ func LocalTipVerdict(tip, head string, ancestor bool, ancestorErr error) TipVerd
 // not read when the verdict is unknown. Pure.
 func KeptLaneMessage(v TipVerdict, branch, pr string, n int, tip, head string) string {
 	const kept = "kept the worktree and branch (push them, or delete them yourself)"
+	// Unknown is not "unshipped" (#230 review): "push them" would recreate a
+	// branch the merge deleted, at a stale tip.
+	const unsure = "kept the worktree and branch (delete them yourself once you've checked nothing is missing)"
 	switch {
 	case v == TipUnshipped && n > 0:
 		return fmt.Sprintf("%s has %d commit(s) that were not in PR #%s; %s", branch, n, pr, kept)
 	case v == TipUnshipped:
 		return fmt.Sprintf("%s has commits that were not in PR #%s (wt could not count them); %s", branch, pr, kept)
 	case head == "":
-		return fmt.Sprintf("%s may have commits that were not in PR #%s: wt could not read the PR's head commit; %s", branch, pr, kept)
+		return fmt.Sprintf("%s may have commits that were not in PR #%s: wt could not read the PR's head commit; %s", branch, pr, unsure)
 	case tip == "":
-		return fmt.Sprintf("%s may have commits that were not in PR #%s: wt could not read the branch's tip; %s", branch, pr, kept)
+		return fmt.Sprintf("%s may have commits that were not in PR #%s: wt could not read the branch's tip; %s", branch, pr, unsure)
 	}
-	return fmt.Sprintf("%s may have commits that were not in PR #%s: wt could not compare its tip with the PR's head %.12s (is that commit fetched here?); %s", branch, pr, head, kept)
+	fetch := "fetch it into this clone"
+	if n := PRNumber(pr); n != "" {
+		fetch = "`git fetch origin refs/pull/" + n + "/head` brings it in"
+	}
+	return fmt.Sprintf("%s may have commits that were not in PR #%s: wt could not compare its tip with the PR's head %.12s, which is not in this clone (%s; then run it again); %s", branch, pr, head, fetch, unsure)
 }

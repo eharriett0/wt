@@ -178,3 +178,111 @@ func TestCmdMergePR_keepsTheLaneUnlessMerged(t *testing.T) {
 		})
 	}
 }
+
+// TestCmdMergePR_autoCleanFromInsideTheLane is #230: merge-pr run from inside
+// the PR's own worktree (the usual place) removed the worktree, then deleted
+// the branch with git running in the directory just removed (exit 128, the
+// branch stayed), and told the operator to cd into that same directory. The
+// branch now goes too, and the hint names the main checkout.
+func TestCmdMergePR_autoCleanFromInsideTheLane(t *testing.T) {
+	gitBin, repo, lane := inLaneMergeRepo(t, false)
+	var code int
+	out, errOut := captureT(t, func() { code = cmdMergePR([]string{"99999"}) })
+	if code != 0 {
+		t.Fatalf("cmdMergePR = %d\n%s%s", code, out, errOut)
+	}
+	if _, err := os.Stat(lane); err == nil {
+		t.Errorf("the lane was kept\n%s%s", out, errOut)
+	}
+	if exec.Command(gitBin, "-C", repo, "rev-parse", "-q", "--verify", "refs/heads/feat-x").Run() == nil {
+		t.Errorf("the merged branch was kept (deleted from the removed directory?)\n%s%s", out, errOut)
+	}
+	if strings.Contains(out+errOut, "not deleted") || !strings.Contains(out+errOut, "cd "+repo+" ") {
+		t.Errorf("want the branch deleted and the hint to name the main checkout %s:\n%s%s", repo, out, errOut)
+	}
+}
+
+// #187 from inside the lane (#230 review): since #230 the branch delete works
+// there, so a lane with a commit the PR doesn't have must still be kept, as it
+// is from the main checkout.
+func TestCmdMergePR_keepsAnUnshippedLaneFromInsideIt(t *testing.T) {
+	gitBin, repo, lane := inLaneMergeRepo(t, true)
+	tip, err := exec.Command(gitBin, "-C", lane, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var code int
+	out, errOut := captureT(t, func() { code = cmdMergePR([]string{"99999"}) })
+	if code != 0 {
+		t.Fatalf("cmdMergePR = %d\n%s%s", code, out, errOut)
+	}
+	if _, err := os.Stat(lane); err != nil {
+		t.Errorf("the lane was removed: %v\n%s%s", err, out, errOut)
+	}
+	got, _ := exec.Command(gitBin, "-C", repo, "rev-parse", "-q", "--verify", "refs/heads/feat-x").Output()
+	if strings.TrimSpace(string(got)) != strings.TrimSpace(string(tip)) {
+		t.Errorf("feat-x at %q, want kept at its follow-up %s\n%s%s", got, tip, out, errOut)
+	}
+	if !strings.Contains(out+errOut, "feat-x has 1 commit(s) that were not in PR #99999") {
+		t.Errorf("want the kept-lane warning:\n%s%s", out, errOut)
+	}
+}
+
+// inLaneMergeRepo is a repo with lane feat-x, PR 99999's head, behind the fake
+// gh, and the cwd inside the lane. followUp adds a commit the PR doesn't have.
+func inLaneMergeRepo(t *testing.T, followUp bool) (gitBin, repo, lane string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake gh is a shell script")
+	}
+	gitBin, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("no git")
+	}
+	hermeticGitT(t)
+	ghDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ghDir, "gh"), []byte(postMergeGh), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sep := string(os.PathListSeparator)
+	t.Setenv("PATH", ghDir+sep+filepath.Dir(gitBin)+sep+"/usr/bin"+sep+"/bin")
+	if got, err := exec.LookPath("gh"); err != nil || got != filepath.Join(ghDir, "gh") {
+		t.Fatalf("gh resolves to %q (%v), not the fake", got, err)
+	}
+	t.Setenv("HOME", t.TempDir())
+	postMergeSleep = func(time.Duration) {}
+	t.Cleanup(func() { postMergeSleep = time.Sleep })
+
+	parent, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo = filepath.Join(parent, "repo")
+	lane = filepath.Join(parent, "repo-worktrees", "feat-x")
+	for _, args := range [][]string{
+		{"init", "-q", "-b", "main", repo},
+		{"-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base"},
+		{"-C", repo, "worktree", "add", "-q", "-b", "feat-x", lane},
+	} {
+		if out, err := exec.Command(gitBin, args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	head, err := exec.Command(gitBin, "-C", lane, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, text := range map[string][]byte{"state": []byte("OPEN"), "head": head, "merges": nil} {
+		if err := os.WriteFile(filepath.Join(ghDir, name), text, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = os.Remove(filepath.Join(ghDir, "fails"))
+	if followUp {
+		if out, err := exec.Command(gitBin, "-C", lane, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "follow-up").CombinedOutput(); err != nil {
+			t.Fatalf("follow-up commit: %v\n%s", err, out)
+		}
+	}
+	t.Chdir(lane)
+	return gitBin, repo, lane
+}

@@ -34,8 +34,20 @@ func TestDeleteRemoteBranch(t *testing.T) {
 		t.Fatal("expected non-fast-forward rejection re-pushing a divergent branch (the #159 bug)")
 	}
 
-	// the fix: delete the remote branch, then the re-push succeeds cleanly
-	if err := DeleteRemoteBranch(repo, "feat-1"); err != nil {
+	// the fix: delete the remote branch, then the re-push succeeds cleanly. Only
+	// at the tip it was checked at (#230 review): a stale tip is refused.
+	remoteTip, err := RemoteBranchTip(repo, "feat-1")
+	if err != nil || remoteTip == "" {
+		t.Fatalf("RemoteBranchTip: %q, %v", remoteTip, err)
+	}
+	stale := strings.TrimSpace(gitOut(t, repo, "rev-parse", "HEAD"))
+	if err := DeleteRemoteBranch(repo, "feat-1", stale); err == nil || !strings.Contains(err.Error(), "stale info") {
+		t.Fatalf("DeleteRemoteBranch at a tip origin's branch is not at: %v, want git's lease refusal (stale info)", err)
+	}
+	if got, _ := RemoteBranchTip(repo, "feat-1"); got != remoteTip {
+		t.Fatalf("origin's feat-1 at %q after a refused delete, want %s", got, remoteTip)
+	}
+	if err := DeleteRemoteBranch(repo, "feat-1", remoteTip); err != nil {
 		t.Fatalf("DeleteRemoteBranch: %v", err)
 	}
 	if out, _ := RunDir(repo, "ls-remote", "--heads", "origin", "feat-1"); strings.TrimSpace(out) != "" {
@@ -48,7 +60,7 @@ func TestDeleteRemoteBranch(t *testing.T) {
 	// deleting an already-absent remote branch is an error the caller treats as
 	// best-effort (release --clean logs and moves on).
 	runGit(t, repo, "push", "-q", "origin", "--delete", "feat-1")
-	if err := DeleteRemoteBranch(repo, "feat-1"); err == nil {
+	if err := DeleteRemoteBranch(repo, "feat-1", remoteTip); err == nil {
 		t.Error("deleting an absent remote branch should error (caller treats best-effort)")
 	}
 }
