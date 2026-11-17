@@ -1515,13 +1515,17 @@ func ChangedRangesNew(dir, base, file string) []LineRange {
 // base, else base's). A line deleted has no line in the window's copy, so New
 // alone credited a deleted section to the section above it, or to nothing
 // once the file was emptied or deleted: deleting another window's section
-// read "disjoint" while git conflicts. All: count every section, the copy's
-// and Old's, because the measurement failed (a diff git couldn't run, or an
-// Old it couldn't read), never "no edits".
+// read "disjoint" while git conflicts. Gaps are the diff's pure insertions,
+// in Old's numbers too (Gap ranges: between Start and Start+1; Start 0 is the
+// top), so an insertion can claim the line it lands after in Old (#237
+// review: a new section's own lines have no section in Old, and deleting the
+// section it was added to read "disjoint"). All: count every section,
+// because the measurement failed (a diff git couldn't run, or an Old it
+// couldn't read), never "no edits".
 type DocEdits struct {
-	New, Deleted []LineRange
-	Old          string
-	All          bool
+	New, Deleted, Gaps []LineRange
+	Old                string
+	All                bool
 }
 
 // ChangedDocEdits is the section grade's measurement of file in the worktree
@@ -1548,11 +1552,12 @@ func ChangedDocEdits(dir, base, file string) DocEdits {
 }
 
 // docEditsFrom reads a -U0 diff from the blob old (a "<rev>:<path>") into
-// DocEdits. Old is read only when the diff deleted something: as stored
-// (cat-file, no filters), the frame the diff's old side counts in.
+// DocEdits. Old is read only when the diff deleted or inserted something
+// (an old-frame claim to place): as stored (cat-file, no filters), the frame
+// the diff's old side counts in.
 func docEditsFrom(dir, old, diff string) DocEdits {
-	e := DocEdits{New: parseHunkRanges(diff), Deleted: parseDeletedRanges(diff)}
-	if len(e.Deleted) > 0 {
+	e := DocEdits{New: parseHunkRanges(diff), Deleted: parseDeletedRanges(diff), Gaps: parseInsertGaps(diff)}
+	if len(e.Deleted) > 0 || len(e.Gaps) > 0 {
 		content, err := runRaw(dir, "cat-file", "blob", old)
 		if err != nil {
 			e.All = true
@@ -1561,6 +1566,19 @@ func docEditsFrom(dir, old, diff string) DocEdits {
 		}
 	}
 	return e
+}
+
+// parseInsertGaps extracts the OLD-side gap of each pure insertion (#237
+// review): a hunk with an old count of zero adds lines after old line Start
+// (0: before the first). Pure.
+func parseInsertGaps(diff string) []LineRange {
+	var out []LineRange
+	for _, h := range parseHunks(diff) {
+		if h.oldCount == 0 {
+			out = append(out, gapAfter(h.oldStart))
+		}
+	}
+	return out
 }
 
 // parseDeletedRanges extracts the OLD-side lines each -U0 hunk removed or

@@ -571,6 +571,43 @@ type PendingDoc struct {
 	Edits   gitx.DocEdits
 }
 
+// oldClaims are the lines of the old copy (secs, parsed from e.Old) whose
+// sections a window's edit claims there (#237 and its review):
+//   - every line it deleted or replaced;
+//   - for a deleted or replaced HEADING line, the line above it too: git
+//     conflicts the heading's change with an edit of the line before it,
+//     the previous section's last line (a rename of "## Beta" against an
+//     edit of the last Alpha line);
+//   - for an insertion, the line it lands after (the first line, inserted
+//     at the top): git conflicts it with a change of that line or another
+//     insertion in that gap, and a new section's own lines have no section
+//     in the old copy, so deleting the section it was added to, or emptying
+//     the doc, read "disjoint". Not the line after the gap, on purpose:
+//     appending a section at the end of your lane would claim the next lane
+//     (an edit of the next heading line itself is caught from its side, by
+//     the rule above).
+//
+// Pure.
+func oldClaims(secs []section.Section, e gitx.DocEdits) []gitx.LineRange {
+	heading := map[int]bool{}
+	for _, s := range secs {
+		if s.Heading != "" {
+			heading[s.Start] = true
+		}
+	}
+	out := append([]gitx.LineRange(nil), e.Deleted...)
+	for _, d := range e.Deleted {
+		if heading[d.Start] && d.Start > 1 {
+			out = append(out, gitx.LineRange{Start: d.Start - 1, End: d.Start - 1})
+		}
+	}
+	for _, g := range e.Gaps {
+		k := max(g.Start, 1)
+		out = append(out, gitx.LineRange{Start: k, End: k})
+	}
+	return out
+}
+
 // SharedSectionsAcrossWith is SharedSectionsAcross with some worktrees' copies
 // given instead of read from disk (pending, keyed by worktree): the edit hooks
 // grade a structured doc's sections as they will read once the edit is made,
@@ -609,8 +646,9 @@ func SharedSectionsAcrossWith(base string, worktrees []string, rel, delimiter st
 		}
 		any = true
 		heads := section.EditedHeadings(section.Parse(content, re), e.New)
-		if len(e.Deleted) > 0 {
-			heads = append(heads, section.EditedHeadings(section.Parse(e.Old, re), e.Deleted)...)
+		if len(e.Deleted) > 0 || len(e.Gaps) > 0 {
+			old := section.Parse(e.Old, re)
+			heads = append(heads, section.EditedHeadings(old, oldClaims(old, e))...)
 		}
 		if e.All {
 			all++
