@@ -131,6 +131,13 @@ func TestSectionDeletions_MatchMergeTree(t *testing.T) {
 		{name: "wa adds a section at the end of Alpha, wb edits Beta's body", plan: deletePlan,
 			wa: []func(*testing.T, string){edit("a3\n", "a3\n## Delta\nd1\n")},
 			wb: []func(*testing.T, string){edit("b4\n", "Xb4\n")}},
+		// Base has no PLAN.md and each window adds its own (#244 review):
+		// git conflicts (add/add); a doc the measured revision lacks is
+		// every section.
+		{name: "N1: both windows add the doc", plan: "",
+			wa:       []func(*testing.T, string){func(t *testing.T, dir string) { writeT(t, dir, "PLAN.md", "# Plan\n## A\na1\n") }},
+			wb:       []func(*testing.T, string){func(t *testing.T, dir string) { writeT(t, dir, "PLAN.md", "# Plan\n## B\nb1\n") }},
+			conflict: true, high: true},
 		// wa is behind main (main inserted lines in Alpha after wa forked):
 		// its deletion is read in the merge base's copy. main inserts more
 		// lines than Beta has, so read in base's copy instead, the deleted
@@ -180,7 +187,9 @@ func sectionDeleteWindows(t *testing.T, plan string, main func(*testing.T, strin
 	gitT(t, root, "config", "user.email", "t@t.test")
 	gitT(t, root, "config", "user.name", "t")
 	writeT(t, root, ".wt.conf", "shared_docs = PLAN.md\nstructured_doc.PLAN.md = ^##\\s\n")
-	writeT(t, root, "PLAN.md", plan)
+	if plan != "" { // "": base has no PLAN.md
+		writeT(t, root, "PLAN.md", plan)
+	}
 	gitT(t, root, "add", "-A")
 	gitT(t, root, "commit", "-qm", "base")
 	dirs := t.TempDir()

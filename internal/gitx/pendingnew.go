@@ -62,7 +62,7 @@ func ChangedDocEditsWith(dir, base, file string, content []byte) (DocEdits, bool
 		if err != nil {
 			return DocEdits{}, err
 		}
-		return docEditsFrom(dir, old, string(out)), nil
+		return docEditsFrom(dir, old, string(out), old == empty), nil
 	}
 	// The working tree's side of `git diff <rev> -- file`: the copy when the
 	// index tracks the file, else nothing.

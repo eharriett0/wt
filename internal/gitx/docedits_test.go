@@ -140,3 +140,23 @@ func TestParseInsertGaps(t *testing.T) {
 		t.Errorf("parseInsertGaps = %v, want %v", got, want)
 	}
 }
+
+// A doc the measured revision lacks is added whole: All, in both
+// measurements alike (#244 review). git conflicts two windows' adds of one
+// path (add/add); and the pending measurement names the missing side by the
+// empty blob, which this repo holds (an empty file is committed), so reading
+// it "succeeded" and the hook would have disagreed with wt check.
+func TestChangedDocEdits_NewDocIsAll(t *testing.T) {
+	dir := gitRepo(t)
+	writeFile(t, dir, "empty.txt", "")
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "commit", "-qm", "base, with an empty file")
+	const doc = "# Plan\n## A\na1\n"
+	writeFile(t, dir, "PLAN.md", doc)
+	runGit(t, dir, "add", "PLAN.md")
+	written := ChangedDocEdits(dir, "main", "PLAN.md")
+	pending, ok := ChangedDocEditsWith(dir, "main", "PLAN.md", []byte(doc))
+	if !ok || !written.All || !reflect.DeepEqual(pending, written) {
+		t.Errorf("a new doc: written %+v, pending %+v (ok %v); want both All, equal", written, pending, ok)
+	}
+}

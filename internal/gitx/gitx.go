@@ -1541,29 +1541,41 @@ func ChangedDocEdits(dir, base, file string) DocEdits {
 	}
 	if mb := behindMergeBase(dir, ref, sha, file); mb != "" {
 		if out, err := runRaw(dir, gradeDiff([]string{mb}, file)...); err == nil {
-			return docEditsFrom(dir, mb+":"+file, out)
+			return docEditsFrom(dir, mb+":"+file, out, false)
 		}
 	}
 	out, err := runRaw(dir, gradeDiff([]string{ref}, file)...)
 	if err != nil {
 		return DocEdits{New: wholeFile, All: true}
 	}
-	return docEditsFrom(dir, ref+":"+file, out)
+	return docEditsFrom(dir, ref+":"+file, out, false)
 }
 
 // docEditsFrom reads a -U0 diff from the blob old (a "<rev>:<path>") into
 // DocEdits. Old is read only when the diff deleted or inserted something
 // (an old-frame claim to place): as stored (cat-file, no filters), the frame
-// the diff's old side counts in.
-func docEditsFrom(dir, old, diff string) DocEdits {
+// the diff's old side counts in. ⚠ oldMissing: the measured revision has no
+// such file, so the window adds the doc whole; that is All, deliberately
+// (#244 review): git conflicts one window's add with any other window's add
+// of the same path (add/add) unless the copies are identical, and a new
+// doc's sections have nothing in an old copy to be claimed in. The written
+// measurement gets there because `cat-file blob <rev>:<path>` fails; the
+// pending one names the missing side by the empty blob, which `cat-file` may
+// well find, so it says so.
+func docEditsFrom(dir, old, diff string, oldMissing bool) DocEdits {
 	e := DocEdits{New: parseHunkRanges(diff), Deleted: parseDeletedRanges(diff), Gaps: parseInsertGaps(diff)}
-	if len(e.Deleted) > 0 || len(e.Gaps) > 0 {
-		content, err := runRaw(dir, "cat-file", "blob", old)
-		if err != nil {
-			e.All = true
-		} else {
-			e.Old = content
-		}
+	if len(e.Deleted) == 0 && len(e.Gaps) == 0 {
+		return e
+	}
+	if oldMissing {
+		e.All = true
+		return e
+	}
+	content, err := runRaw(dir, "cat-file", "blob", old)
+	if err != nil {
+		e.All = true // unreadable, or (written) no such file: every section
+	} else {
+		e.Old = content
 	}
 	return e
 }
