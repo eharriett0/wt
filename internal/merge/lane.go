@@ -12,17 +12,19 @@ import (
 // fetchPRHead is gitx.FetchPRHeadNoPrompt; a var so a test can count it.
 var fetchPRHead = gitx.FetchPRHeadNoPrompt
 
-var prURLNumber = regexp.MustCompile(`/pull/(\d+)/?$`)
+var prURLNumber = regexp.MustCompile(`/pull/(\d+)(?:[/?#]|$)`)
 
-// PRNumber is pr's number: pr itself when it is one, else the number at the
-// end of a PR URL (gh takes either), "" otherwise (#230 re-review: a URL got
-// no fetch, and a broken fetch command). Pure.
+// PRNumber is pr's number, as gh reads a selector: a number (`5`, `#5`), or
+// the number in a PR URL, `/files` and `?…` tails included; "" for anything
+// else (a branch name) (#230 re-review: a URL got no fetch, and a broken fetch
+// command). Normalized: `05` is 5. Pure.
 func PRNumber(pr string) string {
-	if _, err := strconv.Atoi(pr); err == nil {
-		return pr
+	s := strings.TrimPrefix(pr, "#")
+	if m := prURLNumber.FindStringSubmatch(s); m != nil {
+		s = m[1]
 	}
-	if m := prURLNumber.FindStringSubmatch(pr); m != nil {
-		return m[1]
+	if n, err := strconv.Atoi(s); err == nil && n > 0 && !strings.HasPrefix(s, "+") {
+		return strconv.Itoa(n)
 	}
 	return ""
 }

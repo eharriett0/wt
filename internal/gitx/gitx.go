@@ -358,7 +358,7 @@ func Fetch(remote, branch string) error {
 // git's prompt, and ssh in BatchMode unless the user set their own ssh
 // command.
 func FetchNoPrompt(remote, branch string) error {
-	return fetchNoPrompt(remote, "+refs/heads/"+branch+":refs/remotes/"+remote+"/"+branch)
+	return fetchNoPrompt(remote, "+refs/heads/"+branch+":refs/remotes/"+remote+"/"+branch, baseFetchTimeout)
 }
 
 // FetchPRHeadNoPrompt fetches GitHub's refs/pull/<pr>/head from remote into
@@ -370,24 +370,30 @@ func FetchPRHeadNoPrompt(remote, pr string) error {
 	if _, err := strconv.Atoi(pr); err != nil {
 		return fmt.Errorf("not a PR number: %q", pr)
 	}
-	return fetchNoPrompt(remote, "refs/pull/"+pr+"/head")
+	return fetchNoPrompt(remote, "refs/pull/"+pr+"/head", fetchTimeout)
 }
 
-// fetchTimeout bounds a no-prompt fetch (#230 re-review): an origin that
+// fetchTimeout bounds the PR-head fetch (#230 re-review): an origin that
 // takes the connection and never answers (a proxy, a half-up VPN) hung
 // merge-pr's post-merge cleanup. A var so a test can shorten it.
 var fetchTimeout = 30 * time.Second
 
-func fetchNoPrompt(remote, refspec string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
+// baseFetchTimeout bounds merge-pr's base-branch fetch (#223's fallback for
+// the base .wt.conf), longer: a slow but working fetch past it reads the copy
+// as last fetched.
+var baseFetchTimeout = 120 * time.Second
+
+func fetchNoPrompt(remote, refspec string, budget time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	// A stalled HTTPS transfer gives up after 15s below 1 byte/s; ssh's
 	// connect after 10s (below).
 	cmd := exec.CommandContext(ctx, "git", "-c", "http.lowSpeedLimit=1", "-c", "http.lowSpeedTime=15",
 		"fetch", "--no-prune", remote, refspec)
-	// Killing git leaves its transport helper (git-remote-http, ssh) holding
-	// the output pipe until its own timeout: stop waiting on it (measured: 15s
-	// past a 2s deadline without this).
+	stopGroupOnCancel(cmd)
+	// A transport helper (git-remote-http, ssh) can hold the output pipe
+	// past the cancel: stop waiting on it, and SIGKILL the leader (measured:
+	// 15s past a 2s deadline without this).
 	cmd.WaitDelay = time.Second
 	cmd.Env = append(scopedEnv(), "GIT_TERMINAL_PROMPT=0")
 	// GIT_TERMINAL_PROMPT stops git's own (HTTPS) prompt only; ssh reads
@@ -403,7 +409,7 @@ func fetchNoPrompt(remote, refspec string) error {
 	cmd.Stderr = &stderr
 	if _, err := cmd.Output(); err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			return fmt.Errorf("git fetch %s %s gave no answer in %s", remote, refspec, fetchTimeout)
+			return fmt.Errorf("git fetch %s %s did not finish in %s", remote, refspec, budget)
 		}
 		if msg := gitStderr(stderr.String()); msg != "" {
 			return fmt.Errorf("%w: %s", err, msg)

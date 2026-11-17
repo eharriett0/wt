@@ -725,11 +725,16 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   it, and the lane was kept forever), and an UNKNOWN verdict never advises
   "push them" (that recreates the deleted branch at a stale tip). A PR given
   as a URL is fetched by its number (`merge.PRNumber`). ⚠ **A no-prompt
-  fetch has a deadline** (`fetchTimeout`, 30s; ssh `ConnectTimeout=10`, HTTPS
-  `lowSpeedTime=15`): an origin that took the connection and never answered
-  hung merge-pr's cleanup. `cmd.WaitDelay` matters: killing git leaves its
-  transport helper holding the output pipe, and Wait waited 15s past a 2s
-  deadline (measured). `release --clean` compares the lane's FULL HEAD ref
+  fetch has a deadline** (`fetchTimeout` 30s for the PR head,
+  `baseFetchTimeout` 120s for #223's base fetch; ssh `ConnectTimeout=10`,
+  HTTPS `lowSpeedTime=15`): an origin that took the connection and never
+  answered hung merge-pr's cleanup. ⚠ The fetch runs in its own process group
+  and the deadline SIGTERMs the GROUP (`stopGroupOnCancel`, unix): Apple's git
+  runs the fetch as a child of a wrapper, and killing only the started process
+  left the real fetch and git-remote-http running (pinned: the test pgreps for
+  them while the silent origin still holds the connection). `cmd.WaitDelay`
+  then stops waiting on a helper holding the pipe and SIGKILLs the leader
+  (measured: Wait waited 15s past a 2s deadline without it). `release --clean` compares the lane's FULL HEAD ref
   (`gitx.SymbolicHead`): a tag of the branch's name made `--abbrev-ref` say
   `heads/<b>`. A lease refusal says origin moved. A relative
   `worktree_root` still means a different directory from each cwd (#238).
