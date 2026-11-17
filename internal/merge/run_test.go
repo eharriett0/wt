@@ -232,14 +232,17 @@ esac
 }
 
 // hintGh is a fake gh for Run's refusals: an empty diff when "$d/empty"
-// exists, head branch feat-y.
+// exists, an unreadable one when "$d/nodiff" does, only WIP placeholder
+// commits when "$d/wip" does; head branch feat-y.
 const hintGh = `#!/bin/sh
 d=$(dirname "$0")
 case "$1 $2" in
-"pr diff") [ -e "$d/empty" ] || echo a.txt ;;
+"pr diff") [ -e "$d/nodiff" ] && exit 1; [ -e "$d/empty" ] || echo a.txt ;;
+"api graphql") exit 1 ;;
 "pr view")
 	case "$*" in
-	*messageHeadline*) echo "Fix the widget" ;;
+	*changedFiles*) exit 1 ;;
+	*messageHeadline*) [ -e "$d/wip" ] && echo "WIP: claim #5" || echo "Fix the widget" ;;
 	*headRefName*) echo feat-y ;;
 	*title*) echo "Fix the widget" ;;
 	esac ;;
@@ -286,5 +289,23 @@ func TestRunHintsSpellThePRForAShell(t *testing.T) {
 	empty := stderr(func() { _ = Run("#5", false, false, false, []string{"feat-y"}, nil, nil, "") })
 	if !strings.Contains(empty, "wt merge-pr 5 --bypass") || strings.Contains(empty, "#5 --bypass") {
 		t.Errorf("empty-diff refusal:\n%s", empty)
+	}
+	for _, f := range []string{"empty", "wip"} {
+		_ = os.Remove(filepath.Join(dir, f))
+	}
+	if err := os.WriteFile(filepath.Join(dir, "wip"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wip := stderr(func() { _ = Run("#5", false, false, false, []string{"feat-y"}, nil, nil, "") })
+	if !strings.Contains(wip, "Bypass: wt merge-pr 5 --bypass") {
+		t.Errorf("placeholder-only refusal:\n%s", wip)
+	}
+	_ = os.Remove(filepath.Join(dir, "wip"))
+	if err := os.WriteFile(filepath.Join(dir, "nodiff"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	unread := stderr(func() { _ = Run("#5", false, false, false, []string{"feat-y"}, nil, nil, "") })
+	if !strings.Contains(unread, "gh pr diff 5 --name-only") {
+		t.Errorf("diff-unread refusal:\n%s", unread)
 	}
 }
