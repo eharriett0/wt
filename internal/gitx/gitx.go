@@ -753,9 +753,26 @@ func withUntrackedShown(args ...string) []string {
 
 // BranchDelete force-deletes local branch (git branch -D). Safe to call after a
 // squash-merge, where the branch is not fast-forward-merged into base.
-func BranchDelete(branch string) error {
-	_, err := Run("branch", "-D", branch)
+func BranchDelete(branch string) error { return BranchDeleteIn("", branch) }
+
+// BranchDeleteIn is BranchDelete with git run in dir ("" = the cwd): after a
+// worktree removal the cwd may be the directory just removed (#230).
+func BranchDeleteIn(dir, branch string) error {
+	_, err := RunDir(dir, "branch", "-D", branch)
 	return err
+}
+
+// MainCheckout is the repository's main working tree: the parent of the shared
+// git dir when that is a `.git` directory, "" otherwise (a bare repository or
+// an unusual layout) or when cwd is in no repository. Resolve it BEFORE
+// removing the worktree the process sits in (#230): afterwards git can't run
+// from the cwd at all.
+func MainCheckout() string {
+	common, err := CommonDir()
+	if err != nil || filepath.Base(common) != ".git" {
+		return ""
+	}
+	return filepath.Dir(common)
 }
 
 // Cherry returns `git cherry <base> <branchRef>` output (+/- lines).

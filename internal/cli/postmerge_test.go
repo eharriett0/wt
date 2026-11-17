@@ -178,3 +178,73 @@ func TestCmdMergePR_keepsTheLaneUnlessMerged(t *testing.T) {
 		})
 	}
 }
+
+// TestCmdMergePR_autoCleanFromInsideTheLane is #230: merge-pr run from inside
+// the PR's own worktree (the usual place) removed the worktree, then deleted
+// the branch with git running in the directory just removed (exit 128, the
+// branch stayed), and told the operator to cd into that same directory. The
+// branch now goes too, and the hint names the main checkout.
+func TestCmdMergePR_autoCleanFromInsideTheLane(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake gh is a shell script")
+	}
+	gitBin, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("no git")
+	}
+	hermeticGitT(t)
+	ghDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ghDir, "gh"), []byte(postMergeGh), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sep := string(os.PathListSeparator)
+	t.Setenv("PATH", ghDir+sep+filepath.Dir(gitBin)+sep+"/usr/bin"+sep+"/bin")
+	if got, err := exec.LookPath("gh"); err != nil || got != filepath.Join(ghDir, "gh") {
+		t.Fatalf("gh resolves to %q (%v), not the fake", got, err)
+	}
+	t.Setenv("HOME", t.TempDir())
+	postMergeSleep = func(time.Duration) {}
+	t.Cleanup(func() { postMergeSleep = time.Sleep })
+
+	parent, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := filepath.Join(parent, "repo")
+	lane := filepath.Join(parent, "repo-worktrees", "feat-x")
+	for _, args := range [][]string{
+		{"init", "-q", "-b", "main", repo},
+		{"-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base"},
+		{"-C", repo, "worktree", "add", "-q", "-b", "feat-x", lane},
+	} {
+		if out, err := exec.Command(gitBin, args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	head, err := exec.Command(gitBin, "-C", lane, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, text := range map[string][]byte{"state": []byte("OPEN"), "head": head, "merges": nil} {
+		if err := os.WriteFile(filepath.Join(ghDir, name), text, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = os.Remove(filepath.Join(ghDir, "fails"))
+	t.Chdir(lane)
+
+	var code int
+	out, errOut := captureT(t, func() { code = cmdMergePR([]string{"99999"}) })
+	if code != 0 {
+		t.Fatalf("cmdMergePR = %d\n%s%s", code, out, errOut)
+	}
+	if _, err := os.Stat(lane); err == nil {
+		t.Errorf("the lane was kept\n%s%s", out, errOut)
+	}
+	if exec.Command(gitBin, "-C", repo, "rev-parse", "-q", "--verify", "refs/heads/feat-x").Run() == nil {
+		t.Errorf("the merged branch was kept (deleted from the removed directory?)\n%s%s", out, errOut)
+	}
+	if strings.Contains(out+errOut, "not deleted") || !strings.Contains(out+errOut, "cd "+repo+" ") {
+		t.Errorf("want the branch deleted and the hint to name the main checkout %s:\n%s%s", repo, out, errOut)
+	}
+}

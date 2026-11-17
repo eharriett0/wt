@@ -882,7 +882,11 @@ func remove(c *config.Config, wtPath, branch string, force, allowOutsideRoot boo
 			return fmt.Errorf("%s", why)
 		}
 	}
-	if err := gitx.WorktreeRemove(wtPath, force); err != nil {
+	// #230: git runs from the main checkout, resolved while the cwd still
+	// exists. merge-pr usually runs inside the worktree it removes, and the
+	// branch delete that followed ran in the removed directory and failed.
+	home := gitx.MainCheckout()
+	if err := gitx.WorktreeRemoveIn(home, wtPath, force); err != nil {
 		return fmt.Errorf("git worktree remove: %w", err)
 	}
 	ui.OK("removed worktree %s", filepath.Base(wtPath))
@@ -894,7 +898,7 @@ func remove(c *config.Config, wtPath, branch string, force, allowOutsideRoot boo
 		return nil
 	}
 	if branch != "" && branch != "HEAD" {
-		if err := gitx.BranchDelete(branch); err != nil {
+		if err := gitx.BranchDeleteIn(home, branch); err != nil {
 			ui.Warn("branch %s not deleted (harmless): %v", branch, err)
 		} else {
 			ui.Step("deleted local branch %s", branch)

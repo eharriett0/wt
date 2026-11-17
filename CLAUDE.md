@@ -687,6 +687,14 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   `merge.LocalTipVerdict` needs the tip to BE the PR's `headRefOid` or an
   ancestor of it; otherwise, or when it can't tell (no head, not fetched here),
   the worktree and branch stay and the warning counts the commits not in the PR.
+  ⚠ **The removal's git runs from the main checkout (#230).** merge-pr usually
+  runs INSIDE the worktree it removes; `git branch -D` then ran in the removed
+  directory, exited 128, and the merged branch stayed, while the hint said to
+  cd into that same directory (`c.Root` is the cwd's worktree). `worktree.remove`
+  resolves `gitx.MainCheckout()` (the shared `.git`'s parent) before removing
+  and runs `WorktreeRemoveIn`/`BranchDeleteIn` there; auto-clean reads
+  `cwdUnder` and the main checkout before the removal too, and the hint names
+  it. A bare repository has no main checkout: git runs from the cwd, as before.
 - **merge-pr's checks gate never reads a failed read, or `--admin`, as green
   (#179).** It reads the head commit's statusCheckRollup (one GraphQL query,
   paged: `ghx.PRChecks`) and what the base branch requires, from the PR's own
