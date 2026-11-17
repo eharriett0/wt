@@ -124,9 +124,10 @@ rather than empty). Two agents sharing one working tree look like one window
 to the collision engine, so this is a sign of the second one. An agent whose
 wt hooks are installed (`wt install-claude-hook`, `wt install-codex-hook`)
 shows from its first prompt: its per-turn hook marks the session present at
-most once an hour (a `presence` record, never shown as an announcement and
-pruned after a day). One without the hooks shows only once it runs a
-coordination command.
+most once an hour (a `presence` record, never shown as an announcement; only
+the last day's are read, and `wt prune-coord` drops older ones, which `wt
+doctor` lists without a warning). One without the hooks shows only once it
+runs a coordination command.
 
 ### Stale branches don't count
 
@@ -614,8 +615,10 @@ hooks = false
   Under an older Codex your `wt` commands record no session, while the
   per-turn hook reads the session id Codex sends it, so the banner lists this
   session's own announcements as another session's (advisory, nothing
-  blocks). Upgrade Codex, or start it from a shell with its own `WT_SESSION`
-  set: both your commands and the hooks read that first.
+  blocks). The hook's presence mark carries that id too, so `wt status`
+  and `wt doctor` in this session's shell warn that another session shares
+  the checkout: it is this one. Upgrade Codex, or start it from a shell with
+  its own `WT_SESSION` set: both your commands and the hooks read that first.
 
 The awareness is proactive-but-coarse (per prompt, not per edit) because that's
 what Codex exposes — but the pre-push guard is the hard gate for both agents, so

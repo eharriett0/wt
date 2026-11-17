@@ -371,21 +371,35 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   per-turn hooks (`hookAgentContext` → `markPresence`) write a
   `coord.KindPresence` record for a session with a real token when
   `coord.PresenceDue` (nothing of its own, this window AND session, any kind,
-  in the last `PresenceEvery`, an hour): at most 24 a day a session.
-  `coord.AppendIfFree` never waits (one lock try; a held lock skips the turn)
-  and never prints. In a single-worktree repo with no log, a turn with a
-  token no longer returns before `config.Load`: its mark creates the log
-  (the #163 case, two agents in one checkout), and later turns read the
-  coordination block there as any repo with a log does. Inbox, holds,
-  acks and the gate select announcements by kind, so a presence record
-  never reads as one (an older wt's included); `PruneRecords` drops it after
-  `SharedCheckoutWindow`, or undatable. It does count as the session's
+  in the last `PresenceEvery`, an hour): at most 24 a day per window and
+  session. `coord.AppendIfFree` never waits (one lock try; a held lock skips
+  the turn) and never prints. In a single-worktree repo with no log, a turn
+  with a token no longer returns before `config.Load`: its mark creates the
+  log (the #163 case, two agents in one checkout), and later turns read the
+  coordination block there as any repo with a log does. ⚠ So the hook reads
+  the log with `coord.LoadForHook`, which waits a second for a writer, not
+  Load's 5s (review: far more repos now have a log, and a prune stopped
+  mid-rewrite stalled every prompt there; what it reads is advisory). Inbox,
+  holds, acks and the gate select announcements by kind, so a presence
+  record never reads as one (an older wt's included); `PruneRecords` drops
+  it after `SharedCheckoutWindow`, or undatable (`presenceExpired`). Nothing
+  prunes on its own, so doctor lists expired marks
+  (`coord.ExpiredPresence`, `presence_expired`) apart from the `prunable`
+  records it warns about: some expire every day wherever agents prompt, and
+  a daily warning gets ignored (measured: 50k marks, 14 MB, cost the hook
+  114 ms against 66 ms). ⚠ Under a Codex older than 0.148.0 the mark carries
+  the payload id while the session's shells stamp none, so its own `wt
+  status` warns that another session shares the checkout (README, Codex
+  section). It does count as the session's
   activity elsewhere, on purpose: `OtherSessions`, the token-less inbox
   hedge (`InboxClearAmbiguous`) and `HoldLooksOrphaned`'s "silent for 4h"
   (a prompting session's hold is not orphaned). A session with no wt hooks
   that never runs a coordination command is still invisible. Pinned by
   `TestHookPresence_marksASilentSession`, `TestPresenceDue`,
-  `TestPruneRecords_presence`, `TestAppendIfFree`, and
+  `TestPruneRecords_presence`, `TestAppendIfFree`,
+  `TestPresence_countsAsTheSessionsActivity`,
+  `TestHookPresence_neverStallsOnAHeldLog`,
+  `TestDoctor_listsExpiredPresenceWithoutWarning`, and
   `TestOtherSessions_countBlockReservations`, `TestCheckoutActivity` and
   `TestRecentBlockLedgers`.
   ⚠ `wt mcp` reads its session from its env ONCE, at spawn: after

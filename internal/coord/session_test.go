@@ -944,15 +944,56 @@ func TestPruneRecords_presence(t *testing.T) {
 	at := func(d time.Duration) string { return now.Add(-d).UTC().Format(time.RFC3339) }
 	recs := []Record{
 		{ID: "fresh", Kind: KindPresence, TS: at(time.Hour)},
+		{ID: "day-old", Kind: KindPresence, TS: at(23 * time.Hour)},
 		{ID: "old", Kind: KindPresence, TS: at(25 * time.Hour)},
 		{ID: "undatable", Kind: KindPresence, TS: "?"},
+		{ID: "ack", Kind: KindAck, AckOf: "gone", TS: at(48 * time.Hour)},
 	}
 	kept, dropped := PruneRecords(recs, now, 24*time.Hour)
-	if dropped != 2 || len(kept) != 1 || kept[0].ID != "fresh" {
-		t.Errorf("kept %v (dropped %d), want only fresh", kept, dropped)
+	var ids []string
+	for _, r := range kept {
+		ids = append(ids, r.ID)
+	}
+	if dropped != 2 || strings.Join(ids, ",") != "fresh,day-old,ack" {
+		t.Errorf("kept %v (dropped %d), want fresh, day-old and the ack", ids, dropped)
+	}
+	// doctor lists these apart from the prunable records it warns about.
+	if n := ExpiredPresence(recs, now); n != 2 {
+		t.Errorf("ExpiredPresence = %d, want 2 (old, undatable)", n)
 	}
 	// Presence is no announcement: inbox never shows it.
 	if in := Inbox([]Record{{ID: "p", Kind: KindPresence, Window: "/w", Session: "B", TS: at(0)}}, Self{Window: "/w", Session: "A"}, now); len(in) != 0 {
 		t.Errorf("inbox shows a presence record: %v", in)
+	}
+}
+
+// A presence record is its session's activity (#197 item 2 review: claimed,
+// untested): a prompting session's hold doesn't look orphaned, and a
+// token-less inbox hedges when another session was active here.
+func TestPresence_countsAsTheSessionsActivity(t *testing.T) {
+	now := time.Now()
+	at := func(d time.Duration) string { return now.Add(-d).UTC().Format(time.RFC3339) }
+	hold := Record{ID: "h", Kind: KindAnnounce, Window: "/w", Session: "A", Hold: []string{"merge-main"}, TS: at(5 * time.Hour)}
+	if orphaned, why := HoldLooksOrphaned([]Record{hold}, hold, now); !orphaned {
+		t.Fatalf("control: a hold whose session wrote nothing for 5h reads live (%q)", why)
+	}
+	mark := Record{ID: "p", Kind: KindPresence, Window: "/w", Session: "A", TS: at(time.Hour)}
+	if orphaned, why := HoldLooksOrphaned([]Record{hold, mark}, hold, now); orphaned {
+		t.Errorf("a hold whose session marked presence an hour ago reads orphaned: %s", why)
+	}
+	other := Record{ID: "q", Kind: KindPresence, Window: "/w", Session: "B", TS: at(time.Hour)}
+	if orphaned, _ := HoldLooksOrphaned([]Record{hold, other}, hold, now); !orphaned {
+		t.Errorf("another session's presence kept A's hold alive")
+	}
+
+	tokenless := Self{Window: "/w", Session: SessionNone}
+	if InboxClearAmbiguous(nil, tokenless, now) {
+		t.Fatal("control: an empty log hedges")
+	}
+	if !InboxClearAmbiguous([]Record{other}, tokenless, now) {
+		t.Errorf("a token-less inbox doesn't hedge for another session's presence in this checkout")
+	}
+	if InboxClearAmbiguous([]Record{{ID: "q", Kind: KindPresence, Window: "/w", Session: "B", TS: at(25 * time.Hour)}}, tokenless, now) {
+		t.Errorf("a presence older than a day still hedges")
 	}
 }

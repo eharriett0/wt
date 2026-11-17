@@ -676,9 +676,20 @@ func Load(path string) ([]Record, error) { return loadWithin(path, false, loadLo
 // review).
 func LoadForGate(path string) ([]Record, error) { return loadWithin(path, true, loadLockWait) }
 
-// loadLockWait bounds how long Load waits for a writer. A var so a test can
-// shorten it; a prune's rewrite takes milliseconds.
-var loadLockWait = 5 * time.Second
+// LoadForHook is Load for the per-turn agent hooks, which wait at most
+// hookLoadWait (#197 item 2 review): a hook must return promptly, and the
+// presence mark gives far more repositories a log, so a prune stopped
+// mid-rewrite (Ctrl-Z) stalled every prompt there for Load's 5s. What it
+// reads is advisory, as Load's unlocked read after its wait is.
+func LoadForHook(path string) ([]Record, error) { return loadWithin(path, false, hookLoadWait) }
+
+// loadLockWait bounds how long Load waits for a writer, hookLoadWait how long
+// LoadForHook does. Vars so a test can shorten them; a prune's rewrite takes
+// milliseconds.
+var (
+	loadLockWait = 5 * time.Second
+	hookLoadWait = time.Second
+)
 
 // ErrLogLocked is LoadForGate giving up on a log another process kept locked.
 var ErrLogLocked = errors.New("the coordination log stayed locked by another wt process (a prune-coord or an append stopped mid-write?)")
@@ -968,6 +979,27 @@ func ActiveHolds(recs []Record, self Self, op string, now time.Time) []Record {
 	return out
 }
 
+// presenceExpired is PruneRecords' rule for a presence record: only the last
+// SharedCheckoutWindow is ever read (#197 item 2), and an undatable one says
+// nothing about when. Pure.
+func presenceExpired(r Record, now time.Time) bool {
+	t, err := time.Parse(time.RFC3339, r.TS)
+	return err != nil || now.Sub(t) > SharedCheckoutWindow
+}
+
+// ExpiredPresence counts the presence records PruneRecords would drop. doctor
+// lists them apart from the prunable records it warns about (#197 item 2
+// review): a prompting session writes one an hour, so some expire every day,
+// and a warning that never goes away teaches people to ignore it. Pure.
+func ExpiredPresence(recs []Record, now time.Time) (n int) {
+	for _, r := range recs {
+		if r.Kind == KindPresence && presenceExpired(r, now) {
+			n++
+		}
+	}
+	return n
+}
+
 // PruneRecords returns the log with resolved + expired records removed (#33):
 // (a) every announcement that has been all-cleared, together with its acks and
 // the all-clear record itself (a completed handshake — no longer live); and (b)
@@ -993,10 +1025,7 @@ func PruneRecords(recs []Record, now time.Time, blockMaxAge time.Duration) (kept
 		case KindBlockWritten, KindBlockAbandoned:
 			drop = true // the marker is only needed while its reservation lives
 		case KindPresence:
-			// Only the last SharedCheckoutWindow is ever read (#197 item 2);
-			// an undatable one says nothing about when.
-			t, err := time.Parse(time.RFC3339, r.TS)
-			drop = err != nil || now.Sub(t) > SharedCheckoutWindow
+			drop = presenceExpired(r, now)
 		}
 		if !drop {
 			kept = append(kept, r)

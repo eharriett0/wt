@@ -256,10 +256,11 @@ func hookAgentContext(r io.Reader, codex bool) int {
 	// and from another session sharing this checkout (#163). The session is the
 	// one this agent's own `wt` commands stamp on their records: the hook's env
 	// (coordCtx), with Codex's payload fallback (agentHookSession). Fail-open: a
-	// coord read error just omits this block (never breaks the turn).
+	// coord read error just omits this block (never breaks the turn), and the
+	// read waits at most a second for a writer (coord.LoadForHook).
 	if logPath, self := coordCtx(c); logPath != "" {
 		self.Session = session
-		if recs, rerr := coord.Load(logPath); rerr == nil {
+		if recs, rerr := coord.LoadForHook(logPath); rerr == nil {
 			now := time.Now()
 			if run {
 				box := hookInbox(coord.Inbox(recs, self, now), coord.ViewOf(recs, self), overlaps)

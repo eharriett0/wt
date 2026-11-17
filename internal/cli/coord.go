@@ -301,7 +301,7 @@ func inboxClearMessage(recs []coord.Record, self coord.Self, now time.Time) (msg
 // can't vouch that nothing else is pending in a checkout other sessions use.
 func tokenlessCaveat() string {
 	return "this shell has no session token (neither " + strings.Join(coord.SessionEnvVars, " nor ") + " is set), " +
-		"and other sessions posted from this checkout in the last day, so another token-less session sharing it " +
+		"and other sessions were active in this checkout in the last day, so another token-less session sharing it " +
 		"would be indistinguishable from you. Set WT_SESSION to a value unique to this session, or move to your own " +
 		"worktree (`wt new <branch>`)."
 }
