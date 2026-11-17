@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -996,6 +997,28 @@ func TestPruneLegacyWiring(t *testing.T) {
 	plain, _ := captureOutputForTest(t, func() { cmdPruneCoord(nil) })
 	if strings.Contains(plain, "--legacy") {
 		t.Errorf("nothing left to suggest:\n%s", plain)
+	}
+}
+
+// A block ledger prune-coord couldn't prune (one another process kept locked
+// past the writers' deadline, #235) is reported, and what it did drop counts.
+// The error used to be dropped with the count.
+func TestPruneCoord_reportsALedgerItCouldntPrune(t *testing.T) {
+	coordWiringRepo(t, "aaaaaaaa-1111-2222-3333-444444444444")
+	defer func(old func(string, time.Time, time.Duration) (int, error)) { pruneBlockLedgers = old }(pruneBlockLedgers)
+	pruneBlockLedgers = func(string, time.Time, time.Duration) (int, error) {
+		return 2, errors.New("/x/ledger.jsonl stayed locked by another wt process for 30s")
+	}
+	var code int
+	out, errOut := captureOutputForTest(t, func() { code = cmdPruneCoord(nil) })
+	if code != 0 {
+		t.Errorf("exit %d, want 0: the log itself was pruned", code)
+	}
+	if !strings.Contains(errOut, "block ledgers not all pruned") || !strings.Contains(errOut, "/x/ledger.jsonl stayed locked") {
+		t.Errorf("the ledger error was not reported:\n%s", errOut)
+	}
+	if !strings.Contains(out, "pruned 2 ") {
+		t.Errorf("what the ledgers did drop must count:\n%s", out)
 	}
 }
 

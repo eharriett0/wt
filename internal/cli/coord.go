@@ -893,6 +893,10 @@ func holdersPhrase(holds []coord.Record, self coord.Self) string {
 	return strings.Join(kinds, " AND ")
 }
 
+// pruneBlockLedgers is prune-coord's ledger GC; a var so a test can make it
+// fail.
+var pruneBlockLedgers = coord.PruneBlockLedgers
+
 // cmdPruneCoord GCs the coordination log — drops completed (all-cleared)
 // announce+ack+all-clear handshakes and aged-out block reservations, keeping
 // every still-open record (#33). The log is append-only and re-parsed on every
@@ -939,8 +943,12 @@ func cmdPruneCoord(args []string) int {
 		// #152: block reservations live in per-file ledgers now — GC those too, or
 		// they'd grow append-only forever (the per-repo PruneLog never sees them).
 		if home, herr := os.UserHomeDir(); herr == nil && home != "" {
-			if bd, berr := coord.PruneBlockLedgers(home, now, dur); berr == nil {
-				dropped += bd
+			bd, berr := pruneBlockLedgers(home, now, dur)
+			dropped += bd
+			if berr != nil {
+				// A ledger another process keeps locked fails after the
+				// writers' deadline (#235); say so, never prune silently less.
+				ui.Warn("block ledgers not all pruned: %v", berr)
 			}
 		}
 		if dropped == 0 {
