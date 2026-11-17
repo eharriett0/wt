@@ -141,7 +141,11 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   A delimiter that doesn't compile leaves the entries as they were (`wt
   check` can't section-grade that doc either). The empty side of a
   measurement is hashed `--no-filters` (git's /dev/null never sees a clean
-  filter; one adding a header moved every range). Pinned by `TestPreEditHooks_StructuredDocSections` (into, staying
+  filter; one adding a header moved every range of a file measured against it:
+  one new since the measured revision, or an untracked copy). Known gap, for
+  #237: a two-step history (a same-named heading renamed earlier, then
+  restored while the shared one is deleted) keeps the count equal, and the
+  stopgap misses it. Pinned by `TestPreEditHooks_StructuredDocSections` (into, staying
   out of, past an insert into, and out of the other window's section, each held
   to `wt check` after the edit, both hooks, both block modes) and the
   `StructuredDoc*` cases beside it. Claude (`claudePendingContent`): Claude Code's Edit replayed (refused

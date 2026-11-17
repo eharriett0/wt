@@ -698,11 +698,21 @@ func regradeSections(c *config.Config, root, rel string, content []byte, predict
 	f := newGitGradeFacts(c.Base)
 	f.pendingPath = rel
 	f.pending = map[string]collide.PendingDoc{root: {Content: string(content), Ranges: ranges}}
-	var before map[string]int
-	if cur, read := readForPrediction(filepath.Join(root, rel)); read == fileReadOK {
-		before = headingCounts(cur, re)
+	// The headings are counted only when a section HIGH would be dropped, the
+	// one case headingGone decides (#226 re-review: the file was re-read on
+	// every edit).
+	var before, after map[string]int
+	counted := false
+	gone := func(sections []string) bool {
+		if !counted {
+			counted = true
+			if cur, read := readForPrediction(filepath.Join(root, rel)); read == fileReadOK {
+				before = headingCounts(cur, re)
+			}
+			after = headingCounts(string(content), re)
+		}
+		return headingGone(sections, before, after)
 	}
-	after := headingCounts(string(content), re)
 	for _, e := range entries {
 		switch {
 		case !sectionGraded(e):
@@ -711,7 +721,8 @@ func regradeSections(c *config.Config, root, rel string, content []byte, predict
 			graded = append(graded, pendingGrade{entry: e})
 		default:
 			shared, sok := f.SharedSections([]string{root, e.otherWorktree}, rel, delim)
-			if g, keep := sectionGrade(e, shared, sok, headingGone(e.SharedSections, before, after)); keep {
+			lost := sok && len(shared) == 0 && e.Category == CatBlocking && gone(e.SharedSections)
+			if g, keep := sectionGrade(e, shared, sok, lost); keep {
 				graded = append(graded, g)
 			}
 		}
