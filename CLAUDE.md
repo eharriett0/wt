@@ -303,9 +303,17 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   not be read: unknown, not empty). ⚠ **It reads the block ledgers too**
   (`coord.CheckoutActivity`, #197 item 2): a reservation lives in its file's
   ledger, not the log, so a session whose only records were reservations was
-  invisible to `other_sessions`, the status banner and doctor (doctor counts
-  them even before the log exists). A session that never wrote anything is
-  still invisible. Pinned by `TestOtherSessions_countBlockReservations`.
+  invisible to `other_sessions`, the status banner and doctor (text and
+  JSON, even before the log exists). ⚠ Only THIS repository's ledger
+  records count (`Repo`, the log's own scope): the ledgers are machine-wide,
+  and a pinned WT_WINDOW names one window in several repositories, so
+  another repo's reservation read as this checkout's (#197 review). The
+  read is advisory (`coord.RecentBlockLedgers`): a ledger untouched for 24h
+  is skipped, and a locked one is read without waiting (`Load` waited 5s per
+  stuck ledger on every `status --json`). A session that never wrote
+  anything is still invisible. Pinned by
+  `TestOtherSessions_countBlockReservations`, `TestCheckoutActivity` and
+  `TestRecentBlockLedgers`.
   ⚠ `wt mcp` reads its session from its env ONCE, at spawn: after
   `/clear` its `other_sessions` counts the new session's records as another
   session's until the client restarts it, and whether a client passes its
