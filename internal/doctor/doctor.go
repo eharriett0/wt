@@ -97,8 +97,9 @@ type CoordHealth struct {
 	Prunable         int    `json:"prunable"`
 	Err              string `json:"err,omitempty"`
 
-	// #163: this process's identity, and any OTHER session that recently posted
-	// under the same window id — i.e. shares this checkout.
+	// #163: this process's identity, and any OTHER session recently active
+	// under the same window id (coordination records, or this repository's
+	// block reservations, #197): it shares this checkout.
 	Window        string                  `json:"window"`
 	Session       string                  `json:"session"`                  // token, or coord.SessionNone
 	SessionSource string                  `json:"session_source,omitempty"` // env var it came from; "" = none set
@@ -422,11 +423,16 @@ func coordHealth(c *config.Config) *CoordHealth {
 	// log), so count them regardless of whether the per-repo log exists yet — else a
 	// block-only repo reports 0 while `wt holds` shows the reservation (#152).
 	// Owned by session like every coordination record (#197).
+	var ledger []coord.Record
 	if home, herr := os.UserHomeDir(); herr == nil && home != "" {
-		ledger := coord.LoadBlockLedgers(home)
+		ledger = coord.LoadBlockLedgers(home)
 		h.OwnBlockReserves = len(coord.OwnBlockReservations(ledger, self))
 		_, h.Prunable = coord.PruneRecords(ledger, time.Now(), pruneBlockMaxAge)
 	}
+	// #197 item 2: another session's block reservations in this checkout (this
+	// repository's, coord.CheckoutActivity) are evidence it shares the
+	// checkout, with or without a coordination log.
+	h.OtherSessions = coord.OtherSessions(coord.CheckoutActivity(nil, ledger, repoName(c)), self, time.Now(), coord.SharedCheckoutWindow)
 	if _, err := os.Stat(path); err != nil {
 		return h // per-repo coord log not created yet — ledger reserves already counted
 	}
@@ -439,7 +445,7 @@ func coordHealth(c *config.Config) *CoordHealth {
 	h.Readable = true
 	h.Records = len(recs)
 	h.OwnOpen = len(coord.OwnOpenAnnouncements(recs, self))
-	h.OtherSessions = coord.OtherSessions(recs, self, time.Now(), coord.SharedCheckoutWindow)
+	h.OtherSessions = coord.OtherSessions(coord.CheckoutActivity(recs, ledger, repoName(c)), self, time.Now(), coord.SharedCheckoutWindow)
 	if _, p := coord.PruneRecords(recs, time.Now(), pruneBlockMaxAge); p > 0 {
 		h.Prunable += p
 	}
@@ -549,11 +555,13 @@ func render(rep *Report) {
 			if h.Prunable > 0 {
 				ui.Warn("coord log — %d resolved/expired record(s) prunable (run `wt prune-coord`)", h.Prunable)
 			}
-			// #163: another session posting under THIS window id shares the checkout.
-			self := coord.Self{Window: h.Window, Session: h.Session}
-			if msg := coord.SharedCheckoutWarning(h.OtherSessions, self, time.Now()); msg != "" {
-				ui.Warn("%s", msg)
-			}
+		}
+		// #163/#197: another session active under THIS window id shares the
+		// checkout. Outside the switch (#197 review): before the log exists, its
+		// block reservations are the only sign, and the text report said nothing.
+		self := coord.Self{Window: h.Window, Session: h.Session}
+		if msg := coord.SharedCheckoutWarning(h.OtherSessions, self, time.Now()); msg != "" {
+			ui.Warn("%s", msg)
 		}
 	}
 

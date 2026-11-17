@@ -117,12 +117,13 @@ pre-push hooks. A range with `"Gap": true` is an insertion between lines `Start`
 and `End`; `overlap_spans` gives the lines where two windows' edits meet (for
 edits that only touch, the line on each side). `wt status --json` also carries
 `session` (the reader's coordination session) and `other_sessions`: the other
-sessions that posted coordination records from this checkout in the last 24h,
-as `wt doctor --json` reports them (`sessions_unread` says the log could not
-be read, so the list is unknown rather than empty). Two agents sharing one
-working tree look like one window to the collision engine, so this is a sign
-of the second one, but only of one that has posted: a session that never
-wrote a coordination record, or only reserved block ids, does not show.
+sessions active in this checkout in the last 24h (coordination records, or
+block ids reserved from this repository), as `wt doctor --json` reports them
+(`sessions_unread` says the log could not be read, so the list is unknown
+rather than empty). Two agents sharing one working tree look like one window
+to the collision engine, so this is a sign of the second one, but only of one
+that has written something: a session that never ran a coordination command
+here does not show.
 
 ### Stale branches don't count
 
@@ -625,7 +626,7 @@ server exposing wt's **read-only** surface as tools, so the agent can ask "who
 else is in this file?" mid-conversation:
 
 - **`wt_status`** — every active window + graded cross-window overlaps, and
-  the other sessions posting from this checkout (`other_sessions`). The server
+  the other sessions active in this checkout (`other_sessions`). The server
   reads its session from its environment once, when the client starts it:
   after a `/clear` (a new session) it still answers as the old one, until the
   client restarts it, and a client that doesn't pass its session id to the

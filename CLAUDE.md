@@ -300,9 +300,21 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   `wt status --json` and MCP `wt_status` carry `session`, `other_sessions`
   (`statusSessions`: `coord.OtherSessions` within `SharedCheckoutWindow`, the
   banner's reading; doctor's field names) and `sessions_unread` (the log could
-  not be read: unknown, not empty). It sees only sessions that wrote to the
-  coordination log: a block reservation lives in its file's ledger (#197
-  item 2). ⚠ `wt mcp` reads its session from its env ONCE, at spawn: after
+  not be read: unknown, not empty). ⚠ **It reads the block ledgers too**
+  (`coord.CheckoutActivity`, #197 item 2): a reservation lives in its file's
+  ledger, not the log, so a session whose only records were reservations was
+  invisible to `other_sessions`, the status banner and doctor (text and
+  JSON, even before the log exists). ⚠ Only THIS repository's ledger
+  records count (`Repo`, the log's own scope): the ledgers are machine-wide,
+  and a pinned WT_WINDOW names one window in several repositories, so
+  another repo's reservation read as this checkout's (#197 review). The
+  read is advisory (`coord.RecentBlockLedgers`): a ledger untouched for 24h
+  is skipped, and a locked one is read without waiting (`Load` waited 5s per
+  stuck ledger on every `status --json`). A session that never wrote
+  anything is still invisible. Pinned by
+  `TestOtherSessions_countBlockReservations`, `TestCheckoutActivity` and
+  `TestRecentBlockLedgers`.
+  ⚠ `wt mcp` reads its session from its env ONCE, at spawn: after
   `/clear` its `other_sessions` counts the new session's records as another
   session's until the client restarts it, and whether a client passes its
   session id to a stdio MCP server at all is not verified. The payload's
@@ -1288,8 +1300,10 @@ The formula supports `head "…", branch: "main"` for `--HEAD` builds.
   number.
 - **Ask gh about auth only through `ghx.AuthedFor`/`Authed`** (#172), or, for
   merge-pr's own reads only, `SignedInFor`/`SignedIn` (#217, above). The answer
-  is memoized per host for `authTTL` (a minute: one command asks once, and a
-  long-lived `wt mcp` still notices a `gh auth login`). In a repo with no forge
+  is memoized per gh binary and host for `authTTL` (a minute: one command asks
+  once, and a long-lived `wt mcp` still notices a `gh auth login`); per binary
+  since #197's review, when a test's real gh answer was reused for a later
+  test's fake gh. In a repo with no forge
   host (a local-path origin, which is what a scratch-repo smoke uses) the check
   is a bare `gh auth status`, deliberately (#100), and that validates EVERY
   configured host: about 6 s with two. Uncached, it ran once per PR lookup and
