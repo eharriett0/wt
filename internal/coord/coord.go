@@ -1235,16 +1235,22 @@ func consumedBlocks(recs []Record) map[string]map[int]bool {
 // session's live one. A marker with no AckOf (an older wt) still closes by
 // (file, block). Pure.
 func openReservation(recs []Record) func(Record) bool {
-	abandoned := abandonedReservationIDs(recs)
-	writtenIDs := map[string]bool{}
+	type closer struct {
+		id, file string
+		block    int
+	}
+	closed := map[closer]bool{} // a marker closes the reservation it names AND whose file and block it carries (#197 re-review)
 	legacy := map[string]map[int]bool{}
 	for _, r := range recs {
-		if r.Kind != KindBlockWritten {
+		if r.Kind != KindBlockWritten && r.Kind != KindBlockAbandoned {
 			continue
 		}
 		if r.AckOf != "" {
-			writtenIDs[r.AckOf] = true
+			closed[closer{r.AckOf, r.File, r.Block}] = true
 			continue
+		}
+		if r.Kind == KindBlockAbandoned {
+			continue // an abandon always names its reservation (#160)
 		}
 		if r.File == "" {
 			continue
@@ -1255,8 +1261,35 @@ func openReservation(recs []Record) func(Record) bool {
 		legacy[r.File][r.Block] = true
 	}
 	return func(r Record) bool {
-		return !abandoned[r.ID] && !writtenIDs[r.ID] && !legacy[r.File][r.Block]
+		return !closed[closer{r.ID, r.File, r.Block}] && !legacy[r.File][r.Block]
 	}
+}
+
+// OwnClosedReservation is how self's newest reservation of (file, block) was
+// closed when none of self's is open: KindBlockWritten, KindBlockAbandoned, or
+// "" when self has none (#197 re-review: a retried --written was told to
+// reserve a new id for a block already written). Pure.
+func OwnClosedReservation(recs []Record, self Self, file string, block int) string {
+	var mine Record
+	ok := false
+	for _, r := range recs {
+		if r.Kind == KindBlockReserve && r.File == file && r.Block == block && self.ReservationIsMine(r) {
+			mine, ok = r, true
+		}
+	}
+	if !ok {
+		return ""
+	}
+	state := ""
+	for _, m := range recs {
+		if (m.Kind == KindBlockWritten || m.Kind == KindBlockAbandoned) && m.AckOf == mine.ID && m.File == file && m.Block == block {
+			state = m.Kind
+		}
+	}
+	if state == "" && !openReservation(recs)(mine) {
+		state = KindBlockWritten // closed by an older wt's (file, block) marker
+	}
+	return state
 }
 
 // abandonedReservationIDs is the set of RESERVATION record IDs that have a
@@ -1330,8 +1363,8 @@ func RecentBlockReservations(recs []Record, self Self, now time.Time, maxAge tim
 	open := openReservation(recs)
 	var out []Record
 	for _, r := range recs {
-		if r.Kind != KindBlockReserve || self.ReservationIsMine(r) {
-			continue
+		if r.Kind != KindBlockReserve || self.Owns(r) {
+			continue // your own token from another checkout stays: a subagent's prepend is still imminent (#197 re-review)
 		}
 		if !open(r) {
 			continue // written (#35) or abandoned (#160) → no longer imminent

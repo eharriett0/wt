@@ -240,13 +240,24 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   reservation still frees its id on its own after `DefaultBlockReserveTTL`, so a
   crashed session's, or an older wt's (no session), never strands. ⚠ **Only an
   OPEN reservation is a handle** (`coord.openReservation`, #197 review): a
-  block-written marker names its reservation by `AckOf` (an older wt's marker
-  without one still closes its (file, block)), and FindOwnReservation skips
-  abandoned and written ones. Keyed by (file, block), a dead reservation's
-  owner could mark, and prune could drop, another session's live reservation
-  of the reused number. The status banner shows every open reservation self
-  doesn't own. ⚠ Rollout: an older wt (window-keyed) still running in the
-  checkout can mark or abandon a new session's reservation until upgraded.
+  block-written or block-abandoned marker closes the reservation its `AckOf`
+  names AND whose file and block it carries (an older wt's written marker
+  without `AckOf` still closes its (file, block)), and FindOwnReservation
+  skips closed ones. Keyed by (file, block), a dead reservation's owner could
+  mark, and prune could drop, another session's live reservation of the reused
+  number. A retried `--written` of a reservation already marked exits 0
+  ("already marked", `coord.OwnClosedReservation`), and one after your own
+  abandon is refused for that reason; neither advises reserving a new id for a
+  block already in the file. `--not-mine` goes with `--abandon` only (exit 64
+  otherwise). `wt holds` flags an own reservation past the TTL as expired (its
+  id may have been handed out and written by someone else). The status banner
+  shows every open reservation self doesn't `Own`, its own token's from another
+  checkout included and labelled (a subagent's prepend is imminent too). The
+  /clear hint appears only between two tagged sessions; a token-less shell is
+  pointed at WT_SESSION. Messages say "this window": a pinned WT_WINDOW makes
+  one window of several checkouts. ⚠ Rollout: an older wt (window-keyed) still
+  running in the checkout can mark or abandon a new session's reservation
+  until upgraded.
   `wt status --json` and MCP `wt_status` carry `session`, `other_sessions`
   (`statusSessions`: `coord.OtherSessions` within `SharedCheckoutWindow`, the
   banner's reading; doctor's field names) and `sessions_unread` (the log could

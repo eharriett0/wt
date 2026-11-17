@@ -47,7 +47,7 @@ func TestCmdBlockID_ownedBySession(t *testing.T) {
 
 	t.Setenv("WT_SESSION", "session-B")
 	out, errOut = captureT(t, func() { code = cmdBlockID([]string{"log.md", "--abandon", "4"}) })
-	if code != 1 || !strings.Contains(errOut, "another session in this checkout (session ") || !strings.Contains(errOut, "not by you") {
+	if code != 1 || !strings.Contains(errOut, "another session in this window (session ") || !strings.Contains(errOut, "not by you") {
 		t.Errorf("B abandons A's reservation: code %d (want 1)\nstdout: %s\nstderr: %s", code, out, errOut)
 	}
 	if err := os.WriteFile(logFile, []byte("## NEWEST-4\nnew\n## NEWEST-3\nolder\n"), 0o644); err != nil {
@@ -66,7 +66,7 @@ func TestCmdBlockID_ownedBySession(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, errOut = captureT(t, func() { blockReservationBanner(c) })
-	if !strings.Contains(errOut, "reserved block 4") || !strings.Contains(errOut, "this checkout") {
+	if !strings.Contains(errOut, "reserved block 4") || !strings.Contains(errOut, "this window") {
 		t.Errorf("B's status banner doesn't show A's imminent prepend:\n%s", errOut)
 	}
 
@@ -218,5 +218,92 @@ func TestStatusJSON_unreadableLog(t *testing.T) {
 	}
 	if p.SessionsUnread == "" || len(p.OtherSessions) != 0 {
 		t.Errorf("unreadable log: sessions_unread %q, other_sessions %v; want the read error and no sessions", p.SessionsUnread, p.OtherSessions)
+	}
+}
+
+// #197 re-review: a retried --written succeeds ("already marked"), --written
+// after your own abandon is refused for that reason, --not-mine goes only
+// with --abandon, the /clear hint only fits two tagged sessions, and an
+// expired own reservation is flagged in wt holds.
+func TestCmdBlockID_reReviewCases(t *testing.T) {
+	repo := sessionTestRepo(t)
+	logFile := filepath.Join(repo, "log.md")
+	write := func(text string) {
+		t.Helper()
+		if err := os.WriteFile(logFile, []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run := func(args ...string) (int, string) {
+		var code int
+		out, errOut := captureT(t, func() { code = cmdBlockID(args) })
+		return code, out + errOut
+	}
+	write("## NEWEST-3\n")
+	t.Setenv("WT_SESSION", "A")
+	if code, _ := run("log.md"); code != 0 {
+		t.Fatal("reserve")
+	}
+	write("## NEWEST-4\n## NEWEST-3\n")
+	if code, out := run("log.md", "--written", "4"); code != 0 {
+		t.Fatalf("first --written: %d\n%s", code, out)
+	}
+	if code, out := run("log.md", "--written", "4"); code != 0 || !strings.Contains(out, "already marked written") || strings.Contains(out, "to reserve your own") {
+		t.Errorf("a retried --written: code %d (want 0, already marked)\n%s", code, out)
+	}
+	if code, _ := run("log.md", "--not-mine"); code != 64 {
+		t.Errorf("--not-mine without --abandon: code %d, want 64", code)
+	}
+	if code, _ := run("log.md", "--written", "4", "--not-mine"); code != 64 {
+		t.Errorf("--not-mine with --written: code %d, want 64", code)
+	}
+
+	// A reserves 5 and abandons it; --written 5 is then refused for that reason.
+	if code, _ := run("log.md"); code != 0 {
+		t.Fatal("reserve 5")
+	}
+	if code, _ := run("log.md", "--abandon", "5"); code != 0 {
+		t.Fatal("abandon 5")
+	}
+	write("## NEWEST-5\n## NEWEST-4\n## NEWEST-3\n")
+	if code, out := run("log.md", "--written", "5"); code != 1 || !strings.Contains(out, "you abandoned your reservation") {
+		t.Errorf("--written after your own abandon: code %d\n%s", code, out)
+	}
+
+	// The /clear hint: only between two tagged sessions.
+	if code, _ := run("log.md"); code != 0 { // A reserves 6
+		t.Fatal("reserve 6")
+	}
+	t.Setenv("WT_SESSION", "B")
+	if _, out := run("log.md", "--abandon", "6"); !strings.Contains(out, "/clear") {
+		t.Errorf("tagged vs tagged: no /clear hint\n%s", out)
+	}
+	t.Setenv("WT_SESSION", "")
+	if _, out := run("log.md", "--abandon", "6"); strings.Contains(out, "/clear") || !strings.Contains(out, "WT_SESSION") {
+		t.Errorf("a token-less shell vs a tagged reservation: want the WT_SESSION hint, not /clear\n%s", out)
+	}
+	if code, _ := run("log.md"); code != 0 { // a token-less reservation of 7
+		t.Fatal("reserve 7")
+	}
+	t.Setenv("WT_SESSION", "B")
+	if _, out := run("log.md", "--abandon", "7"); strings.Contains(out, "/clear") || !strings.Contains(out, "a shell or agent with no session token") {
+		t.Errorf("a tagged session vs a token-less reservation: wrong wording\n%s", out)
+	}
+
+	// An own reservation past the TTL is flagged as expired in wt holds.
+	c, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, self := coordCtx(c)
+	home, _ := os.UserHomeDir()
+	ledger := coord.BlockLedgerPath(home, canonicalFilePath("log.md"))
+	if err := coord.Append(ledger, coord.Record{ID: "old9", Kind: coord.KindBlockReserve, Window: self.Window, Session: "B",
+		File: canonicalFilePath("log.md"), Block: 9, TS: time.Now().Add(-45 * time.Minute).UTC().Format(time.RFC3339)}); err != nil {
+		t.Fatal(err)
+	}
+	out, errOut := captureT(t, func() { cmdHolds(nil) })
+	if !strings.Contains(out+errOut, "expired: its id may have been handed out again") {
+		t.Errorf("an expired own reservation isn't flagged in wt holds:\n%s%s", out, errOut)
 	}
 }

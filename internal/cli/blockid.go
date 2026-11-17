@@ -148,7 +148,11 @@ func cmdBlockID(args []string) int {
 	}
 	file := strings.TrimSpace(strings.Join(pos, " "))
 	if file == "" {
-		ui.Err(`usage: wt block-id <file> [--pattern "NEWEST-{n}"] [--format] [--written N | --abandon N]`)
+		ui.Err(`usage: wt block-id <file> [--pattern "NEWEST-{n}"] [--format] [--written N | --abandon N [--not-mine]]`)
+		return 64
+	}
+	if *notMine && *abandon < 0 {
+		ui.Err("--not-mine goes with --abandon N only (nothing else frees a reservation)")
 		return 64
 	}
 	re, err := blockPatternRe(*pattern)
@@ -201,8 +205,17 @@ func cmdBlockID(args []string) int {
 			recs, _ := coord.Load(ledger)
 			res, ok := coord.FindOwnReservation(recs, self, absFile, *written)
 			if !ok {
-				ui.Err("%s; `wt block-id %s` to reserve your own (nothing recorded)",
-					notYourReservation(recs, self, absFile, *written, time.Now()), file)
+				// #197 re-review: a retried --written found nothing open and was
+				// told to reserve a new id, for a block already in the file.
+				switch coord.OwnClosedReservation(recs, self, absFile, *written) {
+				case coord.KindBlockWritten:
+					ui.OK("block %d on %s is already marked written (nothing recorded)", *written, filepath.Base(absFile))
+					return 0
+				case coord.KindBlockAbandoned:
+					ui.Err("you abandoned your reservation of block %d on %s, so it is not yours to mark written (nothing recorded)", *written, filepath.Base(absFile))
+					return 1
+				}
+				ui.Err("%s (nothing recorded)", notYourReservation(recs, self, absFile, *written, time.Now()))
 				return 1
 			}
 			m := newRecord(c, self, coord.KindBlockWritten)
@@ -234,8 +247,12 @@ func cmdBlockID(args []string) int {
 			if self.Attribute(res) == coord.AttrMineFallback && !*notMine {
 				why := "was reserved with no session token, like this shell: wt counts it as yours but can't prove it, " +
 					"since every token-less shell or agent in this checkout reads it the same way, and abandoning frees the id for the next reservation"
-				if !confirmInteractive() || !confirmAbandon(*abandon, why, os.Stdin) {
-					ui.Err("not abandoned: block %d %s.", *abandon, why)
+				if interactive := confirmInteractive(); !interactive || !confirmAbandon(*abandon, why, os.Stdin) {
+					if interactive {
+						ui.Err("not abandoned: block %d.", *abandon)
+					} else {
+						ui.Err("not abandoned: block %d %s.", *abandon, why)
+					}
 					ui.Info("abandon it anyway: wt block-id %s --abandon %d --not-mine   ·   set WT_SESSION to a value unique to each shell or agent, and wt can prove which reservations are yours", file, *abandon)
 					return 1
 				}
@@ -286,11 +303,21 @@ func notYourReservation(recs []coord.Record, self coord.Self, file string, block
 	age := humanAge(coord.Age(r, now))
 	switch self.Attribute(r) {
 	case coord.AttrAnotherSession:
-		return fmt.Sprintf("block %d on %s was reserved %s by another session in this checkout (%s), not by you (%s): only its owner marks it, and %s "+
-			"(if this session ran /clear since reserving it, the reservation was yours before it)",
-			block, filepath.Base(file), age, coord.ShortSession(r.Session), selfLabel(self), frees)
+		who := "another session in this window (" + coord.ShortSession(r.Session) + ")"
+		if r.Session == coord.SessionNone {
+			who = "a shell or agent with no session token in this window"
+		}
+		msg := fmt.Sprintf("block %d on %s was reserved %s by %s, not by you (%s): only its owner marks it, and %s",
+			block, filepath.Base(file), age, who, selfLabel(self), frees)
+		switch {
+		case self.Session == coord.SessionNone:
+			msg += " (this shell has no session token: set WT_SESSION, unique per shell or agent, to tell them apart)"
+		case r.Session != coord.SessionNone:
+			msg += " (if this session ran /clear since reserving it, the reservation was yours before it)"
+		}
+		return msg
 	case coord.AttrUnattributable:
-		return fmt.Sprintf("block %d on %s was reserved %s in this checkout by a wt without session support, so no session can mark it; %s",
+		return fmt.Sprintf("block %d on %s was reserved %s in this window by a wt without session support, so no session can mark it; %s",
 			block, filepath.Base(file), age, frees)
 	}
 	return fmt.Sprintf("block %d on %s was reserved %s from window %s (%s), not by you (%s): only its owner marks it, and %s",
@@ -336,8 +363,11 @@ func blockReservationBanner(c *config.Config) {
 	ui.Banner(fmt.Sprintf("%d recent block-id reservation(s) not yours (any repo — reservations are per shared file) — a prepend may be imminent", len(res)))
 	for _, r := range res {
 		who := r.Window
-		if r.Window == self.Window {
-			who += " (" + coord.ShortSession(r.Session) + ", this checkout)"
+		switch {
+		case self.ProvablyWrote(r):
+			who += " (your session, another checkout: a subagent's?)"
+		case r.Window == self.Window:
+			who += " (" + coord.ShortSession(r.Session) + ", this window)"
 		}
 		fmt.Fprintf(os.Stderr, "  %s reserved block %s on %s  %s\n",
 			ui.Cyan(who), ui.Bold(strconv.Itoa(r.Block)),

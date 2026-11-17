@@ -1075,6 +1075,11 @@ func cmdHolds(args []string) int {
 				case r.Window != self.Window:
 					tag = " " + ui.Dim("(yours, placed from checkout "+r.Window+")")
 				}
+				if coord.Age(r, now) > coord.DefaultBlockReserveTTL {
+					// #197 re-review: past the TTL its id is free again, and may
+					// have been handed out and written by someone else.
+					tag += " " + ui.Yellow("(expired: its id may have been handed out again; check the file before marking it)")
+				}
 				fmt.Printf("  block %s on %s  %s%s\n",
 					ui.Bold(fmt.Sprintf("%d", r.Block)), filepath.Base(r.File),
 					ui.Dim(humanAge(coord.Age(r, now))), tag)

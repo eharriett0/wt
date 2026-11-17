@@ -164,9 +164,11 @@ func TestBlockReservations_OwnedBySession(t *testing.T) {
 		own, notMine string // OwnBlockReservations, RecentBlockReservations (newest first)
 		finds        map[int]bool
 	}{
-		// A's own token from another checkout ("elsewhere") is A's too (#197
-		// review): a subagent in its own worktree shares its parent's id.
-		{Self{Window: "co", Session: "A"}, "elsewhere,mine", "nosession,tokenless,theirs",
+		// A's own token from another checkout ("elsewhere") is A's to list and
+		// mark (#197 review: a subagent in its own worktree shares its parent's
+		// id), and still shows in A's banner (#197 re-review: the subagent's
+		// prepend is imminent too).
+		{Self{Window: "co", Session: "A"}, "elsewhere,mine", "elsewhere,nosession,tokenless,theirs",
 			map[int]bool{4: true, 5: false, 6: false, 7: false, 8: true}},
 		{Self{Window: "co", Session: "B"}, "theirs", "elsewhere,nosession,tokenless,mine",
 			map[int]bool{4: false, 5: true, 6: false, 7: false}},
@@ -240,6 +242,29 @@ func TestOpenReservation_writtenByID(t *testing.T) {
 	}
 	if got := OwnBlockReservations(legacy, A); len(got) != 0 {
 		t.Errorf("a marker without AckOf no longer closes its (file, block): %+v", got)
+	}
+}
+
+// #197 re-review: a marker closes only the reservation it names AND whose
+// file and block it carries, so two records sharing an id can't close each
+// other across files.
+func TestOpenReservation_markerMustMatchFileAndBlock(t *testing.T) {
+	fresh := time.Now().Add(-time.Minute).Format(time.RFC3339)
+	A := Self{Window: "co", Session: "A"}
+	recs := []Record{
+		{ID: "dup", Kind: KindBlockReserve, Window: "co", Session: "A", File: "one.md", Block: 4, TS: fresh},
+		{ID: "dup", Kind: KindBlockReserve, Window: "co", Session: "A", File: "two.md", Block: 7, TS: fresh},
+		{Kind: KindBlockWritten, Window: "co", Session: "A", File: "one.md", Block: 4, AckOf: "dup", TS: fresh},
+	}
+	got := OwnBlockReservations(recs, A)
+	if len(got) != 1 || got[0].File != "two.md" {
+		t.Errorf("a marker for one.md#4 closed two.md#7 too: %+v", got)
+	}
+	if st := OwnClosedReservation(recs, A, "one.md", 4); st != KindBlockWritten {
+		t.Errorf("OwnClosedReservation(one.md, 4) = %q, want written", st)
+	}
+	if st := OwnClosedReservation(recs, A, "two.md", 7); st != "" {
+		t.Errorf("OwnClosedReservation(two.md, 7) = %q, want open (\"\")", st)
 	}
 }
 
