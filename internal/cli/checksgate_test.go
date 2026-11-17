@@ -550,7 +550,7 @@ func TestCmdMergePR_checksGate(t *testing.T) {
 		{name: "-R other/repo: that PR is read, and its base repository's rules", args: []string{"99999", "--keep", "--", "-R", "other/repo"},
 			rollup: rollupIn("other/repo", runNode("test", "COMPLETED", "SUCCESS")), code: 0,
 			merged: append(append([]string{}, pinned...), "-R", "other/repo"),
-			calls: []string{"-R other/repo", "url=https://github.com/other/repo/pull/99999",
+			calls: []string{`--json number,url --jq "\(.number) \(.url)" -R other/repo`, "url=https://github.com/other/repo/pull/99999",
 				"api --hostname github.com repos/other/repo/branches/main", "api --hostname github.com repos/other/repo/rules/branches/main"},
 			noCalls: []string{"repos/o/r/"}},
 		// A passthrough that merges nothing: no gate, no pin.

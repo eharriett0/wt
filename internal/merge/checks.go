@@ -63,6 +63,8 @@ type ChecksInput struct {
 	RequiredUnread []string               // where the required checks could not be read from, and why
 	MinChecks      int                    // merge_min_checks: fewer checks ran blocks; 0 = no floor
 	MinChecksBad   string                 // merge_min_checks set to something that is not a count
+	MinChecksFrom  string                 // where MinChecksBad was set (#223: the checkout or the base branch)
+	FloorUnread    string                 // the base branch's settings could not be read, so no floor is known (#223): why
 }
 
 // ChecksVerdict is the gate's decision and everything it rests on.
@@ -84,6 +86,8 @@ type ChecksVerdict struct {
 	Ran              int    // checks that ran or are running: all but SKIPPED
 	Floor            int    // the merge_min_checks Ran fell short of; 0 = met, or none set
 	FloorBad         string // merge_min_checks is not a count: its value
+	FloorBadFrom     string // where it was set
+	FloorUnread      string // no floor is known: why (#223)
 	RequiredUnread   []string
 }
 
@@ -159,12 +163,12 @@ func DecideChecks(in ChecksInput) ChecksVerdict {
 	if in.MinChecks > 0 && v.Ran < in.MinChecks {
 		v.Floor = in.MinChecks
 	}
-	v.FloorBad = in.MinChecksBad
+	v.FloorBad, v.FloorBadFrom, v.FloorUnread = in.MinChecksBad, in.MinChecksFrom, in.FloorUnread
 	v.RequiredUnread = in.RequiredUnread
 	switch {
 	case len(v.Pending)+len(v.Failed)+len(v.Unknown)+len(v.Missing)+len(v.OtherApp) > 0,
 		len(v.MissingWorkflows)+len(v.Unverifiable) > 0,
-		v.Floor > 0, v.FloorBad != "", len(v.RequiredUnread) > 0:
+		v.Floor > 0, v.FloorBad != "", v.FloorUnread != "", len(v.RequiredUnread) > 0:
 		v.Status = ChecksBlocked
 	case v.Ran == 0:
 		v.Status = ChecksNone
@@ -268,6 +272,9 @@ func (v ChecksVerdict) Reasons() []string {
 	}
 	if v.FloorBad != "" {
 		out = append(out, "merge_min_checks is not a count")
+	}
+	if v.FloorUnread != "" {
+		out = append(out, "merge_min_checks could not be read")
 	}
 	if len(v.RequiredUnread) > 0 {
 		out = append(out, "the required checks could not be read")

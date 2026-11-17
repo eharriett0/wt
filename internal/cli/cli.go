@@ -460,17 +460,23 @@ func cmdMergePR(args []string) int {
 	// branch, and the stricter applies. This checkout is usually the PR's own
 	// worktree, so on its own the branch being merged decided its own gate: a
 	// PR could turn merge_is_deploy off, and a branch cut before the base added
-	// a deploy glob skipped the gate for a path that now deploys.
-	gates := mergeGates(c, pr, merge.ParseForwardedRepo(ghArgs), *dryRun)
+	// a deploy glob skipped the gate for a path that now deploys. A passthrough
+	// that merges nothing reads neither, and no gate below needs them.
+	repo := merge.ParseForwardedRepo(ghArgs)
+	nonMerging := merge.NonMerging(ghArgs)
+	gates := []gateSource{{from: "this checkout", gate: c.Gate()}}
+	if nonMerging == "" {
+		gates = mergeGates(c, pr, repo, *dryRun)
+	}
 	pin, checksLabel, prHost := "", "skipped", ""
-	if flag := merge.NonMerging(ghArgs); flag != "" {
-		fmt.Println(skippedChecksLine(pr, flag))
+	if nonMerging != "" {
+		fmt.Println(skippedChecksLine(pr, nonMerging))
 	} else {
 		var ok bool
-		minChecks, minChecksBad := strictestFloor(gates)
+		floor := strictestFloor(gates)
 		pin, checksLabel, prHost, ok = checksGate(pr, checksOpts{dryRun: *dryRun, checksOK: *checksOK, admin: *admin, bypass: *bypass,
-			auto: merge.ForwardsAuto(ghArgs), repo: merge.ParseForwardedRepo(ghArgs),
-			minChecks: minChecks, minChecksBad: minChecksBad}, os.Stdin, stdinIsTTY(), liveChecksReads)
+			auto: merge.ForwardsAuto(ghArgs), repo: repo,
+			minChecks: floor.n, minChecksBad: floor.bad, badFrom: floor.badFrom, floorUnread: floor.unread}, os.Stdin, stdinIsTTY(), liveChecksReads)
 		if !ok {
 			return 1
 		}
@@ -482,24 +488,29 @@ func cmdMergePR(args []string) int {
 	// #178: right before the confirm, GitHub's status page is read (github.com
 	// only) and an Actions incident is warned about; a dry run prints the same
 	// lines, and like the real gate reads nothing for a draft it would refuse.
-	if deployGateApplies(gates, pr) {
+	// A passthrough that merges nothing (--disable-auto, --help) deploys
+	// nothing either, so it skips the deploy gate as it skips the checks gate.
+	if fires, unsure := deployGateApplies(gates, pr, repo); fires && nonMerging == "" {
 		statusHost := deployStatusHost(prHost)
 		if *dryRun {
-			draft, derr := ghx.PRIsDraft(pr)
+			draft, derr := ghx.PRIsDraft(pr, repo)
 			isDraft := draft && derr == nil
-			ui.Warn("%s", deployDryRunNote(pr, isDraft, *confirmDeploy))
+			ui.Warn("%s", deployDryRunNote(pr, isDraft, *confirmDeploy, unsure))
 			if !isDraft {
 				warnActionsStatus(statusHost)
 			}
-		} else if code := deployGate(pr, *confirmDeploy, statusHost); code != 0 {
+		} else if code := deployGate(pr, repo, *confirmDeploy, statusHost, unsure); code != 0 {
 			return code
 		}
 	}
 	// Cross-window coordination interlock (#13): refuse if another window holds
 	// `merge-main` (a disruptive change in flight) and this window hasn't acked
-	// it. --bypass overrides, matching the collision guard's escape hatch.
+	// it. --bypass overrides, matching the collision guard's escape hatch. #223:
+	// hold_max_age and coord_issue are the stricter of the checkout's and the
+	// base's, so a PR can't shorten a hold's life or drop the mirror.
 	if !*dryRun && !*bypass {
-		if code := mergeCoordGate(c); code != 0 {
+		holdAge, issues := strictestHolds(gates)
+		if code := mergeCoordGateWith(c, holdAge, issues); code != 0 {
 			return code
 		}
 	}
@@ -670,9 +681,10 @@ func anyDeployPath(files, globs []string) bool {
 			continue
 		}
 		if strings.HasPrefix(g, "!") {
-			if ex := strings.TrimSpace(g[1:]); ex != "" {
-				exclude = append(exclude, ex)
-			}
+			// A bare `!` excludes nothing, but it is still an exclusion: dropped,
+			// a list of only that (`merge_is_deploy_paths = !`, a typo) was
+			// neither include nor exclude and never gated (#223 review).
+			exclude = append(exclude, strings.TrimSpace(g[1:]))
 			continue
 		}
 		include = append(include, g)
@@ -706,14 +718,18 @@ func matchesAny(globs []string, name string) bool {
 // once deployGateApplies has said it fires (#170). It follows deployGate's own
 // order: a draft is refused before anything else, then --confirm-deploy decides
 // whether the real merge would stop for the typed ack. Pure.
-func deployDryRunNote(pr string, draft, confirmed bool) string {
+func deployDryRunNote(pr string, draft, confirmed bool, unsure string) string {
+	applies := "AUTO-APPLIES to prod (merge_is_deploy)"
+	if unsure != "" {
+		applies = "MAY auto-apply to prod: " + unsure
+	}
 	switch {
 	case draft:
 		return "--dry-run: a real merge would REFUSE here: PR #" + pr + " is a DRAFT in a merge==deploy repo. Mark it ready first."
 	case confirmed:
-		return "--dry-run: merging PR #" + pr + " AUTO-APPLIES to prod (merge_is_deploy); --confirm-deploy is set, so a real merge would proceed."
+		return "--dry-run: merging PR #" + pr + " " + applies + "; --confirm-deploy is set, so a real merge would proceed."
 	default:
-		return "--dry-run: a real merge stops at the deploy gate: merging PR #" + pr + " AUTO-APPLIES to prod (merge_is_deploy). Pass --confirm-deploy, or type deploy at a terminal."
+		return "--dry-run: a real merge stops at the deploy gate: merging PR #" + pr + " " + applies + ". Pass --confirm-deploy, or type deploy at a terminal."
 	}
 }
 
@@ -723,13 +739,19 @@ func deployDryRunNote(pr string, draft, confirmed bool) string {
 // host; github.com only, #178), and requires either --confirm-deploy or a typed
 // "deploy" at an interactive prompt. The warning sits right before the
 // confirm, so whoever confirms has just read it; it never blocks.
-func deployGate(pr string, confirmed bool, statusHost string) int {
-	if draft, err := ghx.PRIsDraft(pr); err == nil && draft {
+func deployGate(pr, repo string, confirmed bool, statusHost, unsure string) int {
+	if draft, err := ghx.PRIsDraft(pr, repo); err == nil && draft {
 		ui.Err("PR #%s is a DRAFT — refusing to merge in a merge==deploy repo (would auto-apply to prod).", pr)
 		ui.Info("mark it ready first: gh pr ready %s", pr)
 		return 1
 	}
-	ui.Banner("⚠ merge_is_deploy — merging PR #" + pr + " AUTO-APPLIES to prod")
+	if unsure != "" {
+		// #223 review: nothing says this repo deploys, only that it can't be
+		// ruled out; the banner must not state a deploy as fact.
+		ui.Banner("⚠ merging PR #" + pr + " MAY auto-apply to prod: " + unsure)
+	} else {
+		ui.Banner("⚠ merge_is_deploy — merging PR #" + pr + " AUTO-APPLIES to prod")
+	}
 	warnActionsStatus(statusHost)
 	if confirmed {
 		ui.Info("--confirm-deploy set — proceeding with the prod deploy.")

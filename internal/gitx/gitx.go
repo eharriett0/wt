@@ -945,27 +945,56 @@ func RefBlob(worktree, ref, path string) (string, bool) {
 	return out, true
 }
 
-// RefFileText returns the text of the file at path in commit ref (`ref:path`,
-// whose path git reads literally) and whether ref has a file there (#223). An
-// error when ref does not resolve to a commit, when something other than a
-// file sits at path, or when git cannot read the blob: none of those is a ref
-// without the file. No network: it reads the object store as last fetched.
+// RefFileText returns the text of the regular file at path in commit ref and
+// whether ref has an entry there (#223). path is from the repository's top
+// (`--full-tree`, so the cwd doesn't matter) and compared exactly. Absent is
+// only what `git ls-tree` says: no entry at path in a commit that resolves. An
+// error when ref does not resolve to a commit, when the entry is a symlink (a
+// blob read would hand back the link's target as if it were the file, #223
+// review), a directory or a submodule, or when the blob can't be read: in a
+// partial clone a blob never fetched is in the tree but not here, and git
+// fetches it on the read (or fails offline), which is no ref without the file.
 func RefFileText(ref, path string) (string, bool, error) {
 	if _, err := Run("rev-parse", "--verify", "--quiet", ref+"^{commit}"); err != nil {
 		return "", false, fmt.Errorf("%s does not resolve to a commit here", ref)
 	}
-	kind, err := Run("cat-file", "-t", ref+":"+path)
+	out, err := runRaw("", "ls-tree", "-z", "--full-tree", ref, "--", path)
 	if err != nil {
-		return "", false, nil // the commit resolves, so the path is not in it
+		return "", false, fmt.Errorf("cannot list %s in %s: %w", path, ref, err)
 	}
-	if kind != "blob" {
+	mode, kind, oid, ok := lsTreeEntry(out, path)
+	if !ok {
+		return "", false, nil
+	}
+	switch {
+	case mode == "120000":
+		return "", false, fmt.Errorf("%s in %s is a symlink, which wt does not follow", path, ref)
+	case kind != "blob":
 		return "", false, fmt.Errorf("%s in %s is a %s, not a file", path, ref, kind)
 	}
-	text, err := runRaw("", "cat-file", "blob", ref+":"+path)
+	text, err := runRaw("", "cat-file", "blob", oid)
 	if err != nil {
 		return "", false, fmt.Errorf("cannot read %s in %s: %w", path, ref, err)
 	}
 	return text, true, nil
+}
+
+// lsTreeEntry finds the entry named exactly path in `git ls-tree -z` output
+// (`<mode> SP <type> SP <oid> TAB <path> NUL` per entry): its mode, type and
+// object id. A pattern git matched that is not path itself is skipped. Pure.
+func lsTreeEntry(out, path string) (mode, kind, oid string, ok bool) {
+	for _, e := range splitNUL(out) {
+		meta, name, found := strings.Cut(e, "\t")
+		if !found || name != path {
+			continue
+		}
+		f := strings.Fields(meta)
+		if len(f) != 3 {
+			continue
+		}
+		return f[0], f[1], f[2], true
+	}
+	return "", "", "", false
 }
 
 // ResolveRemoteBase returns the best last-known base ref for offline base-drift

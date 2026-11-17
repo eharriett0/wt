@@ -13,57 +13,73 @@ import (
 	"time"
 
 	"github.com/eharriett0/wt/internal/config"
+	"github.com/eharriett0/wt/internal/coord"
 	"github.com/eharriett0/wt/internal/ghx"
 )
 
 // TestBaseGateSource pins where the base branch's gate settings come from
 // (#223): GitHub's copy when it was read; else this clone's origin/<base>,
-// with a warning; else, or for a forwarded -R, fail closed (deploy on for the
-// whole repository, no floor invented).
+// fetched first, but only for the base branch GitHub named and only when the
+// PR's repository is this clone's origin; else fail closed.
 func TestBaseGateSource(t *testing.T) {
-	on := ghx.BaseConf{Base: "main", Commit: "0123456789abc", Found: true, Text: "merge_is_deploy = true\nmerge_is_deploy_paths = infra/**\nmerge_min_checks = 3\n"}
+	on := ghx.BaseConf{Base: "main", Owner: "o", Name: "r", Commit: "0123456789abc", Found: true,
+		Text: "merge_is_deploy = true\nmerge_is_deploy_paths = infra/**\nmerge_min_checks = 3\n"}
+	resolved := ghx.BaseConf{Base: "release", Owner: "o", Name: "r", Host: "github.com"} // gh named the PR; the conf read failed
 	unread := errors.New("HTTP 502")
-	localRef := "refs/remotes/origin/main"
+	ref := "refs/remotes/origin/release"
+	defaults := config.GateFromConf("")
 	cases := []struct {
-		name      string
-		fresh     ghx.BaseConf
-		freshErr  error
-		forwarded bool
-		local     localBaseConf
-		wantFrom  string
-		want      config.Gate
-		wantWarn  []string // "" = no warning
+		name         string
+		fresh        ghx.BaseConf
+		freshErr     error
+		originIsBase bool
+		local        localBaseConf
+		wantFrom     string
+		want         config.Gate
+		wantUnread   bool
+		wantWarn     []string // none = no warning
 	}{
 		{name: "GitHub's copy", fresh: on,
 			wantFrom: "main's .wt.conf on GitHub (at 0123456)",
-			want:     config.Gate{MergeIsDeploy: true, MergeIsDeployPaths: []string{"infra/**"}, MergeMinChecks: 3}},
-		{name: "GitHub says the base has no .wt.conf", fresh: ghx.BaseConf{Base: "main", Commit: "abc"},
-			wantFrom: "main on GitHub, which has no .wt.conf"},
-		{name: "GitHub unread: this clone's copy, with a warning", freshErr: unread,
-			local:    localBaseConf{ref: localRef, found: true, text: "merge_is_deploy = true\n"},
-			wantFrom: "origin/main's .wt.conf as last fetched", want: config.Gate{MergeIsDeploy: true},
-			wantWarn: []string{"HTTP 502", "origin/main as last fetched, which may be stale"}},
-		{name: "GitHub unread, this clone's copy has no .wt.conf", freshErr: unread,
-			local:    localBaseConf{ref: localRef},
-			wantFrom: "origin/main as last fetched, which has no .wt.conf",
-			wantWarn: []string{"which may be stale"}},
-		{name: "GitHub unread, no copy here: fail closed", freshErr: unread,
-			local:    localBaseConf{ref: localRef, err: errors.New("refs/remotes/origin/main does not resolve to a commit here")},
-			wantFrom: "the base branch's .wt.conf, which could not be read", want: config.Gate{MergeIsDeploy: true},
-			wantWarn: []string{"HTTP 502", "does not resolve", "so it gates"}},
-		{name: "GitHub unread for a forwarded -R: fail closed, the clone is another repository", freshErr: unread, forwarded: true,
-			local:    localBaseConf{ref: localRef, found: true, text: "merge_is_deploy = false\n"},
-			wantFrom: "the base branch's .wt.conf, which could not be read", want: config.Gate{MergeIsDeploy: true},
-			wantWarn: []string{"(-R)", "so it gates"}},
+			want: config.Gate{MergeIsDeploy: true, MergeIsDeployPaths: []string{"infra/**"}, MergeMinChecks: 3,
+				HoldMaxAge: config.DefaultHoldMaxAge}},
+		{name: "GitHub says the base has no .wt.conf: defaults", fresh: ghx.BaseConf{Base: "main", Commit: "abc"},
+			wantFrom: "main on GitHub, which has no .wt.conf", want: defaults},
+		{name: "GitHub unread: the PR's base, fetched just now", fresh: resolved, freshErr: unread, originIsBase: true,
+			local:    localBaseConf{ref: ref, found: true, text: "merge_is_deploy = true\n"},
+			wantFrom: "origin/release's .wt.conf fetched just now", want: config.Gate{MergeIsDeploy: true, HoldMaxAge: config.DefaultHoldMaxAge},
+			wantWarn: []string{"HTTP 502", "origin/release, fetched just now"}},
+		{name: "GitHub unread and the fetch failed: as last fetched, may be stale", fresh: resolved, freshErr: unread, originIsBase: true,
+			local:    localBaseConf{ref: ref, fetchErr: errors.New("offline"), found: true, text: "merge_is_deploy = true\n"},
+			wantFrom: "origin/release's .wt.conf as last fetched", want: config.Gate{MergeIsDeploy: true, HoldMaxAge: config.DefaultHoldMaxAge},
+			wantWarn: []string{"offline", "which may be stale"}},
+		{name: "GitHub unread, this clone's copy has no .wt.conf", fresh: resolved, freshErr: unread, originIsBase: true,
+			local:    localBaseConf{ref: ref},
+			wantFrom: "origin/release fetched just now, which has no .wt.conf", want: defaults,
+			wantWarn: []string{"fetched just now"}},
+		{name: "the base branch was never resolved: fail closed, never a guess", freshErr: unread,
+			wantUnread: true, want: config.Gate{MergeIsDeploy: true},
+			wantWarn: []string{"the PR's base branch could not be resolved", "checks gate refuses without --checks-ok"}},
+		{name: "the PR's repository is not origin (-R, a URL, GH_REPO, a fork): fail closed", fresh: resolved, freshErr: unread,
+			local:      localBaseConf{ref: ref, found: true, text: "merge_is_deploy = false\n"},
+			wantUnread: true, want: config.Gate{MergeIsDeploy: true},
+			wantWarn: []string{"o/r is not this clone's origin"}},
+		{name: "this clone's copy can't be read (a symlink, an unfetched blob): fail closed", fresh: resolved, freshErr: unread, originIsBase: true,
+			local:      localBaseConf{ref: ref, err: errors.New(".wt.conf in refs/remotes/origin/release is a symlink")},
+			wantUnread: true, want: config.Gate{MergeIsDeploy: true},
+			wantWarn: []string{"is a symlink"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			src, warn := baseGateSource(tc.fresh, tc.freshErr, tc.forwarded, tc.local)
-			if src.from != tc.wantFrom {
+			src, warn := baseGateSource(tc.fresh, tc.freshErr, tc.originIsBase, tc.local)
+			if tc.wantFrom != "" && src.from != tc.wantFrom {
 				t.Errorf("from = %q, want %q", src.from, tc.wantFrom)
 			}
 			if !reflect.DeepEqual(src.gate, tc.want) {
 				t.Errorf("gate = %+v, want %+v", src.gate, tc.want)
+			}
+			if (src.unread != "") != tc.wantUnread {
+				t.Errorf("unread = %q, want unread: %v", src.unread, tc.wantUnread)
 			}
 			if (warn == "") != (len(tc.wantWarn) == 0) {
 				t.Errorf("warn = %q, want one: %v", warn, len(tc.wantWarn) > 0)
@@ -78,24 +94,56 @@ func TestBaseGateSource(t *testing.T) {
 }
 
 func TestStrictestFloor(t *testing.T) {
-	src := func(n int, bad string) gateSource {
-		return gateSource{gate: config.Gate{MergeMinChecks: n, MergeMinChecksBad: bad}}
+	src := func(from string, n int, bad string) gateSource {
+		return gateSource{from: from, gate: config.Gate{MergeMinChecks: n, MergeMinChecksBad: bad}}
 	}
 	cases := []struct {
 		name string
 		srcs []gateSource
-		n    int
-		bad  string
+		want floorSpec
 	}{
-		{"none", []gateSource{src(0, ""), src(0, "")}, 0, ""},
-		{"the checkout lowers the base's floor: the base's", []gateSource{src(0, ""), src(3, "")}, 3, ""},
-		{"the checkout raises it: its own", []gateSource{src(5, ""), src(3, "")}, 5, ""},
-		{"a value that is not a count, in the base: refused", []gateSource{src(2, ""), src(0, "three")}, 0, "three"},
-		{"a value that is not a count, in the checkout: refused", []gateSource{src(0, "x"), src(3, "")}, 0, "x"},
+		{"none", []gateSource{src("co", 0, ""), src("base", 0, "")}, floorSpec{}},
+		{"the checkout lowers the base's floor: the base's", []gateSource{src("co", 0, ""), src("base", 3, "")}, floorSpec{n: 3}},
+		{"the checkout raises it: its own", []gateSource{src("co", 5, ""), src("base", 3, "")}, floorSpec{n: 5}},
+		{"a value that is not a count, in the base: refused, and says where", []gateSource{src("co", 2, ""), src("base", 0, "three")},
+			floorSpec{bad: "three", badFrom: "base"}},
+		{"a value that is not a count, in the checkout", []gateSource{src("co", 0, "x"), src("base", 3, "")},
+			floorSpec{bad: "x", badFrom: "co"}},
+		// #223 review: an unread base's floor is unknown, not none.
+		{"an unread base: the floor is unknown", []gateSource{src("co", 0, ""), {from: "base", gate: config.Gate{MergeIsDeploy: true}, unread: "GitHub down"}},
+			floorSpec{unread: "GitHub down"}},
 	}
 	for _, tc := range cases {
-		if n, bad := strictestFloor(tc.srcs); n != tc.n || bad != tc.bad {
-			t.Errorf("%s: strictestFloor = (%d, %q), want (%d, %q)", tc.name, n, bad, tc.n, tc.bad)
+		if got := strictestFloor(tc.srcs); got != tc.want {
+			t.Errorf("%s: strictestFloor = %+v, want %+v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestStrictestHolds pins the hold gate's settings over both sources (#223
+// review): hold_max_age 0 (never) wins, else the longest; every coord_issue
+// counts; an unread source sets nothing.
+func TestStrictestHolds(t *testing.T) {
+	src := func(age time.Duration, issue int) gateSource {
+		return gateSource{gate: config.Gate{HoldMaxAge: age, CoordIssue: issue}}
+	}
+	cases := []struct {
+		name   string
+		srcs   []gateSource
+		age    time.Duration
+		issues []int
+	}{
+		{"the checkout shortens hold_max_age: the base's", []gateSource{src(time.Minute, 0), src(24*time.Hour, 0)}, 24 * time.Hour, nil},
+		{"never expire beats any age", []gateSource{src(time.Hour, 0), src(0, 0)}, 0, nil},
+		{"the checkout drops coord_issue: the base's mirror still read", []gateSource{src(time.Hour, 0), src(time.Hour, 36)}, time.Hour, []int{36}},
+		{"two mirrors: both read, once each", []gateSource{src(time.Hour, 7), src(time.Hour, 36), src(time.Hour, 7)}, time.Hour, []int{7, 36}},
+		{"an unread base sets nothing", []gateSource{src(time.Minute, 0), {gate: config.Gate{MergeIsDeploy: true}, unread: "x"}}, time.Minute, nil},
+		{"no source read: the default", []gateSource{{unread: "x"}}, config.DefaultHoldMaxAge, nil},
+	}
+	for _, tc := range cases {
+		age, issues := strictestHolds(tc.srcs)
+		if age != tc.age || !reflect.DeepEqual(issues, tc.issues) {
+			t.Errorf("%s: strictestHolds = (%v, %v), want (%v, %v)", tc.name, age, issues, tc.age, tc.issues)
 		}
 	}
 }
@@ -140,6 +188,11 @@ func TestDeployDecision(t *testing.T) {
 		{name: "no files listed: fires (fail closed)",
 			srcs: []gateSource{src("co", false), src("base", true, "infra/**")}, files: []string{},
 			needFiles: true, fires: true},
+		// #223 review: `merge_is_deploy_paths = !` (a typo) excluded nothing and
+		// included nothing, so it never gated.
+		{name: "a bare ! is an exclusions-only list: fails closed",
+			srcs: []gateSource{src("co", false), src("base", true, "!")}, files: []string{"infra/x.yaml"},
+			needFiles: true, fires: true, by: "base"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -154,29 +207,73 @@ func TestDeployDecision(t *testing.T) {
 	}
 }
 
-// baseGateGh is gh for #223's end-to-end test: open PR 99999 in o/r on its own
-// host (so ghx's process-wide auth memo, #172, stays apart), base main. The
-// base's .wt.conf is the JSON in "baseconf.json" (ReadBaseConf's --jq form),
-// and its read fails when "base.fail" exists. The PR's files are "rest" (REST
-// pulls/{n}/files lines), "nfiles" and "diffnames". One check passed, nothing
-// is required. Every call goes to "calls", a merge's argv to "argv".
+// A bare `!`, alone or repeated, is an exclusions-only list, and an empty
+// exclusion matches nothing next to a real include (#223 review).
+func TestAnyDeployPath_bareBang(t *testing.T) {
+	for _, globs := range [][]string{{"!"}, {"! "}, {"!", "!"}} {
+		if !anyDeployPath([]string{"infra/x.yaml"}, globs) {
+			t.Errorf("anyDeployPath(%q) = false: the gate never fires", globs)
+		}
+	}
+	if !anyDeployPath([]string{"infra/x.yaml"}, []string{"infra/**", "!"}) {
+		t.Error("an empty exclusion beside an include excluded a deploy path")
+	}
+}
+
+func TestGateSummaryAndDiffer(t *testing.T) {
+	a := gateSource{from: "co", gate: config.Gate{MergeIsDeploy: true, MergeIsDeployPaths: []string{"infra/**"}, HoldMaxAge: time.Hour}}
+	b := gateSource{from: "base", gate: config.Gate{MergeIsDeploy: true, MergeIsDeployPaths: []string{"infrastructure/**"}, HoldMaxAge: time.Hour, CoordIssue: 36}}
+	off := gateSource{from: "off", gate: config.Gate{MergeIsDeployPaths: []string{"infra/**"}}}
+	for _, tc := range []struct {
+		s    gateSource
+		want string
+	}{
+		{a, "co: merge_is_deploy on [merge_is_deploy_paths infra/**], merge_min_checks off, hold_max_age 1h0m0s"},
+		{b, "base: merge_is_deploy on [merge_is_deploy_paths infrastructure/**], merge_min_checks off, hold_max_age 1h0m0s, coord_issue #36"},
+		{off, "off: merge_is_deploy off [merge_is_deploy_paths infra/**], merge_min_checks off, hold_max_age never"},
+		{gateSource{from: "u", unread: "GitHub down", gate: config.Gate{MergeIsDeploy: true}},
+			"u (GitHub down): taken as merge_is_deploy on (whole repository), merge_min_checks unknown"},
+	} {
+		if got := gateSummary(tc.s); got != tc.want {
+			t.Errorf("gateSummary = %q, want %q", got, tc.want)
+		}
+	}
+	if gatesDiffer([]gateSource{a, a}) || !gatesDiffer([]gateSource{a, b}) || gatesDiffer(nil) || gatesDiffer([]gateSource{a}) {
+		t.Error("gatesDiffer: equal sources differ, different ones don't, or an empty list panics")
+	}
+	if !gatesDiffer([]gateSource{a, {gate: a.gate, unread: "x"}}) {
+		t.Error("an unread source must always read as different")
+	}
+}
+
+// baseGateGh is gh for #223's end-to-end tests: open PR 99999 on its own host
+// (so ghx's process-wide auth memo, #172, stays apart). Files steer it:
+// "basename" (the PR's base, default main), "prrepo" (its repository, default
+// o/r), "prview.fail" (gh can't resolve the PR), "base.fail" (the .wt.conf
+// read fails), "baseconf.json" (ReadBaseConf's --jq answer), "rest",
+// "nfiles", "diffnames" (the PR's files). One check passed, nothing is
+// required. Every call goes to "calls", a merge's argv to "argv".
 const baseGateGh = `#!/bin/sh
 d=$(dirname "$0")
 H=basegate.example.com
 printf '%s\n' "$*" >> "$d/calls"
+B=main; [ -e "$d/basename" ] && B=$(cat "$d/basename")
+R=o/r; [ -e "$d/prrepo" ] && R=$(cat "$d/prrepo")
 case "$*" in
 "auth status --json hosts --active"*) printf '{"hosts":{"%s":[{"state":"success","active":true,"host":"%s","login":"octo"}]}}\n' $H $H; exit 0 ;;
 "auth status"*) exit 0 ;;
-*"--json number,url,baseRefName"*) echo "$3 https://$H/o/r/pull/$3 main"; exit 0 ;;
-*"expr=refs/heads/main:.wt.conf"*)
+*"--json number,url,baseRefName"*)
+	[ -e "$d/prview.fail" ] && { echo "gh: Something went wrong (HTTP 502)" >&2; exit 1; }
+	echo "$3 https://$H/$R/pull/$3 $B"; exit 0 ;;
+*"expr=refs/heads/"*)
 	[ -e "$d/base.fail" ] && { echo "gh: Something went wrong (HTTP 502)" >&2; exit 1; }
 	cat "$d/baseconf.json"; exit 0 ;;
-"api --hostname $H repos/o/r/pulls/99999/files"*) cat "$d/rest"; exit 0 ;;
+"api --hostname $H repos/"*"/pulls/99999/files"*) cat "$d/rest"; exit 0 ;;
 "api --include /"*) exit 1 ;;
-"api --hostname $H repos/o/r/branches/"*) echo '` + unprotected + `'; exit 0 ;;
-"api --hostname $H repos/o/r/rules/branches/"*) echo '[]'; exit 0 ;;
-*"--json number,url,changedFiles"*) echo "$3 https://$H/o/r/pull/$3 $(cat "$d/nfiles")"; exit 0 ;;
-*"--json number,url"*) echo "$3 https://$H/o/r/pull/$3"; exit 0 ;;
+"api --hostname $H repos/"*"/rules/branches/"*) echo '[]'; exit 0 ;;
+"api --hostname $H repos/"*"/branches/"*) echo '` + unprotected + `'; exit 0 ;;
+*"--json number,url,changedFiles"*) echo "$3 https://$H/$R/pull/$3 $(cat "$d/nfiles")"; exit 0 ;;
+*"--json number,url"*) echo "$3 https://$H/$R/pull/$3"; exit 0 ;;
 *statusCheckRollup*) echo '` + greenRollup + `'; exit 0 ;;
 esac
 case "$1 $2" in
@@ -188,7 +285,7 @@ case "$1 $2" in
 	*headRefName*) echo feat-x ;;
 	*title*) echo "Change the widget" ;;
 	*" body "*) echo "Refs #3" ;;
-	*" url "*) echo "https://$H/o/r/pull/99999" ;;
+	*" url "*) echo "https://$H/$R/pull/99999" ;;
 	esac ;;
 "pr diff") cat "$d/diffnames" ;;
 "api graphql")
@@ -202,14 +299,17 @@ esac
 exit 0
 `
 
-// TestCmdMergePR_gateSettingsComeFromTheBaseToo is #223 end to end: merge-pr
-// runs in the PR's own worktree, whose .wt.conf is the branch being merged.
-// It read its gates from that file alone, so a PR turning merge_is_deploy off,
-// lowering merge_min_checks, or cut before the base added a deploy glob merged
-// without the gate. The base branch's .wt.conf (GitHub's copy, else this
-// clone's origin/main, else fail closed) now counts too, and the stricter
-// applies.
-func TestCmdMergePR_gateSettingsComeFromTheBaseToo(t *testing.T) {
+// gateEnv is a scratch repo whose origin is o/r on baseGateGh's host, with the
+// fake gh alone on PATH, an isolated HOME and no WT_* gate overrides.
+type gateEnv struct {
+	t     *testing.T
+	repo  string
+	ghDir string
+	git   func(args ...string) string
+}
+
+func newGateEnv(t *testing.T) *gateEnv {
+	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("the fake gh is a shell script")
 	}
@@ -228,18 +328,7 @@ func TestCmdMergePR_gateSettingsComeFromTheBaseToo(t *testing.T) {
 		return strings.TrimSpace(string(out))
 	}
 	git("init", "-q", "-b", "main")
-	git("remote", "add", "origin", "https://basegate.example.com/o/r.git") // never fetched: gh is the fake
-	// Two commits a test can point origin/main at: one whose .wt.conf gates
-	// infra/**, one without a .wt.conf.
-	git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "no conf")
-	noConf := git("rev-parse", "HEAD")
-	if err := os.WriteFile(filepath.Join(repo, ".wt.conf"), []byte("merge_is_deploy = true\nmerge_is_deploy_paths = infra/**\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	git("add", ".wt.conf")
-	git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "gate infra")
-	gateInfra := git("rev-parse", "HEAD")
-
+	git("remote", "add", "origin", "https://basegate.example.com/o/r.git") // never fetched: fetchBase is stubbed
 	ghDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(ghDir, "gh"), []byte(baseGateGh), 0o755); err != nil {
 		t.Fatal(err)
@@ -250,129 +339,292 @@ func TestCmdMergePR_gateSettingsComeFromTheBaseToo(t *testing.T) {
 		t.Fatalf("gh resolves to %q (%v), not the fake", got, err)
 	}
 	t.Setenv("HOME", t.TempDir())
-	for _, k := range []string{"WT_MERGE_IS_DEPLOY", "WT_MERGE_IS_DEPLOY_PATHS", "WT_MERGE_MIN_CHECKS", "WT_BASE"} {
+	for _, k := range []string{"WT_MERGE_IS_DEPLOY", "WT_MERGE_IS_DEPLOY_PATHS", "WT_MERGE_MIN_CHECKS", "WT_HOLD_MAX_AGE",
+		"WT_COORD_ISSUE", "WT_BASE", "GH_REPO", "WT_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_SESSION_ID", "WT_WINDOW"} {
 		t.Setenv(k, "")
 		os.Unsetenv(k) // the _PATHS key counts when set at all, even empty
 	}
 	t.Chdir(repo)
 	postMergeSleep = func(time.Duration) {}
 	liveChecksReads.sleep = func(time.Duration) {}
-	realTTY := stdinIsTTY
+	realTTY, realFetch := stdinIsTTY, fetchBase
 	stdinIsTTY = func() bool { return false }
+	fetchBase = func(string) error { return errors.New("offline (test)") }
 	t.Cleanup(func() {
 		postMergeSleep, liveChecksReads.sleep = time.Sleep, time.Sleep
-		stdinIsTTY = realTTY
+		stdinIsTTY, fetchBase = realTTY, realFetch
 	})
+	return &gateEnv{t: t, repo: repo, ghDir: ghDir, git: git}
+}
 
-	baseJSON := func(text string, found bool) string {
-		v := map[string]any{"oid": fakeHead, "conf": nil}
-		if found {
-			v["conf"] = map[string]any{"__typename": "Blob", "text": text, "isBinary": false, "isTruncated": false}
+// commit makes a commit whose tree holds .wt.conf = conf ("" = none) and
+// returns it.
+func (e *gateEnv) commit(conf string) string {
+	e.t.Helper()
+	p := filepath.Join(e.repo, ".wt.conf")
+	if conf == "" {
+		_ = os.Remove(p)
+		e.git("rm", "-q", "--cached", "--ignore-unmatch", ".wt.conf")
+	} else {
+		if err := os.WriteFile(p, []byte(conf), 0o644); err != nil {
+			e.t.Fatal(err)
 		}
-		b, err := json.Marshal(v)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return string(b)
+		e.git("add", ".wt.conf")
 	}
-	const gateOn = "merge_is_deploy = true\nmerge_is_deploy_paths = infra/**\n"
+	e.git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "c")
+	return e.git("rev-parse", "HEAD")
+}
+
+// checkout sets this checkout's .wt.conf on disk ("" = none): what
+// config.Load reads, as in the PR's own worktree.
+func (e *gateEnv) checkout(conf string) {
+	e.t.Helper()
+	p := filepath.Join(e.repo, ".wt.conf")
+	if conf == "" {
+		_ = os.Remove(p)
+		return
+	}
+	if err := os.WriteFile(p, []byte(conf), 0o644); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
+// fake sets the fake gh's state: the PR changes file, and kv's files.
+func (e *gateEnv) fake(file string, kv map[string]string) {
+	e.t.Helper()
+	for _, name := range []string{"argv", "calls", "merged", "base.fail", "prview.fail", "basename", "prrepo", "baseconf.json"} {
+		_ = os.Remove(filepath.Join(e.ghDir, name))
+	}
+	rest, _ := json.Marshal(map[string]any{"f": file, "p": nil, "s": "modified"})
+	files := map[string]string{"rest": string(rest) + "\n", "nfiles": "1", "diffnames": file + "\n", "baseconf.json": baseJSON("", false)}
+	for k, v := range kv {
+		files[k] = v
+	}
+	for name, text := range files {
+		if err := os.WriteFile(filepath.Join(e.ghDir, name), []byte(text), 0o644); err != nil {
+			e.t.Fatal(err)
+		}
+	}
+}
+
+func (e *gateEnv) merge(args ...string) (code int, out string, merged bool) {
+	e.t.Helper()
+	stdout, stderr := captureT(e.t, func() { code = cmdMergePR(args) })
+	_, err := os.Stat(filepath.Join(e.ghDir, "argv"))
+	return code, stdout + stderr, err == nil
+}
+
+func (e *gateEnv) calls() string {
+	b, _ := os.ReadFile(filepath.Join(e.ghDir, "calls"))
+	return string(b)
+}
+
+// baseJSON is ReadBaseConf's --jq answer for a base whose .wt.conf is text
+// (found) or absent, at the given mode (0 = a regular file).
+func baseJSON(text string, found bool, mode ...int) string {
+	v := map[string]any{"oid": fakeHead, "mode": nil, "conf": nil}
+	if found {
+		m := 0o100644
+		if len(mode) > 0 {
+			m = mode[0]
+		}
+		v["mode"] = m
+		v["conf"] = map[string]any{"__typename": "Blob", "text": text, "isBinary": false, "isTruncated": false}
+	}
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
+const gateInfra = "merge_is_deploy = true\nmerge_is_deploy_paths = infra/**\n"
+
+// TestCmdMergePR_gateSettingsComeFromTheBaseToo is #223 end to end: merge-pr
+// runs in the PR's own worktree, whose .wt.conf is the branch being merged.
+// It read its gates from that file alone, so a PR turning merge_is_deploy off,
+// lowering merge_min_checks, or cut before the base added a deploy glob merged
+// without the gate. The base branch's .wt.conf (GitHub's copy, else this
+// clone's origin/<base>, else fail closed) now counts too, and the stricter
+// applies.
+func TestCmdMergePR_gateSettingsComeFromTheBaseToo(t *testing.T) {
+	e := newGateEnv(t)
+	noConf := e.commit("")
+	gated := e.commit(gateInfra)
 	cases := []struct {
 		name      string
 		checkout  string // this checkout's .wt.conf; "" = none
-		base      string // the base's on GitHub; "" = none
-		baseFail  bool   // GitHub's read fails
-		originAt  string // what origin/main points at; "" = no origin/main
+		kv        map[string]string
+		origin    string // what origin/main points at: "", "gated", "noConf"
 		file      string // the PR's one changed file
-		dryRun    bool
+		args      []string
 		code      int
 		merged    bool
 		want, not []string
 	}{
 		{name: "the checkout turns the deploy gate off, the base has it on: gates",
-			checkout: "merge_is_deploy = false\nmerge_is_deploy_paths = infra/**\n", base: gateOn, file: "infra/x.yaml", code: 1,
-			want: []string{"the stricter of the two applies", "this checkout's settings alone would skip the prod gate", "prod deploy not confirmed"}},
+			checkout: "merge_is_deploy = false\nmerge_is_deploy_paths = infra/**\n", kv: map[string]string{"baseconf.json": baseJSON(gateInfra, true)},
+			file: "infra/x.yaml", code: 1,
+			want: []string{"the stricter of the two applies", "this checkout's settings alone would skip the prod gate", "prod deploy not confirmed",
+				"AUTO-APPLIES to prod"}},
 		{name: "a branch older than the base's newest deploy glob: gates",
-			checkout: gateOn, base: "merge_is_deploy = true\nmerge_is_deploy_paths = infra/**,newtree/**\n", file: "newtree/a.yaml", code: 1,
-			want: []string{"main's .wt.conf on GitHub (at 0123456): merge_is_deploy on (2 merge_is_deploy_paths glob(s))", "prod deploy not confirmed"}},
+			checkout: gateInfra, kv: map[string]string{"baseconf.json": baseJSON("merge_is_deploy = true\nmerge_is_deploy_paths = infra/**,newtree/**\n", true)},
+			file: "newtree/a.yaml", code: 1,
+			want: []string{"main's .wt.conf on GitHub (at 0123456): merge_is_deploy on [merge_is_deploy_paths infra/**,newtree/**]", "prod deploy not confirmed"}},
 		{name: "the checkout lowers the checks floor: held to the base's",
-			checkout: "merge_min_checks = off\n", base: "merge_min_checks = 3\n", file: "docs/a.md", code: 1,
-			want: []string{"fewer than merge_min_checks = 3"}},
+			checkout: "merge_min_checks = off\n", kv: map[string]string{"baseconf.json": baseJSON("merge_min_checks = 3\n", true)},
+			file: "docs/a.md", code: 1, want: []string{"fewer than merge_min_checks = 3"}},
 		{name: "the checkout tightens the gate: held to its own",
 			checkout: "merge_is_deploy = true\n", file: "docs/a.md", code: 1,
 			want: []string{"prod deploy not confirmed"}, not: []string{"alone would skip"}},
 		{name: "both scope the gate and the PR is outside it: merges",
-			checkout: gateOn, base: gateOn, file: "docs/a.md", code: 0, merged: true,
+			checkout: gateInfra, kv: map[string]string{"baseconf.json": baseJSON(gateInfra, true)}, file: "docs/a.md", code: 0, merged: true,
 			want: []string{"changes no deploy-path files"}, not: []string{"differ"}},
-		{name: "GitHub unread, no origin/main here: fails closed",
-			baseFail: true, file: "docs/a.md", code: 1,
-			want: []string{"couldn't read the base branch's .wt.conf from GitHub", "HTTP 502", "so it gates", "prod deploy not confirmed"}},
-		{name: "GitHub unread: this clone's origin/main copy decides, with a warning",
-			checkout: "merge_is_deploy = false\n", baseFail: true, originAt: "gateInfra", file: "infra/x.yaml", code: 1,
+		{name: "GitHub unread, no origin/main here: fails closed, says MAY, and refuses the unknown floor",
+			kv: map[string]string{"base.fail": ""}, file: "docs/a.md", args: []string{"--confirm-deploy"}, code: 1,
+			want: []string{"this clone's copy can't be read", "merge_min_checks is unknown", "--checks-ok"}},
+		{name: "... and with --checks-ok it stops at the deploy gate, which says MAY",
+			kv: map[string]string{"base.fail": ""}, file: "docs/a.md", args: []string{"--checks-ok"}, code: 1,
+			want: []string{"MAY auto-apply to prod", "prod deploy not confirmed"}, not: []string{"AUTO-APPLIES"}},
+		{name: "GitHub unread: this clone's origin/main copy decides (the fetch failed: may be stale)",
+			checkout: "merge_is_deploy = false\n", kv: map[string]string{"base.fail": ""}, origin: "gated", file: "infra/x.yaml", code: 1,
 			want: []string{"which may be stale", "origin/main's .wt.conf as last fetched", "prod deploy not confirmed"}},
 		{name: "GitHub unread, origin/main has no .wt.conf: merges, with a warning",
-			baseFail: true, originAt: "noConf", file: "infra/x.yaml", code: 0, merged: true,
+			kv: map[string]string{"base.fail": ""}, origin: "noConf", file: "infra/x.yaml", code: 0, merged: true,
 			want: []string{"which may be stale"}, not: []string{"prod deploy not confirmed"}},
+		// #223 review F1: the fallback read origin/<default branch>, not the PR's base.
+		{name: "a PR into release, GitHub unread: the fallback reads origin/release",
+			checkout: "merge_is_deploy = false\n", kv: map[string]string{"base.fail": "", "basename": "release"}, origin: "noConf",
+			file: "infra/x.yaml", code: 1, want: []string{"origin/release's .wt.conf as last fetched", "prod deploy not confirmed"}},
+		// #223 review F2: the PR's own `base =` steered the fallback.
+		{name: "the checkout's base key never picks the fallback's branch",
+			checkout: "merge_is_deploy = false\nbase = feat-x\n", kv: map[string]string{"base.fail": ""}, origin: "gated",
+			file: "infra/x.yaml", code: 1, want: []string{"origin/main's .wt.conf", "prod deploy not confirmed"}, not: []string{"origin/feat-x"}},
+		// #223 review F3: a PR in another repository (URL, GH_REPO, a fork's
+		// default) read THIS clone's origin.
+		{name: "a PR in another repository, GitHub unread: fails closed",
+			kv: map[string]string{"base.fail": "", "prrepo": "other/repo"}, origin: "noConf", file: "infra/x.yaml",
+			args: []string{"--checks-ok"}, code: 1, want: []string{"other/repo is not this clone's origin", "MAY auto-apply"}},
+		// #223 review F5: a symlinked .wt.conf read as its target's path.
+		{name: "the base's .wt.conf is a symlink: never read as a config with no keys",
+			kv: map[string]string{"baseconf.json": baseJSON("conf/wt.conf", true, 0o120000)}, file: "conf/wt.conf",
+			args: []string{"--checks-ok"}, code: 1, want: []string{"is a symlink", "prod deploy not confirmed"}},
+		// #223 review: gh can't name the PR at all: never guess the base.
+		{name: "gh can't resolve the PR: fails closed",
+			kv: map[string]string{"prview.fail": ""}, origin: "gated", file: "docs/a.md", args: []string{"--checks-ok"}, code: 1,
+			want: []string{"the PR's base branch could not be resolved"}},
+		// #223 review: a passthrough that merges nothing deploys nothing.
+		{name: "--disable-auto in a repo that never deploys, GitHub unread: no deploy gate",
+			kv: map[string]string{"base.fail": ""}, file: "docs/a.md", args: []string{"--", "--disable-auto"},
+			not: []string{"deploy not confirmed", "auto-apply", "AUTO-APPLIES"}},
+		{name: "--disable-auto in a repo that deploys: disarming auto-merge deploys nothing",
+			checkout: "merge_is_deploy = true\n", kv: map[string]string{"baseconf.json": baseJSON("merge_is_deploy = true\n", true)},
+			file: "infra/x.yaml", args: []string{"--", "--disable-auto"},
+			not: []string{"deploy not confirmed", "AUTO-APPLIES", "gate settings"}},
 		{name: "--dry-run names both sources",
-			checkout: "merge_is_deploy = false\n", base: gateOn, file: "infra/x.yaml", dryRun: true, code: 0,
-			want: []string{"this checkout's .wt.conf and WT_* environment: merge_is_deploy off, merge_min_checks off",
-				"main's .wt.conf on GitHub (at 0123456): merge_is_deploy on (1 merge_is_deploy_paths glob(s)), merge_min_checks off",
+			checkout: "merge_is_deploy = false\n", kv: map[string]string{"baseconf.json": baseJSON(gateInfra, true)}, file: "infra/x.yaml",
+			args: []string{"--dry-run"}, code: 0,
+			want: []string{"this checkout's .wt.conf and WT_* environment: merge_is_deploy off, merge_min_checks off, hold_max_age 24h0m0s",
+				"main's .wt.conf on GitHub (at 0123456): merge_is_deploy on [merge_is_deploy_paths infra/**], merge_min_checks off",
 				"a real merge stops at the deploy gate"}},
 		{name: "--dry-run with nothing set still says where the settings came from",
-			file: "infra/x.yaml", dryRun: true, code: 0,
+			file: "infra/x.yaml", args: []string{"--dry-run"}, code: 0,
 			want: []string{"merge-pr's gate settings:", "main on GitHub, which has no .wt.conf: merge_is_deploy off"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			switch tc.originAt {
+			switch tc.origin {
 			case "":
-				_ = exec.Command(gitBin, "-C", repo, "update-ref", "-d", "refs/remotes/origin/main").Run()
-			case "gateInfra":
-				git("update-ref", "refs/remotes/origin/main", gateInfra)
+				_ = exec.Command("git", "-C", e.repo, "update-ref", "-d", "refs/remotes/origin/main").Run()
+				_ = exec.Command("git", "-C", e.repo, "update-ref", "-d", "refs/remotes/origin/release").Run()
+			case "gated":
+				e.git("update-ref", "refs/remotes/origin/main", gated)
+				e.git("update-ref", "refs/remotes/origin/feat-x", noConf) // the PR's own branch, if anything read it
 			case "noConf":
-				git("update-ref", "refs/remotes/origin/main", noConf)
+				e.git("update-ref", "refs/remotes/origin/main", noConf)
+				e.git("update-ref", "refs/remotes/origin/release", gated)
 			}
-			// this checkout's .wt.conf, on disk (config.Load reads the file)
-			conf := filepath.Join(repo, ".wt.conf")
-			if tc.checkout == "" {
-				_ = os.Remove(conf)
-			} else if err := os.WriteFile(conf, []byte(tc.checkout), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			for _, name := range []string{"argv", "calls", "merged", "base.fail"} {
-				_ = os.Remove(filepath.Join(ghDir, name))
-			}
-			rest, _ := json.Marshal(map[string]any{"f": tc.file, "p": nil, "s": "modified"})
-			files := map[string]string{"baseconf.json": baseJSON(tc.base, tc.base != ""), "rest": string(rest) + "\n",
-				"nfiles": "1", "diffnames": tc.file + "\n"}
-			if tc.baseFail {
-				files["base.fail"] = ""
-			}
-			for name, text := range files {
-				if err := os.WriteFile(filepath.Join(ghDir, name), []byte(text), 0o644); err != nil {
-					t.Fatal(err)
-				}
-			}
-			args := []string{"99999", "--keep"}
-			if tc.dryRun {
-				args = append(args, "--dry-run")
-			}
-			var code int
-			stdout, stderr := captureT(t, func() { code = cmdMergePR(args) })
+			e.checkout(tc.checkout)
+			e.fake(tc.file, tc.kv)
+			code, out, merged := e.merge(append([]string{"99999", "--keep"}, tc.args...)...)
 			if code != tc.code {
-				t.Errorf("cmdMergePR = %d, want %d\nstdout: %s\nstderr: %s", code, tc.code, stdout, stderr)
+				t.Errorf("cmdMergePR = %d, want %d\n%s", code, tc.code, out)
 			}
 			for _, w := range tc.want {
-				if !strings.Contains(stdout+stderr, w) {
-					t.Errorf("output lacks %q\nstdout: %s\nstderr: %s", w, stdout, stderr)
+				if !strings.Contains(out, w) {
+					t.Errorf("output lacks %q\n%s", w, out)
 				}
 			}
 			for _, w := range tc.not {
-				if strings.Contains(stdout+stderr, w) {
-					t.Errorf("output has %q\nstdout: %s\nstderr: %s", w, stdout, stderr)
+				if strings.Contains(out, w) {
+					t.Errorf("output has %q\n%s", w, out)
 				}
 			}
-			if _, err := os.Stat(filepath.Join(ghDir, "argv")); (err == nil) != tc.merged {
-				t.Errorf("gh pr merge ran = %v, want %v", err == nil, tc.merged)
+			if strings.Contains(strings.Join(tc.args, " "), "--disable-auto") {
+				// A passthrough that merges nothing reads no gate settings at all.
+				if strings.Contains(e.calls(), "baseRefName") {
+					t.Errorf("--disable-auto read the base's settings:\n%s", e.calls())
+				}
+				return // gh "merges" in the fake either way; only the gates matter here
+			}
+			if merged != tc.merged {
+				t.Errorf("gh pr merge ran = %v, want %v\n%s", merged, tc.merged, out)
+			}
+		})
+	}
+}
+
+// #223 review F6: with a forwarded -R, the deploy gate's file list and draft
+// read are of THAT repository's PR, not this clone's PR of the same number.
+func TestCmdMergePR_forwardedRepoReadsThatPRsFiles(t *testing.T) {
+	e := newGateEnv(t)
+	e.fake("docs/a.md", map[string]string{"prrepo": "other/repo", "baseconf.json": baseJSON(gateInfra, true)})
+	_, out, _ := e.merge("99999", "--keep", "--dry-run", "--", "-R", "other/repo")
+	var listed bool
+	for _, ln := range strings.Split(e.calls(), "\n") {
+		if strings.Contains(ln, "number,url,changedFiles") {
+			listed = true
+			if !strings.Contains(ln, "-R other/repo") {
+				t.Errorf("the deploy gate's file list read this clone's PR, not other/repo's: %q\n%s", ln, out)
+			}
+		}
+	}
+	if !listed {
+		t.Errorf("the deploy gate never listed the PR's files\n%s", out)
+	}
+}
+
+// #223 review: hold_max_age and coord_issue are gate settings too. A PR's own
+// `hold_max_age = 1m` made another session's 2h-old hold stale, so it no
+// longer blocked; the base's 24h now holds.
+func TestCmdMergePR_holdSettingsComeFromTheBaseToo(t *testing.T) {
+	e := newGateEnv(t)
+	c, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath, self := coordCtx(c)
+	hold := coord.Record{ID: "h1", Kind: coord.KindAnnounce, Window: self.Window, Session: "another-session",
+		Hold: []string{"merge-main"}, Message: "rolling the cluster", TS: time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339)}
+	if err := coord.Append(logPath, hold); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WT_SESSION", "this-session")
+	for _, tc := range []struct {
+		name     string
+		checkout string
+		base     string
+		code     int
+	}{
+		{"the checkout shortens hold_max_age, the base keeps the default: the hold blocks", "hold_max_age = 1m\n", "", 1},
+		{"both short: the hold is stale and warns", "hold_max_age = 1m\n", "hold_max_age = 1m\n", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e.checkout(tc.checkout)
+			e.fake("docs/a.md", map[string]string{"baseconf.json": baseJSON(tc.base, tc.base != "")})
+			code, out, _ := e.merge("99999", "--keep")
+			if code != tc.code {
+				t.Errorf("cmdMergePR = %d, want %d\n%s", code, tc.code, out)
+			}
+			if tc.code == 1 && !strings.Contains(out, "merge blocked") {
+				t.Errorf("refused, but not by the hold:\n%s", out)
 			}
 		})
 	}

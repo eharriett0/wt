@@ -46,30 +46,34 @@ type Config struct {
 }
 
 // Gate is the part of the config that decides whether merge-pr stops a merge:
-// the deploy gate (merge_is_deploy, merge_is_deploy_paths) and the checks
-// floor (merge_min_checks). merge-pr reads it twice (#223), from this checkout
-// and from the PR's base branch, and the stricter of the two applies: the
-// checkout is usually the PR's own worktree, so on its own the branch being
-// merged would decide its own gate.
+// the deploy gate (merge_is_deploy, merge_is_deploy_paths), the checks floor
+// (merge_min_checks) and the hold gate (hold_max_age, coord_issue). merge-pr
+// reads it twice (#223), from this checkout and from the PR's base branch, and
+// the stricter of the two applies: the checkout is usually the PR's own
+// worktree, so on its own the branch being merged would decide its own gate.
 type Gate struct {
 	MergeIsDeploy      bool
 	MergeIsDeployPaths []string
 	MergeMinChecks     int
 	MergeMinChecksBad  string
+	HoldMaxAge         time.Duration // 0 = holds never expire
+	CoordIssue         int
 }
 
 // Gate returns c's gate settings, environment overlay included.
 func (c *Config) Gate() Gate {
 	return Gate{MergeIsDeploy: c.MergeIsDeploy, MergeIsDeployPaths: c.MergeIsDeployPaths,
-		MergeMinChecks: c.MergeMinChecks, MergeMinChecksBad: c.MergeMinChecksBad}
+		MergeMinChecks: c.MergeMinChecks, MergeMinChecksBad: c.MergeMinChecksBad,
+		HoldMaxAge: c.HoldMaxAge, CoordIssue: c.CoordIssue}
 }
 
 // GateFromConf returns the gate settings a .wt.conf body sets on its own: no
 // environment overlay (a base branch's file is read as the repository wrote
-// it), and every key it leaves out at its default (off, no floor). The gate
-// keys read nothing but body.
+// it), and every key it leaves out at its default (deploy off, no floor, holds
+// expire after DefaultHoldMaxAge, no mirror issue), as Load would resolve it.
+// The gate keys read nothing but body.
 func GateFromConf(body string) Gate {
-	var c Config
+	c := Config{HoldMaxAge: DefaultHoldMaxAge}
 	ApplyConf(&c, ParseConf(body))
 	return c.Gate()
 }

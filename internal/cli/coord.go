@@ -641,6 +641,19 @@ func allClear(c *config.Config, path string, self coord.Self, id string, notMine
 // blocks a merge (fail-open — coordination is advisory infrastructure, not a
 // gate that can wedge the user's ship path if the log is unreadable).
 func mergeCoordGate(c *config.Config) int {
+	return mergeCoordGateWith(c, c.HoldMaxAge, nonZero(c.CoordIssue))
+}
+
+func nonZero(n int) []int {
+	if n > 0 {
+		return []int{n}
+	}
+	return nil
+}
+
+// mergeCoordGateWith is mergeCoordGate with the hold settings merge-pr resolved
+// (#223: the stricter of this checkout's and the base branch's).
+func mergeCoordGateWith(c *config.Config, holdMaxAge time.Duration, issues []int) int {
 	path, self := coordCtx(c)
 	recs, err := coord.Load(path)
 	if err != nil {
@@ -649,15 +662,15 @@ func mergeCoordGate(c *config.Config) int {
 	// Fold in cross-machine holds from the pinned mirror issue so a hold on
 	// another machine actually gates this merge (#36). Best-effort — a read
 	// failure leaves the gate local-only (fail-open, as before).
-	if c.CoordIssue > 0 {
-		recs = coord.MergeByID(recs, remoteRecords(c.CoordIssue))
+	for _, iss := range issues {
+		recs = coord.MergeByID(recs, remoteRecords(iss))
 	}
 	now := time.Now()
 	v := coord.ViewOf(recs, self)
 	// Only self.Owns exempts a hold: another session's hold in THIS checkout
 	// gates the merge exactly like another window's (#163), and so does one wt
 	// can't attribute to any session (#211).
-	fresh, stale := coord.ActiveHoldsAt(recs, self, "merge-main", now, c.HoldMaxAge)
+	fresh, stale := coord.ActiveHoldsAt(recs, self, "merge-main", now, holdMaxAge)
 	// Stale holds (aged past their limit — hold_max_age, or 24h for pre-upgrade
 	// records wt can't attribute) WARN but never block, so a dead window can't
 	// wedge merge forever (#32).

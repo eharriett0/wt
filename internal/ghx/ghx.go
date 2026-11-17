@@ -370,8 +370,8 @@ func diffNames(out string) []string {
 //
 // When the REST diff fails (#217) the list comes from GraphQL instead
 // (prFilesGraphQL), and only when it is the whole list.
-func PRChangedFiles(pr string) ([]string, error) {
-	ref, total, err := resolvePR(pr)
+func PRChangedFiles(pr, repo string) ([]string, error) {
+	ref, total, err := resolvePR(pr, repo)
 	if err != nil {
 		return nil, err
 	}
@@ -387,10 +387,16 @@ func PRChangedFiles(pr string) ([]string, error) {
 }
 
 // resolvePR is PR pr's number, URL and host, as gh resolves pr here (a
-// number, a URL or a branch), and how many files it changes (GraphQL
-// changedFiles, in the same call): what the REST list must add up to.
-func resolvePR(pr string) (prRef, int, error) {
-	out, err := run("pr", "view", pr, "--json", "number,url,changedFiles", "--jq", `"\(.number) \(.url) \(.changedFiles)"`)
+// number, a URL or a branch) or in repo when it is not "" (a forwarded -R,
+// #223 review: the base's paths must be matched against THAT PR's files), and
+// how many files it changes (GraphQL changedFiles, in the same call): what the
+// REST list must add up to.
+func resolvePR(pr, repo string) (prRef, int, error) {
+	args := []string{"pr", "view", pr, "--json", "number,url,changedFiles", "--jq", `"\(.number) \(.url) \(.changedFiles)"`}
+	if repo != "" {
+		args = append(args, "-R", repo)
+	}
+	out, err := run(args...)
 	if err != nil {
 		return prRef{}, 0, fmt.Errorf("cannot resolve PR #%s: %w", pr, ghErrAt(RepoHost(), apiGraphQL, err))
 	}
@@ -1010,9 +1016,14 @@ func PRStateByURL(url string) string {
 	return strings.TrimSpace(out)
 }
 
-// PRIsDraft reports whether PR pr is a draft.
-func PRIsDraft(pr string) (bool, error) {
-	out, err := run("pr", "view", pr, "--json", "isDraft", "--jq", ".isDraft")
+// PRIsDraft reports whether PR pr (in repo when not "": a forwarded -R) is a
+// draft.
+func PRIsDraft(pr, repo string) (bool, error) {
+	args := []string{"pr", "view", pr, "--json", "isDraft", "--jq", ".isDraft"}
+	if repo != "" {
+		args = append(args, "-R", repo)
+	}
+	out, err := run(args...)
 	if err != nil {
 		return false, err
 	}

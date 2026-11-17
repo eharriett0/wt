@@ -126,6 +126,10 @@ func TestDecideChecks(t *testing.T) {
 			want{status: ChecksBlocked, pending: 1, ran: 2}},
 		{"merge_min_checks that is not a count", ChecksInput{Checks: []ghx.Check{chk("a", "SUCCESS")}, MinChecksBad: "five"},
 			want{status: ChecksBlocked, ran: 1}},
+		// #223 review: the base branch's settings could not be read, so its
+		// floor is unknown, and a passing check doesn't make up for that.
+		{"merge_min_checks could not be read", ChecksInput{Checks: []ghx.Check{chk("a", "SUCCESS")}, FloorUnread: "GitHub down"},
+			want{status: ChecksBlocked, ran: 1}},
 		{"the required checks could not be read", ChecksInput{Checks: []ghx.Check{chk("a", "SUCCESS")}, RequiredUnread: []string{"rulesets: HTTP 502"}},
 			want{status: ChecksBlocked, ran: 1}},
 		{"no checks, and the required ones could not be read", ChecksInput{RequiredUnread: []string{"branch protection: HTTP 502"}},
@@ -170,6 +174,9 @@ func TestChecksVerdictText(t *testing.T) {
 	}
 	if got := DecideChecks(ChecksInput{MinChecksBad: "-1"}).Reasons(); !reflect.DeepEqual(got, []string{"merge_min_checks is not a count"}) {
 		t.Errorf("Reasons with a bad floor = %q", got)
+	}
+	if got := DecideChecks(ChecksInput{FloorUnread: "x"}).Reasons(); !reflect.DeepEqual(got, []string{"merge_min_checks could not be read"}) {
+		t.Errorf("Reasons with an unread floor = %q", got)
 	}
 }
 

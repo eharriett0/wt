@@ -56,6 +56,8 @@ type checksOpts struct {
 	repo         string // the passthrough's -R/--repo: gh merges that repository's PR, so that is the one read
 	minChecks    int    // merge_min_checks
 	minChecksBad string // merge_min_checks that is not a count
+	badFrom      string // where it was set (#223)
+	floorUnread  string // the base's floor could not be read: why (#223)
 }
 
 // gateAction is what the checks gate does with a verdict.
@@ -152,7 +154,7 @@ func checksGate(pr string, o checksOpts, stdin io.Reader, tty bool, r checksRead
 // stays a failed read: the verdict blocks on it). ghx.ErrRulesetsUnavailable
 // is an answer, so it is not retried.
 func readChecks(pr string, o checksOpts, r checksReads) (ghx.PRChecksRead, merge.ChecksInput) {
-	in := merge.ChecksInput{MinChecks: o.minChecks, MinChecksBad: o.minChecksBad}
+	in := merge.ChecksInput{MinChecks: o.minChecks, MinChecksBad: o.minChecksBad, MinChecksFrom: o.badFrom, FloorUnread: o.floorUnread}
 	read, err := r.checks(pr, o.repo)
 	if retryable(err) {
 		r.sleep(checksRetryWait)
@@ -294,7 +296,14 @@ func checksDetail(v merge.ChecksVerdict, head string) []string {
 		out = append(out, fmt.Sprintf("only %d check(s) ran, fewer than merge_min_checks = %d (CI may not have started)", v.Ran, v.Floor))
 	}
 	if v.FloorBad != "" {
-		out = append(out, fmt.Sprintf("merge_min_checks = %q is not a count, so the floor cannot be applied: fix .wt.conf or WT_MERGE_MIN_CHECKS", v.FloorBad))
+		where := ".wt.conf or WT_MERGE_MIN_CHECKS"
+		if v.FloorBadFrom != "" {
+			where = v.FloorBadFrom
+		}
+		out = append(out, fmt.Sprintf("merge_min_checks = %q is not a count (set in %s), so the floor cannot be applied: fix it there, or pass --checks-ok", v.FloorBad, where))
+	}
+	if v.FloorUnread != "" {
+		out = append(out, fmt.Sprintf("merge_min_checks is unknown: %s; pass --checks-ok to merge without the floor", v.FloorUnread))
 	}
 	for _, u := range v.RequiredUnread {
 		out = append(out, "could not read the required checks from "+u+", so a required check that never started cannot be ruled out")
