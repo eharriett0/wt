@@ -906,3 +906,53 @@ func TestCheckoutActivity(t *testing.T) {
 		t.Errorf("the log's records changed: %v", log)
 	}
 }
+
+// PresenceDue (#197 item 2): a session with a real token marks presence when
+// nothing of its own (this window AND session, any kind) is in the log from
+// the last PresenceEvery.
+func TestPresenceDue(t *testing.T) {
+	now := time.Now()
+	self := Self{Window: "/w", Session: "A"}
+	at := func(d time.Duration) string { return now.Add(-d).UTC().Format(time.RFC3339) }
+	for _, tc := range []struct {
+		name string
+		self Self
+		recs []Record
+		want bool
+	}{
+		{"nothing yet", self, nil, true},
+		{"no token", Self{Window: "/w", Session: SessionNone}, nil, false},
+		{"zero session", Self{Window: "/w"}, nil, false},
+		{"own announce 30m ago", self, []Record{{Window: "/w", Session: "A", Kind: KindAnnounce, TS: at(30 * time.Minute)}}, false},
+		{"own presence 59m ago", self, []Record{{Window: "/w", Session: "A", Kind: KindPresence, TS: at(59 * time.Minute)}}, false},
+		{"own presence 61m ago", self, []Record{{Window: "/w", Session: "A", Kind: KindPresence, TS: at(61 * time.Minute)}}, true},
+		{"another session's, just now", self, []Record{{Window: "/w", Session: "B", Kind: KindPresence, TS: at(0)}}, true},
+		{"own session, another window", self, []Record{{Window: "/x", Session: "A", Kind: KindPresence, TS: at(0)}}, true},
+		{"undatable", self, []Record{{Window: "/w", Session: "A", Kind: KindPresence, TS: "?"}}, true},
+		{"an hour in the future (clock skew)", self, []Record{{Window: "/w", Session: "A", Kind: KindPresence, TS: at(-time.Hour)}}, true},
+	} {
+		if got := PresenceDue(tc.recs, tc.self, now); got != tc.want {
+			t.Errorf("%s: PresenceDue = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// prune-coord drops presence past SharedCheckoutWindow, the only span it is
+// read for, and an undatable one (#197 item 2).
+func TestPruneRecords_presence(t *testing.T) {
+	now := time.Now()
+	at := func(d time.Duration) string { return now.Add(-d).UTC().Format(time.RFC3339) }
+	recs := []Record{
+		{ID: "fresh", Kind: KindPresence, TS: at(time.Hour)},
+		{ID: "old", Kind: KindPresence, TS: at(25 * time.Hour)},
+		{ID: "undatable", Kind: KindPresence, TS: "?"},
+	}
+	kept, dropped := PruneRecords(recs, now, 24*time.Hour)
+	if dropped != 2 || len(kept) != 1 || kept[0].ID != "fresh" {
+		t.Errorf("kept %v (dropped %d), want only fresh", kept, dropped)
+	}
+	// Presence is no announcement: inbox never shows it.
+	if in := Inbox([]Record{{ID: "p", Kind: KindPresence, Window: "/w", Session: "B", TS: at(0)}}, Self{Window: "/w", Session: "A"}, now); len(in) != 0 {
+		t.Errorf("inbox shows a presence record: %v", in)
+	}
+}

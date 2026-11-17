@@ -60,7 +60,39 @@ const (
 	// (the id is not in the file), so NextBlock stops counting it immediately
 	// rather than waiting out DefaultBlockReserveTTL.
 	KindBlockAbandoned = "block-abandoned"
+	// KindPresence marks a session at work in a checkout (#197 item 2): the
+	// per-turn agent hooks write one for a session that has written nothing
+	// there for PresenceEvery, so a session that never runs a coordination
+	// command still shows in OtherSessions (the shared-checkout warning,
+	// other_sessions, doctor). It is no announcement: inbox, holds and the
+	// gate select announcements by kind, so they never see it (an older wt's
+	// too). prune-coord drops it after SharedCheckoutWindow.
+	KindPresence = "presence"
 )
+
+// PresenceEvery bounds how often a session marks presence in a checkout: at
+// most one record per session per checkout per hour, so the log grows by at
+// most 24 a day a session, and prune-coord drops them after a day.
+const PresenceEvery = time.Hour
+
+// PresenceDue reports whether self should mark presence in its checkout now
+// (#197 item 2): it has a real session token (a token-less shell names no
+// party), and the log holds no record of self's, this window AND this
+// session, of any kind, from the last PresenceEvery. Pure.
+func PresenceDue(recs []Record, self Self, now time.Time) bool {
+	if self.Session == "" || self.Session == SessionNone {
+		return false
+	}
+	for _, r := range recs {
+		if r.Window != self.Window || r.Session != self.Session {
+			continue
+		}
+		if t, err := time.Parse(time.RFC3339, r.TS); err == nil && now.Sub(t) < PresenceEvery && now.Sub(t) > -time.Minute {
+			return false
+		}
+	}
+	return true
+}
 
 // DefaultBlockReserveTTL bounds how long an UN-written block reservation is
 // honored: after this it's assumed written-or-abandoned, so it stops surfacing
@@ -576,6 +608,33 @@ type lockTimeoutError struct{ msg string }
 func (e *lockTimeoutError) Error() string { return e.msg }
 func (e *lockTimeoutError) Unwrap() error { return lock.ErrTimeout }
 
+// AppendIfFree is Append that never waits on the lock (#197 item 2): one
+// try, and written=false when another process holds it, so a per-turn hook
+// returns at once and marks presence next turn instead. Silent: a filesystem
+// that can't lock gets the unlocked O_APPEND write Append makes there, without
+// Append's warning (a hook's stderr is the session's). Any other lock error
+// writes nothing and is returned.
+func AppendIfFree(path string, r Record) (written bool, err error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return false, err
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	// The lock call itself, with no waiting notice: a hook never prints.
+	switch lerr := exclusiveWithin(f, 0, 0, nil); {
+	case lerr == nil:
+		defer lock.Release(f)
+	case errors.Is(lerr, lock.ErrTimeout) || errors.Is(lerr, lock.ErrSeenHeld):
+		return false, nil // held: next turn
+	case !lock.Unsupported(lerr):
+		return false, fmt.Errorf("cannot lock %s: %w", path, lerr)
+	}
+	return true, appendLocked(f, r)
+}
+
 // appendLocked writes r as one JSON line at the end of f, whose lock the
 // caller holds. f must be opened O_APPEND (Append's and ReserveBlock's both
 // are), never seek-then-write: the lock only excludes other lockers, so a
@@ -933,6 +992,11 @@ func PruneRecords(recs []Record, now time.Time, blockMaxAge time.Duration) (kept
 			drop = !open(r) || (blockMaxAge > 0 && Age(r, now) > blockMaxAge)
 		case KindBlockWritten, KindBlockAbandoned:
 			drop = true // the marker is only needed while its reservation lives
+		case KindPresence:
+			// Only the last SharedCheckoutWindow is ever read (#197 item 2);
+			// an undatable one says nothing about when.
+			t, err := time.Parse(time.RFC3339, r.TS)
+			drop = err != nil || now.Sub(t) > SharedCheckoutWindow
 		}
 		if !drop {
 			kept = append(kept, r)
