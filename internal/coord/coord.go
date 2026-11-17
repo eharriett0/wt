@@ -550,14 +550,31 @@ var (
 // names the log. ⚠ The advice is to RESUME the holder, never kill it: a
 // prune killed after its truncate leaves the log empty (#234).
 func lockForWrite(f *os.File, path string) error {
-	err := exclusiveWithin(f, writeLockWait, writeLockNotice, func() {
+	return lockForWriteWithin(f, path, writeLockWait)
+}
+
+// lockForWriteWithin is lockForWrite waiting at most wait (PruneBlockLedgers
+// shares one deadline across its ledgers).
+func lockForWriteWithin(f *os.File, path string, wait time.Duration) error {
+	err := exclusiveWithin(f, wait, writeLockNotice, func() {
 		fmt.Fprintf(lockNotices, "wt: waiting for the lock on %s (another wt process holds it)\n", path)
 	})
-	if errors.Is(err, lock.ErrTimeout) {
-		return fmt.Errorf("%s stayed locked by another wt process for %s (a prune-coord or block-id stopped with Ctrl-Z, or hung on a network mount?): find it with `lsof %s`, resume it if it was stopped (`fg`, or `kill -CONT <pid>`) and let it finish, then try again. Don't kill it: a prune killed mid-rewrite leaves the log empty (%w)", path, writeLockWait, path, lock.ErrTimeout)
+	switch {
+	case errors.Is(err, lock.ErrTimeout):
+		return &lockTimeoutError{fmt.Sprintf("%s stayed locked by another wt process (a prune-coord or block-id stopped with Ctrl-Z, or hung on a network mount?): find it with `lsof %s`, resume it if it was stopped (`fg`, or `kill -CONT <pid>`) and let it finish, then try again. Don't kill it: a prune killed mid-rewrite leaves the log empty", path, path)}
+	case err != nil:
+		// %w: lock.Unsupported still sees through it (Append's fallback).
+		return fmt.Errorf("cannot lock %s: %w", path, err)
 	}
-	return err
+	return nil
 }
+
+// lockTimeoutError is lockForWrite's deadline error: its own words, and
+// lock.ErrTimeout for errors.Is.
+type lockTimeoutError struct{ msg string }
+
+func (e *lockTimeoutError) Error() string { return e.msg }
+func (e *lockTimeoutError) Unwrap() error { return lock.ErrTimeout }
 
 // appendLocked writes r as one JSON line at the end of f, whose lock the
 // caller holds. f must be opened O_APPEND (Append's and ReserveBlock's both
@@ -607,6 +624,10 @@ var loadLockWait = 5 * time.Second
 // ErrLogLocked is LoadForGate giving up on a log another process kept locked.
 var ErrLogLocked = errors.New("the coordination log stayed locked by another wt process (a prune-coord or an append stopped mid-write?)")
 
+// ErrLogUnlockable is LoadForGate failing to lock the log for any other reason
+// than a holder or a filesystem that can't lock (#235 review): EIO, say.
+var ErrLogUnlockable = errors.New("could not lock the coordination log to read it")
+
 func load(path string, strict bool) ([]Record, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -623,12 +644,14 @@ func load(path string, strict bool) ([]Record, error) {
 		lock.Release(f)
 	case strict && errors.Is(lerr, lock.ErrTimeout):
 		return nil, ErrLogLocked
-	case strict && !lock.Unsupported(lerr):
-		// #235 review: any other lock failure (one after a try found the log
-		// held included) leaves the gate reading what may be a log stopped
-		// between its truncate and its rewrite. Only a filesystem that can't
-		// lock at all, where no prune can run, reads unlocked.
+	case strict && errors.Is(lerr, lock.ErrSeenHeld):
 		return nil, fmt.Errorf("%w (%v)", ErrLogLocked, lerr)
+	case strict && !lock.Unsupported(lerr):
+		// #235 review: any other lock failure leaves the gate reading what
+		// may be a log stopped between its truncate and its rewrite. Only a
+		// filesystem that can't lock at all, where no prune can run, reads
+		// unlocked.
+		return nil, fmt.Errorf("%w: %v", ErrLogUnlockable, lerr)
 	default:
 		data, err = io.ReadAll(f)
 	}
@@ -921,7 +944,11 @@ func PruneRecords(recs []Record, now time.Time, blockMaxAge time.Duration) (kept
 // -> PruneRecords -> rewrite the file with only the survivors. Returns how many
 // records were dropped. A missing/empty log is a no-op.
 func PruneLog(path string, now time.Time, blockMaxAge time.Duration) (dropped int, err error) {
-	err = withLockedLog(path, func(recs []Record) ([]Record, bool) {
+	return pruneLogWithin(path, now, blockMaxAge, writeLockWait)
+}
+
+func pruneLogWithin(path string, now time.Time, blockMaxAge, wait time.Duration) (dropped int, err error) {
+	err = withLockedLogWithin(path, wait, func(recs []Record) ([]Record, bool) {
 		kept, n := PruneRecords(recs, now, blockMaxAge)
 		dropped = n
 		return kept, n > 0
@@ -1009,6 +1036,10 @@ var lockedLogPause func()
 var lockedLogTruncated func()
 
 func withLockedLog(path string, fn func(recs []Record) (kept []Record, rewrite bool)) error {
+	return withLockedLogWithin(path, writeLockWait, fn)
+}
+
+func withLockedLogWithin(path string, wait time.Duration, fn func(recs []Record) (kept []Record, rewrite bool)) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -1017,7 +1048,7 @@ func withLockedLog(path string, fn func(recs []Record) (kept []Record, rewrite b
 		return err
 	}
 	defer lf.Close()
-	if err := lockForWrite(lf, path); err != nil {
+	if err := lockForWriteWithin(lf, path, wait); err != nil {
 		return err
 	}
 	defer lock.Release(lf)
@@ -1613,30 +1644,36 @@ func BlockLedgerPath(home, absFile string) string {
 // same age-based drop PruneLog applies to the per-repo log, applied to each ledger,
 // so relocating block records to ledgers didn't strand them beyond the #33/#35 GC
 // (each written or aged-out reservation is dropped). Returns total records dropped.
-// Missing dir → (0, nil). A ledger that fails (one another process keeps
-// locked past the writers' deadline, #235) doesn't stop the rest: every error
-// comes back joined, with what the others dropped (#235 review: the first
-// failure left every ledger after it unpruned).
-func PruneBlockLedgers(home string, now time.Time, blockMaxAge time.Duration) (dropped int, err error) {
+// Missing dir → (0, nil, nil). A ledger another process keeps locked doesn't
+// stop the rest (#235 review: the first failure left every ledger after it
+// unpruned): the ledgers share ONE writers' deadline (each waiting its own
+// would cost writeLockWait per held ledger), locked lists the ones still held
+// at it, and any other failure comes back in err, joined.
+func PruneBlockLedgers(home string, now time.Time, blockMaxAge time.Duration) (dropped int, locked []string, err error) {
 	entries, rerr := os.ReadDir(BlocksDir(home))
 	if rerr != nil {
 		if os.IsNotExist(rerr) {
-			return 0, nil
+			return 0, nil, nil
 		}
-		return 0, rerr
+		return 0, nil, rerr
 	}
+	deadline := time.Now().Add(writeLockWait)
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
 			continue
 		}
-		d, perr := PruneLog(filepath.Join(BlocksDir(home), e.Name()), now, blockMaxAge)
-		if perr != nil {
+		path := filepath.Join(BlocksDir(home), e.Name())
+		d, perr := pruneLogWithin(path, now, blockMaxAge, max(time.Until(deadline), 0))
+		switch {
+		case errors.Is(perr, lock.ErrTimeout):
+			locked = append(locked, path)
+		case perr != nil:
 			err = errors.Join(err, perr)
-			continue
+		default:
+			dropped += d
 		}
-		dropped += d
 	}
-	return dropped, err
+	return dropped, locked, err
 }
 
 // LoadBlockLedgers reads every per-file block ledger this machine has coordinated

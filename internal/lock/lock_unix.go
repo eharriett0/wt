@@ -34,9 +34,9 @@ func SharedWithin(f *os.File, d time.Duration) error {
 // long as it stayed stopped. waiting, when set, runs once, when the file has
 // stayed held for noticeAfter, so the caller can say what it is waiting on
 // (another writer's append holds it for microseconds: no notice for that).
-// Past d: ErrTimeout. Any other flock error is returned as is, except a
-// "can't lock here" error (Unsupported) after a try found the file held,
-// which is returned as a plain error.
+// Past d: ErrTimeout. EINTR is retried. Any other flock error is returned as
+// is, except a "can't lock here" error (Unsupported) after a try found the
+// file held: ErrSeenHeld, which is not Unsupported.
 func ExclusiveWithin(f *os.File, d, noticeAfter time.Duration, waiting func()) error {
 	return within(f, syscall.LOCK_EX, d, noticeAfter, waiting)
 }
@@ -48,23 +48,29 @@ func within(f *os.File, how int, d, noticeAfter time.Duration, waiting func()) e
 		switch {
 		case err == nil:
 			return nil
+		case errors.Is(err, syscall.EWOULDBLOCK):
+			held = true
+		case errors.Is(err, syscall.EINTR):
+			// A signal during an NFS lock call (#235 review): try again.
 		case held && Unsupported(err):
 			// #235 review: this machine's lock service failed (NFS lockd
 			// unreachable: ENOLCK) after a try found the file HELD, so locks
 			// do work here and someone holds this one. Not Unsupported (%v,
 			// not %w): a caller that writes unlocked on Unsupported would
 			// write into a prune's rewrite.
-			return fmt.Errorf("flock failed (%v) after another process was seen holding the lock", err)
-		case !errors.Is(err, syscall.EWOULDBLOCK):
+			return fmt.Errorf("%w (%v)", ErrSeenHeld, err)
+		default:
 			return err
 		}
-		held = true
 		waited := time.Since(start)
-		if waiting != nil && !told && waited >= noticeAfter {
+		if waiting != nil && !told && held && waited >= noticeAfter {
 			told = true
 			waiting()
 		}
 		if waited > d {
+			if !held {
+				return err // only signals, never a holder: not "stayed locked"
+			}
 			return ErrTimeout
 		}
 		time.Sleep(10 * time.Millisecond)

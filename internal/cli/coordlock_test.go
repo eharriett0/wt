@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -43,6 +44,15 @@ func TestMergeCoordGate_RefusesALogLockedByAnotherProcess(t *testing.T) {
 	}
 	if !strings.Contains(errOut, "kill -CONT") || strings.Contains(errOut, "--bypass") {
 		t.Errorf("the refusal must say to resume the holder, and not point at --bypass:\n%s", errOut)
+	}
+	// #235 review: a lock that failed for another reason (EIO) has no holder
+	// to hunt for: refused, with a retry, not the resume advice.
+	loadForGate = func(string) ([]coord.Record, error) {
+		return nil, fmt.Errorf("%w: input/output error", coord.ErrLogUnlockable)
+	}
+	_, errOut = captureOutputForTest(t, func() { code = mergeCoordGate(c) })
+	if code != 1 || !strings.Contains(errOut, "could not lock the coordination log") || !strings.Contains(errOut, "Run the merge again") || strings.Contains(errOut, "kill -CONT") {
+		t.Errorf("merge gate when the lock failed = %d, want 1 with a retry, no holder advice:\n%s", code, errOut)
 	}
 	loadForGate = func(string) ([]coord.Record, error) { return nil, nil }
 	if code := mergeCoordGate(c); code != 0 {

@@ -5,6 +5,7 @@ package coord
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -266,16 +267,18 @@ func TestLoadForGate_refusesOnLockErrorsButUnsupported(t *testing.T) {
 		name   string
 		err    error
 		refuse bool
+		want   error
 	}{
-		{"held, then the lock service failed", errors.New("flock failed (no locks available) after another process was seen holding the lock"), true},
-		{"EIO", syscall.EIO, true},
-		{"the filesystem can't lock", syscall.ENOLCK, false},
-		{"locked", nil, false},
+		{"held throughout", lock.ErrTimeout, true, ErrLogLocked},
+		{"held, then the lock service failed", fmt.Errorf("%w (no locks available)", lock.ErrSeenHeld), true, ErrLogLocked},
+		{"EIO", syscall.EIO, true, ErrLogUnlockable},
+		{"the filesystem can't lock", syscall.ENOLCK, false, nil},
+		{"locked", nil, false, nil},
 	} {
 		sharedWithin = func(*os.File, time.Duration) error { return tc.err }
 		recs, err := LoadForGate(path)
-		if tc.refuse != errors.Is(err, ErrLogLocked) {
-			t.Errorf("%s: LoadForGate err = %v, want refused=%v", tc.name, err, tc.refuse)
+		if refused := err != nil; refused != tc.refuse || tc.want != nil && !errors.Is(err, tc.want) {
+			t.Errorf("%s: LoadForGate err = %v, want refused=%v (%v)", tc.name, err, tc.refuse, tc.want)
 		}
 		if !tc.refuse && len(recs) != 1 {
 			t.Errorf("%s: read %d record(s), want the hold", tc.name, len(recs))
@@ -291,11 +294,13 @@ func TestLoadForGate_refusesOnLockErrorsButUnsupported(t *testing.T) {
 // pruned and the failure comes back with what they dropped.
 func TestPruneBlockLedgers_prunesPastAHeldLedger(t *testing.T) {
 	home := t.TempDir()
-	shortWriteLock(t, 200*time.Millisecond, 0)
+	const wait = 400 * time.Millisecond
+	shortWriteLock(t, wait, 0)
 	old := time.Now().Add(-72 * time.Hour).UTC().Format(time.RFC3339)
 	held := filepath.Join(BlocksDir(home), "a-held.jsonl")
-	free := filepath.Join(BlocksDir(home), "b-free.jsonl")
-	for _, p := range []string{held, free} {
+	held2 := filepath.Join(BlocksDir(home), "b-held.jsonl")
+	free := filepath.Join(BlocksDir(home), "c-free.jsonl")
+	for _, p := range []string{held, held2, free} {
 		for i, id := range []string{"r1", "r2"} {
 			r := Record{ID: id, Kind: KindBlockReserve, Window: "w", Session: "s", File: "/doc.md", Block: i + 1, TS: old}
 			if err := Append(p, r); err != nil {
@@ -304,9 +309,16 @@ func TestPruneBlockLedgers_prunesPastAHeldLedger(t *testing.T) {
 		}
 	}
 	holdLog(t, held)
-	dropped, err := PruneBlockLedgers(home, time.Now(), 24*time.Hour)
-	if err == nil || !strings.Contains(err.Error(), held) {
-		t.Errorf("err = %v, want the held ledger named", err)
+	holdLog(t, held2)
+	start := time.Now()
+	dropped, locked, err := PruneBlockLedgers(home, time.Now(), 24*time.Hour)
+	if err != nil || strings.Join(locked, ",") != held+","+held2 {
+		t.Errorf("locked = %v, err = %v; want both held ledgers listed, no other error", locked, err)
+	}
+	// One deadline for every ledger (#235 review: each held ledger cost its
+	// own 30s).
+	if took := time.Since(start); took > wait+300*time.Millisecond {
+		t.Errorf("took %s for two held ledgers, want one %s deadline in all", took, wait)
 	}
 	if dropped != 2 {
 		t.Errorf("dropped %d, want the free ledger's 2", dropped)

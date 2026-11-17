@@ -344,14 +344,20 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   `ReserveBlock` (an id needs the lock across its read and write) and
   `withLockedLog` (a rewrite without it is #229) still fail. ⚠ **Only a
   failure on a try that never saw the file held is Unsupported** (#235
-  review): `within` returns ENOLCK after an EWOULDBLOCK as a plain error,
-  since the lock service failed (lockd unreachable) while someone held the
-  file, and writing unlocked then lost a hold to a prune's rewrite (measured
-  with a stubbed flock). `LoadForGate` likewise refuses on every lock error
-  but Unsupported, not only on the timeout. prune-coord reports a block
-  ledger it couldn't prune and prunes the rest (`PruneBlockLedgers` joins
-  the errors; it used to stop at the first and drop the error and the
-  count). `wt append`'s doc lock is bounded the same way (`appendLockWait`)
+  review): `within` returns ENOLCK after an EWOULDBLOCK as
+  `lock.ErrSeenHeld`, not Unsupported, since the lock service failed (lockd
+  unreachable) while someone held the file, and writing unlocked then lost a
+  hold to a prune's rewrite (measured with a stubbed flock). ⚠ The check is
+  per call: a retry whose first try gets ENOLCK while lockd stays down still
+  reads it as Unsupported. EINTR (a signal during an NFS lock call) is
+  retried, never read as a holder. `LoadForGate` refuses on every lock error
+  but Unsupported, not only on the timeout: a holder (`ErrLogLocked`, the
+  resume advice) or any other failure (`ErrLogUnlockable`, EIO say: retry).
+  prune-coord prunes past a locked block ledger and lists the locked ones,
+  one a line, with the advice once (`PruneBlockLedgers` returns them, and
+  the ledgers share ONE writers' deadline: each waiting its own cost 30s per
+  held ledger); it used to stop at the first and drop the error and the
+  count. `wt append`'s doc lock is bounded the same way (`appendLockWait`)
   and still fails on a filesystem that can't lock. ⚠ Polling `LOCK_NB` gives
   a writer no place in a queue: a near-continuous stream of readers (two in a
   tight loop) can hold it off to the deadline, where a blocking `LOCK_EX`
@@ -373,7 +379,8 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   `TestExclusiveWithin_unsupportedAfterHeldFailsClosed` (`lock.flock` is the
   seam), `TestLoadForGate_refusesOnLockErrorsButUnsupported`,
   `TestPruneBlockLedgers_prunesPastAHeldLedger`, `TestWriteLockDefaults`,
-  `TestAppend_givesUpOnAStuckHolder` (cli) and
+  `TestExclusiveWithin_retriesEINTR`, `TestAppend_givesUpOnAStuckHolder`
+  and `TestAppend_lockDefaultsAndNoFallback` (cli) and
   `TestPruneCoord_reportsALedgerItCouldntPrune`. Off unix the lock is a
   no-op, as before.
 - **`ClassifyFacts` precedence:** open PR > merged PR > closed PR > dirty >

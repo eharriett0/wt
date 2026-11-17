@@ -118,7 +118,7 @@ func TestExclusiveWithin_unsupportedAfterHeldFailsClosed(t *testing.T) {
 		return syscall.ENOLCK
 	}
 	err := ExclusiveWithin(f, time.Second, 0, nil)
-	if err == nil || Unsupported(err) || errors.Is(err, ErrTimeout) || !strings.Contains(err.Error(), "seen holding the lock") {
+	if !errors.Is(err, ErrSeenHeld) || Unsupported(err) || errors.Is(err, ErrTimeout) || !strings.Contains(err.Error(), "no locks available") {
 		t.Fatalf("held, then ENOLCK: err = %v (Unsupported %v), want a plain error", err, Unsupported(err))
 	}
 	tries = 1 // the next try is the first to fail: ENOLCK straight away
@@ -128,6 +128,37 @@ func TestExclusiveWithin_unsupportedAfterHeldFailsClosed(t *testing.T) {
 	tries = 0
 	if err := SharedWithin(f, time.Second); err == nil || Unsupported(err) {
 		t.Errorf("readers too: held, then ENOLCK: err = %v, want a plain error", err)
+	}
+}
+
+// #235 review: a signal can interrupt an NFS lock call (EINTR); that is no
+// answer about the lock, so it is tried again, and never read as a holder.
+func TestExclusiveWithin_retriesEINTR(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "log.jsonl")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	orig := flock
+	t.Cleanup(func() { flock = orig })
+	tries := 0
+	flock = func(fd int, how int) error {
+		if tries++; tries < 3 {
+			return syscall.EINTR
+		}
+		return orig(fd, how)
+	}
+	called := false
+	if err := ExclusiveWithin(f, time.Second, 0, func() { called = true }); err != nil || tries != 3 {
+		t.Errorf("err = %v after %d tries, want the lock on the third", err, tries)
+	}
+	if called {
+		t.Error("an interrupted try read as a holder (the waiting notice ran)")
+	}
+	flock = func(int, int) error { return syscall.EINTR }
+	if err := ExclusiveWithin(f, 50*time.Millisecond, 0, nil); !errors.Is(err, syscall.EINTR) {
+		t.Errorf("only signals until the deadline: err = %v, want EINTR, not ErrTimeout", err)
 	}
 }
 

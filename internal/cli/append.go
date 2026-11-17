@@ -30,6 +30,11 @@ const defaultSectionDelimiter = `^#{1,6}\s`
 // its read-modify-write takes milliseconds. Vars so a test can shorten them.
 var appendLockWait, appendLockNotice = 30 * time.Second, time.Second
 
+// appendLock is the doc's lock; a var so a test can make it fail as a
+// filesystem without flock does (it refuses there: no unlocked fallback for
+// a read-modify-write).
+var appendLock = lock.ExclusiveWithin
+
 func cmdAppend(args []string) int {
 	if code, done := guardHelp(args, `usage: wt append <doc> --section "<heading>" "<text>"   (or --file <path>)`); done {
 		return code
@@ -82,11 +87,11 @@ func cmdAppend(args []string) int {
 		// the same doc — without this, two parallel appends lose one update.
 		// Bounded, as the coordination log's writers are (#235 review): an
 		// append stopped with Ctrl-Z held every later one forever, silently.
-		if lerr := lock.ExclusiveWithin(f, appendLockWait, appendLockNotice, func() {
+		if lerr := appendLock(f, appendLockWait, appendLockNotice, func() {
 			ui.Warn("waiting for the lock on %s (another wt append holds it)", doc)
 		}); lerr != nil {
 			if errors.Is(lerr, lock.ErrTimeout) {
-				ui.Err("%s stayed locked by another process for %s: find it with `lsof %s`, resume it if it was stopped (`fg`, or `kill -CONT <pid>`) and let it finish, then try again", doc, appendLockWait, absDoc)
+				ui.Err("%s stayed locked by another process for %s: find it with `lsof %s`, resume it if it was stopped (`fg`, or `kill -CONT <pid>`) and let it finish, then try again. Don't kill it: an append killed mid-rewrite leaves the doc empty", doc, appendLockWait, absDoc)
 				return 1
 			}
 			ui.Err("lock %s: %v", doc, lerr)
