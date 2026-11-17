@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/eharriett0/wt/internal/config"
@@ -675,6 +676,10 @@ func mergeCoordGateWith(c *config.Config, holdMaxAge time.Duration, issues []int
 		// #235 review: no holder to hunt for (EIO, say); the read is still
 		// unsafe unlocked, and a retry usually takes the lock.
 		ui.Err("merge blocked: %v, and an unlocked read could miss a hold a prune is rewriting. Run the merge again.", err)
+		if errors.Is(err, syscall.ENOLCK) {
+			// Retrying won't help while this machine's lock service is down.
+			ui.Info("\"no locks available\" that keeps coming back means this machine's lock service (NFS lockd/statd) is down: start it, or move ~/.wt to a local disk")
+		}
 		return 1
 	}
 	if err != nil {

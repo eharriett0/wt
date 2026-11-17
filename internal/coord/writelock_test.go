@@ -222,14 +222,19 @@ func TestLockedWriters_sameDeadlineAndNoUnlockedFallback(t *testing.T) {
 				t.Errorf("waiting notice printed %d times, want once:\n%s", n, notes)
 			}
 		})
-		t.Run(name+" no flock", func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "log.jsonl")
-			shortWriteLock(t, time.Second, 0)
-			stubLock(t, syscall.ENOLCK)
-			if err := write(path); !errors.Is(err, syscall.ENOLCK) {
-				t.Fatalf("err = %v, want ENOLCK returned", err)
-			}
-		})
+		// ENOTSUP is what Append writes unlocked on; these must not (#235
+		// round-4 review: stubbed with ENOLCK alone, which nothing falls back
+		// on any more, the test no longer told).
+		for _, errno := range []syscall.Errno{syscall.ENOTSUP, syscall.ENOLCK} {
+			t.Run(name+" no flock "+errno.Error(), func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "log.jsonl")
+				shortWriteLock(t, time.Second, 0)
+				stubLock(t, errno)
+				if err := write(path); !errors.Is(err, errno) {
+					t.Fatalf("err = %v, want %v returned", err, errno)
+				}
+			})
+		}
 	}
 }
 

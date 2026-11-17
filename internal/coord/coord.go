@@ -651,7 +651,7 @@ func load(path string, strict bool) ([]Record, error) {
 		// may be a log stopped between its truncate and its rewrite. Only a
 		// filesystem that can't lock at all, where no prune can run, reads
 		// unlocked.
-		return nil, fmt.Errorf("%w: %v", ErrLogUnlockable, lerr)
+		return nil, fmt.Errorf("%w: %w", ErrLogUnlockable, lerr)
 	default:
 		data, err = io.ReadAll(f)
 	}

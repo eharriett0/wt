@@ -270,10 +270,11 @@ On a filesystem that can't lock at all (an NFS mount with `nolocks`, some FUSE
 or SMB mounts), announce, ack, all-clear and `block-id --written`/`--abandon`
 write without the lock and warn once; block reservations, `wt prune-coord` and
 `wt append` need the lock and fail there. A lock service that is down (NFS
-lockd unreachable: "no locks available") is not that: every write fails until
-it is back, since writing unlocked then could lose a hold. The lock guards processes on one
-machine: machines sharing `~/.wt` over a network mount where only some of them
-can lock are not protected from each other.
+lockd unreachable: "no locks available") is not that: every write fails, and
+`wt merge-pr`'s hold gate refuses, until it is back, since writing or reading
+unlocked then could lose a hold. The lock guards processes on one machine:
+machines sharing `~/.wt` over a network mount where only some of them can lock
+are not protected from each other.
 
 Structured shared docs (`structured_doc.<name>` in config) upgrade the blanket
 "shared doc — advisory" to **section-aware** grading: two windows editing the

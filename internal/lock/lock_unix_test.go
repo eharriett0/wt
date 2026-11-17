@@ -174,6 +174,21 @@ func TestExclusiveWithin_retriesEINTR(t *testing.T) {
 	if called {
 		t.Error("an interrupted try read as a holder (the waiting notice ran)")
 	}
+	// A signal after a try found the file held is still retried, never the
+	// after-held failure (#235 round-4 review: nothing pinned the order).
+	tries = 0
+	flock = func(fd int, how int) error {
+		switch tries++; tries {
+		case 1:
+			return syscall.EWOULDBLOCK
+		case 2:
+			return syscall.EINTR
+		}
+		return orig(fd, how)
+	}
+	if err := ExclusiveWithin(f, time.Second, 0, nil); err != nil || tries != 3 {
+		t.Errorf("held, then EINTR, then free: err = %v after %d tries, want the lock on the third", err, tries)
+	}
 	flock = func(int, int) error { return syscall.EINTR }
 	if err := ExclusiveWithin(f, 50*time.Millisecond, 0, nil); !errors.Is(err, syscall.EINTR) {
 		t.Errorf("only signals until the deadline: err = %v, want EINTR, not ErrTimeout", err)

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/eharriett0/wt/internal/config"
@@ -53,6 +54,15 @@ func TestMergeCoordGate_RefusesALogLockedByAnotherProcess(t *testing.T) {
 	_, errOut = captureOutputForTest(t, func() { code = mergeCoordGate(c) })
 	if code != 1 || !strings.Contains(errOut, "could not lock the coordination log") || !strings.Contains(errOut, "Run the merge again") || strings.Contains(errOut, "kill -CONT") {
 		t.Errorf("merge gate when the lock failed = %d, want 1 with a retry, no holder advice:\n%s", code, errOut)
+	}
+	// ENOLCK that keeps coming back is this machine's lock service down: say
+	// so, since running the merge again won't help.
+	loadForGate = func(string) ([]coord.Record, error) {
+		return nil, fmt.Errorf("%w: %w", coord.ErrLogUnlockable, syscall.ENOLCK)
+	}
+	out, errOut := captureOutputForTest(t, func() { code = mergeCoordGate(c) })
+	if code != 1 || !strings.Contains(out+errOut, "lock service (NFS lockd/statd) is down") {
+		t.Errorf("merge gate on ENOLCK = %d, want 1 naming the lock service:\n%s%s", code, out, errOut)
 	}
 	loadForGate = func(string) ([]coord.Record, error) { return nil, nil }
 	if code := mergeCoordGate(c); code != 0 {
