@@ -4,6 +4,7 @@ package gitx
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"math"
 	"os"
@@ -357,7 +358,43 @@ func Fetch(remote, branch string) error {
 // git's prompt, and ssh in BatchMode unless the user set their own ssh
 // command.
 func FetchNoPrompt(remote, branch string) error {
-	cmd := exec.Command("git", "fetch", remote, "+refs/heads/"+branch+":refs/remotes/"+remote+"/"+branch)
+	return fetchNoPrompt(remote, "+refs/heads/"+branch+":refs/remotes/"+remote+"/"+branch, baseFetchTimeout)
+}
+
+// FetchPRHeadNoPrompt fetches GitHub's refs/pull/<pr>/head from remote into
+// FETCH_HEAD only, as FetchNoPrompt fetches (#230 review): a merged PR's head
+// can be a commit this clone never had (the branch updated on GitHub, then
+// deleted with the merge), and the #187 tip check can't compare against it
+// until its objects are here. pr must be a number. No ref is written.
+func FetchPRHeadNoPrompt(remote, pr string) error {
+	if _, err := strconv.Atoi(pr); err != nil {
+		return fmt.Errorf("not a PR number: %q", pr)
+	}
+	return fetchNoPrompt(remote, "refs/pull/"+pr+"/head", fetchTimeout)
+}
+
+// fetchTimeout bounds the PR-head fetch (#230 re-review): an origin that
+// takes the connection and never answers (a proxy, a half-up VPN) hung
+// merge-pr's post-merge cleanup. A var so a test can shorten it.
+var fetchTimeout = 30 * time.Second
+
+// baseFetchTimeout bounds merge-pr's base-branch fetch (#223's fallback for
+// the base .wt.conf), longer: a slow but working fetch past it reads the copy
+// as last fetched.
+var baseFetchTimeout = 120 * time.Second
+
+func fetchNoPrompt(remote, refspec string, budget time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	// A stalled HTTPS transfer gives up after 15s below 1 byte/s; ssh's
+	// connect after 10s (below).
+	cmd := exec.CommandContext(ctx, "git", "-c", "http.lowSpeedLimit=1", "-c", "http.lowSpeedTime=15",
+		"fetch", "--no-prune", remote, refspec)
+	stopGroupOnCancel(cmd)
+	// A transport helper (git-remote-http, ssh) can hold the output pipe
+	// past the cancel: stop waiting on it, and SIGKILL the leader (measured:
+	// 15s past a 2s deadline without this).
+	cmd.WaitDelay = time.Second
 	cmd.Env = append(scopedEnv(), "GIT_TERMINAL_PROMPT=0")
 	// GIT_TERMINAL_PROMPT stops git's own (HTTPS) prompt only; ssh reads
 	// /dev/tty for a passphrase or an unknown host key. BatchMode makes ssh
@@ -365,12 +402,15 @@ func FetchNoPrompt(remote, branch string) error {
 	// review). A GIT_ASKPASS helper is still the user's.
 	if os.Getenv("GIT_SSH_COMMAND") == "" && os.Getenv("GIT_SSH") == "" {
 		if sc, _ := Run("config", "--get", "core.sshCommand"); sc == "" {
-			cmd.Env = append(cmd.Env, "GIT_SSH_COMMAND=ssh -o BatchMode=yes")
+			cmd.Env = append(cmd.Env, "GIT_SSH_COMMAND=ssh -o BatchMode=yes -o ConnectTimeout=10")
 		}
 	}
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	if _, err := cmd.Output(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("git fetch %s %s did not finish in %s", remote, refspec, budget)
+		}
 		if msg := gitStderr(stderr.String()); msg != "" {
 			return fmt.Errorf("%w: %s", err, msg)
 		}
@@ -753,9 +793,40 @@ func withUntrackedShown(args ...string) []string {
 
 // BranchDelete force-deletes local branch (git branch -D). Safe to call after a
 // squash-merge, where the branch is not fast-forward-merged into base.
-func BranchDelete(branch string) error {
-	_, err := Run("branch", "-D", branch)
+func BranchDelete(branch string) error { return BranchDeleteIn("", branch) }
+
+// BranchDeleteIn is BranchDelete with git run in dir ("" = the cwd): after a
+// worktree removal the cwd may be the directory just removed (#230).
+func BranchDeleteIn(dir, branch string) error {
+	_, err := RunDir(dir, "branch", "-D", branch)
 	return err
+}
+
+// MainCheckout is where git runs for the repository once a worktree is
+// removed: the main working tree (the parent of the shared git dir when that
+// is a `.git` directory), or, in a bare repository with linked worktrees, the
+// repository itself (#230 review: there git can still remove a worktree and
+// delete a branch). "" otherwise (a submodule's git dir, an unusual layout) or
+// when cwd is in no repository. Resolve it BEFORE removing the worktree the
+// process sits in (#230): afterwards git can't run from the cwd at all.
+func MainCheckout() string {
+	common, err := CommonDir()
+	if err != nil {
+		return ""
+	}
+	if filepath.Base(common) == ".git" {
+		return filepath.Dir(common)
+	}
+	if IsBareRepo(common) {
+		return common
+	}
+	return ""
+}
+
+// IsBareRepo reports whether dir is a bare repository's git dir.
+func IsBareRepo(dir string) bool {
+	bare, err := RunDir(dir, "rev-parse", "--is-bare-repository")
+	return err == nil && strings.TrimSpace(bare) == "true"
 }
 
 // Cherry returns `git cherry <base> <branchRef>` output (+/- lines).
@@ -1859,10 +1930,16 @@ func PushSetUpstream(dir, branch string) error {
 // DeleteRemoteBranch deletes branch on origin, from dir. `release --clean` uses it
 // to drop the abandoned placeholder branch that claim pushed, so re-claiming the
 // same issue pushes a fresh branch cleanly instead of hitting a non-fast-forward
-// rejection (#159). Errors (e.g. the remote ref is already gone) are the caller's
-// to treat as best-effort.
-func DeleteRemoteBranch(dir, branch string) error {
-	_, err := RunDir(dir, "push", "origin", "--delete", branch)
+// rejection (#159). Errors (e.g. the remote ref is already gone, or it moved
+// from tip) are the caller's to treat as best-effort.
+func DeleteRemoteBranch(dir, branch, tip string) error {
+	// Only while origin's branch is still at tip (#230 review): a check and
+	// a separate delete let a push landing in between be deleted. git applies
+	// the lease to a delete too.
+	if tip == "" {
+		return fmt.Errorf("delete of origin/%s needs the tip it was checked at", branch)
+	}
+	_, err := runReporting(dir, "push", "origin", "--delete", "--force-with-lease=refs/heads/"+branch+":"+tip, branch)
 	return err
 }
 

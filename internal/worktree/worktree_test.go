@@ -217,7 +217,7 @@ func TestRemoveStillRefusesOutOfRoot(t *testing.T) {
 	if err := os.MkdirAll(outside, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	err := Remove(&config.Config{WorktreeRoot: root}, outside, "feat-x", false)
+	err := Remove(&config.Config{WorktreeRoot: root}, outside, "feat-x", "", false)
 	if err == nil {
 		t.Fatal("Remove must refuse a path outside worktree_root")
 	}

@@ -114,7 +114,41 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   is HIGH iff those ranges conflict with the other window's
   (`collide.ConflictSeverity`); an edit that puts the file back to base's copy
   reads HIGH like `wt check`'s empty side, as a heads-up, not a confirmed
-  overlap. Claude (`claudePendingContent`): Claude Code's Edit replayed (refused
+  overlap. A STRUCTURED shared doc is graded by section, not hunk (#22), so
+  `regradeSections` re-grades its entries first (#226): the same
+  `SharedSections` call `gradeEntry` makes, with this window's copy as the edit
+  leaves it (`collide.PendingDoc`) and its ranges in that copy's OWN line
+  numbers (`gitx.ChangedRangesNewWith`; the base frame put an edit past an
+  insert in the wrong section). Advisory or section-HIGH: HIGH, naming the
+  section, iff the copy now shares one with the other window, else dropped.
+  Before #226 an advisory was never re-graded, so an edit moving INTO the other
+  window's section was silent while `wt check` then said HIGH, and one moving
+  OUT kept a heads-up (a deny under block). `ChangedRangesNewWith` IS
+  `ChangedRangesNew` once the copy is written, fallbacks included (no base:
+  the uncommitted ranges; a side without the file is empty and an untracked
+  copy is not the working tree's, as `git diff <rev> -- file` reads them; a
+  failed diff: the whole file); each fallback it lacked read as
+  "unmeasurable" (#226 review). ⚠ A copy the hook can't predict or put in as
+  a blob may still read HIGH in `wt check`, so every section-graded entry
+  stays a file-level heads-up, an advisory included; only an ungradable doc
+  (a bad delimiter, where `wt check` is the blanket advisory too) drops one.
+  ⚠ New-frame ranges can't show a deletion, so deleting the shared section,
+  or emptying or deleting the file, reads disjoint in `wt check` while git
+  conflicts (#237): until the grader counts deleted lines, a section HIGH
+  whose heading the copy has FEWER of than the file has now stays a heads-up
+  (`headingGone`, counted: sections are identified by heading text, so
+  deleting one of two "## Notes" left the heading present), as main kept it.
+  A delimiter that doesn't compile leaves the entries as they were (`wt
+  check` can't section-grade that doc either). The empty side of a
+  measurement is hashed `--no-filters` (git's /dev/null never sees a clean
+  filter; one adding a header moved every range of a file measured against it:
+  one new since the measured revision, or an untracked copy). Known gap, for
+  #237: a two-step history (a same-named heading renamed earlier, then
+  restored while the shared one is deleted) keeps the count equal, and the
+  stopgap misses it. Pinned by `TestPreEditHooks_StructuredDocSections` (into, staying
+  out of, past an insert into, and out of the other window's section, each held
+  to `wt check` after the edit, both hooks, both block modes) and the
+  `StructuredDoc*` cases beside it. Claude (`claudePendingContent`): Claude Code's Edit replayed (refused
   for an absent `old_string`, or a repeated one without `replace_all`; an empty
   `new_string` takes the newline after it), MultiEdit's edits in turn, Write's
   content; a CRLF file is edited as LF (the edit's own CRLFs too) and written
@@ -279,10 +313,30 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   `appendLocked`. Both handles are `O_APPEND`, so a writer that doesn't lock
   (an older wt mid-rollout, a no-lock build) can't be overwritten by these
   writes; a prune can still drop its record, which is #229 itself.
-  ⚠ Readers (`Load`) take no lock yet, so a read during a prune's rewrite can
-  see an empty log (#234). Pinned by
+  ⚠ **Readers take the SHARED lock (#234):** unlocked, a `Load` between the
+  prune's truncate and its rewrite read an empty log, so merge-pr's hold gate
+  (and inbox, holds, the hooks, MCP, doctor) missed a hold that never left the
+  file. `Load` waits while a prune or an append holds the log, reads the bytes
+  under the lock and parses after releasing it; the two callers that hold the
+  exclusive lock read through their OWN handle (`readHeld`), so they can't
+  wait on themselves. ⚠ **The wait is bounded** (`loadLockWait`, 5s; #234
+  review: a prune stopped with Ctrl-Z blocked every reader, the per-turn hooks
+  included): then `Load` reads unlocked, as before #234, and `LoadForGate`
+  returns `ErrLogLocked`, which merge-pr's hold gate refuses on (an unlocked
+  read could be a log stopped between its truncate and its rewrite). A lock
+  that fails (no flock) reads unlocked, as before. ⚠ The refusal says to
+  RESUME the holder (`kill -CONT`), never to kill it: a prune killed after its
+  truncate leaves the log empty for good. Not covered here: writers (`Append`,
+  `ReserveBlock`) still wait on a stopped holder without limit (#235), and a
+  prune longer than the wait (measured 8.9s for a 1M-record log on Linux; a
+  real log is ~10k) lets a non-gate reader read unlocked mid-rewrite.
+  Pinned by
   `TestAppend_waitsForAPruneRewrite` (a prune paused between its read and its
-  rewrite; `lockedLogPause` is the seam) and
+  rewrite; `lockedLogPause` is the seam),
+  `TestLoad_waitsForAPruneRewrite` (paused right after the truncate,
+  `lockedLogTruncated`), `TestLockHolders_readWithoutSelfDeadlock`,
+  `TestLoad_givesUpOnAStuckHolder`,
+  `TestMergeCoordGate_RefusesALogLockedByAnotherProcess` and
   `TestReserveBlock_noSelfDeadlockAndAppendsLand`. Off unix the lock is a
   no-op, as before.
 - **`ClassifyFacts` precedence:** open PR > merged PR > closed PR > dirty >
@@ -500,6 +554,14 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   on the BASE branch** (`ReapableBranch`): "patch-equivalent on base" is
   trivially true for the base itself, so every downstream verdict says shipped
   and the printed command becomes `git branch -D main` (#101).
+  ⚠ **A merged PR reaps only a tip that shipped in it (#230 review).** It
+  proves only the commits it had: clean reaped a merged PR's lane without
+  asking, and a commit made there after the merge went with the branch.
+  `merge.UnshippedLane` (merge-pr's #187 check, one function for both) must
+  find the tip at the PR's `headRefOid` or an ancestor of it; otherwise the
+  merged PR proves nothing and only the cherry proof can reap. Every proof is
+  about the tip read at decision time, and the branch is deleted only there.
+  `prLookup` is the test seam (gh's auth answer is memoized process-wide).
   ⚠ **Untracked files count whatever `status.showUntrackedFiles` says (#208).**
   A repo set to `no` hid them from a plain porcelain status AND from `git
   worktree remove`'s own check, so `clean -y`, merge-pr's auto-clean and
@@ -704,6 +766,51 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   `merge.LocalTipVerdict` needs the tip to BE the PR's `headRefOid` or an
   ancestor of it; otherwise, or when it can't tell (no head, not fetched here),
   the worktree and branch stay and the warning counts the commits not in the PR.
+  ⚠ **The removal's git runs from the main checkout (#230).** merge-pr usually
+  runs INSIDE the worktree it removes; `git branch -D` then ran in the removed
+  directory, exited 128, and the merged branch stayed, while the hint said to
+  cd into that same directory (`c.Root` is the cwd's worktree). `worktree.remove`
+  resolves `gitx.MainCheckout()` (the shared `.git`'s parent; in a bare
+  repository, the repository itself) before removing, runs the removal and the
+  delete there, and prints the cd hint itself (`holdsCwd`, read before, so a
+  symlinked or differently-cased cwd still gets it). ⚠⚠ **That fix made the
+  delete WORK where it used to fail, which armed guards that failure had been
+  hiding (#230 review; "scope-widening" below):** every remover now
+  (1) makes the path absolute from the cwd first, since the guards read it
+  there and git, run from the main checkout, read a relative one there (`release
+  --clean` from a subdirectory checked one lane and removed another);
+  (2) deletes the branch only at the tip its caller CHECKED
+  (`gitx.DeleteBranchAt`, as discard does; `Remove(c, path, branch, tip,
+  force)`, no tip keeps the branch), since `git branch -D` deleted a commit that
+  landed after the check;
+  (3) keeps a case twin of the base (`sameBranch`, `Main` under
+  `core.ignorecase` is main's loose ref).
+  `release --clean` reads its placeholder tip first and origin from the main
+  checkout (read from the removed lane it failed, read as "gone", and origin's
+  placeholder stayed), removes only a lane still ON the claim's branch, and
+  deletes origin's placeholder with a lease on that tip
+  (`DeleteRemoteBranch(dir, b, tip)`: `--force-with-lease`, which git applies
+  to a delete). `wt clean` removes the cwd's lane last (`cwdLast`). ⚠ The #187
+  check fetches `refs/pull/<n>/head` once when the PR's head is not in this
+  clone (updated on GitHub, then deleted with the merge: no plain fetch brings
+  it, and the lane was kept forever), and an UNKNOWN verdict never advises
+  "push them" (that recreates the deleted branch at a stale tip). A PR given
+  as a URL is fetched by its number (`merge.PRNumber`). ⚠ **A no-prompt
+  fetch has a deadline** (`fetchTimeout` 30s for the PR head,
+  `baseFetchTimeout` 120s for #223's base fetch; ssh `ConnectTimeout=10`,
+  HTTPS `lowSpeedTime=15`): an origin that took the connection and never
+  answered hung merge-pr's cleanup. ⚠ The fetch runs in its own process group
+  and the deadline SIGTERMs the GROUP (`stopGroupOnCancel`, unix): Apple's git
+  runs the fetch as a child of a wrapper, and killing only the started process
+  left the real fetch and git-remote-http running (pinned: the test pgreps for
+  them while the silent origin still holds the connection). `cmd.WaitDelay`
+  then stops waiting on a helper holding the pipe and SIGKILLs the leader
+  (measured: Wait waited 15s past a 2s deadline without it). `release --clean` compares the lane's FULL HEAD ref
+  (`gitx.SymbolicHead`): a tag of the branch's name made `--abbrev-ref` say
+  `heads/<b>`. A lease refusal says origin moved. A relative
+  `worktree_root` still means a different directory from each cwd (#238).
+  Pinned by `remove_review_test.go`, `TestRelease_CleanFromInsideTheLane` and
+  `TestCmdMergePR_keepsAnUnshippedLaneFromInsideIt`.
 - **merge-pr's checks gate never reads a failed read, or `--admin`, as green
   (#179).** It reads the head commit's statusCheckRollup (one GraphQL query,
   paged: `ghx.PRChecks`) and what the base branch requires, from the PR's own
@@ -1000,8 +1107,9 @@ exit 0** (advisory / fail-open; a coordination nicety must never break the sessi
   FYI) against this window's ranges as they will read once the patch is applied:
   `predictCodexPatch` replays apply_patch over the on-disk files
   (`codex_apply.go`) and `gitx.ChangedRangesWith` measures each result, with the
-  same `regradePending` as the Claude hook (#108/#184/#199). A disjoint patch to
-  a shared file therefore stays silent. Emits `additionalContext` on overlap;
+  same `regradePending` as the Claude hook (#108/#184/#199), after the same
+  `regradeSections` for a structured doc (#226). A disjoint patch to a shared
+  file therefore stays silent. Emits `additionalContext` on overlap;
   `WT_CODEX_HOOK_BLOCK=1` upgrades a **confirmed** HIGH (a computed hunk overlap) to
   `deny` — a file-level-only match never denies. Each file's line names EVERY
   window editing it, each with its own liveness and confirmed / not-computed tag

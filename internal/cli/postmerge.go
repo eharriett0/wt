@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"strings"
 	"time"
 
 	"github.com/eharriett0/wt/internal/ghx"
@@ -51,22 +50,10 @@ func mergedDespiteFailure(pr string) bool {
 
 // unshippedLane returns "" when every commit on the merged PR's local branch
 // shipped in the PR, and otherwise the warning merge-pr prints instead of
-// removing the branch's worktree and deleting the branch (#187).
-func unshippedLane(pr, branch string) string {
-	head, _ := ghx.PRHeadOid(pr)
-	tip := gitx.BranchTip(branch)
-	var ancestor bool
-	var ancestorErr error
-	if tip != "" && head != "" && !strings.EqualFold(tip, head) {
-		ancestor, ancestorErr = gitx.IsAncestor(tip, head)
-	}
-	v := merge.LocalTipVerdict(tip, head, ancestor, ancestorErr)
-	if v == merge.TipShipped {
-		return ""
-	}
-	n := -1
-	if v == merge.TipUnshipped {
-		n = gitx.BehindCount(head, tip) // rev-list --count head..tip: the commits the PR lacks
-	}
-	return merge.KeptLaneMessage(v, branch, pr, n, tip, head)
+// removing the branch's worktree and deleting the branch (#187). tip is the
+// commit it checked: the branch is deleted only while it still points there
+// (#230 review).
+func unshippedLane(pr, branch string) (msg, tip string) {
+	tip = gitx.BranchTip(branch)
+	return merge.UnshippedLane(pr, branch, tip), tip
 }
