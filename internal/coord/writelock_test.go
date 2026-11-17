@@ -327,3 +327,28 @@ func TestPruneBlockLedgers_prunesPastAHeldLedger(t *testing.T) {
 		t.Errorf("the ledger after the held one kept %v", got)
 	}
 }
+
+// Every ledger that fails for another reason is reported, not only the last
+// (errors.Join, #235 review).
+func TestPruneBlockLedgers_reportsEveryFailure(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root opens a mode-000 file")
+	}
+	home := t.TempDir()
+	var bad []string
+	for _, n := range []string{"a-bad.jsonl", "b-bad.jsonl"} {
+		p := filepath.Join(BlocksDir(home), n)
+		if err := Append(p, lockRec("r")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(p, 0o644) })
+		bad = append(bad, p)
+	}
+	_, locked, err := PruneBlockLedgers(home, time.Now(), 24*time.Hour)
+	if len(locked) != 0 || err == nil || !strings.Contains(err.Error(), bad[0]) || !strings.Contains(err.Error(), bad[1]) {
+		t.Errorf("locked %v, err = %v; want both unreadable ledgers in err", locked, err)
+	}
+}
