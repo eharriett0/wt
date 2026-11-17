@@ -1033,7 +1033,9 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   Unresolvable: refuse. ⚠ **A PR given by its URL is resolved the same way**
   (`ghx.IsPRURL`; #228 review): the guard's own hints print that form under
   `-R`, and it read the issues and squash settings in the cwd's repository
-  and auto-cleaned unchecked. ⚠ **Auto-clean keys on where the lane can be**
+  and auto-cleaned unchecked. `IsPRURL` is gh's own reading (its finder's
+  `^/<owner>/<name>/pull/<n>`, a PREFIX match), so `…/pull/5.diff`, which gh
+  merges as PR 5, is resolved too. ⚠ **Auto-clean keys on where the lane can be**
   (`laneMayBeHere`): the PR's repository OR its head's
   (`headRepository`) is origin. Keyed on the repository alone, a fork origin
   merging upstream's PR with `-R` kept its lane and said there was none; a
@@ -1042,7 +1044,14 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   reads that take the PR's URL (`PRClosingIssueNumbers`, `PRCommits`) pass
   its host (`withURLHost`), as `PRChecks` does: bare, gh asked its default
   host. Messages name the PR with `merge.PRLabel` (`#5`, or the URL, never
-  `#<url>`), and the draft refusal's `gh pr ready` hint carries the `-R`.
+  `#<url>`). ⚠ Command hints (`prCommand`: the draft refusal's `gh pr
+  ready`, the checks gate's `gh pr checks --watch`; merge.Run's `wt merge-pr
+  … --bypass`) carry the forwarded `-R`, and spell the PR without a `#`
+  (`merge.PRArg`): pasted, `gh pr ready #5 -R o/r` is a bare `gh pr ready`
+  after the shell's comment, which marks the CURRENT branch's PR ready. With
+  origin a fork and `-R` naming upstream, #187's PR-head fetch and its hint
+  go to the PR's own repository (`merge.prRemote`), where PR n on origin is
+  another PR or none.
   Pinned by `TestCmdMergePR_forwardedRepoReadsOnlyThatPR` (`-R` and URL),
   whose fake gh answers only that PR and logs any other read, plus
   `…AlreadyMergedLeavesTheLane` (the precheck's auto-clean, with a lane here
