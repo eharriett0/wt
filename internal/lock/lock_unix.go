@@ -35,8 +35,8 @@ func SharedWithin(f *os.File, d time.Duration) error {
 // stayed held for noticeAfter, so the caller can say what it is waiting on
 // (another writer's append holds it for microseconds: no notice for that).
 // Past d: ErrTimeout. EINTR is retried. Any other flock error is returned as
-// is, except a "can't lock here" error (Unsupported) after a try found the
-// file held: ErrSeenHeld, which is not Unsupported.
+// is, except after a try found the file held: then ErrSeenHeld, which is not
+// Unsupported.
 func ExclusiveWithin(f *os.File, d, noticeAfter time.Duration, waiting func()) error {
 	return within(f, syscall.LOCK_EX, d, noticeAfter, waiting)
 }
@@ -52,12 +52,11 @@ func within(f *os.File, how int, d, noticeAfter time.Duration, waiting func()) e
 			held = true
 		case errors.Is(err, syscall.EINTR):
 			// A signal during an NFS lock call (#235 review): try again.
-		case held && Unsupported(err):
-			// #235 review: this machine's lock service failed (NFS lockd
-			// unreachable: ENOLCK) after a try found the file HELD, so locks
-			// do work here and someone holds this one. Not Unsupported (%v,
-			// not %w): a caller that writes unlocked on Unsupported would
-			// write into a prune's rewrite.
+		case held:
+			// #235 review: a try failed after one found the file HELD, so
+			// locks do work here and someone holds this one. Never
+			// Unsupported (%v, not %w): a caller that writes unlocked on
+			// Unsupported would write into a prune's rewrite.
 			return fmt.Errorf("%w (%v)", ErrSeenHeld, err)
 		default:
 			return err
@@ -82,11 +81,15 @@ func within(f *os.File, how int, d, noticeAfter time.Duration, waiting func()) e
 var flock = syscall.Flock
 
 // Unsupported reports whether err says the filesystem can't lock at all (NFS
-// mounted nolocks, lockd unreachable, some FUSE and SMB mounts) rather than
-// that the lock is held (#235).
+// mounted nolocks on macOS, some FUSE and SMB mounts: ENOTSUP, EOPNOTSUPP,
+// ENOSYS) rather than that the lock is held (#235). ⚠ Not ENOLCK (#235
+// review, the owner's call): "no locks available" is a lock service failing
+// (NFS lockd unreachable) on a mount that DOES lock, which can change while
+// a prune holding the log is stopped; written unlocked then, a retry lost a
+// hold to the prune's rewrite. ENOLCK fails, until the service is back.
 func Unsupported(err error) bool {
 	return errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.EOPNOTSUPP) ||
-		errors.Is(err, syscall.ENOLCK) || errors.Is(err, syscall.ENOSYS)
+		errors.Is(err, syscall.ENOSYS)
 }
 
 // Release drops the advisory lock on f. Errors are ignored — closing the fd

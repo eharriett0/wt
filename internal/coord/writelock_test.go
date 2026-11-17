@@ -146,9 +146,11 @@ func TestAppend_noNoticeForAShortWait(t *testing.T) {
 // #235: on a filesystem that can't lock at all, Append refused, and announce,
 // ack, all-clear and block-id --written/--abandon exited 1 where they had
 // worked before #229. It writes unlocked there, warning once per process; any
-// other lock error is still returned and nothing is written.
+// other lock error is still returned and nothing is written, ENOLCK included
+// (a lock service failing on a mount that locks: the owner's call, #235
+// review).
 func TestAppend_writesUnlockedWhereTheFilesystemCantLock(t *testing.T) {
-	for _, errno := range []syscall.Errno{syscall.ENOTSUP, syscall.EOPNOTSUPP, syscall.ENOLCK, syscall.ENOSYS} {
+	for _, errno := range []syscall.Errno{syscall.ENOTSUP, syscall.EOPNOTSUPP, syscall.ENOSYS} {
 		t.Run(errno.Error(), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "log.jsonl")
 			notes := shortWriteLock(t, time.Second, 0)
@@ -166,7 +168,7 @@ func TestAppend_writesUnlockedWhereTheFilesystemCantLock(t *testing.T) {
 			}
 		})
 	}
-	for _, errno := range []syscall.Errno{syscall.EIO, syscall.EBADF, syscall.EINTR} {
+	for _, errno := range []syscall.Errno{syscall.ENOLCK, syscall.EIO, syscall.EBADF, syscall.EINTR} {
 		t.Run("other "+errno.Error(), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "log.jsonl")
 			shortWriteLock(t, time.Second, 0)
@@ -272,7 +274,8 @@ func TestLoadForGate_refusesOnLockErrorsButUnsupported(t *testing.T) {
 		{"held throughout", lock.ErrTimeout, true, ErrLogLocked},
 		{"held, then the lock service failed", fmt.Errorf("%w (no locks available)", lock.ErrSeenHeld), true, ErrLogLocked},
 		{"EIO", syscall.EIO, true, ErrLogUnlockable},
-		{"the filesystem can't lock", syscall.ENOLCK, false, nil},
+		{"the filesystem can't lock", syscall.ENOTSUP, false, nil},
+		{"the lock service failed (ENOLCK)", syscall.ENOLCK, true, ErrLogUnlockable},
 		{"locked", nil, false, nil},
 	} {
 		sharedWithin = func(*os.File, time.Duration) error { return tc.err }

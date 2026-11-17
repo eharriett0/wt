@@ -334,23 +334,24 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   `writeLockWait` (30s) it fails with an error naming the log and the same
   resume advice. Before, a stopped prune hung every announce and ack
   silently, an agent's tool call until its own timeout. ⚠ **A filesystem
-  that can't lock at all** (`lock.Unsupported`: ENOTSUP, EOPNOTSUPP, ENOLCK,
-  ENOSYS; NFS `nolocks`, some FUSE/SMB mounts) made `Append` refuse after
+  that can't lock at all** (`lock.Unsupported`: ENOTSUP, EOPNOTSUPP, ENOSYS;
+  macOS NFS `nolocks`, some FUSE/SMB mounts) made `Append` refuse after
   #229, which stopped announce, ack, all-clear and block-id
   `--written`/`--abandon`. `Append` alone writes unlocked there, `O_APPEND`
   as before #229, warning once per process: every locker ON THIS MACHINE
   fails the same way there, so no prune here can rewrite under it (machines
   sharing `~/.wt` where only some can lock were never protected).
   `ReserveBlock` (an id needs the lock across its read and write) and
-  `withLockedLog` (a rewrite without it is #229) still fail. ⚠ **Only a
-  failure on a try that never saw the file held is Unsupported** (#235
-  review): `within` returns ENOLCK after an EWOULDBLOCK as
-  `lock.ErrSeenHeld`, not Unsupported, since the lock service failed (lockd
-  unreachable) while someone held the file, and writing unlocked then lost a
-  hold to a prune's rewrite (measured with a stubbed flock). ⚠ The check is
-  per call: a retry whose first try gets ENOLCK while lockd stays down still
-  reads it as Unsupported. EINTR (a signal during an NFS lock call) is
-  retried, never read as a holder. `LoadForGate` refuses on every lock error
+  `withLockedLog` (a rewrite without it is #229) still fail. ⚠ **ENOLCK is
+  NOT Unsupported** (#235 review; the owner chose failing closed): "no locks
+  available" is a lock service failing (NFS lockd unreachable) on a mount
+  that does lock, and it can start while a prune holding the log is stopped.
+  Read as "can't lock", a retry wrote unlocked into the prune's rewrite and
+  lost a hold (measured with a stubbed flock). So announce and ack fail
+  until lockd is back, as on main before #235. ⚠ **Nor is any failure after
+  a try found the file held**: `within` returns it as `lock.ErrSeenHeld`.
+  EINTR (a signal during an NFS lock call) is retried, never read as a
+  holder. `LoadForGate` refuses on every lock error
   but Unsupported, not only on the timeout: a holder (`ErrLogLocked`, the
   resume advice) or any other failure (`ErrLogUnlockable`, EIO say: retry).
   prune-coord prunes past a locked block ledger and lists the locked ones,

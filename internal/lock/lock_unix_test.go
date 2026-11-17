@@ -102,8 +102,8 @@ func TestExclusiveWithin_takesAFreeLockAndPassesOtherErrors(t *testing.T) {
 // #235 review: a "can't lock here" error after a try found the file HELD
 // means this machine's lock service failed (NFS lockd unreachable), not that
 // the filesystem can't lock: someone holds it. It must not read as
-// Unsupported, or Append writes unlocked into a prune's rewrite. The same
-// error on the first try is Unsupported, as before.
+// Unsupported, or Append writes unlocked into a prune's rewrite. ENOTSUP on
+// the first try is Unsupported; ENOLCK never is (the owner's call).
 func TestExclusiveWithin_unsupportedAfterHeldFailsClosed(t *testing.T) {
 	path, _ := heldFile(t)
 	f := open(t, path)
@@ -115,19 +115,23 @@ func TestExclusiveWithin_unsupportedAfterHeldFailsClosed(t *testing.T) {
 		if tries == 1 {
 			return syscall.EWOULDBLOCK
 		}
-		return syscall.ENOLCK
+		return syscall.ENOTSUP
 	}
 	err := ExclusiveWithin(f, time.Second, 0, nil)
-	if !errors.Is(err, ErrSeenHeld) || Unsupported(err) || errors.Is(err, ErrTimeout) || !strings.Contains(err.Error(), "no locks available") {
-		t.Fatalf("held, then ENOLCK: err = %v (Unsupported %v), want a plain error", err, Unsupported(err))
+	if !errors.Is(err, ErrSeenHeld) || Unsupported(err) || errors.Is(err, ErrTimeout) || !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("held, then ENOTSUP: err = %v (Unsupported %v), want ErrSeenHeld", err, Unsupported(err))
 	}
-	tries = 1 // the next try is the first to fail: ENOLCK straight away
+	tries = 1 // the next try is the first to fail: ENOTSUP straight away
 	if err := ExclusiveWithin(f, time.Second, 0, nil); !Unsupported(err) {
-		t.Errorf("ENOLCK on the first try: err = %v, want Unsupported", err)
+		t.Errorf("ENOTSUP on the first try: err = %v, want Unsupported", err)
 	}
 	tries = 0
-	if err := SharedWithin(f, time.Second); err == nil || Unsupported(err) {
-		t.Errorf("readers too: held, then ENOLCK: err = %v, want a plain error", err)
+	if err := SharedWithin(f, time.Second); !errors.Is(err, ErrSeenHeld) || Unsupported(err) {
+		t.Errorf("readers too: held, then ENOTSUP: err = %v, want ErrSeenHeld", err)
+	}
+	flock = func(int, int) error { return syscall.ENOLCK }
+	if err := ExclusiveWithin(f, time.Second, 0, nil); Unsupported(err) || !errors.Is(err, syscall.ENOLCK) {
+		t.Errorf("ENOLCK on the first try: err = %v, want ENOLCK, never Unsupported", err)
 	}
 }
 
@@ -169,9 +173,9 @@ func TestUnsupported(t *testing.T) {
 	}{
 		{syscall.ENOTSUP, true},
 		{syscall.EOPNOTSUPP, true},
-		{syscall.ENOLCK, true},
+		{syscall.ENOLCK, false}, // a lock service failing, not a mount that can't lock
 		{syscall.ENOSYS, true},
-		{fmt.Errorf("flock: %w", syscall.ENOLCK), true},
+		{fmt.Errorf("flock: %w", syscall.ENOSYS), true},
 		{&os.PathError{Op: "flock", Path: "x", Err: syscall.ENOTSUP}, true},
 		{syscall.EWOULDBLOCK, false},
 		{syscall.EBADF, false},
