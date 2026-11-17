@@ -33,6 +33,8 @@ case "$*" in
 "api --include /"*) printf 'HTTP/2.0 403 Forbidden\r\nX-Ratelimit-Remaining: 0\r\nX-Ratelimit-Reset: %s\r\n\r\n{}\n' $(( $(date +%s) + 1380 )); exit 1 ;;
 "pr diff"*) echo "could not find pull request diff: HTTP 403: $refusal" >&2; exit 1 ;;
 "api --hostname $H repos/"*) printf '{"message":"%s","status":"403"}' "$refusal"; echo "gh: $refusal (HTTP 403)" >&2; exit 1 ;;
+*"--json number,url,baseRefName"*) echo "$3 https://$H/o/r/pull/$3 main"; exit 0 ;;
+*"expr=refs/heads/main:.wt.conf"*) echo '{"oid":"` + fakeHead + `","conf":null}'; exit 0 ;;
 *"--json number,url,changedFiles"*) echo "$3 https://$H/o/r/pull/$3 2"; exit 0 ;;
 *"--json number,url"*) echo "$3 https://$H/o/r/pull/$3"; exit 0 ;;
 *statusCheckRollup*) cat "$d/rollup"; exit 0 ;;

@@ -782,6 +782,83 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   Pinned end to end by `TestCmdMergePR_restQuotaUsedUp` (its own host, so the
   process-wide auth memo can't leak in), which fails on the pre-#217 code with
   every symptom above.
+- **merge-pr's gate settings come from the base branch too, and the stricter
+  applies (#223).** `config.Load` reads the `.wt.conf` of the checkout wt runs
+  in, and merge-pr usually runs in the PR's own worktree, so the branch being
+  merged decided its own gate: a PR setting `merge_is_deploy = false` (or
+  narrowing `merge_is_deploy_paths`, lowering `merge_min_checks`, shortening
+  `hold_max_age`, dropping `coord_issue`) merged under its own settings, and so
+  did a branch cut before the base added a deploy glob. `mergeGates` reads two
+  `config.Gate`s: this checkout's (`.wt.conf` + `WT_*`) and the base branch's
+  (`ghx.ReadBaseConf`: `gh pr view --json number,url,baseRefName`, then one
+  GraphQL query at the PR URL's host for `refs/heads/<base>`'s tip, its root
+  tree's entry modes, and `object(expression: "refs/heads/<base>:.wt.conf")`;
+  the full ref, since git resolves a bare name to a tag before a branch, per
+  gitrevisions, not measured on GitHub). The stricter applies: the deploy gate
+  fires if ANY source gates the PR (`deployDecision`; each source's `!`
+  exclusions apply only to its own globs, so a checkout can't carve a file out
+  of the base's gate; a bare `!` is an exclusion, so `merge_is_deploy_paths =
+  !` fails closed), the checks floor is the highest (`strictestFloor`; a value
+  that is not a count, from either, refuses and names where it was set), and
+  holds use the longer `hold_max_age` (0 wins) and every `coord_issue`
+  (`strictestHolds`, `mergeCoordGateWith`, whose stale-hold warning names the
+  limit applied). `GateFromConf` starts from Load's defaults, so a base with no
+  `.wt.conf` holds at hold_max_age 24h: hold_max_age is the one key whose
+  default is not the loosest, so neither `WT_HOLD_MAX_AGE` nor an untracked
+  local `.wt.conf` can shorten a hold below that any more (#223 re-review,
+  accepted; `wt holds` and `prune-coord --legacy` still read only the
+  checkout's value, so they can disagree with merge-pr).
+  ⚠ Measured: a missing file is a null object with NO error (and no tree
+  entry), a missing branch nulls the ref too, so no tip is an error, never "no
+  file" (`parseBaseConf`); `Commit.file(path:)` was not used because GitHub
+  answers a missing path with a NOT_FOUND error and gh exits 1. ⚠ **A symlink
+  is a Blob whose text is its target** (#223 review: `object(expression:)` and
+  `git cat-file blob` both hand it back), which parsed as a config with no
+  keys while `config.Load` followed the link. Only the tree entry's mode
+  (0o120000, decimal 40960) tells it apart: a symlink, a directory, a
+  submodule, an entry and an object that disagree, or any mode but 100644 /
+  100755 is an error. ⚠ **GitHub unread** (`baseGateSource`): the fallback is
+  this clone's `origin/<base>` for the base GitHub NAMED for this PR, never
+  `c.Base` (#223 review: the PR's own `base =` steered it, and a PR into
+  `release` read `origin/main`), and only when the PR's repository is this
+  clone's origin (owner and name, case-insensitive; the host is not compared,
+  since an ssh alias names it differently), so `-R`, a PR URL, `GH_REPO` or a
+  fork's default naming ANOTHER repository fail closed (a `-R` naming origin's
+  own repository takes the fallback). The read is retried once first, as the
+  checks gate's are (`retryable`: not for a rate limit). It fetches first
+  (`fetchBase` = `gitx.FetchNoPrompt`, the git transport, which a GraphQL quota
+  doesn't stop, with GIT_TERMINAL_PROMPT=0 against git's own HTTPS prompt and
+  ssh in BatchMode unless the user set an ssh command; a GIT_ASKPASS helper is
+  still the user's); a failed fetch reads the copy as last fetched, and says it
+  may be stale. A retry that fails earlier than the first try keeps what the
+  first resolved. ⚠ The tree entry and the object are resolved separately in
+  one query, so both object ids are required and must match (a push between
+  could pair a regular file's mode with a symlink's blob). ⚠ `ReadBaseConf` returns what it resolved WITH its error (base, owner,
+  name, host), or the fallback can't read the right branch. ⚠
+  `gitx.RefFileText` decides presence by `git ls-tree -z --full-tree` (exact
+  path, from the top, whatever the cwd) and reads the blob by id: a failed
+  `cat-file -t` used to read as "no file", so in an offline blob:none partial
+  clone a `.wt.conf` the base added after the clone was absent (#223 review).
+  Any read failure is an error. ⚠ **Fail closed** (`gateSource.unread`): the
+  deploy gate gates the whole repository, its banner, draft refusal, confirm
+  line and dry-run note say the merge MAY auto-apply (the reason, never
+  "AUTO-APPLIES" as fact), the checks gate refuses, or asks at a terminal
+  (`ChecksInput.FloorUnread`, with its own hint), until `--checks-ok`, and
+  holds keep at least the default hold_max_age (#223 re-review: skipped, the
+  PR's own hold_max_age decided while GitHub was down). A repo that never set
+  merge_is_deploy can meet that when GitHub is unreachable; accepted. ⚠ A
+  passthrough that merges nothing (`merge.NonMerging`) reads nothing from the
+  base and lists no files, and passes neither the deploy nor the checks gate;
+  the hold gate still applies to it, as before #223. ⚠ With `-R`,
+  the deploy gate's file list and draft read are that repository's PR
+  (`PRChangedFiles(pr, repo)`, `PRIsDraft(pr, repo)`); before, they read this
+  clone's PR of the same number. The `WT_*` overlay is the checkout's side, so
+  the environment can tighten but never loosen a gate the base sets;
+  `--confirm-deploy` / `--checks-ok` are the ways past it. Pinned by
+  `TestCmdMergePR_gateSettingsComeFromTheBaseToo` (merges ungated on the
+  pre-#223 code), `TestCmdMergePR_holdSettingsComeFromTheBaseToo` and
+  `TestCmdMergePR_forwardedRepoReadsThatPRsFiles`. Not covered: an LFS pointer
+  or a clean-filtered `.wt.conf` reads as its stored text.
 - **The deploy gate's GitHub status read only WARNS, and fails open (#178).**
   Inside the deploy confirm (draft refusal → prod banner → status → confirm),
   for a PR on github.com (`merge.GitHubStatusCovers`; the host is the checks

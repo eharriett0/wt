@@ -28,6 +28,8 @@ case "$*" in
 "api --include /"*) exit 1 ;;
 "api --hostname $H repos/o/r/branches/"*) echo '` + unprotected + `'; exit 0 ;;
 "api --hostname $H repos/o/r/rules/branches/"*) echo '[]'; exit 0 ;;
+*"--json number,url,baseRefName"*) echo "$3 https://$H/o/r/pull/$3 main"; exit 0 ;;
+*"expr=refs/heads/main:.wt.conf"*) echo '{"oid":"` + fakeHead + `","conf":null}'; exit 0 ;;
 *"--json number,url,changedFiles"*) echo "$3 https://$H/o/r/pull/$3 $(cat "$d/nfiles")"; exit 0 ;;
 *"--json number,url"*) echo "$3 https://$H/o/r/pull/$3"; exit 0 ;;
 *statusCheckRollup*) echo '` + greenRollup + `'; exit 0 ;;

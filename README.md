@@ -380,6 +380,43 @@ path, so moving a file out of a deploy path (which deletes it there) still
 gates. If GitHub's REST API can't be read and its GraphQL file list shows a
 rename, the old path is unknown, so the PR is gated.
 
+**Where the gate settings come from.** `merge-pr` usually runs in the PR's own
+worktree, whose `.wt.conf` is the branch being merged. So it reads its gate
+settings (`merge_is_deploy`, `merge_is_deploy_paths`, `merge_min_checks`,
+`hold_max_age`, `coord_issue`) from two places: this checkout (its `.wt.conf`
+and the `WT_*` environment) and the `.wt.conf` on the PR's base branch, read
+from GitHub at merge time. The stricter of the two applies:
+
+- the deploy gate fires if either source turns `merge_is_deploy` on and gates
+  the PR (each source's `!` exclusions apply to its own globs only);
+- the higher checks floor holds;
+- a hold lives for the longer `hold_max_age` (`0`, never expire, beats any
+  age), and every `coord_issue` mirror named is read.
+
+So a PR that turns the gate off, narrows the paths, lowers the floor or
+shortens `hold_max_age` is still held to the base's settings, and a branch cut
+before the base added a deploy glob is gated for it. A base branch without a
+`.wt.conf` counts as the defaults, so `hold_max_age` stays at least 24h there
+too. The environment can only tighten these settings, never loosen the base's:
+`--confirm-deploy` and `--checks-ok` are the ways past them. (`wt holds` and
+`wt prune-coord` still read only this checkout's `hold_max_age`.)
+
+When GitHub can't be read (after one retry; a rate limit is not retried), `merge-pr` fetches the PR's base
+branch into this clone and reads that copy (with a warning; if the fetch fails
+too, the copy as last fetched, which may be stale), but only when the PR's
+repository is this clone's `origin` (owner and name; the host is not compared,
+since an ssh alias names it differently). In every other case (gh could not
+name the PR's base, the PR is in another repository through `-R`, a URL,
+`GH_REPO` or a fork's default, or this clone's copy can't be read, a symlinked
+or unfetched `.wt.conf` included) it fails closed: the deploy gate gates,
+saying the merge **may** auto-apply rather than that it does, the checks gate
+refuses (at a terminal, asks) without `--checks-ok`, since the base's floor is
+unknown, and holds keep at least the default `hold_max_age`. That can happen in
+a repository that never set `merge_is_deploy`, when GitHub is unreachable. A
+passthrough that merges nothing (`-- --disable-auto`, `-- --help`) reads
+nothing from the base and passes neither the deploy nor the checks gate; the
+hold gate still applies. `--dry-run` names both sources and what each one sets.
+
 ## Cross-repo epics
 
 A logical change often spans repos (a build PR in repo A gates a deploy PR in
@@ -549,7 +586,8 @@ announce, merge) stays in the CLI + git hooks.
 ## Configuration
 
 Zero-config works by derivation. Override via a repo-root `.wt.conf`
-(`key=value`) or environment variables (env wins):
+(`key=value`) or environment variables (env wins; for `merge-pr`'s gate settings the
+base branch's `.wt.conf` counts too, and the stricter applies, see the merge section):
 
 | `.wt.conf` key | env | default |
 |---|---|---|
@@ -563,10 +601,11 @@ Zero-config works by derivation. Override via a repo-root `.wt.conf`
 | `structured_doc.<basename>` | *(config-file only)* | *(none)* — section-delimiter regex; the doc grades by SECTION (same section = HIGH). e.g. `structured_doc.CLAUDE.md = ^##\s` |
 | `append_only_paths` | `WT_APPEND_ONLY_PATHS` | *(none)* — globs whose overlaps are always FYI (`**` matches any depth) |
 | `max_age` | `WT_MAX_AGE` | *(off)* — dormancy threshold, e.g. `4d`, `2w`, `36h`, or a bare int (days) |
-| `hold_max_age` | `WT_HOLD_MAX_AGE` | `24h` — a `--hold` older than this stops hard-blocking `merge-pr` (warns instead); `0`/`off` = never expire |
-| `coord_issue` | `WT_COORD_ISSUE` | *(off)* — a pinned GitHub issue as the **cross-machine** mirror: announce/ack/all-clear auto-mirror to it, and `inbox` + the `merge-pr` gate read it back, so a hold on one machine blocks/warns on another |
-| `merge_is_deploy` | `WT_MERGE_IS_DEPLOY` | `false` — enable the prod-deploy gate on `merge-pr` |
-| `merge_min_checks` | `WT_MERGE_MIN_CHECKS` | *(off)* — `merge-pr` refuses when fewer checks ran on the PR's head (skipped ones don't count): the "CI never started" floor for a repo that requires no check. A value that isn't a count makes `merge-pr` refuse until it's fixed |
+| `hold_max_age` | `WT_HOLD_MAX_AGE` | `24h` — a `--hold` older than this stops hard-blocking `merge-pr` (warns instead); `0`/`off` = never expire. `merge-pr` also reads it from the PR's base branch; the longer applies |
+| `coord_issue` | `WT_COORD_ISSUE` | *(off)* — a pinned GitHub issue as the **cross-machine** mirror: announce/ack/all-clear auto-mirror to it, and `inbox` + the `merge-pr` gate read it back, so a hold on one machine blocks/warns on another. `merge-pr` also reads the base branch's, and both mirrors |
+| `merge_is_deploy` | `WT_MERGE_IS_DEPLOY` | `false` — enable the prod-deploy gate on `merge-pr`. Also read from the PR's base branch at merge time; the stricter applies |
+| `merge_is_deploy_paths` | `WT_MERGE_IS_DEPLOY_PATHS` | *(none: the whole repo deploys)*. Globs scoping the deploy gate; `!` excludes. Also read from the PR's base branch; a file gates if either source turns `merge_is_deploy` on and its list gates it |
+| `merge_min_checks` | `WT_MERGE_MIN_CHECKS` | *(off)* — `merge-pr` refuses when fewer checks ran on the PR's head (skipped ones don't count): the "CI never started" floor for a repo that requires no check. A value that isn't a count makes `merge-pr` refuse until it's fixed. Also read from the PR's base branch; the higher floor holds |
 
 Color is auto-disabled when stdout isn't a TTY; force off with `NO_COLOR=1`.
 

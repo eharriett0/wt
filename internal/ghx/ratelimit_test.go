@@ -329,7 +329,7 @@ func TestPRDiffReads(t *testing.T) {
 	if n, err := PRChangedFileCount("7"); n != 2 || err != nil {
 		t.Errorf("REST reads: PRChangedFileCount = (%d, %v), want 2", n, err)
 	}
-	if files, err := PRChangedFiles("7"); !reflect.DeepEqual(files, []string{"a.md", "infra/x.yaml"}) || err != nil {
+	if files, err := PRChangedFiles("7", ""); !reflect.DeepEqual(files, []string{"a.md", "infra/x.yaml"}) || err != nil {
 		t.Errorf("REST reads: PRChangedFiles = (%q, %v)", files, err)
 	}
 	if c := calls(); strings.Contains(c, "--json changedFiles") || strings.Contains(c, "api graphql") {
@@ -347,7 +347,7 @@ func TestPRDiffReads(t *testing.T) {
 	if n, err := PRChangedFileCount("7"); n != 6 || err != nil {
 		t.Errorf("REST refused: PRChangedFileCount = (%d, %v), want GraphQL's 6", n, err)
 	}
-	if files, err := PRChangedFiles("7"); !reflect.DeepEqual(files, []string{"a.md", "infra/x.yaml"}) || err != nil {
+	if files, err := PRChangedFiles("7", ""); !reflect.DeepEqual(files, []string{"a.md", "infra/x.yaml"}) || err != nil {
 		t.Errorf("REST refused: PRChangedFiles = (%q, %v), want GraphQL's two", files, err)
 	}
 	if c := calls(); !strings.Contains(c, "query="+prFilesQuery) || !strings.Contains(c, "url=https://ghe.example.com/o/r/pull/7") {
@@ -356,7 +356,7 @@ func TestPRDiffReads(t *testing.T) {
 	// #221: only GraphQL answers, and a file was renamed: its old path may have
 	// been a deploy path, so the list is an error and the gate gates.
 	set("files", `{"total":2,"paths":["a.md","docs/x.yaml"],"renamed":["docs/x.yaml"]}`+"\n")
-	if files, err := PRChangedFiles("7"); err == nil || files != nil || !strings.Contains(err.Error(), "renamed file(s) (docs/x.yaml)") || !IsRateLimit(err) {
+	if files, err := PRChangedFiles("7", ""); err == nil || files != nil || !strings.Contains(err.Error(), "renamed file(s) (docs/x.yaml)") || !IsRateLimit(err) {
 		t.Errorf("REST refused, GraphQL lists a rename: PRChangedFiles = (%q, %v), want an error naming both", files, err)
 	}
 
@@ -366,7 +366,7 @@ func TestPRDiffReads(t *testing.T) {
 	if err == nil || n != 0 || !IsRateLimit(err) || !strings.Contains(err.Error(), "REST API rate limit") || !strings.Contains(err.Error(), `got "null"`) {
 		t.Errorf("both reads fail: PRChangedFileCount = (%d, %v), want an error naming the rate limit and GraphQL's answer", n, err)
 	}
-	files, err := PRChangedFiles("7")
+	files, err := PRChangedFiles("7", "")
 	if err == nil || files != nil || !IsRateLimit(err) || !strings.Contains(err.Error(), "1 of the PR's 285") {
 		t.Errorf("both reads fail: PRChangedFiles = (%q, %v), want an error, never part of the list", files, err)
 	}
@@ -377,7 +377,7 @@ func TestPRDiffReads(t *testing.T) {
 	// #217 review: `gh api graphql` refused for its quota prints no API marker;
 	// the file list's refusal is still GraphQL's, with no REST reset beside it.
 	set("files.fail", "gh: API rate limit already exceeded for user ID 1.")
-	if _, err := PRChangedFiles("7"); err == nil || !strings.Contains(err.Error(), "the GraphQL file list read failed too: GitHub's GraphQL API rate limit") {
+	if _, err := PRChangedFiles("7", ""); err == nil || !strings.Contains(err.Error(), "the GraphQL file list read failed too: GitHub's GraphQL API rate limit") {
 		t.Errorf("both quotas used up: PRChangedFiles err = %v, want the file list's refusal named GraphQL", err)
 	}
 }

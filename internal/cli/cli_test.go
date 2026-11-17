@@ -345,17 +345,27 @@ func TestDeployDryRunNote(t *testing.T) {
 	cases := []struct {
 		name             string
 		draft, confirmed bool
+		unsure           string
 		want             []string
 	}{
-		{"not confirmed → the real merge stops for the ack", false, false,
+		{"not confirmed → the real merge stops for the ack", false, false, "",
 			[]string{"a real merge stops at the deploy gate", "AUTO-APPLIES to prod", "--confirm-deploy"}},
-		{"confirmed → the real merge would proceed, and still says it deploys", false, true,
+		{"confirmed → the real merge would proceed, and still says it deploys", false, true, "",
 			[]string{"AUTO-APPLIES to prod", "would proceed"}},
-		{"draft → refused, before --confirm-deploy is considered", true, true,
+		{"draft → refused, before --confirm-deploy is considered", true, true, "",
 			[]string{"would REFUSE", "DRAFT"}},
+		// #223 review: gated only because the base's settings went unread, it
+		// says MAY, never that the merge deploys.
+		{"unsure → stops, and says it may deploy", false, false, "the base was unread",
+			[]string{"a real merge stops at the deploy gate", "MAY auto-apply to prod: the base was unread"}},
+		{"unsure draft → refused, and says it may deploy", true, false, "the base was unread",
+			[]string{"would REFUSE", "DRAFT", "MAY auto-apply to prod: the base was unread"}},
 	}
 	for _, c := range cases {
-		got := deployDryRunNote("2602", c.draft, c.confirmed)
+		got := deployDryRunNote("2602", c.draft, c.confirmed, c.unsure)
+		if c.unsure != "" && (strings.Contains(got, "AUTO-APPLIES") || strings.Contains(got, "merge==deploy repo")) {
+			t.Errorf("%s: %q states a deploy as fact", c.name, got)
+		}
 		if !strings.HasPrefix(got, "--dry-run: ") || !strings.Contains(got, "#2602") {
 			t.Errorf("%s: %q must say it is a dry run and name the PR", c.name, got)
 		}

@@ -351,6 +351,34 @@ func Fetch(remote, branch string) error {
 	return err
 }
 
+// FetchNoPrompt is Fetch for a read nobody is watching (#223: merge-pr's
+// fallback for the base branch's .wt.conf): GIT_TERMINAL_PROMPT=0, so a
+// credential git can't find over HTTPS fails the fetch instead of waiting on
+// git's prompt, and ssh in BatchMode unless the user set their own ssh
+// command.
+func FetchNoPrompt(remote, branch string) error {
+	cmd := exec.Command("git", "fetch", remote, "+refs/heads/"+branch+":refs/remotes/"+remote+"/"+branch)
+	cmd.Env = append(scopedEnv(), "GIT_TERMINAL_PROMPT=0")
+	// GIT_TERMINAL_PROMPT stops git's own (HTTPS) prompt only; ssh reads
+	// /dev/tty for a passphrase or an unknown host key. BatchMode makes ssh
+	// fail instead, unless the user chose their own ssh command (#223 final
+	// review). A GIT_ASKPASS helper is still the user's.
+	if os.Getenv("GIT_SSH_COMMAND") == "" && os.Getenv("GIT_SSH") == "" {
+		if sc, _ := Run("config", "--get", "core.sshCommand"); sc == "" {
+			cmd.Env = append(cmd.Env, "GIT_SSH_COMMAND=ssh -o BatchMode=yes")
+		}
+	}
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if _, err := cmd.Output(); err != nil {
+		if msg := gitStderr(stderr.String()); msg != "" {
+			return fmt.Errorf("%w: %s", err, msg)
+		}
+		return err
+	}
+	return nil
+}
+
 // WorktreeAddNewBranch creates a new worktree at path on a NEW branch cut from
 // base. git refuses when the branch already exists, so it can never re-attach
 // one: `wt new` decides that itself, after checking the branch against
@@ -943,6 +971,58 @@ func RefBlob(worktree, ref, path string) (string, bool) {
 		return "", false
 	}
 	return out, true
+}
+
+// RefFileText returns the text of the regular file at path in commit ref and
+// whether ref has an entry there (#223). path is from the repository's top
+// (`--full-tree`, so the cwd doesn't matter) and compared exactly. Absent is
+// only what `git ls-tree` says: no entry at path in a commit that resolves. An
+// error when ref does not resolve to a commit, when the entry is a symlink (a
+// blob read would hand back the link's target as if it were the file, #223
+// review), a directory or a submodule, or when the blob can't be read: in a
+// partial clone a blob never fetched is in the tree but not here, and git
+// fetches it on the read (or fails offline), which is no ref without the file.
+func RefFileText(ref, path string) (string, bool, error) {
+	if _, err := Run("rev-parse", "--verify", "--quiet", ref+"^{commit}"); err != nil {
+		return "", false, fmt.Errorf("%s does not resolve to a commit here", ref)
+	}
+	out, err := runRaw("", "ls-tree", "-z", "--full-tree", ref, "--", path)
+	if err != nil {
+		return "", false, fmt.Errorf("cannot list %s in %s: %w", path, ref, err)
+	}
+	mode, kind, oid, ok := lsTreeEntry(out, path)
+	if !ok {
+		return "", false, nil
+	}
+	switch {
+	case mode == "120000":
+		return "", false, fmt.Errorf("%s in %s is a symlink, which wt does not follow", path, ref)
+	case kind != "blob":
+		return "", false, fmt.Errorf("%s in %s is a %s, not a file", path, ref, kind)
+	}
+	text, err := runRaw("", "cat-file", "blob", oid)
+	if err != nil {
+		return "", false, fmt.Errorf("cannot read %s in %s: %w", path, ref, err)
+	}
+	return text, true, nil
+}
+
+// lsTreeEntry finds the entry named exactly path in `git ls-tree -z` output
+// (`<mode> SP <type> SP <oid> TAB <path> NUL` per entry): its mode, type and
+// object id. A pattern git matched that is not path itself is skipped. Pure.
+func lsTreeEntry(out, path string) (mode, kind, oid string, ok bool) {
+	for _, e := range splitNUL(out) {
+		meta, name, found := strings.Cut(e, "\t")
+		if !found || name != path {
+			continue
+		}
+		f := strings.Fields(meta)
+		if len(f) != 3 {
+			continue
+		}
+		return f[0], f[1], f[2], true
+	}
+	return "", "", "", false
 }
 
 // ResolveRemoteBase returns the best last-known base ref for offline base-drift

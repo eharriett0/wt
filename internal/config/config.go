@@ -45,6 +45,39 @@ type Config struct {
 	StructuredDocs     map[string]string // basename → section-delimiter regex (#22): docs that partition into sections/lanes, so a cross-window touch grades by SECTION (same section = HIGH) instead of the blanket shared-doc advisory. Per-doc because delimiters differ (CLAUDE.md by "## " headings, the resume memory by "**═══" lane bars). Config-file only.
 }
 
+// Gate is the part of the config that decides whether merge-pr stops a merge:
+// the deploy gate (merge_is_deploy, merge_is_deploy_paths), the checks floor
+// (merge_min_checks) and the hold gate (hold_max_age, coord_issue). merge-pr
+// reads it twice (#223), from this checkout and from the PR's base branch, and
+// the stricter of the two applies: the checkout is usually the PR's own
+// worktree, so on its own the branch being merged would decide its own gate.
+type Gate struct {
+	MergeIsDeploy      bool
+	MergeIsDeployPaths []string
+	MergeMinChecks     int
+	MergeMinChecksBad  string
+	HoldMaxAge         time.Duration // 0 = holds never expire
+	CoordIssue         int
+}
+
+// Gate returns c's gate settings, environment overlay included.
+func (c *Config) Gate() Gate {
+	return Gate{MergeIsDeploy: c.MergeIsDeploy, MergeIsDeployPaths: c.MergeIsDeployPaths,
+		MergeMinChecks: c.MergeMinChecks, MergeMinChecksBad: c.MergeMinChecksBad,
+		HoldMaxAge: c.HoldMaxAge, CoordIssue: c.CoordIssue}
+}
+
+// GateFromConf returns the gate settings a .wt.conf body sets on its own: no
+// environment overlay (a base branch's file is read as the repository wrote
+// it), and every key it leaves out at its default (deploy off, no floor, holds
+// expire after DefaultHoldMaxAge, no mirror issue), as Load would resolve it.
+// The gate keys read nothing but body.
+func GateFromConf(body string) Gate {
+	c := Config{HoldMaxAge: DefaultHoldMaxAge}
+	ApplyConf(&c, ParseConf(body))
+	return c.Gate()
+}
+
 // Load resolves config for the repo containing cwd.
 func Load() (*Config, error) {
 	root, err := gitx.RepoRoot()

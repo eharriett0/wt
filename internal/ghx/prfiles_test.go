@@ -50,7 +50,7 @@ case "$*" in
 *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
 `)
-	got, err := PRChangedFiles("7")
+	got, err := PRChangedFiles("7", "")
 	if err != nil {
 		t.Fatal(err)
 	}
