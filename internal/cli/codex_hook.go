@@ -822,7 +822,7 @@ func codexEditDecision(high []codexGradedEntry, deny bool) (string, bool) {
 	seen := map[windowKey]bool{}
 	who := map[string][]string{}
 	var paths []string
-	anyConfirmed, anyFileLevel := false, false
+	anyConfirmed, anyFileLevel, anyHunk := false, false, false
 	for _, g := range high {
 		e := g.entry
 		id := e.otherWorktree
@@ -839,6 +839,8 @@ func codexEditDecision(high []codexGradedEntry, deny bool) (string, bool) {
 			tag = "overlapping hunks"
 			if len(e.SharedSections) > 0 {
 				tag = sectionsString(e.SharedSections) // #226
+			} else {
+				anyHunk = true
 			}
 			anyConfirmed = true
 		} else {
@@ -854,8 +856,12 @@ func codexEditDecision(high []codexGradedEntry, deny bool) (string, bool) {
 		lines = append(lines, fmt.Sprintf("  %s — also being edited by %s", p, strings.Join(who[p], ", ")))
 	}
 	header := "wt: your apply_patch touches file(s) another live window is editing:"
-	if anyConfirmed && !anyFileLevel {
+	switch {
+	case anyConfirmed && !anyFileLevel && anyHunk:
 		header = "wt collision: with this apply_patch, your version OVERLAPS hunks another live window is editing (`wt check` will grade it HIGH):"
+	case anyConfirmed && !anyFileLevel:
+		// #226 review: a section grade overlaps no hunk.
+		header = "wt collision: with this apply_patch, your version OVERLAPS a section another live window is editing (`wt check` will grade it HIGH):"
 	}
 	msg := header + "\n" + strings.Join(lines, "\n") +
 		"\nCoordinate before applying to avoid a merge conflict / duplicate PR. (Set WT_SKIP_COLLISION=1 to silence.)"

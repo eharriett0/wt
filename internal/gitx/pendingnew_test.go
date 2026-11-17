@@ -1,6 +1,7 @@
 package gitx
 
 import (
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -24,22 +25,37 @@ func TestChangedRangesNewWith(t *testing.T) {
 	runGit(t, dir, "branch", "behind")
 
 	objects := func() string { return gitOut(t, dir, "count-objects", "-v") }
-	same := func(dir, file, content string, want []LineRange) {
+	sameFrom := func(base, dir, file, content string, want []LineRange) {
 		t.Helper()
 		before := objects()
-		got, ok := ChangedRangesNewWith(dir, "main", file, []byte(content))
+		got, ok := ChangedRangesNewWith(dir, base, file, []byte(content))
 		if after := objects(); after != before {
 			t.Errorf("ChangedRangesNewWith wrote into the repo's objects:\nbefore %s\nafter %s", before, after)
 		}
 		if !ok || !reflect.DeepEqual(got, want) {
-			t.Errorf("ChangedRangesNewWith = %v, %v; want %v, true", got, ok, want)
+			t.Errorf("ChangedRangesNewWith(%s) = %v, %v; want %v, true", file, got, ok, want)
 		}
-		orig := readFileT(t, dir, file)
+		orig, had := "", true
+		if b, err := os.ReadFile(filepath.Join(dir, file)); err == nil {
+			orig = string(b)
+		} else {
+			had = false
+		}
 		writeFile(t, dir, file, content)
-		defer writeFile(t, dir, file, orig)
-		if wt := ChangedRangesNew(dir, "main", file); !reflect.DeepEqual(wt, got) {
-			t.Errorf("ChangedRangesNew with that content written = %v, ChangedRangesNewWith said %v", wt, got)
+		defer func() {
+			if had {
+				writeFile(t, dir, file, orig)
+			} else {
+				os.Remove(filepath.Join(dir, file))
+			}
+		}()
+		if wt := ChangedRangesNew(dir, base, file); !reflect.DeepEqual(wt, got) {
+			t.Errorf("ChangedRangesNew(%s) with that content written = %v, ChangedRangesNewWith said %v", file, wt, got)
 		}
+	}
+	same := func(dir, file, content string, want []LineRange) {
+		t.Helper()
+		sameFrom("main", dir, file, content, want)
 	}
 	same(dir, "data.txt", replaceLine("line05", "line05 EDITED")(base), []LineRange{span(5, 5)})
 	same(dir, "data.txt", base, nil) // back to base: no edits
@@ -74,16 +90,28 @@ func TestChangedRangesNewWith(t *testing.T) {
 	}
 	same(dir, "crlf.txt", "one\r\nTWO\r\nthree\r\n", []LineRange{span(2, 2)})
 
-	// Can't be measured that way → ok=false, never "no edits": a base-less
-	// repo, a file base doesn't have (as ChangedRangesWith), a git error.
-	if _, ok := ChangedRangesNewWith(dir, "no-such-base", "data.txt", []byte(base)); ok {
-		t.Error("base-less: want ok=false")
-	}
-	if _, ok := ChangedRangesNewWith(dir, "main", "new.txt", []byte("n\n")); ok {
-		t.Error("a file absent from base: want ok=false")
-	}
+	// ChangedRangesNew's fallbacks (#226 review: each read as "unmeasurable"
+	// here, and the hook dropped an entry `wt check` then graded HIGH).
+	// A file base doesn't have: a tracked one is all new, an untracked one is
+	// no edits, as `git diff <base> -- file` reads them.
+	same(dir, "new.txt", "n1\nn2\n", nil)
+	writeFile(t, dir, "new.txt", "n1\n")
+	runGit(t, dir, "add", "new.txt")
+	same(dir, "new.txt", "n1\nn2\n", []LineRange{span(1, 2)})
+	// A file base has that the index no longer tracks reads as deleted.
+	runGit(t, dir, "rm", "-q", "--cached", "other.txt")
+	same(dir, "other.txt", "x\ny\n", []LineRange{span(0, 1)}) // NEW frame: never a Gap
+	runGit(t, dir, "add", "other.txt")
+	// No base: the uncommitted ranges, index to the copy plus what is staged.
+	sameFrom("no-such-base", dir, "new.txt", "n1\nEDIT\n", []LineRange{span(2, 2), span(1, 1)})
+	// A diff that fails: the whole file, never "no edits".
 	failGit(t, func(args []string) bool { return len(args) > 0 && args[0] == "diff" })
+	if got, ok := ChangedRangesNewWith(wt, "main", "other.txt", []byte("x\ny\n")); !ok || !reflect.DeepEqual(got, wholeFile) {
+		t.Errorf("git diff failing: %v, %v; want the whole file, as ChangedRangesNew", got, ok)
+	}
+	// Only a copy that can't be put in as a blob is unmeasurable.
+	failGit(t, func(args []string) bool { return len(args) > 0 && args[0] == "hash-object" })
 	if _, ok := ChangedRangesNewWith(wt, "main", "other.txt", []byte("x\ny\n")); ok {
-		t.Error("git diff failing: want ok=false, never \"no edits\"")
+		t.Error("hash-object failing: want ok=false")
 	}
 }

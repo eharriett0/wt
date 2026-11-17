@@ -80,22 +80,25 @@ func TestPreEditHooks_StructuredDocSections(t *testing.T) {
 				if tc.high && !strings.Contains(out, "## Beta") {
 					t.Errorf("%s %s block=%v: the warning doesn't name the shared section, as wt check does:\n%s", tc.name, h.kind, block, out)
 				}
+				if strings.Contains(out, "OVERLAPS hunks") {
+					t.Errorf("%s %s block=%v: a section grade overlaps no hunk:\n%s", tc.name, h.kind, block, out)
+				}
 			}
 		}
 	}
 }
 
-// When this window's copy can't be measured, a structured doc's entries go
-// back to regradePending as they were: an advisory is dropped and a section
-// HIGH stays a file-level heads-up, never dropped on an unknown (#226).
+// When this window's copy can't be measured, `wt check` after the edit may
+// say HIGH, so every section-graded entry stays a file-level heads-up, an
+// advisory included (#226 review: dropping the advisory failed open).
 func TestPreEditHooks_StructuredDocUnmeasurable(t *testing.T) {
 	wc := sectionHookRepo(t)
 	orig := pendingRangesNew
 	t.Cleanup(func() { pendingRangesNew = orig })
 	pendingRangesNew = func(dir, base, file string, content []byte) ([]gitx.LineRange, bool) { return nil, false }
 	t.Setenv("WT_CLAUDE_HOOK_BLOCK", "0")
-	if got := hookVerdict(t, runHookCapture(t, hookClaudeEdit, sectionClaudePayload(wc, "b6\n", "Xb6\n"))); got != "silent" {
-		t.Errorf("advisory, copy unmeasurable: claude says %s, want silent (as before #226)", got)
+	if got := hookVerdict(t, runHookCapture(t, hookClaudeEdit, sectionClaudePayload(wc, "b6\n", "Xb6\n"))); got != "file-level" {
+		t.Errorf("advisory, copy unmeasurable: claude says %s, want a file-level heads-up", got)
 	}
 	writeT(t, wc, "PLAN.md", strings.Replace(readT(t, wc, "PLAN.md"), "b6\n", "Wb6\n", 1))
 	gitT(t, wc, "commit", "-qam", "wc edits b6 too")
@@ -131,18 +134,21 @@ func TestSectionGrade(t *testing.T) {
 		e         CheckEntry
 		shared    []string
 		graded    bool
+		gone      bool // the edit deletes a shared heading
 		keep      bool
 		confirmed bool
 		sections  []string
 	}{
-		{"advisory, now a shared section", adv, []string{"## Alpha"}, true, true, true, []string{"## Alpha"}},
-		{"advisory, still disjoint", adv, nil, true, false, false, nil},
-		{"HIGH, still shared, by another section", high, []string{"## Alpha"}, true, true, true, []string{"## Alpha"}},
-		{"HIGH, now disjoint", high, nil, true, false, false, nil},
-		{"advisory, ungradable", adv, nil, false, false, false, nil},
-		{"HIGH, ungradable: a heads-up, never dropped", high, nil, false, true, false, []string{"## Beta"}},
+		{"advisory, now a shared section", adv, []string{"## Alpha"}, true, false, true, true, []string{"## Alpha"}},
+		{"advisory, still disjoint", adv, nil, true, false, false, false, nil},
+		{"HIGH, still shared, by another section", high, []string{"## Alpha"}, true, false, true, true, []string{"## Alpha"}},
+		{"HIGH, now disjoint", high, nil, true, false, false, false, nil},
+		{"HIGH, its heading deleted: a heads-up (#237)", high, nil, true, true, true, false, []string{"## Beta"}},
+		{"advisory, a heading deleted: dropped, as wt check grades it", adv, nil, true, true, false, false, nil},
+		{"advisory, ungradable", adv, nil, false, false, false, false, nil},
+		{"HIGH, ungradable: a heads-up, never dropped", high, nil, false, false, true, false, []string{"## Beta"}},
 	} {
-		g, keep := sectionGrade(tc.e, tc.shared, tc.graded)
+		g, keep := sectionGrade(tc.e, tc.shared, tc.graded, tc.gone)
 		if keep != tc.keep {
 			t.Errorf("%s: keep = %v, want %v", tc.name, keep, tc.keep)
 			continue
@@ -239,4 +245,84 @@ func sectionGradeOf(t *testing.T, wc string) CheckEntry {
 	}
 	t.Fatal("no wa entry in the check report for PLAN.md")
 	return CheckEntry{}
+}
+
+// An edit the hook can't predict (Claude Code would refuse it: old_string is
+// not in the file) keeps a structured doc's advisory as a heads-up (#226
+// review): what the file becomes is unknown, and `wt check` may say HIGH.
+func TestPreEditHooks_StructuredDocUnpredictedKeepsHeadsUp(t *testing.T) {
+	wc := sectionHookRepo(t)
+	t.Setenv("WT_CLAUDE_HOOK_BLOCK", "0")
+	if got := hookVerdict(t, runHookCapture(t, hookClaudeEdit, sectionClaudePayload(wc, "not in the file\n", "x\n"))); got != "file-level" {
+		t.Errorf("unpredicted edit: claude says %s, want a file-level heads-up", got)
+	}
+}
+
+// Deleting the shared section, or emptying the file, reads disjoint in `wt
+// check` (its new-frame ranges can't show a deletion, #237) while git
+// conflicts. main kept a heads-up for the section HIGH, and so do the hooks
+// until the grader sees deletions (#226 review).
+func TestPreEditHooks_StructuredDocDeletionKeepsHeadsUp(t *testing.T) {
+	wc := sectionHookRepo(t)
+	writeT(t, wc, "PLAN.md", strings.Replace(readT(t, wc, "PLAN.md"), "b6\n", "Wb6\n", 1))
+	gitT(t, wc, "commit", "-qam", "wc edits b6 too")
+	if e := sectionGradeOf(t, wc); e.Category != CatBlocking {
+		t.Fatalf("precondition: wc and wa both in Beta: wt check says %s, want HIGH", e.Category)
+	}
+	beta := readT(t, wc, "PLAN.md")[strings.Index(readT(t, wc, "PLAN.md"), "## Beta\n"):]
+	t.Setenv("WT_CLAUDE_HOOK_BLOCK", "1")
+	for _, tc := range []struct{ name, old, new string }{
+		{"the whole Beta section deleted", beta, ""},
+		{"the file emptied", readT(t, wc, "PLAN.md"), ""},
+	} {
+		if got := hookVerdict(t, runHookCapture(t, hookClaudeEdit, sectionClaudePayload(wc, tc.old, tc.new))); got != "deny" {
+			t.Errorf("%s, claude, block: hook says %s, want the file-level heads-up's deny (as on main)", tc.name, got)
+		}
+	}
+	// Codex: deleting the file.
+	p, _ := json.Marshal(map[string]any{"cwd": wc, "tool_name": "apply_patch", "tool_input": map[string]string{
+		"command": "*** Begin Patch\n*** Delete File: PLAN.md\n*** End Patch\n"}})
+	t.Setenv("WT_CODEX_HOOK_BLOCK", "0")
+	if got := hookVerdict(t, runHookCapture(t, hookCodexEdit, string(p))); got != "file-level" {
+		t.Errorf("codex deletes PLAN.md: hook says %s, want a file-level heads-up", got)
+	}
+}
+
+// A structured doc base doesn't have (each window adds its own) is measured as
+// `wt check` measures it: the whole copy is new (#226 review: it read as
+// unmeasurable and the hook dropped the entry while `wt check` said HIGH).
+func TestPreEditHooks_StructuredDocNotInBase(t *testing.T) {
+	offlineGH(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("WT_SKIP_COLLISION", "")
+	t.Setenv("HOOK_DISABLE_MULTIWINDOW_CHECK", "")
+	t.Chdir(t.TempDir())
+	root := t.TempDir()
+	gitT(t, root, "init", "-q", "-b", "main")
+	gitT(t, root, "config", "user.email", "t@t.test")
+	gitT(t, root, "config", "user.name", "t")
+	writeT(t, root, ".wt.conf", "shared_docs = PLAN.md\nstructured_doc.PLAN.md = ^##\\s\n")
+	gitT(t, root, "add", "-A")
+	gitT(t, root, "commit", "-qm", "base")
+	gitT(t, root, "branch", "wa")
+	gitT(t, root, "branch", "wc")
+	wa := filepath.Join(t.TempDir(), "wa")
+	wc := filepath.Join(t.TempDir(), "wc")
+	gitT(t, root, "worktree", "add", "-q", wa, "wa")
+	gitT(t, root, "worktree", "add", "-q", wc, "wc")
+	writeT(t, wa, "PLAN.md", "# Plan\n## Beta\nb1\n")
+	gitT(t, wa, "add", "PLAN.md")
+	gitT(t, wa, "commit", "-qm", "wa adds Beta")
+	writeT(t, wc, "PLAN.md", "# Plan\n## Alpha\na1\n")
+	gitT(t, wc, "add", "PLAN.md")
+	gitT(t, wc, "commit", "-qm", "wc adds Alpha")
+
+	post := postEditSectionGrade(t, wc, "a1\n", "a1\n## Beta\nb9\n")
+	if post.Category != CatBlocking {
+		t.Fatalf("precondition: wt check after wc adds Beta says %s, want HIGH", post.Category)
+	}
+	t.Setenv("WT_CLAUDE_HOOK_BLOCK", "0")
+	if got := hookVerdict(t, runHookCapture(t, hookClaudeEdit, sectionClaudePayload(wc, "a1\n", "a1\n## Beta\nb9\n"))); got != "overlap" {
+		t.Errorf("claude says %s, want overlap, as wt check after the edit", got)
+	}
 }

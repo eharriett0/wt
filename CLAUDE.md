@@ -123,11 +123,23 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   section, iff the copy now shares one with the other window, else dropped.
   Before #226 an advisory was never re-graded, so an edit moving INTO the other
   window's section was silent while `wt check` then said HIGH, and one moving
-  OUT kept a heads-up (a deny under block). Copy unmeasurable: entries go to
-  `regradePending` as they were (an advisory dropped, a section HIGH a heads-up),
-  as before. Pinned by `TestPreEditHooks_StructuredDocSections` (into, staying
+  OUT kept a heads-up (a deny under block). `ChangedRangesNewWith` IS
+  `ChangedRangesNew` once the copy is written, fallbacks included (no base:
+  the uncommitted ranges; a side without the file is empty and an untracked
+  copy is not the working tree's, as `git diff <rev> -- file` reads them; a
+  failed diff: the whole file); each fallback it lacked read as
+  "unmeasurable" (#226 review). ⚠ A copy the hook can't predict or put in as
+  a blob may still read HIGH in `wt check`, so every section-graded entry
+  stays a file-level heads-up, an advisory included; only an ungradable doc
+  (a bad delimiter, where `wt check` is the blanket advisory too) drops one.
+  ⚠ New-frame ranges can't show a deletion, so deleting the shared section,
+  or emptying or deleting the file, reads disjoint in `wt check` while git
+  conflicts (#237): until the grader counts deleted lines, a section HIGH
+  whose heading the copy no longer has stays a heads-up (`headingGone`), as
+  main kept it. Pinned by `TestPreEditHooks_StructuredDocSections` (into, staying
   out of, past an insert into, and out of the other window's section, each held
-  to `wt check` after the edit, both hooks, both block modes). Claude (`claudePendingContent`): Claude Code's Edit replayed (refused
+  to `wt check` after the edit, both hooks, both block modes) and the
+  `StructuredDoc*` cases beside it. Claude (`claudePendingContent`): Claude Code's Edit replayed (refused
   for an absent `old_string`, or a repeated one without `replace_all`; an empty
   `new_string` takes the newline after it), MultiEdit's edits in turn, Write's
   content; a CRLF file is edited as LF (the edit's own CRLFs too) and written
