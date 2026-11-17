@@ -4,6 +4,7 @@ package gitx
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"math"
 	"os"
@@ -372,8 +373,22 @@ func FetchPRHeadNoPrompt(remote, pr string) error {
 	return fetchNoPrompt(remote, "refs/pull/"+pr+"/head")
 }
 
+// fetchTimeout bounds a no-prompt fetch (#230 re-review): an origin that
+// takes the connection and never answers (a proxy, a half-up VPN) hung
+// merge-pr's post-merge cleanup. A var so a test can shorten it.
+var fetchTimeout = 30 * time.Second
+
 func fetchNoPrompt(remote, refspec string) error {
-	cmd := exec.Command("git", "fetch", "--no-prune", remote, refspec)
+	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
+	defer cancel()
+	// A stalled HTTPS transfer gives up after 15s below 1 byte/s; ssh's
+	// connect after 10s (below).
+	cmd := exec.CommandContext(ctx, "git", "-c", "http.lowSpeedLimit=1", "-c", "http.lowSpeedTime=15",
+		"fetch", "--no-prune", remote, refspec)
+	// Killing git leaves its transport helper (git-remote-http, ssh) holding
+	// the output pipe until its own timeout: stop waiting on it (measured: 15s
+	// past a 2s deadline without this).
+	cmd.WaitDelay = time.Second
 	cmd.Env = append(scopedEnv(), "GIT_TERMINAL_PROMPT=0")
 	// GIT_TERMINAL_PROMPT stops git's own (HTTPS) prompt only; ssh reads
 	// /dev/tty for a passphrase or an unknown host key. BatchMode makes ssh
@@ -381,12 +396,15 @@ func fetchNoPrompt(remote, refspec string) error {
 	// review). A GIT_ASKPASS helper is still the user's.
 	if os.Getenv("GIT_SSH_COMMAND") == "" && os.Getenv("GIT_SSH") == "" {
 		if sc, _ := Run("config", "--get", "core.sshCommand"); sc == "" {
-			cmd.Env = append(cmd.Env, "GIT_SSH_COMMAND=ssh -o BatchMode=yes")
+			cmd.Env = append(cmd.Env, "GIT_SSH_COMMAND=ssh -o BatchMode=yes -o ConnectTimeout=10")
 		}
 	}
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	if _, err := cmd.Output(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("git fetch %s %s gave no answer in %s", remote, refspec, fetchTimeout)
+		}
 		if msg := gitStderr(stderr.String()); msg != "" {
 			return fmt.Errorf("%w: %s", err, msg)
 		}
@@ -1915,7 +1933,7 @@ func DeleteRemoteBranch(dir, branch, tip string) error {
 	if tip == "" {
 		return fmt.Errorf("delete of origin/%s needs the tip it was checked at", branch)
 	}
-	_, err := RunDir(dir, "push", "origin", "--delete", "--force-with-lease=refs/heads/"+branch+":"+tip, branch)
+	_, err := runReporting(dir, "push", "origin", "--delete", "--force-with-lease=refs/heads/"+branch+":"+tip, branch)
 	return err
 }
 

@@ -2,6 +2,7 @@ package claim
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -42,6 +43,66 @@ func TestRelease_CleanFromInsideTheLane(t *testing.T) {
 				t.Errorf("release said:\n%s\nwant origin's placeholder deleted", out)
 			}
 		})
+	}
+}
+
+// #230 re-review: a tag with the branch's name turned --abbrev-ref's answer
+// into "heads/<branch>", and release refused the claim's own lane. The full ref
+// is compared.
+func TestRelease_CleanWithATagOfTheBranchsName(t *testing.T) {
+	f := newClaimFixture(t)
+	if err := f.claim(true); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	f.git(f.repo, "tag", claimBranch)
+	out, err := capturedRelease(t, f)
+	if err != nil {
+		t.Fatalf("Release: %v\n%s", err, out)
+	}
+	if _, serr := os.Stat(f.dir()); serr == nil {
+		t.Errorf("the lane was kept\n%s", out)
+	}
+}
+
+// The claim rollback deletes the branch it cut only at the commit it left
+// there (#230 re-review): a commit landing before the rollback keeps the
+// branch. origin's hook makes that commit in the lane, then rejects the push.
+func TestClaim_RollbackKeepsABranchACommitLandedOn(t *testing.T) {
+	f := newClaimFixture(t)
+	hook := filepath.Join(f.origin, "hooks", "pre-receive")
+	script := "#!/bin/sh\nenv -u GIT_DIR -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_QUARANTINE_PATH " +
+		"git -C '" + f.dir() + "' commit -q --allow-empty -m 'landed during the claim'\necho rejected by the test >&2\nexit 1\n"
+	if err := os.WriteFile(hook, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.claim(true); err == nil {
+		t.Fatal("Claim succeeded although origin rejects every push")
+	}
+	tip := f.ref(f.repo, "refs/heads/"+claimBranch)
+	if tip == "" {
+		t.Fatal("the branch was deleted with the commit that landed on it")
+	}
+	if subj := f.git(f.repo, "log", "-1", "--format=%s", tip); subj != "landed during the claim" {
+		t.Errorf("branch at %q (%s), want it kept at the commit that landed", subj, tip)
+	}
+}
+
+// ...and when the placeholder commit itself fails, the branch is still at
+// the commit it was cut at, and goes.
+func TestClaim_RollbackAfterAFailedPlaceholderCommit(t *testing.T) {
+	f := newClaimFixture(t)
+	hook := filepath.Join(f.repo, ".git", "hooks", "commit-msg")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\necho no placeholder >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.claim(true); err == nil {
+		t.Fatal("Claim succeeded although the placeholder commit is refused")
+	}
+	if got := f.ref(f.repo, "refs/heads/"+claimBranch); got != "" {
+		t.Errorf("the branch the claim cut is still at %s; the rollback deletes it", got)
+	}
+	if _, serr := os.Stat(f.dir()); !os.IsNotExist(serr) {
+		t.Errorf("the worktree the claim made must be removed (stat: %v)", serr)
 	}
 }
 

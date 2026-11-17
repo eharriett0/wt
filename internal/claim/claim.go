@@ -449,8 +449,14 @@ func cleanAbandonedWorktree(c *config.Config, e activework.Entry) {
 	// Everything below proves the CLAIM's branch abandoned, so the worktree
 	// must still hold it (#230 review): one switched to other work was removed
 	// with that work's ignored files.
-	if on, err := gitx.CurrentBranchIn(e.Worktree); err != nil || on != e.Branch {
-		ui.Warn("--clean: worktree %s is not on %s (it holds %q) — left in place", e.Worktree, e.Branch, on)
+	// The full ref, never abbreviated: a tag of the branch's name turned
+	// --abbrev-ref's answer into "heads/<b>" (#230 re-review).
+	if on := gitx.SymbolicHead(e.Worktree); on != "refs/heads/"+e.Branch {
+		held := "a detached HEAD"
+		if on != "" {
+			held = strings.TrimPrefix(on, "refs/heads/")
+		}
+		ui.Warn("--clean: worktree %s is not on %s (it holds %s) — left in place", e.Worktree, e.Branch, held)
 		return
 	}
 	// The local placeholder tip is read FIRST and everything below is about
@@ -511,6 +517,11 @@ func cleanAbandonedWorktree(c *config.Config, e activework.Entry) {
 		// no remote branch (already gone) — nothing to do
 	case remoteTip == localTip:
 		if err := gitx.DeleteRemoteBranch(home, e.Branch, localTip); err != nil {
+			if now, rerr := gitx.RemoteBranchTip(home, e.Branch); rerr == nil && now != "" && now != localTip {
+				// The lease refused it (#230 re-review): say so.
+				ui.Warn("--clean: origin/%s moved to %s after it was checked — left in place", e.Branch, abbrev(now))
+				return
+			}
 			ui.Info("--clean: remote origin/%s not deleted: %v", e.Branch, err)
 		} else {
 			ui.OK("--clean: deleted remote branch origin/%s", e.Branch)

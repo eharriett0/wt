@@ -113,5 +113,9 @@ func KeptLaneMessage(v TipVerdict, branch, pr string, n int, tip, head string) s
 	case tip == "":
 		return fmt.Sprintf("%s may have commits that were not in PR #%s: wt could not read the branch's tip; %s", branch, pr, unsure)
 	}
-	return fmt.Sprintf("%s may have commits that were not in PR #%s: wt could not compare its tip with the PR's head %.12s, which is not in this clone (`git fetch origin refs/pull/%s/head` brings it in; then run it again); %s", branch, pr, head, pr, unsure)
+	fetch := "fetch it into this clone"
+	if n := PRNumber(pr); n != "" {
+		fetch = "`git fetch origin refs/pull/" + n + "/head` brings it in"
+	}
+	return fmt.Sprintf("%s may have commits that were not in PR #%s: wt could not compare its tip with the PR's head %.12s, which is not in this clone (%s; then run it again); %s", branch, pr, head, fetch, unsure)
 }

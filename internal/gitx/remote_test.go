@@ -41,8 +41,8 @@ func TestDeleteRemoteBranch(t *testing.T) {
 		t.Fatalf("RemoteBranchTip: %q, %v", remoteTip, err)
 	}
 	stale := strings.TrimSpace(gitOut(t, repo, "rev-parse", "HEAD"))
-	if err := DeleteRemoteBranch(repo, "feat-1", stale); err == nil {
-		t.Fatal("DeleteRemoteBranch at a tip origin's branch is not at: want a refusal")
+	if err := DeleteRemoteBranch(repo, "feat-1", stale); err == nil || !strings.Contains(err.Error(), "stale info") {
+		t.Fatalf("DeleteRemoteBranch at a tip origin's branch is not at: %v, want git's lease refusal (stale info)", err)
 	}
 	if got, _ := RemoteBranchTip(repo, "feat-1"); got != remoteTip {
 		t.Fatalf("origin's feat-1 at %q after a refused delete, want %s", got, remoteTip)
