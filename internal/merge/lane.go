@@ -13,8 +13,13 @@ import (
 // fetchPRHead is gitx.FetchPRHeadNoPrompt; a var so a test can count it.
 var fetchPRHead = gitx.FetchPRHeadNoPrompt
 
-// originRepo is ghx.OriginRepo; a var so a test can name origin.
-var originRepo = ghx.OriginRepo
+// originRepo is ghx.OriginRepo, remoteNames gitx.Remotes and remoteRepo
+// ghx.RemoteRepo; vars so a test can name the remotes.
+var (
+	originRepo  = ghx.OriginRepo
+	remoteNames = gitx.Remotes
+	remoteRepo  = ghx.RemoteRepo
+)
 
 var prURLNumber = regexp.MustCompile(`/pull/(\d+)(?:[/?#]|$)`)
 
@@ -76,7 +81,7 @@ func UnshippedLane(pr, branch, tip string) string {
 	var ancestorErr error
 	if tip != "" && head != "" && !strings.EqualFold(tip, head) {
 		ancestor, ancestorErr = gitx.IsAncestor(tip, head)
-		if ancestorErr != nil && fetchPRHead(remote, PRNumber(pr)) == nil {
+		if ancestorErr != nil && fetchHeadFrom(remote, PRNumber(pr)) {
 			// #230 review: the head can be a commit this clone never had (the
 			// branch updated on GitHub, then deleted with the merge); no plain
 			// fetch brings it, so the lane was kept on every run. Once.
@@ -94,11 +99,28 @@ func UnshippedLane(pr, branch, tip string) string {
 	return KeptLaneMessage(v, branch, pr, remote, n, tip, head)
 }
 
+// fetchHeadFrom fetches PR n's head from remote and, when that fails and
+// remote is not origin, from origin (#243 review), reporting whether either
+// fetch worked. origin can be the PR's own repository under a name prRemote
+// can't match: a renamed or transferred repository, which GitHub's URL names
+// by its new name. In a fork clone origin's PR n is another PR, whose
+// commits change nothing: the check compares with the head gh named.
+func fetchHeadFrom(remote, n string) bool {
+	if fetchPRHead(remote, n) == nil {
+		return true
+	}
+	return remote != "origin" && fetchPRHead("origin", n) == nil
+}
+
 // prRemote is where pr's refs/pull/<n>/head can be fetched from: origin,
 // unless pr is the URL of a PR in another repository than origin's (origin a
 // fork, -R naming upstream, #228 review), where that number on origin is
-// another PR or none; then that repository's URL, which git fetches from
-// directly. An origin wt can't read as owner/name keeps "origin".
+// another PR or none. Then a configured remote whose URL names that
+// repository (`upstream`), so the fetch and its hint use the user's own
+// transport and credentials (#243 review: an ssh-only user has no https
+// ones), else the repository's URL, which git fetches from directly. The
+// host is not compared (an ssh alias names it differently). An origin wt
+// can't read as owner/name keeps "origin".
 var prRemote = func(pr string) string {
 	if !ghx.IsPRURL(pr) {
 		return "origin"
@@ -108,9 +130,28 @@ var prRemote = func(pr string) string {
 		return "origin"
 	}
 	parts := strings.Split(strings.TrimPrefix(u.Path, "/"), "/")
+	names := func(owner, name string) bool {
+		return strings.EqualFold(parts[0], owner) && strings.EqualFold(parts[1], name)
+	}
 	_, owner, name := originRepo()
-	if owner == "" || strings.EqualFold(parts[0], owner) && strings.EqualFold(parts[1], name) {
+	if owner == "" || names(owner, name) {
 		return "origin"
 	}
+	for _, r := range remoteNames() {
+		if _, owner, name := remoteRepo(r); r != "origin" && owner != "" && names(owner, name) {
+			return r
+		}
+	}
 	return u.Scheme + "://" + u.Host + "/" + parts[0] + "/" + parts[1]
+}
+
+// LaneSelector is how `wt clean` names PR n to UnshippedLane, given the URL gh
+// gave for it (#243): the URL when it is another repository's PR than
+// origin's, so the check fetches from there and its message says which; else
+// the number, so the message says "#5" as every other clean line does.
+func LaneSelector(n, url string) string {
+	if url != "" && prRemote(url) != "origin" {
+		return url
+	}
+	return n
 }

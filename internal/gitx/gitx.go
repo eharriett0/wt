@@ -1126,6 +1126,16 @@ func RemoteURL(remote string) string {
 	return strings.TrimSpace(out)
 }
 
+// Remotes lists the configured remotes' names, in `git remote` order; nil on
+// error.
+func Remotes() []string {
+	out, err := Run("remote")
+	if err != nil {
+		return nil
+	}
+	return strings.Fields(out)
+}
+
 // BehindCount returns how many commits base is ahead of head (`git rev-list
 // --count head..base`) — the "behind main by N" signal (#78). -1 when it can't
 // be computed (bad refs), so the caller can suppress the line rather than lie.

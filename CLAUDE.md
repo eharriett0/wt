@@ -917,15 +917,27 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   it, and the lane was kept forever), and an UNKNOWN verdict never advises
   "push them" (that recreates the deleted branch at a stale tip). A PR given
   as a URL is fetched by its number (`merge.PRNumber`). ⚠ **`wt clean` hands
-  the check the PR's URL** (`prURL`, #243): its number is gh's resolved
-  repository's PR, and in a fork clone whose gh default is upstream,
-  `refs/pull/<n>/head` on origin is another PR, so the head never arrived and
-  the lane was kept on every run, its hint naming the wrong PR. With the URL,
-  `merge.prRemote` fetches from the PR's own repository; no URL from gh keeps
-  the number (origin), as before. Pinned end to end with real git by
-  `TestClean_ForkCloneFetchesThePRHeadFromThePRsRepository` (origin through a
-  fake ssh: git expands `insteadOf` in `remote get-url`, so a rewritten origin
-  reads as a local path). ⚠ **A no-prompt
+  the check another repository's PR by its URL** (`prURL` +
+  `merge.LaneSelector`, #243): its number is gh's resolved repository's PR,
+  and in a fork clone whose gh default is upstream, `refs/pull/<n>/head` on
+  origin is another PR, so the head never arrived and the lane was kept on
+  every run, its hint naming the wrong PR. origin's own PR, or one gh gives no
+  URL for, keeps the number (and "#5" in the message). ⚠ **Where
+  `merge.prRemote` fetches another repository's PR from** (#243 review): a
+  configured remote whose URL names that repository (`upstream`; owner and
+  name, not the host), else the repository's https URL, and when that fetch
+  fails, origin (`fetchHeadFrom`). The bare https URL ignored the user's own
+  transport (an ssh-only user has no https credentials), and an origin still
+  on a renamed repository's old name, which GitHub's URL names by its new
+  one, was kept where the number had reaped it. Fetching origin's PR n when
+  it is another PR is harmless: the check compares with the head gh named.
+  Pinned end to end with real git by
+  `TestClean_ForkCloneFetchesThePRHeadFromThePRsRepository` (remotes through
+  a fake ssh, https through `insteadOf` with a catch-all so nothing reaches
+  the network; origin can't use `insteadOf`: git expands it in `remote
+  get-url`, so wt would read a local path), and `TestPRRemote`,
+  `TestLaneSelector` and `TestUnshippedLane_FetchesThePRHeadByNumber`.
+  ⚠ **A no-prompt
   fetch has a deadline** (`fetchTimeout` 30s for the PR head,
   `baseFetchTimeout` 120s for #223's base fetch; ssh `ConnectTimeout=10`,
   HTTPS `lowSpeedTime=15`): an origin that took the connection and never

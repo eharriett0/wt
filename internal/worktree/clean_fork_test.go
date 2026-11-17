@@ -11,25 +11,38 @@ import (
 // not in this clone. It fetched from origin, always: in a fork clone whose gh
 // default repository is upstream, the number is upstream's PR, and PR n on
 // origin is another PR, so the head never arrived and the lane was kept on
-// every run, with a hint naming the wrong PR. Now clean hands the check the
-// PR's URL, and the fetch goes to the PR's own repository (merge.prRemote).
+// every run, with a hint naming the wrong PR. Now clean hands the check
+// another repository's PR by its URL, and the fetch goes to that repository
+// (merge.prRemote): a configured remote naming it first (the user's own
+// transport: an ssh-only user has no https credentials), else its URL, then
+// origin (#243 review: origin can be the PR's repository under the old name
+// of a renamed one, which the URL names by its new name).
 //
-// Real git end to end: origin is github.com/me/repo, reached through a fake
-// ssh; upstream is github.com/up/repo, reached through url.insteadOf (git
-// expands insteadOf in `remote get-url`, so origin can't use it: wt would read
-// a local path and never tell the fork apart). The lane's tip is an ancestor
-// of the PR's head, which only the PR's own repository holds.
+// Real git end to end: origin is github.com/me/repo and a configured
+// upstream github.com/up/repo, both reached through a fake ssh; https URLs
+// through url.insteadOf, every github.com one to a local path (a catch-all
+// sends the rest nowhere, so no case reaches the network). origin can't use
+// insteadOf: git expands it in `remote get-url`, so wt would read a local path
+// and never tell the fork apart. The lane's tip is an ancestor of the PR's
+// head, which only the PR's own repository holds.
 func TestClean_ForkCloneFetchesThePRHeadFromThePRsRepository(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		url    string // what gh gives for PR 5's URL; "" when it can't
-		onFork bool   // the PR is origin's own, so origin holds its head
-		reaped bool
-		hint   string // in the kept lane's warning
+		name     string
+		url      string // what gh gives for PR 5's URL; "" when it can't
+		onOrigin bool   // origin holds the PR's head (else upstream does)
+		remote   bool   // upstream is a configured remote, over ssh
+		https    bool   // upstream's https URL can be fetched
+		reaped   bool
+		says     string // in the kept lane's warning
 	}{
-		{"upstream's PR, fetched from upstream", "https://github.com/up/repo/pull/5", false, true, ""},
-		{"control: origin's own PR, fetched from origin", "https://github.com/me/repo/pull/5", true, true, ""},
-		{"no URL from gh: origin, as before, and the lane is kept", "", false, false, "`git fetch origin refs/pull/5/head`"},
+		{"upstream's PR, over https", "https://github.com/up/repo/pull/5", false, false, true, true, ""},
+		{"upstream's PR, from the configured remote (ssh only)", "https://github.com/up/repo/pull/5", false, true, false, true, ""},
+		{"upstream's PR, no remote and no https: kept, naming its repository", "https://github.com/up/repo/pull/5", false, false, false, false,
+			"not in PR https://github.com/up/repo/pull/5: wt could not compare its tip with the PR's head"},
+		{"origin under a renamed repository's old name: origin, after the URL", "https://github.com/me/newname/pull/5", true, false, false, true, ""},
+		{"control: origin's own PR", "https://github.com/me/repo/pull/5", true, false, false, true, ""},
+		{"no URL from gh: origin, as before, and the lane is kept", "", false, false, true, false,
+			"not in PR #5: wt could not compare its tip with the PR's head"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newAdoptFixture(t)
@@ -42,26 +55,35 @@ func TestClean_ForkCloneFetchesThePRHeadFromThePRsRepository(t *testing.T) {
 			gitW(t, tmp, "init", "-q", "--bare", "-b", "main", up)
 			gitW(t, f.repo, "push", "-q", up, "feat-x")
 			prRepo := up
-			if tc.onFork {
+			if tc.onOrigin {
 				prRepo = f.origin
 			}
 			head := f.commitIn(prRepo, tip, "updated on GitHub")
 			gitW(t, prRepo, "update-ref", "refs/pull/5/head", head)
-			if !tc.onFork {
+			if !tc.onOrigin {
 				// PR 5 on the fork is another PR.
 				gitW(t, f.origin, "update-ref", "refs/pull/5/head", f.commitIn(f.origin, f.base, "the fork's PR 5"))
 			}
 			headGh(t, head)
 
 			ssh := filepath.Join(tmp, "ssh")
-			script := "#!/bin/sh\ncase \"$*\" in\n*\"'me/repo.git'\"*) exec git upload-pack '" + f.origin + "' ;;\nesac\necho \"fake ssh: $*\" >&2\nexit 1\n"
+			script := "#!/bin/sh\ncase \"$*\" in\n" +
+				"*\"'me/repo.git'\"*) exec git upload-pack '" + f.origin + "' ;;\n" +
+				"*\"'up/repo.git'\"*) exec git upload-pack '" + up + "' ;;\n" +
+				"esac\necho \"fake ssh: $*\" >&2\nexit 1\n"
 			if err := os.WriteFile(ssh, []byte(script), 0o755); err != nil {
 				t.Fatal(err)
 			}
 			t.Setenv("GIT_SSH_COMMAND", ssh)
 			t.Setenv("GIT_SSH_VARIANT", "simple")
 			gitW(t, f.repo, "remote", "set-url", "origin", "git@github.com:me/repo.git")
-			gitW(t, f.repo, "config", "url."+up+".insteadOf", "https://github.com/up/repo")
+			if tc.remote {
+				gitW(t, f.repo, "remote", "add", "upstream", "git@github.com:up/repo.git")
+			}
+			gitW(t, f.repo, "config", "url."+filepath.Join(tmp, "nowhere")+"/.insteadOf", "https://github.com/")
+			if tc.https {
+				gitW(t, f.repo, "config", "url."+up+".insteadOf", "https://github.com/up/repo")
+			}
 
 			var asked []string
 			orig := prURL
@@ -89,8 +111,8 @@ func TestClean_ForkCloneFetchesThePRHeadFromThePRsRepository(t *testing.T) {
 			if !tc.reaped && branchAt(f, "feat-x") != tip {
 				t.Errorf("branch moved from %s\n%s", tip, out)
 			}
-			if tc.hint != "" && !strings.Contains(out, tc.hint) {
-				t.Errorf("clean said:\n%s\nwant the hint %s", out, tc.hint)
+			if tc.says != "" && !strings.Contains(out, tc.says) {
+				t.Errorf("clean said:\n%s\nwant %q", out, tc.says)
 			}
 		})
 	}
