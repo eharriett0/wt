@@ -380,6 +380,19 @@ path, so moving a file out of a deploy path (which deletes it there) still
 gates. If GitHub's REST API can't be read and its GraphQL file list shows a
 rename, the old path is unknown, so the PR is gated.
 
+**Where the gate settings come from.** `merge-pr` usually runs in the PR's own
+worktree, whose `.wt.conf` is the branch being merged. So it reads
+`merge_is_deploy`, `merge_is_deploy_paths` and `merge_min_checks` from two
+places: this checkout (its `.wt.conf` and the `WT_*` environment) and the
+`.wt.conf` on the PR's base branch, read from GitHub at merge time. The
+stricter of the two applies: the deploy gate fires if either one gates the PR,
+and the higher checks floor holds. A PR that turns the gate off, narrows the
+paths or lowers the floor is still held to the base's settings, and a branch
+cut before the base added a deploy glob is gated for it. When GitHub can't be
+read, this clone's `origin/<base>` copy is used, with a warning that it may be
+stale; when neither can be read, the deploy gate gates. `--dry-run` names both
+sources and what each one sets.
+
 ## Cross-repo epics
 
 A logical change often spans repos (a build PR in repo A gates a deploy PR in
@@ -565,8 +578,9 @@ Zero-config works by derivation. Override via a repo-root `.wt.conf`
 | `max_age` | `WT_MAX_AGE` | *(off)* — dormancy threshold, e.g. `4d`, `2w`, `36h`, or a bare int (days) |
 | `hold_max_age` | `WT_HOLD_MAX_AGE` | `24h` — a `--hold` older than this stops hard-blocking `merge-pr` (warns instead); `0`/`off` = never expire |
 | `coord_issue` | `WT_COORD_ISSUE` | *(off)* — a pinned GitHub issue as the **cross-machine** mirror: announce/ack/all-clear auto-mirror to it, and `inbox` + the `merge-pr` gate read it back, so a hold on one machine blocks/warns on another |
-| `merge_is_deploy` | `WT_MERGE_IS_DEPLOY` | `false` — enable the prod-deploy gate on `merge-pr` |
-| `merge_min_checks` | `WT_MERGE_MIN_CHECKS` | *(off)* — `merge-pr` refuses when fewer checks ran on the PR's head (skipped ones don't count): the "CI never started" floor for a repo that requires no check. A value that isn't a count makes `merge-pr` refuse until it's fixed |
+| `merge_is_deploy` | `WT_MERGE_IS_DEPLOY` | `false` — enable the prod-deploy gate on `merge-pr`. Also read from the PR's base branch at merge time; the stricter applies |
+| `merge_is_deploy_paths` | `WT_MERGE_IS_DEPLOY_PATHS` | *(none: the whole repo deploys)*. Globs scoping the deploy gate; `!` excludes. Also read from the PR's base branch; a file gates if either list gates it |
+| `merge_min_checks` | `WT_MERGE_MIN_CHECKS` | *(off)* — `merge-pr` refuses when fewer checks ran on the PR's head (skipped ones don't count): the "CI never started" floor for a repo that requires no check. A value that isn't a count makes `merge-pr` refuse until it's fixed. Also read from the PR's base branch; the higher floor holds |
 
 Color is auto-disabled when stdout isn't a TTY; force off with `NO_COLOR=1`.
 

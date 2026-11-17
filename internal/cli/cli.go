@@ -456,14 +456,21 @@ func cmdMergePR(args []string) int {
 	// checks it read (WithMatchHead, below). A forwarded -R/--repo is the PR's
 	// repository, so the gate reads that PR; a passthrough that merges nothing
 	// (--disable-auto, --help) skips the gate and the pin.
+	// #223: the gates' settings come from this checkout AND the PR's base
+	// branch, and the stricter applies. This checkout is usually the PR's own
+	// worktree, so on its own the branch being merged decided its own gate: a
+	// PR could turn merge_is_deploy off, and a branch cut before the base added
+	// a deploy glob skipped the gate for a path that now deploys.
+	gates := mergeGates(c, pr, merge.ParseForwardedRepo(ghArgs), *dryRun)
 	pin, checksLabel, prHost := "", "skipped", ""
 	if flag := merge.NonMerging(ghArgs); flag != "" {
 		fmt.Println(skippedChecksLine(pr, flag))
 	} else {
 		var ok bool
+		minChecks, minChecksBad := strictestFloor(gates)
 		pin, checksLabel, prHost, ok = checksGate(pr, checksOpts{dryRun: *dryRun, checksOK: *checksOK, admin: *admin, bypass: *bypass,
 			auto: merge.ForwardsAuto(ghArgs), repo: merge.ParseForwardedRepo(ghArgs),
-			minChecks: c.MergeMinChecks, minChecksBad: c.MergeMinChecksBad}, os.Stdin, stdinIsTTY(), liveChecksReads)
+			minChecks: minChecks, minChecksBad: minChecksBad}, os.Stdin, stdinIsTTY(), liveChecksReads)
 		if !ok {
 			return 1
 		}
@@ -475,7 +482,7 @@ func cmdMergePR(args []string) int {
 	// #178: right before the confirm, GitHub's status page is read (github.com
 	// only) and an Actions incident is warned about; a dry run prints the same
 	// lines, and like the real gate reads nothing for a draft it would refuse.
-	if c.MergeIsDeploy && deployGateApplies(c, pr) {
+	if deployGateApplies(gates, pr) {
 		statusHost := deployStatusHost(prHost)
 		if *dryRun {
 			draft, derr := ghx.PRIsDraft(pr)
@@ -633,31 +640,6 @@ func cwdUnder(dir string) bool {
 	}
 	rel, err := filepath.Rel(dir, cwd)
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
-}
-
-// deployGateApplies reports whether the merge==deploy prod gate should fire for
-// this PR. With merge_is_deploy_paths UNSET, every merge is a deploy (legacy: the
-// whole repo is a deploy surface). With it SET, the gate fires only when the PR
-// changes at least one file matching a deploy glob — a docs/CI/scripts-only PR is
-// not a prod deploy and shouldn't demand the ack. Fails CLOSED: if the globs are
-// set but the PR's files can't be listed, gate anyway rather than risk skipping.
-func deployGateApplies(c *config.Config, pr string) bool {
-	if len(c.MergeIsDeployPaths) == 0 {
-		return true // no path scoping → whole-repo deploy surface (legacy behavior)
-	}
-	files, err := ghx.PRChangedFiles(pr)
-	if err != nil {
-		ui.Warn("merge_is_deploy_paths set but couldn't list PR #%s files (%v) — gating to be safe", pr, err)
-		return true // fail CLOSED
-	}
-	if len(files) == 0 {
-		return true // empty diff (the merge guard blocks it anyway) — gate to be safe
-	}
-	if anyDeployPath(files, c.MergeIsDeployPaths) {
-		return true
-	}
-	ui.Info("PR #%s changes no deploy-path files (merge_is_deploy_paths) — skipping the prod gate", pr)
-	return false
 }
 
 // anyDeployPath reports whether any changed file matches any deploy glob. Reuses

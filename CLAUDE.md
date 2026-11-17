@@ -782,6 +782,33 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   Pinned end to end by `TestCmdMergePR_restQuotaUsedUp` (its own host, so the
   process-wide auth memo can't leak in), which fails on the pre-#217 code with
   every symptom above.
+- **merge-pr's gate settings come from the base branch too, and the stricter
+  applies (#223).** `config.Load` reads the `.wt.conf` of the checkout wt runs
+  in, and merge-pr usually runs in the PR's own worktree, so the branch being
+  merged decided its own gate: a PR setting `merge_is_deploy = false` (or
+  narrowing `merge_is_deploy_paths`, or lowering `merge_min_checks`) merged
+  ungated, and so did a branch cut before the base added a deploy glob.
+  `mergeGates` reads two `config.Gate`s: this checkout's (`.wt.conf` + `WT_*`)
+  and the base branch's (`ghx.ReadBaseConf`: `gh pr view --json
+  number,url,baseRefName`, then one GraphQL query at the PR URL's host for
+  `refs/heads/<base>`'s tip and `object(expression:
+  "refs/heads/<base>:.wt.conf")`; the full ref, since in a bare `<base>:` a tag
+  of the same name wins). The deploy gate fires if ANY source gates the PR
+  (`deployDecision`; each source's `!` exclusions apply only to its own globs,
+  so a checkout can't carve a file out of the base's gate), and the checks floor
+  is the highest (`strictestFloor`; a value that is not a count, from either,
+  refuses). ⚠ Measured: a missing file is a null object with NO error, and a
+  missing branch nulls the ref too, so no tip is an error, never "no file"
+  (`parseBaseConf`). (`Commit.file(path:)` was not used: GitHub answers a
+  missing path with a NOT_FOUND error and gh exits 1.) ⚠ **GitHub unread**
+  (`baseGateSource`): this clone's `origin/<base>` as last fetched
+  (`gitx.RefFileText`), with a warning; no such ref, or a forwarded `-R` (this
+  clone is another repository) → FAIL CLOSED: merge_is_deploy on for the whole
+  repository, no floor invented. ⚠ The `WT_*` overlay is the checkout's side,
+  so `WT_MERGE_IS_DEPLOY=0` no longer turns off a gate the base sets;
+  `--confirm-deploy` is the way past it. Pinned by
+  `TestCmdMergePR_gateSettingsComeFromTheBaseToo`, which merges ungated on the
+  pre-#223 code.
 - **The deploy gate's GitHub status read only WARNS, and fails open (#178).**
   Inside the deploy confirm (draft refusal → prod banner → status → confirm),
   for a PR on github.com (`merge.GitHubStatusCovers`; the host is the checks

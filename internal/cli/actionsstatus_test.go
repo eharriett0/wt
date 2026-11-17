@@ -345,6 +345,8 @@ d=$(dirname "$0")
 h=$(cat "$d/host")
 printf '%s\n' "$*" >> "$d/calls"
 case "$*" in
+*"--json number,url,baseRefName"*) echo "$3 https://$h/o/r/pull/$3 main"; exit 0 ;;
+*"expr=refs/heads/main:.wt.conf"*) echo '{"oid":"` + fakeHead + `","conf":null}'; exit 0 ;;
 *"--json number,url,changedFiles"*) echo "$3 https://$h/o/r/pull/$3 1"; exit 0 ;;
 *"--json number,url"*) echo "$3 https://$h/o/r/pull/$3"; exit 0 ;;
 *statusCheckRollup*) [ -e "$d/rollup.fail" ] && { echo "gh: Something went wrong (HTTP 502)" >&2; exit 1; }; echo '` + greenRollup + `'; exit 0 ;;

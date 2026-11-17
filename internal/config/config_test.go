@@ -33,6 +33,30 @@ empty_key_ignored
 	}
 }
 
+// GateFromConf reads only what the file says (#223): no environment overlay,
+// defaults for what it leaves out, and a floor that is not a count kept as
+// such so merge-pr refuses for it.
+func TestGateFromConf(t *testing.T) {
+	t.Setenv("WT_MERGE_IS_DEPLOY", "0")
+	t.Setenv("WT_MERGE_IS_DEPLOY_PATHS", "")
+	t.Setenv("WT_MERGE_MIN_CHECKS", "9")
+	got := GateFromConf("# comment\nmerge_is_deploy = yes\nmerge_is_deploy_paths = infra/**, !infra/*.md\nmerge_min_checks = 2\nprefix = x-\n")
+	want := Gate{MergeIsDeploy: true, MergeIsDeployPaths: []string{"infra/**", "!infra/*.md"}, MergeMinChecks: 2}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("GateFromConf = %+v, want %+v", got, want)
+	}
+	if got := GateFromConf(""); !reflect.DeepEqual(got, Gate{}) {
+		t.Errorf("GateFromConf(\"\") = %+v, want the zero Gate (off, no floor)", got)
+	}
+	if got := GateFromConf("merge_min_checks = three\n"); got.MergeMinChecksBad != "three" || got.MergeMinChecks != 0 {
+		t.Errorf("a floor that is not a count: %+v", got)
+	}
+	c := &Config{MergeIsDeploy: true, MergeIsDeployPaths: []string{"a/**"}, MergeMinChecks: 4, MergeMinChecksBad: ""}
+	if got := c.Gate(); !reflect.DeepEqual(got, Gate{MergeIsDeploy: true, MergeIsDeployPaths: []string{"a/**"}, MergeMinChecks: 4}) {
+		t.Errorf("Config.Gate = %+v", got)
+	}
+}
+
 func TestApplyConf(t *testing.T) {
 	c := &Config{Base: "main", Prefix: "feat-", LinkFiles: []string{".env"}, ClaimOpenPR: true}
 	ApplyConf(c, ParseConf("base=trunk\nprefix=wip-\nlink_files=.env,.npmrc\nclaim_open_pr=no"))

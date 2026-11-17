@@ -19,11 +19,22 @@ import (
 // fakeHead is the head commit greenChecksGh reports.
 const fakeHead = "0123456789abcdef0123456789abcdef01234567"
 
+// baseConfGh is the part of a fake gh that answers merge-pr's read of the PR's
+// base branch and the .wt.conf on it (#223): base main in o/r, whose .wt.conf
+// is the JSON in the file "baseconf.json" (as ReadBaseConf's --jq prints it),
+// else none. greenChecksGh starts with it; put it before any other
+// `--json number,url` answer.
+const baseConfGh = `case "$*" in
+*"--json number,url,baseRefName"*) echo "$3 https://github.com/o/r/pull/$3 main"; exit 0 ;;
+*"expr=refs/heads/main:.wt.conf"*) if [ -e "$d/baseconf.json" ]; then cat "$d/baseconf.json"; else echo '{"oid":"` + fakeHead + `","conf":null}'; fi; exit 0 ;;
+esac
+`
+
 // greenChecksGh is the part of a fake gh that answers the checks gate's reads
 // (#179): PR <n>'s URL in o/r, one passing check run on fakeHead, an
-// unprotected base and no rulesets. Put it right after the script's
-// `d=$(dirname "$0")`.
-const greenChecksGh = `case "$*" in
+// unprotected base and no rulesets, and the base read (baseConfGh). Put it
+// right after the script's `d=$(dirname "$0")`.
+const greenChecksGh = baseConfGh + `case "$*" in
 *"--json number,url"*) echo "$3 https://github.com/o/r/pull/$3"; exit 0 ;;
 *statusCheckRollup*) echo '` + greenRollup + `'; exit 0 ;;
 "api --hostname github.com repos/o/r/branches/"*) echo '` + unprotected + `'; exit 0 ;;
@@ -368,6 +379,9 @@ const checksGh = `#!/bin/sh
 d=$(dirname "$0")
 printf '%s\n' "$*" >> "$d/calls"
 case "$*" in
+*"--json number,url,baseRefName"*"-R other/repo"*) echo "$3 https://github.com/other/repo/pull/$3 main"; exit 0 ;;
+*"--json number,url,baseRefName"*) echo "$3 https://github.com/o/r/pull/$3 main"; exit 0 ;;
+*"expr=refs/heads/main:.wt.conf"*) echo '{"oid":"` + fakeHead + `","conf":null}'; exit 0 ;;
 *"--json number,url"*"-R other/repo"*) echo "$3 https://github.com/other/repo/pull/$3"; exit 0 ;;
 *"--json number,url"*) echo "$3 https://github.com/o/r/pull/$3"; exit 0 ;;
 *statusCheckRollup*) [ -e "$d/rollup.fail" ] && { echo "gh: Something went wrong (HTTP 502)" >&2; exit 1; }; cat "$d/rollup"; exit 0 ;;

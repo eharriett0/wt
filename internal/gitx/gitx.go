@@ -945,6 +945,29 @@ func RefBlob(worktree, ref, path string) (string, bool) {
 	return out, true
 }
 
+// RefFileText returns the text of the file at path in commit ref (`ref:path`,
+// whose path git reads literally) and whether ref has a file there (#223). An
+// error when ref does not resolve to a commit, when something other than a
+// file sits at path, or when git cannot read the blob: none of those is a ref
+// without the file. No network: it reads the object store as last fetched.
+func RefFileText(ref, path string) (string, bool, error) {
+	if _, err := Run("rev-parse", "--verify", "--quiet", ref+"^{commit}"); err != nil {
+		return "", false, fmt.Errorf("%s does not resolve to a commit here", ref)
+	}
+	kind, err := Run("cat-file", "-t", ref+":"+path)
+	if err != nil {
+		return "", false, nil // the commit resolves, so the path is not in it
+	}
+	if kind != "blob" {
+		return "", false, fmt.Errorf("%s in %s is a %s, not a file", path, ref, kind)
+	}
+	text, err := runRaw("", "cat-file", "blob", ref+":"+path)
+	if err != nil {
+		return "", false, fmt.Errorf("cannot read %s in %s: %w", path, ref, err)
+	}
+	return text, true, nil
+}
+
 // ResolveRemoteBase returns the best last-known base ref for offline base-drift
 // checks (#78): the remote-tracking `origin/<base>` if it exists (what the PR
 // will actually merge into), else the local `<base>`, else "" when neither
