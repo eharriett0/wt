@@ -292,6 +292,11 @@ func Release(c *config.Config, issue string, clean bool) error {
 			break
 		}
 	}
+	// A claim made under a relative worktree_root, before #238, recorded a
+	// relative path: read it from the main checkout, as the root now is.
+	if recorded.Worktree != "" && !filepath.IsAbs(recorded.Worktree) && c.MainRoot != "" {
+		recorded.Worktree = filepath.Join(c.MainRoot, recorded.Worktree)
+	}
 
 	if content != "" {
 		if newC, changed := activework.RemoveSection(content, issue); changed {
