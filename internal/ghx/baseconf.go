@@ -22,10 +22,11 @@ type BaseConf struct {
 }
 
 // baseConfQuery reads a branch's tip and the .wt.conf at it. Both name the
-// branch as refs/heads/<base>: in a bare `<base>:.wt.conf` a tag of the same
-// name would win, as it does for git rev-parse. A missing file is a null
-// object with no error (a missing branch nulls the ref too); a directory or a
-// submodule there is an object that is not a Blob.
+// branch as refs/heads/<base>: git resolves a bare name to a tag before a
+// branch (gitrevisions), so a bare `<base>:.wt.conf` could read a tag of the
+// same name (not measured on GitHub; the full ref rules it out). Measured: a
+// missing file is a null object with no error (a missing branch nulls the ref
+// too); a directory there is an object that is not a Blob (a Tree).
 const baseConfQuery = `query($owner:String!,$name:String!,$ref:String!,$expr:String!){repository(owner:$owner,name:$name){` +
 	`ref(qualifiedName:$ref){target{oid}} object(expression:$expr){__typename ... on Blob{text isBinary isTruncated}}}}`
 

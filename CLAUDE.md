@@ -792,8 +792,9 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   and the base branch's (`ghx.ReadBaseConf`: `gh pr view --json
   number,url,baseRefName`, then one GraphQL query at the PR URL's host for
   `refs/heads/<base>`'s tip and `object(expression:
-  "refs/heads/<base>:.wt.conf")`; the full ref, since in a bare `<base>:` a tag
-  of the same name wins). The deploy gate fires if ANY source gates the PR
+  "refs/heads/<base>:.wt.conf")`; the full ref, since git resolves a bare
+  name to a tag before a branch, per gitrevisions; not measured on GitHub).
+  The deploy gate fires if ANY source gates the PR
   (`deployDecision`; each source's `!` exclusions apply only to its own globs,
   so a checkout can't carve a file out of the base's gate), and the checks floor
   is the highest (`strictestFloor`; a value that is not a count, from either,
