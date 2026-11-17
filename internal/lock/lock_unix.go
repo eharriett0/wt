@@ -25,17 +25,44 @@ func Exclusive(f *os.File) error {
 // Ctrl-Z blocked every reader, the per-turn hooks included, for as long as it
 // stayed stopped); then ErrTimeout. Any other flock error is returned as is.
 func SharedWithin(f *os.File, d time.Duration) error {
-	deadline := time.Now().Add(d)
-	for {
-		err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB)
+	return within(f, syscall.LOCK_SH, d, 0, nil)
+}
+
+// ExclusiveWithin is Exclusive bounded by d (#235): a holder stopped with
+// Ctrl-Z made every writer (announce, ack, block-id) wait silently for as
+// long as it stayed stopped. waiting, when set, runs once, when the file has
+// stayed held for noticeAfter, so the caller can say what it is waiting on
+// (another writer's append holds it for microseconds: no notice for that).
+// Past d: ErrTimeout. Any other flock error is returned as is.
+func ExclusiveWithin(f *os.File, d, noticeAfter time.Duration, waiting func()) error {
+	return within(f, syscall.LOCK_EX, d, noticeAfter, waiting)
+}
+
+func within(f *os.File, how int, d, noticeAfter time.Duration, waiting func()) error {
+	start := time.Now()
+	for told := false; ; {
+		err := syscall.Flock(int(f.Fd()), how|syscall.LOCK_NB)
 		if err == nil || !errors.Is(err, syscall.EWOULDBLOCK) {
 			return err
 		}
-		if time.Now().After(deadline) {
+		waited := time.Since(start)
+		if waiting != nil && !told && waited >= noticeAfter {
+			told = true
+			waiting()
+		}
+		if waited > d {
 			return ErrTimeout
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// Unsupported reports whether err says the filesystem can't lock at all (NFS
+// mounted nolocks, lockd unreachable, some FUSE and SMB mounts) rather than
+// that the lock is held (#235).
+func Unsupported(err error) bool {
+	return errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.EOPNOTSUPP) ||
+		errors.Is(err, syscall.ENOLCK) || errors.Is(err, syscall.ENOSYS)
 }
 
 // Release drops the advisory lock on f. Errors are ignored — closing the fd

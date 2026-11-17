@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/eharriett0/wt/internal/lock"
@@ -496,6 +497,11 @@ func MergeByID(local, remote []Record) []Record {
 // overwritten by the rewrite, a hold included. ⚠ Never call it while holding
 // the lock on the same file through another descriptor: flock locks are per
 // open file, so it would wait on itself (ReserveBlock writes with appendLocked).
+//
+// The wait is bounded (lockForWrite, #235). A filesystem that can't lock at
+// all (lock.Unsupported) gets the unlocked O_APPEND write wt made before
+// #229, with one warning: every locker fails the same way there, so no prune
+// can rewrite the log under it, and refusing stopped announce and ack.
 func Append(path string, r Record) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
@@ -505,11 +511,51 @@ func Append(path string, r Record) error {
 		return err
 	}
 	defer f.Close()
-	if err := lock.Exclusive(f); err != nil {
+	switch err := lockForWrite(f, path); {
+	case err == nil:
+		defer lock.Release(f)
+	case lock.Unsupported(err):
+		noLockOnce.Do(func() {
+			fmt.Fprintf(lockNotices, "wt: warning: %s can't be locked (%v); writing without the lock\n", path, err)
+		})
+	default:
 		return err
 	}
-	defer lock.Release(f)
 	return appendLocked(f, r)
+}
+
+// writeLockWait bounds how long a writer waits for a log's lock, and
+// writeLockNotice how long before it says it is waiting (#235). Vars so a
+// test can shorten them; a prune's rewrite of a real log takes milliseconds.
+var (
+	writeLockWait   = 30 * time.Second
+	writeLockNotice = time.Second
+)
+
+// lockNotices is where a writer's lock notices go; exclusiveWithin is the
+// lock call. Vars for tests.
+var (
+	lockNotices    io.Writer = os.Stderr
+	exclusiveWithin          = lock.ExclusiveWithin
+	noLockOnce     sync.Once
+)
+
+// lockForWrite takes f's exclusive lock for a writer (Append, ReserveBlock,
+// withLockedLog). Before #235 it waited without limit and without a word: a
+// prune-coord stopped with Ctrl-Z, or a block-id whose doc scan hung on a
+// network mount, hung every announce and ack (and an agent's tool call) for as
+// long as it stayed that way. Now it says it is waiting once the lock stays
+// held for writeLockNotice, and gives up at writeLockWait with an error that
+// names the log. ⚠ The advice is to RESUME the holder, never kill it: a
+// prune killed after its truncate leaves the log empty (#234).
+func lockForWrite(f *os.File, path string) error {
+	err := exclusiveWithin(f, writeLockWait, writeLockNotice, func() {
+		fmt.Fprintf(lockNotices, "wt: waiting for the lock on %s (another wt process holds it)\n", path)
+	})
+	if errors.Is(err, lock.ErrTimeout) {
+		return fmt.Errorf("%s stayed locked by another wt process for %s (a prune-coord or block-id stopped with Ctrl-Z, or hung on a network mount?): find it with `lsof %s`, resume it if it was stopped (`fg`, or `kill -CONT <pid>`) and let it finish, then try again. Don't kill it: a prune killed mid-rewrite leaves the log empty", path, writeLockWait, path)
+	}
+	return err
 }
 
 // appendLocked writes r as one JSON line at the end of f, whose lock the
@@ -962,7 +1008,7 @@ func withLockedLog(path string, fn func(recs []Record) (kept []Record, rewrite b
 		return err
 	}
 	defer lf.Close()
-	if err := lock.Exclusive(lf); err != nil {
+	if err := lockForWrite(lf, path); err != nil {
 		return err
 	}
 	defer lock.Release(lf)
@@ -1514,7 +1560,7 @@ func ReserveBlock(path string, r Record, file string, fileMax func() (int, error
 		return Record{}, err
 	}
 	defer lf.Close()
-	if err := lock.Exclusive(lf); err != nil {
+	if err := lockForWrite(lf, path); err != nil {
 		return Record{}, err
 	}
 	defer lock.Release(lf)
