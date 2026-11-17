@@ -336,7 +336,7 @@ func refuseHints(pr string, v merge.ChecksVerdict, o checksOpts) []string {
 		// Both reads failed and nothing else blocks: still nothing to wait for.
 		out = append(out, "re-run once gh can read the base branch's .wt.conf and the required checks, or pass --checks-ok to merge without them")
 	default:
-		out = append(out, fmt.Sprintf("wait for CI (gh pr checks %s --watch) and re-run, or pass --checks-ok to merge anyway", pr))
+		out = append(out, fmt.Sprintf("wait for CI (%s) and re-run, or pass --checks-ok to merge anyway", prCommand("checks", pr, o.repo, "--watch")))
 	}
 	if o.auto {
 		out = append(out, "--auto is not exempt: when the only checks pending or failing are ones no branch rule requires, gh merges at once instead of waiting for them")

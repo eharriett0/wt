@@ -98,8 +98,9 @@ func LocalTipVerdict(tip, head string, ancestor bool, ancestorErr error) TipVerd
 // KeptLaneMessage is the warning when the auto-clean keeps a merged PR's
 // worktree and branch (#187). n is how many commits on branch were not in PR
 // pr, below 1 when they could not be counted; tip and head say what wt could
-// not read when the verdict is unknown. Pure.
-func KeptLaneMessage(v TipVerdict, branch, pr string, n int, tip, head string) string {
+// not read when the verdict is unknown; remote is where the PR's head can be
+// fetched from (prRemote). Pure.
+func KeptLaneMessage(v TipVerdict, branch, pr, remote string, n int, tip, head string) string {
 	const kept = "kept the worktree and branch (push them, or delete them yourself)"
 	// Unknown is not "unshipped" (#230 review): "push them" would recreate a
 	// branch the merge deleted, at a stale tip.
@@ -117,7 +118,7 @@ func KeptLaneMessage(v TipVerdict, branch, pr string, n int, tip, head string) s
 	}
 	fetch := "fetch it into this clone"
 	if n := PRNumber(pr); n != "" {
-		fetch = "`git fetch origin refs/pull/" + n + "/head` brings it in"
+		fetch = "`git fetch " + remote + " refs/pull/" + n + "/head` brings it in"
 	}
 	return fmt.Sprintf("%s may have commits that were not in PR %s: wt could not compare its tip with the PR's head %.12s, which is not in this clone (%s; then run it again); %s", branch, name, head, fetch, unsure)
 }

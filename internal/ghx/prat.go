@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -35,9 +36,12 @@ const prAtJQ = `"\(.number) \(.url)\n\(.headRepositoryOwner.login // "")/\(.head
 func ResolvePRIn(pr, repo string) (PRAt, error) {
 	args := []string{"pr", "view", pr, "--json", "number,url,headRepository,headRepositoryOwner", "--jq", prAtJQ}
 	where := pr
+	if !IsPRURL(pr) {
+		where = "#" + strings.TrimPrefix(pr, "#")
+	}
 	if repo != "" {
 		args = append(args, "-R", repo)
-		where = "#" + strings.TrimPrefix(pr, "#") + " in " + repo
+		where += " in " + repo
 	}
 	out, err := run(args...)
 	if err != nil {
@@ -67,22 +71,26 @@ func selectorHost(pr, repo string) string {
 	return "github.com"
 }
 
-// IsPRURL reports whether s is a pull request's URL (http(s), a host, and a
-// path ending /pull/<number>, a tail like /files allowed), which gh reads as
-// that PR whatever the cwd's repository. Pure.
+// prURLPath is gh's own reading of a PR URL's path (its PR finder's
+// `^/([^/]+)/([^/]+)/pull/(\d+)`, a prefix match): anything may follow the
+// number (/files, .diff), and nothing may come before the owner.
+var prURLPath = regexp.MustCompile(`^/[^/]+/[^/]+/pull/(\d+)`)
+
+// IsPRURL reports whether s is a pull request's URL as gh reads one (http(s),
+// a host, a path gh's finder parses), which gh takes as that PR whatever the
+// cwd's repository. #228 review: a stricter test let `…/pull/5.diff`, which
+// gh merges as PR 5, past the resolve. Pure.
 func IsPRURL(s string) bool {
 	u, err := url.Parse(strings.TrimSpace(s))
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 		return false
 	}
-	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-	for i := 2; i+1 < len(parts); i++ {
-		if parts[i] == "pull" {
-			n, err := strconv.Atoi(parts[i+1])
-			return err == nil && n > 0
-		}
+	m := prURLPath.FindStringSubmatch(u.Path)
+	if m == nil {
+		return false
 	}
-	return false
+	n, err := strconv.Atoi(m[1])
+	return err == nil && n > 0
 }
 
 // parsePRAt reads ResolvePRIn's output: "<number> <url>" (parsePRRef, then

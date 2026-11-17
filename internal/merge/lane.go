@@ -1,6 +1,7 @@
 package merge
 
 import (
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -11,6 +12,9 @@ import (
 
 // fetchPRHead is gitx.FetchPRHeadNoPrompt; a var so a test can count it.
 var fetchPRHead = gitx.FetchPRHeadNoPrompt
+
+// originRepo is ghx.OriginRepo; a var so a test can name origin.
+var originRepo = ghx.OriginRepo
 
 var prURLNumber = regexp.MustCompile(`/pull/(\d+)(?:[/?#]|$)`)
 
@@ -40,6 +44,12 @@ func PRLabel(pr string) string {
 	return pr
 }
 
+// PRArg is pr as a command hint should spell it: "#5" loses its "#", which a
+// shell reads as the start of a comment (#228 review: the pasted `gh pr ready
+// #5 -R o/r` ran a bare `gh pr ready`, marking the current branch's PR ready).
+// Pure.
+func PRArg(pr string) string { return strings.TrimPrefix(pr, "#") }
+
 // UnshippedLane returns "" when tip, the local branch's tip as the caller read
 // it, shipped in merged PR pr (LocalTipVerdict), and otherwise the warning
 // that keeps the lane (#187). merge-pr's auto-clean and `wt clean` both ask it
@@ -48,11 +58,12 @@ func PRLabel(pr string) string {
 // at that same tip.
 func UnshippedLane(pr, branch, tip string) string {
 	head, _ := ghx.PRHeadOid(pr)
+	remote := prRemote(pr)
 	var ancestor bool
 	var ancestorErr error
 	if tip != "" && head != "" && !strings.EqualFold(tip, head) {
 		ancestor, ancestorErr = gitx.IsAncestor(tip, head)
-		if ancestorErr != nil && fetchPRHead("origin", PRNumber(pr)) == nil {
+		if ancestorErr != nil && fetchPRHead(remote, PRNumber(pr)) == nil {
 			// #230 review: the head can be a commit this clone never had (the
 			// branch updated on GitHub, then deleted with the merge); no plain
 			// fetch brings it, so the lane was kept on every run. Once.
@@ -67,5 +78,26 @@ func UnshippedLane(pr, branch, tip string) string {
 	if v == TipUnshipped {
 		n = gitx.BehindCount(head, tip) // rev-list --count head..tip: the commits the PR lacks
 	}
-	return KeptLaneMessage(v, branch, pr, n, tip, head)
+	return KeptLaneMessage(v, branch, pr, remote, n, tip, head)
+}
+
+// prRemote is where pr's refs/pull/<n>/head can be fetched from: origin,
+// unless pr is the URL of a PR in another repository than origin's (origin a
+// fork, -R naming upstream, #228 review), where that number on origin is
+// another PR or none; then that repository's URL, which git fetches from
+// directly. An origin wt can't read as owner/name keeps "origin".
+var prRemote = func(pr string) string {
+	if !ghx.IsPRURL(pr) {
+		return "origin"
+	}
+	u, err := url.Parse(strings.TrimSpace(pr))
+	if err != nil {
+		return "origin"
+	}
+	parts := strings.Split(strings.TrimPrefix(u.Path, "/"), "/")
+	_, owner, name := originRepo()
+	if owner == "" || strings.EqualFold(parts[0], owner) && strings.EqualFold(parts[1], name) {
+		return "origin"
+	}
+	return u.Scheme + "://" + u.Host + "/" + parts[0] + "/" + parts[1]
 }

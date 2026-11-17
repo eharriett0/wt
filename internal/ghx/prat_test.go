@@ -65,6 +65,14 @@ func TestIsPRURL(t *testing.T) {
 		"feat/pull/5":                             false,
 		"https://github.com/o/r/pull/5?w=1":       true,
 		"https://github.com/o/r/pull/5#discussio": true,
+		// #228 review: gh's finder matches the path as a prefix, so these
+		// are PR 5 to gh, and must be resolved; a path with anything before
+		// the owner is not a PR URL to gh (it reads the selector as a branch).
+		"https://github.com/o/r/pull/5.diff":  true,
+		"https://github.com/o/r/pull/5.patch": true,
+		"https://github.com/o/r/pull/5abc":    true,
+		"https://github.com/x/o/r/pull/5":     false,
+		"https://github.com/o/r/blob/pull/5":  false,
 	} {
 		if got := IsPRURL(s); got != want {
 			t.Errorf("IsPRURL(%q) = %v, want %v", s, got, want)

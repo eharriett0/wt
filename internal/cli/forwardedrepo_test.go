@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/eharriett0/wt/internal/ghx"
+	"github.com/eharriett0/wt/internal/merge"
 )
 
 // forwardedGh answers merge-pr's reads ONLY for other/repo's PR 99999: by its
@@ -271,13 +272,24 @@ func TestLaneMayBeHere(t *testing.T) {
 	}
 }
 
-// The draft refusal's hint names the forwarded repository's PR (#228 review).
-func TestReadyHint(t *testing.T) {
-	if got := readyHint("5", "other/repo"); got != "gh pr ready 5 -R other/repo" {
-		t.Errorf("forwarded: %q", got)
+// The hints' gh commands name the forwarded repository's PR, and never with a
+// "#" a shell reads as a comment (#228 review: `gh pr ready #5 -R o/r` ran a
+// bare `gh pr ready`, marking the current branch's PR ready).
+func TestPRCommandHints(t *testing.T) {
+	for _, tc := range []struct{ got, want string }{
+		{readyHint("5", "other/repo"), "gh pr ready 5 -R other/repo"},
+		{readyHint("#5", "other/repo"), "gh pr ready 5 -R other/repo"},
+		{readyHint("5", ""), "gh pr ready 5"},
+		{readyHint(forwardedURL, ""), "gh pr ready " + forwardedURL},
+		{prCommand("checks", "#5", "other/repo", "--watch"), "gh pr checks 5 --watch -R other/repo"},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%q, want %q", tc.got, tc.want)
+		}
 	}
-	if got := readyHint("5", ""); got != "gh pr ready 5" {
-		t.Errorf("plain: %q", got)
+	hints := strings.Join(refuseHints("#5", merge.ChecksVerdict{}, checksOpts{repo: "other/repo"}), " | ")
+	if !strings.Contains(hints, "gh pr checks 5 --watch -R other/repo") {
+		t.Errorf("the checks gate's wait hint must name the forwarded PR: %s", hints)
 	}
 }
 
@@ -297,6 +309,7 @@ func TestCmdMergePR_forwardedRepoUnresolvableRefuses(t *testing.T) {
 		{[]string{"99999", "--", "-R", "other/repo"}, "rather than read this clone's PR #99999"},
 		{[]string{"#99999", "--", "-R", "other/repo"}, "rather than read this clone's PR #99999"},
 		{[]string{forwardedURL}, "refusing to merge a PR whose repository wt could not read"},
+		{[]string{forwardedURL, "--", "-R", "other/repo"}, "rather than read this clone's PR " + forwardedURL + " in its place"},
 	} {
 		var code int
 		_, errOut := captureT(t, func() { code = cmdMergePR(tc.args) })

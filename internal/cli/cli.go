@@ -446,7 +446,7 @@ func cmdMergePR(args []string) int {
 		a, err := resolvePRIn(pr, repo)
 		if err != nil {
 			if repo != "" {
-				ui.Err("%v: refusing, rather than read this clone's PR #%s in its place", err, strings.TrimPrefix(pr, "#"))
+				ui.Err("%v: refusing, rather than read this clone's PR %s in its place", err, merge.PRLabel(pr))
 			} else {
 				ui.Err("%v: refusing to merge a PR whose repository wt could not read", err)
 			}
@@ -607,14 +607,19 @@ func cmdMergePR(args []string) int {
 // resolvePRIn is ghx.ResolvePRIn; a var so a test can answer it.
 var resolvePRIn = ghx.ResolvePRIn
 
-// readyHint is the command that marks pr ready, in repo when one was
-// forwarded (#228 review: bare, `gh pr ready <n>` names this clone's PR of
-// that number). Pure.
-func readyHint(pr, repo string) string {
+// readyHint is the command that marks pr ready (prCommand). Pure.
+func readyHint(pr, repo string) string { return prCommand("ready", pr, repo) }
+
+// prCommand is the `gh pr <verb>` command line for pr that a hint prints: in
+// repo when one was forwarded (#228 review: bare, `gh pr ready <n>` names this
+// clone's PR of that number), and never with a "#" a shell would read as a
+// comment (merge.PRArg). Pure.
+func prCommand(verb, pr, repo string, extra ...string) string {
+	parts := append([]string{"gh", "pr", verb, merge.PRArg(pr)}, extra...)
 	if repo != "" {
-		return "gh pr ready " + pr + " -R " + repo
+		parts = append(parts, "-R", repo)
 	}
-	return "gh pr ready " + pr
+	return strings.Join(parts, " ")
 }
 
 // laneMayBeHere reports whether this clone, whose origin is owner/name, can
@@ -645,7 +650,7 @@ func autoCleanMergedWorktree(pr string, at *ghx.PRAt) {
 			if head == "" {
 				head = "unknown, a deleted fork?"
 			}
-			ui.Info("merged %s: neither its repository (%s) nor its branch's (%s) is this clone's origin, so no worktree or claim here is its; nothing to clean", at.URL, at.Repo(), head)
+			ui.Info("merged %s: neither its repository (%s) nor its branch's (%s) is this clone's origin (%s/%s), so no worktree or claim here is its; nothing to clean (if origin names that repository by an old name, after a rename or transfer, `wt clean` removes the lane once it ships)", at.URL, at.Repo(), head, owner, name)
 			return
 		}
 	}
