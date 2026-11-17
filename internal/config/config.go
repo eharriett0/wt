@@ -24,6 +24,7 @@ const DefaultHoldMaxAge = 24 * time.Hour
 // Config holds resolved settings for the repo at Root.
 type Config struct {
 	Root         string   // repo top-level
+	MainRoot     string   // the main work tree (`git worktree list`'s first entry; in a bare layout, the repository), the same from every worktree; a relative worktree_root or active_work is read from here (#238)
 	Base         string   // base branch (main/master/trunk...)
 	WorktreeRoot string   // where new worktrees live
 	ActiveWork   string   // active-work state file path
@@ -86,6 +87,7 @@ func Load() (*Config, error) {
 	}
 	common, _ := gitx.CommonDir() // "" on error; absolute (…/<main>/.git) when present
 	name, parent := worktreeRootAnchor(root, common)
+	mainRoot := mainWorkTree(common, root)
 
 	activeWork := filepath.Join(root, ".git", "wt-active-work.md")
 	if common != "" {
@@ -94,6 +96,7 @@ func Load() (*Config, error) {
 
 	c := &Config{
 		Root:         root,
+		MainRoot:     mainRoot,
 		Base:         gitx.DefaultBranch(),
 		WorktreeRoot: filepath.Join(parent, name+"-worktrees"),
 		ActiveWork:   activeWork,
@@ -110,8 +113,41 @@ func Load() (*Config, error) {
 	}
 	// Environment overlay (highest precedence).
 	applyEnv(c)
+	c.WorktreeRoot = anchorPath(c.WorktreeRoot, mainRoot)
+	c.ActiveWork = anchorPath(c.ActiveWork, mainRoot)
 
 	return c, nil
+}
+
+// mainWorkTree is the repository's main work tree as `git worktree list`
+// gives it first, the same from every worktree, derived from the shared git
+// dir Load already has (#238 re-review: an extra `git worktree list` cost every
+// command and hook ~10ms, and matched this in every layout measured): the git
+// dir's parent when it is a `.git`, else the git dir itself. In a bare layout
+// that is the repository (#238 review: each lane read itself as MainRoot, so a
+// relative root meant a directory per lane). ⚠ Under `--separate-git-dir` it
+// is not the work tree: git itself lists that same directory (measured, git
+// 2.39), one directory from every worktree. root when there is no git dir.
+func mainWorkTree(common, root string) string {
+	switch {
+	case common == "":
+		return root
+	case filepath.Base(common) == ".git":
+		return filepath.Dir(common)
+	}
+	return common
+}
+
+// anchorPath reads a relative path from the main checkout (#238): kept
+// relative, a `worktree_root = wts` (or WT_WORKTREE_ROOT=wts) meant a
+// different directory from each cwd, so a claim recorded a path only its own
+// cwd could find, and `release --clean` from another directory read it as
+// "already gone". The default root is anchored there too. Pure.
+func anchorPath(p, mainRoot string) string {
+	if p == "" || filepath.IsAbs(p) {
+		return p
+	}
+	return filepath.Join(mainRoot, p)
 }
 
 // worktreeRootAnchor returns the (name, parent) used to derive the default

@@ -292,6 +292,14 @@ func Release(c *config.Config, issue string, clean bool) error {
 			break
 		}
 	}
+	// A claim made under a relative worktree_root, before #238, recorded a
+	// path relative to whatever cwd the claim ran in. Find the lane by its
+	// branch (#238 review: read from the main checkout, a claim made from a
+	// subdirectory missed its lane, and a decoy worktree at that path was
+	// removed); the main checkout is only the fallback.
+	if recorded.Worktree != "" && !filepath.IsAbs(recorded.Worktree) {
+		recorded.Worktree = relativeRecord(c, recorded)
+	}
 
 	if content != "" {
 		if newC, changed := activework.RemoveSection(content, issue); changed {
@@ -303,6 +311,11 @@ func Release(c *config.Config, issue string, clean bool) error {
 		} else {
 			ui.Info("no active-work entry for #%s", issue)
 		}
+	} else {
+		// Say where it looked (#238 re-review): a relative active_work used to
+		// mean a file per cwd, and a claim recorded in another one was skipped
+		// without a word.
+		ui.Info("no active-work file at %s (no entry for #%s)", c.ActiveWork, issue)
 	}
 	if user, err := ghx.CurrentUser(); err == nil && user != "" {
 		if err := ghx.IssueRemoveAssignee(issue, user); err == nil {
@@ -427,6 +440,27 @@ func abbrev(sha string) string {
 		return sha[:8]
 	}
 	return sha
+}
+
+// relativeRecord resolves a claim's relative Worktree path (recorded before
+// #238): the worktree git lists on the claim's branch, else the path read from
+// the main checkout.
+func relativeRecord(c *config.Config, e activework.Entry) string {
+	if e.Branch != "" {
+		if wts, err := gitx.WorktreeList(); err == nil && len(wts) > 1 {
+			// Never the first entry, the main worktree (#238 re-review): a
+			// claim's lane is never it, and only git's own refusal stood
+			// between a root that contains it and its removal.
+			for _, w := range wts[1:] {
+				if w.Branch == e.Branch {
+					return w.Path
+				}
+			}
+		}
+	}
+	// A miss (a detached lane, a case twin) reads from the main checkout; a
+	// worktree there on another branch is refused by --clean's branch check.
+	return filepath.Join(c.MainRoot, e.Worktree)
 }
 
 // cleanAbandonedWorktree removes the released claim's worktree iff it's under

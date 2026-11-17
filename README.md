@@ -625,8 +625,8 @@ base branch's `.wt.conf` counts too, and the stricter applies, see the merge sec
 | `.wt.conf` key | env | default |
 |---|---|---|
 | `base` | `WT_BASE` | derived from `origin/HEAD` (main → master fallback) |
-| `worktree_root` | `WT_WORKTREE_ROOT` | `<repo-parent>/<repo>-worktrees` |
-| `active_work` | `WT_ACTIVE_WORK` | `$GIT_COMMON_DIR/wt-active-work.md` |
+| `worktree_root` | `WT_WORKTREE_ROOT` | `<repo-parent>/<repo>-worktrees`. A relative value is read from the main checkout, so it names one directory from every window |
+| `active_work` | `WT_ACTIVE_WORK` | `$GIT_COMMON_DIR/wt-active-work.md`. A relative value is read from the main checkout |
 | `prefix` | `WT_PREFIX` | `feat-` (claim branch prefix) |
 | `link_files` | `WT_LINK_FILES` | `.env` (gitignored files symlinked into new worktrees) |
 | `claim_open_pr` | `WT_CLAIM_OPEN_PR` | `true` |
