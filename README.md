@@ -401,7 +401,7 @@ too. The environment can only tighten these settings, never loosen the base's:
 `--confirm-deploy` and `--checks-ok` are the ways past them. (`wt holds` and
 `wt prune-coord` still read only this checkout's `hold_max_age`.)
 
-When GitHub can't be read (after one retry), `merge-pr` fetches the PR's base
+When GitHub can't be read (after one retry; a rate limit is not retried), `merge-pr` fetches the PR's base
 branch into this clone and reads that copy (with a warning; if the fetch fails
 too, the copy as last fetched, which may be stale), but only when the PR's
 repository is this clone's `origin` (owner and name; the host is not compared,

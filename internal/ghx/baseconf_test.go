@@ -53,13 +53,13 @@ func TestPROwnerName(t *testing.T) {
 func TestParseBaseConf(t *testing.T) {
 	const tip = `"oid":"c51032e9ec3c475f282af0f4f577461f2d225cbf"`
 	blob := func(text string) string {
-		return `{"__typename":"Blob","text":` + strconv.Quote(text) + `,"isBinary":false,"isTruncated":false}`
+		return `{"__typename":"Blob","oid":"b10b","text":` + strconv.Quote(text) + `,"isBinary":false,"isTruncated":false}`
 	}
-	read, err := parseBaseConf(`{` + tip + `,"mode":33188,"conf":` + blob("merge_is_deploy = true\n") + `}`)
+	read, err := parseBaseConf(`{` + tip + `,"mode":33188,"eoid":"b10b","conf":` + blob("merge_is_deploy = true\n") + `}`)
 	if err != nil || !read.Found || read.Text != "merge_is_deploy = true\n" || read.Commit != "c51032e9ec3c475f282af0f4f577461f2d225cbf" {
 		t.Errorf("a file: %+v, %v", read, err)
 	}
-	if read, err := parseBaseConf(`{` + tip + `,"mode":33261,"conf":` + blob("x = 1") + `}`); err != nil || !read.Found {
+	if read, err := parseBaseConf(`{` + tip + `,"mode":33261,"eoid":"b10b","conf":` + blob("x = 1") + `}`); err != nil || !read.Found {
 		t.Errorf("an executable file is a file: %+v, %v", read, err)
 	}
 	read, err = parseBaseConf(`{` + tip + `,"mode":null,"conf":null}`)
@@ -72,22 +72,25 @@ func TestParseBaseConf(t *testing.T) {
 	if read, err := parseBaseConf(`{` + tip + `,"mode":33188,"eoid":"aaa","conf":{"__typename":"Blob","oid":"aaa","text":"y","isBinary":false,"isTruncated":false}}`); err != nil || read.Text != "y" {
 		t.Errorf("matching entry and object ids: %+v, %v", read, err)
 	}
-	if read, err := parseBaseConf(`{` + tip + `,"mode":33188,"conf":` + blob("") + `}`); err != nil || !read.Found {
+	if read, err := parseBaseConf(`{` + tip + `,"mode":33188,"eoid":"b10b","conf":` + blob("") + `}`); err != nil || !read.Found {
 		t.Errorf("an empty file is a file: %+v, %v", read, err)
 	}
 	for name, out := range map[string]string{
-		"no tip (branch or repository unread)": `{"oid":null,"mode":null,"conf":null}`,
-		"empty tip":                            `{"oid":"","conf":null}`,
-		"a symlink (its text is the target)":   `{` + tip + `,"mode":40960,"conf":` + blob("conf/wt.conf") + `}`,
-		"a directory":                          `{` + tip + `,"mode":16384,"conf":{"__typename":"Tree"}}`,
-		"a submodule":                          `{` + tip + `,"mode":57344,"conf":{"__typename":"Commit"}}`,
-		"an entry but no object":               `{` + tip + `,"mode":33188,"conf":null}`,
-		"an object but no entry":               `{` + tip + `,"mode":null,"conf":` + blob("x") + `}`,
-		"an odd mode":                          `{` + tip + `,"mode":420,"conf":` + blob("x") + `}`,
+		"no tip (branch or repository unread)":            `{"oid":null,"mode":null,"conf":null}`,
+		"empty tip":                                       `{"oid":"","conf":null}`,
+		"a symlink (its text is the target)":              `{` + tip + `,"mode":40960,"eoid":"b10b","conf":` + blob("conf/wt.conf") + `}`,
+		"a directory":                                     `{` + tip + `,"mode":16384,"conf":{"__typename":"Tree"}}`,
+		"a submodule":                                     `{` + tip + `,"mode":57344,"conf":{"__typename":"Commit"}}`,
+		"an entry but no object":                          `{` + tip + `,"mode":33188,"eoid":"b10b","conf":null}`,
+		"an object but no entry":                          `{` + tip + `,"mode":null,"conf":` + blob("x") + `}`,
+		"no entry oid (#223 final review)":                `{` + tip + `,"mode":33188,"conf":` + blob("x") + `}`,
+		"neither oid (the fields dropped from the query)": `{` + tip + `,"mode":33188,"conf":{"__typename":"Blob","text":"x","isBinary":false,"isTruncated":false}}`,
+		"no blob oid":                                     `{` + tip + `,"mode":33188,"eoid":"b10b","conf":{"__typename":"Blob","text":"x","isBinary":false,"isTruncated":false}}`,
+		"an odd mode":                                     `{` + tip + `,"mode":420,"eoid":"b10b","conf":` + blob("x") + `}`,
 		"the entry and the object are two blobs (#223 re-review: a push between)": `{` + tip + `,"mode":33188,"eoid":"aaa","conf":{"__typename":"Blob","oid":"bbb","text":"x","isBinary":false,"isTruncated":false}}`,
-		"binary":              `{` + tip + `,"mode":33188,"conf":{"__typename":"Blob","text":null,"isBinary":true,"isTruncated":false}}`,
-		"truncated":           `{` + tip + `,"mode":33188,"conf":{"__typename":"Blob","text":"merge_is","isBinary":false,"isTruncated":true}}`,
-		"a Blob without text": `{` + tip + `,"mode":33188,"conf":{"__typename":"Blob","isBinary":false,"isTruncated":false}}`,
+		"binary":              `{` + tip + `,"mode":33188,"eoid":"b10b","conf":{"__typename":"Blob","text":null,"isBinary":true,"isTruncated":false}}`,
+		"truncated":           `{` + tip + `,"mode":33188,"eoid":"b10b","conf":{"__typename":"Blob","text":"merge_is","isBinary":false,"isTruncated":true}}`,
+		"a Blob without text": `{` + tip + `,"mode":33188,"eoid":"b10b","conf":{"__typename":"Blob","isBinary":false,"isTruncated":false}}`,
 		"not JSON":            `7`,
 		"nothing":             ``,
 	} {
@@ -123,5 +126,15 @@ func TestParseRemoteRepo(t *testing.T) {
 	}
 	if (BaseConf{}).Repo() != "" || (BaseConf{Owner: "o", Name: "r"}).Repo() != "o/r" {
 		t.Error("BaseConf.Repo")
+	}
+}
+
+// The query and its jq filter must carry both object ids, or parseBaseConf
+// refuses every answer (#223 final review: a dropped field read as no check).
+func TestBaseConfQuery_carriesObjectIDs(t *testing.T) {
+	for _, want := range []string{"entries{name mode oid}", "Blob{oid text"} {
+		if !strings.Contains(baseConfQuery, want) {
+			t.Errorf("baseConfQuery lacks %q: %s", want, baseConfQuery)
+		}
 	}
 }

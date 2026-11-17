@@ -772,11 +772,19 @@ func deployGate(pr, repo string, confirmed bool, statusHost, unsure string) int 
 		return 0
 	}
 	if !stdinIsTTY() {
-		ui.Err("prod deploy not confirmed. Re-run with --confirm-deploy to merge PR #%s.", pr)
+		if unsure != "" {
+			ui.Err("deploy not confirmed (merging PR #%s may auto-apply to prod). Re-run with --confirm-deploy to merge it.", pr)
+		} else {
+			ui.Err("prod deploy not confirmed. Re-run with --confirm-deploy to merge PR #%s.", pr)
+		}
 		return 1
 	}
-	fmt.Fprintf(os.Stderr, "%s Type %s to merge PR #%s to prod (anything else aborts): ",
-		ui.Yellow("→"), ui.Bold("deploy"), pr)
+	target := "to prod"
+	if unsure != "" {
+		target = "(it may auto-apply to prod)"
+	}
+	fmt.Fprintf(os.Stderr, "%s Type %s to merge PR #%s %s (anything else aborts): ",
+		ui.Yellow("→"), ui.Bold("deploy"), pr, target)
 	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 	if strings.TrimSpace(line) == "deploy" {
 		return 0

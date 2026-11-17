@@ -827,11 +827,13 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   own repository takes the fallback). The read is retried once first, as the
   checks gate's are (`retryable`: not for a rate limit). It fetches first
   (`fetchBase` = `gitx.FetchNoPrompt`, the git transport, which a GraphQL quota
-  doesn't stop, with GIT_TERMINAL_PROMPT=0 so it never waits on a credential
-  prompt); a failed fetch reads the copy as last fetched, and says it may be
-  stale. ⚠ The tree entry and the object are resolved separately in one
-  query, so their object ids must match (a push between could pair a regular
-  file's mode with a symlink's blob). ⚠ `ReadBaseConf` returns what it resolved WITH its error (base, owner,
+  doesn't stop, with GIT_TERMINAL_PROMPT=0 against git's own HTTPS prompt and
+  ssh in BatchMode unless the user set an ssh command; a GIT_ASKPASS helper is
+  still the user's); a failed fetch reads the copy as last fetched, and says it
+  may be stale. A retry that fails earlier than the first try keeps what the
+  first resolved. ⚠ The tree entry and the object are resolved separately in
+  one query, so both object ids are required and must match (a push between
+  could pair a regular file's mode with a symlink's blob). ⚠ `ReadBaseConf` returns what it resolved WITH its error (base, owner,
   name, host), or the fallback can't read the right branch. ⚠
   `gitx.RefFileText` decides presence by `git ls-tree -z --full-tree` (exact
   path, from the top, whatever the cwd) and reads the blob by id: a failed

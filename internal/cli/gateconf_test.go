@@ -15,6 +15,7 @@ import (
 	"github.com/eharriett0/wt/internal/config"
 	"github.com/eharriett0/wt/internal/coord"
 	"github.com/eharriett0/wt/internal/ghx"
+	"github.com/eharriett0/wt/internal/merge"
 )
 
 // TestBaseGateSource pins where the base branch's gate settings come from
@@ -236,7 +237,7 @@ func TestGateSummaryAndDiffer(t *testing.T) {
 		{b, "base: merge_is_deploy on [merge_is_deploy_paths infrastructure/**], merge_min_checks off, hold_max_age 1h0m0s, coord_issue #36"},
 		{off, "off: merge_is_deploy off [merge_is_deploy_paths infra/**], merge_min_checks off, hold_max_age never"},
 		{gateSource{from: "u", unread: "GitHub down", gate: config.Gate{MergeIsDeploy: true}},
-			"u (GitHub down): taken as merge_is_deploy on (whole repository), merge_min_checks unknown"},
+			"u (GitHub down): taken as merge_is_deploy on (whole repository), merge_min_checks unknown, hold_max_age at least 24h0m0s (the default)"},
 	} {
 		if got := gateSummary(tc.s); got != tc.want {
 			t.Errorf("gateSummary = %q, want %q", got, tc.want)
@@ -268,6 +269,10 @@ case "$*" in
 "auth status"*) exit 0 ;;
 *"--json number,url,baseRefName"*)
 	[ -e "$d/prview.fail" ] && { echo "gh: Something went wrong (HTTP 502)" >&2; exit 1; }
+	if [ -e "$d/prview.fail.second" ]; then
+		[ -e "$d/prview.seen" ] && { echo "gh: Something went wrong (HTTP 502)" >&2; exit 1; }
+		: > "$d/prview.seen"
+	fi
 	echo "$3 https://$H/$R/pull/$3 $B"; exit 0 ;;
 *"expr=refs/heads/"*)
 	[ -e "$d/base.fail" ] && { echo "gh: Something went wrong (HTTP 502)" >&2; exit 1; }
@@ -397,7 +402,7 @@ func (e *gateEnv) checkout(conf string) {
 // fake sets the fake gh's state: the PR changes file, and kv's files.
 func (e *gateEnv) fake(file string, kv map[string]string) {
 	e.t.Helper()
-	for _, name := range []string{"argv", "calls", "merged", "base.fail", "base.fail.once", "prview.fail", "basename", "prrepo", "baseconf.json", "draft"} {
+	for _, name := range []string{"argv", "calls", "merged", "base.fail", "base.fail.once", "prview.fail", "prview.fail.second", "prview.seen", "basename", "prrepo", "baseconf.json", "draft"} {
 		_ = os.Remove(filepath.Join(e.ghDir, name))
 	}
 	rest, _ := json.Marshal(map[string]any{"f": file, "p": nil, "s": "modified"})
@@ -434,7 +439,8 @@ func baseJSON(text string, found bool, mode ...int) string {
 			m = mode[0]
 		}
 		v["mode"] = m
-		v["conf"] = map[string]any{"__typename": "Blob", "text": text, "isBinary": false, "isTruncated": false}
+		v["eoid"] = "b10b"
+		v["conf"] = map[string]any{"__typename": "Blob", "oid": "b10b", "text": text, "isBinary": false, "isTruncated": false}
 	}
 	b, _ := json.Marshal(v)
 	return string(b)
@@ -487,7 +493,7 @@ func TestCmdMergePR_gateSettingsComeFromTheBaseToo(t *testing.T) {
 			want: []string{"this clone's copy can't be read", "merge_min_checks is unknown", "--checks-ok"}},
 		{name: "... and with --checks-ok it stops at the deploy gate, which says MAY",
 			kv: map[string]string{"base.fail": ""}, file: "docs/a.md", args: []string{"--checks-ok"}, code: 1,
-			want: []string{"MAY auto-apply to prod", "prod deploy not confirmed"}, not: []string{"AUTO-APPLIES"}},
+			want: []string{"MAY auto-apply to prod", "deploy not confirmed (merging PR #99999 may auto-apply to prod)"}, not: []string{"AUTO-APPLIES", "prod deploy not confirmed"}},
 		{name: "GitHub unread: this clone's origin/main copy decides (the fetch failed: may be stale)",
 			checkout: "merge_is_deploy = false\n", kv: map[string]string{"base.fail": ""}, origin: "gated", file: "infra/x.yaml", code: 1,
 			want: []string{"which may be stale", "origin/main's .wt.conf as last fetched", "prod deploy not confirmed"}},
@@ -510,7 +516,7 @@ func TestCmdMergePR_gateSettingsComeFromTheBaseToo(t *testing.T) {
 		// #223 review F5: a symlinked .wt.conf read as its target's path.
 		{name: "the base's .wt.conf is a symlink: never read as a config with no keys",
 			kv: map[string]string{"baseconf.json": baseJSON("conf/wt.conf", true, 0o120000)}, file: "conf/wt.conf",
-			args: []string{"--checks-ok"}, code: 1, want: []string{"is a symlink", "prod deploy not confirmed"}},
+			args: []string{"--checks-ok"}, code: 1, want: []string{"is a symlink", "deploy not confirmed"}},
 		// #223 re-review: a fork with the same name under another owner is
 		// another repository.
 		{name: "a PR in a same-named repository of another owner: fails closed",
@@ -520,6 +526,13 @@ func TestCmdMergePR_gateSettingsComeFromTheBaseToo(t *testing.T) {
 		{name: "a base read that fails once is retried",
 			checkout: "merge_is_deploy = false\n", kv: map[string]string{"base.fail.once": "", "baseconf.json": baseJSON(gateInfra, true)},
 			file: "infra/x.yaml", code: 1, want: []string{"main's .wt.conf on GitHub", "prod deploy not confirmed"}, not: []string{"could not be read"}},
+		// #223 final review: the retry failed earlier than the first try (gh
+		// couldn't even name the PR again); what the first resolved is kept,
+		// so the fallback still reads the PR's base.
+		{name: "a retry that fails earlier keeps the first try's base",
+			checkout: "merge_is_deploy = false\n", kv: map[string]string{"base.fail": "", "prview.fail.second": ""}, origin: "gated",
+			file: "infra/x.yaml", code: 1, want: []string{"origin/main's .wt.conf as last fetched", "prod deploy not confirmed"},
+			not: []string{"could not be resolved"}},
 		// #223 re-review: a draft under an unread base says MAY too.
 		{name: "a draft under an unread base: refused, and it says MAY",
 			kv: map[string]string{"base.fail": "", "draft": ""}, file: "docs/a.md", args: []string{"--checks-ok"}, code: 1,
@@ -667,5 +680,19 @@ func TestCmdMergePR_holdSettingsComeFromTheBaseToo(t *testing.T) {
 				t.Errorf("refused, but not by the hold:\n%s", out)
 			}
 		})
+	}
+}
+
+// #223 final review: with only the base's floor and the required checks
+// unread, there is no CI to wait for.
+func TestRefuseHints_unreadOnly(t *testing.T) {
+	v := merge.DecideChecks(merge.ChecksInput{Checks: nil, FloorUnread: "GitHub down", RequiredUnread: []string{"rulesets: HTTP 502"}})
+	hints := strings.Join(refuseHints("7", v, checksOpts{}), " | ")
+	if strings.Contains(hints, "wait for CI") || !strings.Contains(hints, "re-run once gh can read") {
+		t.Errorf("hints = %q", hints)
+	}
+	v = merge.DecideChecks(merge.ChecksInput{FloorUnread: "GitHub down"})
+	if hints := strings.Join(refuseHints("7", v, checksOpts{}), " | "); !strings.Contains(hints, "base branch's .wt.conf can be read") {
+		t.Errorf("floor only: hints = %q", hints)
 	}
 }

@@ -180,7 +180,9 @@ func parseBaseConf(out string) (BaseConf, error) {
 		return BaseConf{}, fmt.Errorf("%s on the base branch is a %s, not a file", ConfFile, strings.ToLower(c.Typename))
 	case *v.Mode != modeFile && *v.Mode != modeExecutable:
 		return BaseConf{}, fmt.Errorf("%s on the base branch has mode %o, not a regular file", ConfFile, *v.Mode)
-	case v.EOid != "" && c.Oid != "" && v.EOid != c.Oid:
+	case v.EOid == "" || c.Oid == "":
+		return BaseConf{}, fmt.Errorf("GitHub returned %s without the object ids that tie its tree entry to its text", ConfFile)
+	case v.EOid != c.Oid:
 		// The tree entry and the object are resolved separately in one query: a
 		// push in between could pair a regular file's mode with a symlink's blob
 		// (#223 re-review).

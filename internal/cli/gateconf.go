@@ -41,7 +41,8 @@ type localBaseConf struct {
 // what the PR can't loosen.
 //
 //   - GitHub's copy at the PR's base branch, read just now: the file, or no
-//     file (then the base sets nothing, and nothing is warned).
+//     file (then the base holds the defaults: nothing on, no floor, holds at
+//     least 24h; nothing is warned).
 //   - GitHub unread, but the PR's base branch and repository known, and that
 //     repository is this clone's origin (originIsBase): this clone's
 //     origin/<base>, fetched first (local.fetchErr says whether that worked;
@@ -232,7 +233,8 @@ func readSources(srcs []gateSource) []gateSource {
 // themselves, so two different lists never read alike. Pure.
 func gateSummary(s gateSource) string {
 	if s.unread != "" {
-		return fmt.Sprintf("%s (%s): taken as merge_is_deploy on (whole repository), merge_min_checks unknown", s.from, s.unread)
+		return fmt.Sprintf("%s (%s): taken as merge_is_deploy on (whole repository), merge_min_checks unknown, hold_max_age at least %s (the default)",
+			s.from, s.unread, config.DefaultHoldMaxAge)
 	}
 	g := s.gate
 	deploy := "merge_is_deploy off"
@@ -293,8 +295,15 @@ func mergeGates(c *config.Config, pr, repo string, dryRun bool) []gateSource {
 		// One retry, as the checks gate's reads get (#223 re-review): a single
 		// 502 would otherwise fail closed. A rate limit lifts in minutes, not
 		// here.
+		first := fresh
 		liveChecksReads.sleep(checksRetryWait)
 		fresh, freshErr = readBaseConf(pr, repo)
+		if freshErr != nil && fresh.Base == "" && first.Base != "" {
+			// The retry failed earlier than the first try did: keep what the
+			// first one resolved, so the fallback still reads the PR's base
+			// (#223 final review).
+			fresh.Base, fresh.Owner, fresh.Name, fresh.Host = first.Base, first.Owner, first.Name, first.Host
+		}
 	}
 	var local localBaseConf
 	originIsBase := false
