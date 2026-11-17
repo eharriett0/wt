@@ -24,7 +24,7 @@ const DefaultHoldMaxAge = 24 * time.Hour
 // Config holds resolved settings for the repo at Root.
 type Config struct {
 	Root         string   // repo top-level
-	MainRoot     string   // the MAIN checkout's top-level, the same from every worktree (Root in an unusual layout); a relative path in config is read from here (#238)
+	MainRoot     string   // the main work tree (`git worktree list`'s first entry; in a bare layout, the repository), the same from every worktree; a relative worktree_root or active_work is read from here (#238)
 	Base         string   // base branch (main/master/trunk...)
 	WorktreeRoot string   // where new worktrees live
 	ActiveWork   string   // active-work state file path
@@ -87,7 +87,7 @@ func Load() (*Config, error) {
 	}
 	common, _ := gitx.CommonDir() // "" on error; absolute (…/<main>/.git) when present
 	name, parent := worktreeRootAnchor(root, common)
-	mainRoot := filepath.Join(parent, name)
+	mainRoot := mainWorkTree(filepath.Join(parent, name))
 
 	activeWork := filepath.Join(root, ".git", "wt-active-work.md")
 	if common != "" {
@@ -114,8 +114,22 @@ func Load() (*Config, error) {
 	// Environment overlay (highest precedence).
 	applyEnv(c)
 	c.WorktreeRoot = anchorPath(c.WorktreeRoot, mainRoot)
+	c.ActiveWork = anchorPath(c.ActiveWork, mainRoot)
 
 	return c, nil
+}
+
+// mainWorkTree is the repository's main work tree as git lists it first, the
+// same from every worktree. In a bare layout that is the repository itself
+// (#238 review: each lane read itself as MainRoot, so a relative root meant a
+// directory per lane). ⚠ Under `--separate-git-dir` git lists the git dir's
+// parent, from the work tree too (measured, git 2.39): not the work tree, but
+// still one directory from every worktree. fallback when git can't list them.
+func mainWorkTree(fallback string) string {
+	if wts, err := gitx.WorktreeList(); err == nil && len(wts) > 0 && wts[0].Path != "" {
+		return wts[0].Path
+	}
+	return fallback
 }
 
 // anchorPath reads a relative path from the main checkout (#238): kept

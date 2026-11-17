@@ -54,6 +54,14 @@ func TestLoad_RelativeWorktreeRootIsTheMainCheckouts(t *testing.T) {
 	lane := filepath.Join(main, "wts", "lane")
 	git(main, "worktree", "add", "-q", "-b", "lane", lane)
 
+	// A relative active_work is read from the main checkout too (#238 review).
+	t.Setenv("WT_ACTIVE_WORK", "aw.md")
+	t.Chdir(filepath.Join(lane, "sub"))
+	if c, err := Load(); err != nil || c.ActiveWork != filepath.Join(main, "aw.md") {
+		t.Errorf("WT_ACTIVE_WORK=aw.md from a lane's subdirectory: %q (%v), want %q", c.ActiveWork, err, filepath.Join(main, "aw.md"))
+	}
+	t.Setenv("WT_ACTIVE_WORK", "")
+
 	want := filepath.Join(main, "wts")
 	for _, env := range []string{"", "wts"} {
 		t.Setenv("WT_WORKTREE_ROOT", env)
@@ -70,5 +78,36 @@ func TestLoad_RelativeWorktreeRootIsTheMainCheckouts(t *testing.T) {
 				t.Errorf("from %s: MainRoot = %q, want %q", cwd, c.MainRoot, main)
 			}
 		}
+	}
+
+	// A bare layout (#238 review): every worktree read MainRoot as itself, so
+	// a relative root meant a directory per lane. It is the repository now,
+	// as `git worktree list` gives it, the same from every lane.
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bare := filepath.Join(base, "proj.git")
+	git(base, "clone", "-q", "--bare", main, bare)
+	w1, w2 := filepath.Join(base, "w1"), filepath.Join(base, "w2")
+	git(bare, "worktree", "add", "-q", "-b", "w1", w1)
+	git(bare, "worktree", "add", "-q", "-b", "w2", w2)
+	for _, cwd := range []string{w1, w2} {
+		t.Chdir(cwd)
+		if c, err := Load(); err != nil || c.MainRoot != bare {
+			t.Errorf("bare layout, from %s: MainRoot = %q (%v), want the repository %q", cwd, c.MainRoot, err, bare)
+		}
+	}
+	// ⚠ Under --separate-git-dir git itself lists the git dir's parent as the
+	// main worktree, from the work tree too (measured, git 2.39), so that is
+	// MainRoot: not the work tree, but the same from every worktree.
+	work := filepath.Join(base, "work")
+	if err := os.MkdirAll(filepath.Join(base, "elsewhere"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	git(base, "init", "-q", "-b", "main", "--separate-git-dir="+filepath.Join(base, "elsewhere", ".git"), work)
+	t.Chdir(work)
+	if c, err := Load(); err != nil || c.MainRoot != filepath.Join(base, "elsewhere") {
+		t.Errorf("--separate-git-dir: MainRoot = %q (%v), want what git lists, %q", c.MainRoot, err, filepath.Join(base, "elsewhere"))
 	}
 }

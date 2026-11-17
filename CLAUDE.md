@@ -947,14 +947,18 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   `worktree_root` — an accident, not a guard. `--all-roots` (#101) armed it, and
   the e2e smoke is what caught it. When you widen a blast radius, re-derive which
   guards were load-bearing *by luck*.
-- **A relative path in config is read from the MAIN checkout (#238).**
-  `config.Load` anchors a relative `worktree_root` (`.wt.conf` or
-  `WT_WORKTREE_ROOT`) at `Config.MainRoot` (`anchorPath`), as the default root
-  always was. Kept relative, it meant a different directory from each cwd: a
+- **A relative `worktree_root` or `active_work` is read from the MAIN
+  checkout (#238).** `config.Load` anchors either (`.wt.conf` or the env var)
+  at `Config.MainRoot` (`anchorPath`): `git worktree list`'s first entry, the
+  same from every worktree (in a bare layout, the repository; ⚠ under
+  `--separate-git-dir` git lists the git dir's parent, not the work tree,
+  measured). Kept relative, it meant a different directory from each cwd: a
   claim recorded a path only its own cwd could find, `release --clean` from
   elsewhere read it as "already gone", and `under()` matched from one window
-  and refused from another. A claim recorded relative before #238 is read from
-  the main checkout too (`Release`).
+  and refused from another. A claim recorded relative before #238 is found by
+  its BRANCH in `git worktree list` (`relativeRecord`): read from the main
+  checkout, it missed a lane claimed from a subdirectory, and a decoy worktree
+  at that path was removed.
 - **`clean`'s reach and the collision engine's reach must not drift apart.** The
   engine scans EVERY worktree git knows about; if `clean` manages fewer, the
   difference is a set of worktrees that can hard-block a push with no in-tool way

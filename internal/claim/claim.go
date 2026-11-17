@@ -293,9 +293,12 @@ func Release(c *config.Config, issue string, clean bool) error {
 		}
 	}
 	// A claim made under a relative worktree_root, before #238, recorded a
-	// relative path: read it from the main checkout, as the root now is.
-	if recorded.Worktree != "" && !filepath.IsAbs(recorded.Worktree) && c.MainRoot != "" {
-		recorded.Worktree = filepath.Join(c.MainRoot, recorded.Worktree)
+	// path relative to whatever cwd the claim ran in. Find the lane by its
+	// branch (#238 review: read from the main checkout, a claim made from a
+	// subdirectory missed its lane, and a decoy worktree at that path was
+	// removed); the main checkout is only the fallback.
+	if recorded.Worktree != "" && !filepath.IsAbs(recorded.Worktree) {
+		recorded.Worktree = relativeRecord(c, recorded)
 	}
 
 	if content != "" {
@@ -426,6 +429,22 @@ func abbrev(sha string) string {
 		return sha[:8]
 	}
 	return sha
+}
+
+// relativeRecord resolves a claim's relative Worktree path (recorded before
+// #238): the worktree git lists on the claim's branch, else the path read from
+// the main checkout.
+func relativeRecord(c *config.Config, e activework.Entry) string {
+	if e.Branch != "" {
+		if wts, err := gitx.WorktreeList(); err == nil {
+			for _, w := range wts {
+				if w.Branch == e.Branch && !w.Bare {
+					return w.Path
+				}
+			}
+		}
+	}
+	return filepath.Join(c.MainRoot, e.Worktree)
 }
 
 // cleanAbandonedWorktree removes the released claim's worktree iff it's under
