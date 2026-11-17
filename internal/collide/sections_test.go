@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/eharriett0/wt/internal/gitx"
+	"github.com/eharriett0/wt/internal/section"
 )
 
 // SharedSectionsAcrossWith grades a worktree's copy of a structured doc as a
@@ -159,3 +160,26 @@ func TestSharedSectionsAcross_CountsDeletions(t *testing.T) {
 }
 
 func sp(s string) *string { return &s }
+
+// oldClaims: the old-copy lines a window's edit claims (#237 review).
+func TestOldClaims(t *testing.T) {
+	re, _ := section.Compile(`^##\s`)
+	secs := section.Parse("# Plan\n## Alpha\na1\na2\n## Beta\nb1\nb2\n", re) // ## Beta is line 5
+	r := func(a, b int) gitx.LineRange { return gitx.LineRange{Start: a, End: b} }
+	gap := func(k int) gitx.LineRange { return gitx.LineRange{Start: k, End: k + 1, Gap: true} }
+	for _, tc := range []struct {
+		name string
+		e    gitx.DocEdits
+		want []gitx.LineRange
+	}{
+		{"a body line replaced", gitx.DocEdits{Deleted: []gitx.LineRange{r(6, 6)}}, []gitx.LineRange{r(6, 6)}},
+		{"a heading replaced: the line above too", gitx.DocEdits{Deleted: []gitx.LineRange{r(5, 5)}}, []gitx.LineRange{r(5, 5), r(4, 4)}},
+		{"the first line, a heading-less preamble: nothing above", gitx.DocEdits{Deleted: []gitx.LineRange{r(1, 1)}}, []gitx.LineRange{r(1, 1)}},
+		{"an insertion: the line it lands after", gitx.DocEdits{Gaps: []gitx.LineRange{gap(4)}}, []gitx.LineRange{r(4, 4)}},
+		{"an insertion at the top: the first line", gitx.DocEdits{Gaps: []gitx.LineRange{gap(0)}}, []gitx.LineRange{r(1, 1)}},
+	} {
+		if got := oldClaims(secs, tc.e); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("%s: oldClaims = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

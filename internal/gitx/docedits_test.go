@@ -33,18 +33,19 @@ func docRepo(t *testing.T) string {
 
 // ChangedDocEdits is ChangedRangesNew's one diff with both sides (#237): the
 // new-frame ranges as before, the lines deleted in the old copy's numbers,
-// and that copy (as stored) when anything was deleted.
+// insertions' old-side gaps, and that copy (as stored) when it holds a claim.
 func TestChangedDocEdits(t *testing.T) {
 	dir := docRepo(t)
 	for _, tc := range []struct {
-		name    string
-		content *string // nil: the file is removed
-		deleted []LineRange
+		name          string
+		content       *string // nil: the file is removed
+		deleted, gaps []LineRange
 	}{
-		{"Beta deleted", strPtr("# Plan\n## Alpha\na1\na2\n"), []LineRange{{Start: 5, End: 8}}},
-		{"emptied", strPtr(""), []LineRange{{Start: 1, End: 8}}},
-		{"removed", nil, []LineRange{{Start: 1, End: 8}}},
-		{"a line inserted only", strPtr("# Plan\n## Alpha\na1\nNEW\na2\n## Beta\nb1\nb2\nb3\n"), nil},
+		{"Beta deleted", strPtr("# Plan\n## Alpha\na1\na2\n"), []LineRange{{Start: 5, End: 8}}, nil},
+		{"emptied", strPtr(""), []LineRange{{Start: 1, End: 8}}, nil},
+		{"removed", nil, []LineRange{{Start: 1, End: 8}}, nil},
+		{"a line inserted only", strPtr("# Plan\n## Alpha\na1\nNEW\na2\n## Beta\nb1\nb2\nb3\n"), nil, []LineRange{gapAfter(3)}},
+		{"a line modified", strPtr("# Plan\n## Alpha\nXa1\na2\n## Beta\nb1\nb2\nb3\n"), []LineRange{{Start: 3, End: 3}}, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.content == nil {
@@ -56,10 +57,10 @@ func TestChangedDocEdits(t *testing.T) {
 			}
 			defer writeFile(t, dir, "PLAN.md", docBase)
 			e := ChangedDocEdits(dir, "main", "PLAN.md")
-			if !reflect.DeepEqual(e.Deleted, tc.deleted) || e.All {
-				t.Errorf("Deleted = %v, All = %v; want %v, false", e.Deleted, e.All, tc.deleted)
+			if !reflect.DeepEqual(e.Deleted, tc.deleted) || !reflect.DeepEqual(e.Gaps, tc.gaps) || e.All {
+				t.Errorf("Deleted = %v, Gaps = %v, All = %v; want %v, %v, false", e.Deleted, e.Gaps, e.All, tc.deleted, tc.gaps)
 			}
-			if wantOld := map[bool]string{true: docBase, false: ""}[tc.deleted != nil]; e.Old != wantOld {
+			if wantOld := map[bool]string{true: docBase, false: ""}[tc.deleted != nil || tc.gaps != nil]; e.Old != wantOld {
 				t.Errorf("Old = %q, want %q", e.Old, wantOld)
 			}
 			if got := ChangedRangesNew(dir, "main", "PLAN.md"); !reflect.DeepEqual(got, e.New) {
@@ -110,3 +111,32 @@ func TestChangedDocEdits_FailureIsAll(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+// A window behind base is diffed from its merge base, so its deletions and
+// insertion gaps are numbered in the merge base's copy, and Old is that copy,
+// not base's (#237 review: reading base's copy survived every test).
+func TestChangedDocEdits_BehindReadsTheMergeBase(t *testing.T) {
+	dir := docRepo(t)
+	wt := filepath.Join(t.TempDir(), "wa")
+	runGit(t, dir, "worktree", "add", "-q", "-b", "wa", wt)
+	writeFile(t, dir, "PLAN.md", "# Plan\n## Alpha\na1\nM1\nM2\nM3\nM4\na2\n## Beta\nb1\nb2\nb3\n")
+	runGit(t, dir, "commit", "-qam", "main inserts in Alpha")
+	writeFile(t, wt, "PLAN.md", "# Plan\n## Alpha\na1\na2\n## Delta\nd1\n")
+	e := ChangedDocEdits(wt, "main", "PLAN.md")
+	if e.Old != docBase || !reflect.DeepEqual(e.Deleted, []LineRange{{Start: 5, End: 8}}) {
+		t.Errorf("behind: Old = %q, Deleted = %v; want the merge base's copy and [5-8]", e.Old, e.Deleted)
+	}
+	p, ok := ChangedDocEditsWith(wt, "main", "PLAN.md", []byte("# Plan\n## Alpha\na1\na2\n## Delta\nd1\n"))
+	if !ok || !reflect.DeepEqual(p, e) {
+		t.Errorf("pending, behind: %+v, want %+v", p, e)
+	}
+}
+
+// parseInsertGaps reads each pure insertion's old-side gap (#237 review).
+func TestParseInsertGaps(t *testing.T) {
+	diff := "@@ -0,0 +1 @@\n+top\n@@ -2 +3 @@\n-a\n+A\n@@ -9,0 +10,2 @@\n+e\n+f\n"
+	want := []LineRange{gapAfter(0), gapAfter(9)}
+	if got := parseInsertGaps(diff); !reflect.DeepEqual(got, want) {
+		t.Errorf("parseInsertGaps = %v, want %v", got, want)
+	}
+}

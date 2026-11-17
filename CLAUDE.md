@@ -142,22 +142,42 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   it diffed from (the merge base's for a behind branch, else base's), read as
   stored (`cat-file blob`) only when something was deleted.
   `collide.SharedSectionsAcrossWith` counts both: a window's sections are the
-  ones its edits touch in its own copy AND the ones holding its deleted lines
-  in that old copy. A window whose doc is gone counts its deletions; a
-  measurement that failed (the diff, or the old copy unreadable) is
-  `DocEdits.All`: every section of both copies, never fewer. Heading text
+  ones its edits touch in its own copy AND the ones its old-frame claims
+  touch in that old copy (`collide.oldClaims`): every line it deleted or
+  replaced; for a changed HEADING line, the line above it too (git conflicts
+  a rename of "## Beta" with an edit of the last Alpha line); and for an
+  insertion (`DocEdits.Gaps`), the line it lands after (the first line, at
+  the top). ⚠ #237 review: a new section's own lines have no section in the
+  old copy, so a window whose only edit was a new section claimed nothing
+  there, and deleting the section it was added to, or emptying or deleting
+  the doc, read disjoint (and so did two sections appended at the end).
+  ⚠ Not the line AFTER an insertion's gap, on purpose: appending a section
+  at the end of your lane would then claim the next lane, the case
+  structured docs exist for; an edit of the next heading line itself is
+  caught from its side by the heading rule. Measured on the review's
+  enumeration (124 single edits of a 3-section doc, 7,750 pairs vs `git
+  merge-tree`): 0 conflicts missed (438 before), 1,862 of 4,565 clean pairs
+  over-reported (1,400 before; claiming both neighbours, 2,288). A window
+  whose doc is gone counts its deletions; a measurement that failed (the
+  diff, or the old copy unreadable) is `DocEdits.All`: every section, never
+  fewer. Heading text
   stays the identity (by position, a deletion renumbers a duplicate heading
   in one window's copy and a conflict goes missing), so a rename counts the
   old heading's section and deleting one "## Notes" counts every "## Notes":
   coarser than git, on purpose. ⚠ A pure deletion's new-frame gap still
   claims the lines on both sides, so deleting a section's LAST lines counts
   the next section too, and must: git conflicts with an edit of that next
-  heading line. The hooks' stopgap (`headingGone`) is gone. Not counted: a
-  base-less repo (its uncommitted ranges share no frame to delete from).
+  heading line. The hooks' stopgap (`headingGone`) is gone. Not counted
+  (#247): a base-less repo's deletions and gaps (its fallback reads the
+  uncommitted ranges' new side only, and committed changes not at all), and
+  a heading base renamed after a behind window forked (its claims count under
+  the merge base's heading text).
   Pinned by `TestSectionDeletions_MatchMergeTree` (deleting a section,
   emptying or deleting the doc, a heading deleted or renamed, duplicate
-  headings, the two-step history, a behind branch: each held against `git
-  merge-tree` in `wt check` and pre-push from both windows),
+  headings, the two-step history, a behind branch, a new section against
+  each deletion, two sections appended at the end, and the lanes case that
+  stays advisory: each held against `git merge-tree` in `wt check` and
+  pre-push from both windows), `TestOldClaims`,
   `TestPreEditHooks_StructuredDocDeletionsGradeHIGH`,
   `TestSharedSectionsAcross_CountsDeletions` and `TestChangedDocEdits*`.
   A delimiter that doesn't compile leaves the entries as they were (`wt

@@ -96,11 +96,48 @@ func TestSectionDeletions_MatchMergeTree(t *testing.T) {
 				edit("## Notes\nn1\nn2\nn3\nn4\n", ""),
 			},
 			conflict: true, high: true},
+		// #237 review: the other window's only edit is a NEW section. Its
+		// lines have no section in the old copy; it claims the line it lands
+		// after (S1-S4). And a renamed heading against an edit of the line
+		// above it (S5), and two new sections appended at the end (S6).
+		{name: "S1: wa appends a section, wb deletes the doc", plan: deletePlan,
+			wa:       []func(*testing.T, string){edit("b7\n", "b7\n## Delta\nd1\n")},
+			wb:       []func(*testing.T, string){remove},
+			conflict: true, high: true},
+		{name: "S2: wa appends a section, wb empties the doc", plan: deletePlan,
+			wa:       []func(*testing.T, string){edit("b7\n", "b7\n## Delta\nd1\n")},
+			wb:       []func(*testing.T, string){edit(deletePlan, "")},
+			conflict: true, high: true},
+		{name: "S3: wa appends a section, wb deletes the last section", plan: deletePlan,
+			wa:       []func(*testing.T, string){edit("b7\n", "b7\n## Delta\nd1\n")},
+			wb:       []func(*testing.T, string){edit("## Beta\nb1\nb2\nb3\nb4\nb5\nb6\nb7\n", "")},
+			conflict: true, high: true},
+		{name: "S4: wa splits Beta with a new section, wb deletes Beta", plan: deletePlan,
+			wa:       []func(*testing.T, string){edit("b1\n", "b1\n## Delta\nd1\n")},
+			wb:       []func(*testing.T, string){edit("## Beta\nb1\nb2\nb3\nb4\nb5\nb6\nb7\n", "")},
+			conflict: true, high: true},
+		{name: "S5: wa edits the line above ## Beta, wb renames it", plan: deletePlan,
+			wa:       []func(*testing.T, string){edit("a3\n", "Xa3\n")},
+			wb:       []func(*testing.T, string){edit("## Beta\n", "## Beta two\n")},
+			conflict: true, high: true},
+		{name: "S6: both append a different section at the end", plan: deletePlan,
+			wa:       []func(*testing.T, string){edit("b7\n", "b7\n## Delta\nd1\n")},
+			wb:       []func(*testing.T, string){edit("b7\n", "b7\n## Epsilon\ne1\n")},
+			conflict: true, high: true},
+		// The lanes case structured docs exist for: wa adds a section at the
+		// end of Alpha, right before ## Beta, while wb edits Beta's body.
+		// git merges it; the insertion claims the line it lands after (a3),
+		// never the next lane.
+		{name: "wa adds a section at the end of Alpha, wb edits Beta's body", plan: deletePlan,
+			wa: []func(*testing.T, string){edit("a3\n", "a3\n## Delta\nd1\n")},
+			wb: []func(*testing.T, string){edit("b4\n", "Xb4\n")}},
 		// wa is behind main (main inserted lines in Alpha after wa forked):
-		// its deletion is read in the merge base's copy, where Beta starts
-		// two lines earlier than in main's.
+		// its deletion is read in the merge base's copy. main inserts more
+		// lines than Beta has, so read in base's copy instead, the deleted
+		// span would land in Alpha (#237 review: with a two-line insert that
+		// mistake still read Beta).
 		{name: "behind base: wa deletes the section wb edits", plan: deletePlan,
-			main:     edit("a1\n", "a1\nM1\nM2\n"),
+			main:     edit("a1\n", "a1\nM1\nM2\nM3\nM4\nM5\nM6\nM7\nM8\nM9\nM10\n"),
 			wa:       []func(*testing.T, string){edit("## Beta\nb1\nb2\nb3\nb4\nb5\nb6\nb7\n", "")},
 			wb:       []func(*testing.T, string){edit("b6\n", "Xb6\n")},
 			conflict: true, high: true},
