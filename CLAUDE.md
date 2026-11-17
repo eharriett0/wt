@@ -326,18 +326,37 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   read could be a log stopped between its truncate and its rewrite). A lock
   that fails (no flock) reads unlocked, as before. ⚠ The refusal says to
   RESUME the holder (`kill -CONT`), never to kill it: a prune killed after its
-  truncate leaves the log empty for good. Not covered here: writers (`Append`,
-  `ReserveBlock`) still wait on a stopped holder without limit (#235), and a
-  prune longer than the wait (measured 8.9s for a 1M-record log on Linux; a
-  real log is ~10k) lets a non-gate reader read unlocked mid-rewrite.
+  truncate leaves the log empty for good. ⚠ **So is the writers' wait
+  (#235):** every writer (`Append`, `ReserveBlock`, `withLockedLog`) locks
+  through `lockForWrite` (`lock.ExclusiveWithin`, polling `LOCK_EX|LOCK_NB`):
+  after `writeLockNotice` (1s) it prints "waiting for the lock on <path>"
+  once (not sooner: another append holds it for microseconds), and at
+  `writeLockWait` (30s) it fails with an error naming the log and the same
+  resume advice. Before, a stopped prune hung every announce and ack
+  silently, an agent's tool call until its own timeout. ⚠ **A filesystem
+  that can't lock at all** (`lock.Unsupported`: ENOTSUP, EOPNOTSUPP, ENOLCK,
+  ENOSYS; NFS `nolocks`, some FUSE/SMB mounts) made `Append` refuse after
+  #229, which stopped announce, ack, all-clear and block-id
+  `--written`/`--abandon`. `Append` alone writes unlocked there, `O_APPEND`
+  as before #229, warning once per process: every locker fails the same way
+  there, so no prune can rewrite under it. `ReserveBlock` (an id needs the
+  lock across its read and write) and `withLockedLog` (a rewrite without it
+  is #229) still fail. prune-coord reports a block ledger it couldn't prune
+  (it used to drop the error and the count). Not covered: a prune longer
+  than the readers' wait (measured 8.9s for a 1M-record log on Linux; a real
+  log is ~10k) lets a non-gate reader read unlocked mid-rewrite.
   Pinned by
   `TestAppend_waitsForAPruneRewrite` (a prune paused between its read and its
   rewrite; `lockedLogPause` is the seam),
   `TestLoad_waitsForAPruneRewrite` (paused right after the truncate,
   `lockedLogTruncated`), `TestLockHolders_readWithoutSelfDeadlock`,
   `TestLoad_givesUpOnAStuckHolder`,
-  `TestMergeCoordGate_RefusesALogLockedByAnotherProcess` and
-  `TestReserveBlock_noSelfDeadlockAndAppendsLand`. Off unix the lock is a
+  `TestMergeCoordGate_RefusesALogLockedByAnotherProcess`,
+  `TestReserveBlock_noSelfDeadlockAndAppendsLand`, and for #235
+  `TestAppend_givesUpOnAStuckHolder`,
+  `TestAppend_writesUnlockedWhereTheFilesystemCantLock` (`exclusiveWithin`
+  is the seam), `TestLockedWriters_sameDeadlineAndNoUnlockedFallback` and
+  `TestPruneCoord_reportsALedgerItCouldntPrune`. Off unix the lock is a
   no-op, as before.
 - **`ClassifyFacts` precedence:** open PR > merged PR > closed PR > dirty >
   unmerged > merged-by-ancestry. PR state outranks a dirty index (a
