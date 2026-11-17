@@ -167,9 +167,9 @@ func cmdBlockID(args []string) int {
 	absFile := canonicalFilePath(file)
 	return withConfig(func(c *config.Config) int {
 		path, self := coordCtx(c)
-		// Block reservations stay keyed by WINDOW (the checkout): splitting them by
-		// session is out of scope for #163. Records still carry the session
-		// (newRecord) as provenance.
+		// Reservations are owned by session, as every coordination record is
+		// (#197, #211's self.Owns): another session in this checkout can neither
+		// mark yours written nor abandon it.
 		window := self.Window
 		// block-id coordinates on the shared FILE, not the repo: use a per-file
 		// ledger so windows in ANY repo editing this append-log share one lock +
@@ -196,10 +196,10 @@ func cmdBlockID(args []string) int {
 				return 1
 			}
 			recs, _ := coord.Load(ledger)
-			res, ok := coord.FindOwnReservation(recs, window, absFile, *written)
+			res, ok := coord.FindOwnReservation(recs, self, absFile, *written)
 			if !ok {
-				ui.Err("no reservation for block %d belongs to this window (%s) — it may be another window's block; `wt block-id %s` to reserve your own (nothing recorded)",
-					*written, window, file)
+				ui.Err("%s; `wt block-id %s` to reserve your own (nothing recorded)",
+					notYourReservation(recs, self, absFile, *written, time.Now()), file)
 				return 1
 			}
 			m := newRecord(c, self, coord.KindBlockWritten)
@@ -219,10 +219,9 @@ func cmdBlockID(args []string) int {
 		// (the whole point is it isn't). Clears holds/banner and frees the id.
 		if *abandon >= 0 {
 			recs, _ := coord.Load(ledger)
-			res, ok := coord.FindOwnReservation(recs, window, absFile, *abandon)
+			res, ok := coord.FindOwnReservation(recs, self, absFile, *abandon)
 			if !ok {
-				ui.Err("no reservation for block %d belongs to this window (%s) — nothing to abandon (`wt holds` lists yours)",
-					*abandon, window)
+				ui.Err("%s; nothing to abandon (`wt holds` lists yours)", notYourReservation(recs, self, absFile, *abandon, time.Now()))
 				return 1
 			}
 			m := newRecord(c, self, coord.KindBlockAbandoned)
@@ -260,16 +259,34 @@ func cmdBlockID(args []string) int {
 	})
 }
 
-// blockReservationBanner surfaces recent block-id reservations from OTHER
-// windows at the top of `wt status` — a hint that a prepend to a shared append
-// log is imminent, so don't anchor your own prepend on the same header.
+// notYourReservation says why block on file is not self's to mark (#197): no
+// reservation at all, or whose it is, with when a stale one frees itself. Pure.
+func notYourReservation(recs []coord.Record, self coord.Self, file string, block int, now time.Time) string {
+	r, ok := coord.FindReservation(recs, file, block)
+	if !ok {
+		return fmt.Sprintf("no reservation for block %d on %s is yours (%s)", block, filepath.Base(file), selfLabel(self))
+	}
+	whose := "window " + r.Window
+	switch self.Attribute(r) {
+	case coord.AttrAnotherSession:
+		whose = "another session in this checkout (" + coord.ShortSession(r.Session) + ")"
+	case coord.AttrUnattributable:
+		whose = "this checkout, but no session can be proven for it (written by a wt without session support)"
+	}
+	return fmt.Sprintf("block %d on %s was reserved by %s %s, not by you (%s): only its owner marks it; an unwritten reservation frees its id by itself after %s",
+		block, filepath.Base(file), whose, humanAge(coord.Age(r, now)), selfLabel(self), blockReservationMaxAge)
+}
+
+// blockReservationBanner surfaces recent block-id reservations that are not
+// yours at the top of `wt status` (other windows', and another session's in
+// this checkout, #197): a hint that a prepend to a shared append log is
+// imminent, so don't anchor your own prepend on the same header.
 // Best-effort: no repo / unreadable log / none → prints nothing.
 func blockReservationBanner(c *config.Config) {
 	if c == nil {
 		return
 	}
 	_, self := coordCtx(c)
-	window := self.Window // block reservations are window-keyed (#163 leaves them so)
 	home, herr := os.UserHomeDir()
 	if herr != nil || home == "" {
 		return
@@ -278,14 +295,18 @@ func blockReservationBanner(c *config.Config) {
 	// them — this also surfaces a reservation made from ANOTHER repo on a shared file.
 	recs := coord.LoadBlockLedgers(home)
 	now := time.Now()
-	res := coord.RecentBlockReservations(recs, window, now, blockReservationMaxAge)
+	res := coord.RecentBlockReservations(recs, self, now, blockReservationMaxAge)
 	if len(res) == 0 {
 		return
 	}
-	ui.Banner(fmt.Sprintf("%d recent block-id reservation(s) from another window (any repo — reservations are per shared file) — a prepend may be imminent", len(res)))
+	ui.Banner(fmt.Sprintf("%d recent block-id reservation(s) not yours (any repo — reservations are per shared file) — a prepend may be imminent", len(res)))
 	for _, r := range res {
+		who := r.Window
+		if r.Window == self.Window {
+			who += " (" + coord.ShortSession(r.Session) + ", this checkout)"
+		}
 		fmt.Fprintf(os.Stderr, "  %s reserved block %s on %s  %s\n",
-			ui.Cyan(r.Window), ui.Bold(strconv.Itoa(r.Block)),
+			ui.Cyan(who), ui.Bold(strconv.Itoa(r.Block)),
 			ui.Dim(filepath.Base(r.File)), ui.Dim(humanAge(coord.Age(r, now))))
 	}
 }

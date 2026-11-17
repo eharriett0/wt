@@ -1034,14 +1034,13 @@ func cmdHolds(args []string) int {
 		// #211: ones wt can't attribute to any session are not yours either.
 		defer unattributedHoldsSection(coord.UnattributedOpen(recs, self), coord.GatingHolds(recs, self, now, c.HoldMaxAge), v, now, c.HoldMaxAge)
 		// #152: block reservations live in per-file ledgers (cross-repo shared), not
-		// the per-repo announce/ack log. They stay keyed by window only — splitting
-		// them by session is out of scope for #163/#211.
+		// the per-repo announce/ack log. Owned by session like the rest (#197).
 		var reserves []coord.Record
 		if home, herr := os.UserHomeDir(); herr == nil && home != "" {
-			reserves = coord.OwnBlockReservations(coord.LoadBlockLedgers(home), self.Window)
+			reserves = coord.OwnBlockReservations(coord.LoadBlockLedgers(home), self)
 		}
 		if len(own) == 0 && len(reserves) == 0 {
-			ui.OK("no outstanding holds/announcements of yours, and no block reservations for this window (%s)", selfLabel(self))
+			ui.OK("no outstanding holds/announcements of yours, and no block reservations of yours (%s)", selfLabel(self))
 			return 0
 		}
 		if len(own) > 0 {

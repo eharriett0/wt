@@ -115,7 +115,12 @@ can eyeball disjoint-ness; `wt check --json` / `wt status --json` emit the same
 data structured (with a `severity` field and `blocking` flag) for tooling and
 pre-push hooks. A range with `"Gap": true` is an insertion between lines `Start`
 and `End`; `overlap_spans` gives the lines where two windows' edits meet (for
-edits that only touch, the line on each side).
+edits that only touch, the line on each side). `wt status --json` also carries
+`session` (the reader's coordination session) and `other_sessions`: the other
+sessions that posted coordination records from this checkout in the last 24h,
+as `wt doctor --json` reports them. Two agents sharing one working tree look
+like one window to the collision engine, so this is the only sign of the
+second one.
 
 ### Stale branches don't count
 
@@ -201,7 +206,7 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 | `wt all-clear <id>` | Release your hold — for EVERY window. A hold carrying this session's own token is released at once (also one placed from another checkout); anything else (another session's or window's, one with no session recorded, and a shell's own hold when it has no session token, which wt can't prove) asks first on a terminal, and otherwise refuses unless you pass `--not-mine` |
 | `wt holds` | YOUR outstanding announcements/holds + block reservations, with copy-pasteable all-clear lines (a token-less shell's own are marked: wt can't prove them); this checkout's records wt can't attribute to any session are listed apart, without them, every hold that still gates included. Reads the mirror like `inbox` `[--issue N]` |
 | `wt prune-coord` | GC the coordination log — drop resolved handshakes + aged block reservations `[--block-max-age D]`. `--legacy` lists the open announcements written before wt recorded sessions that gate or show nothing for anyone any more; `--legacy -y` drops them with their acks (a one-time cleanup after upgrading) |
-| `wt block-id <file>` | Atomically reserve the next append-log id so two windows never grab the same `NEWEST-N`. `--written N` marks a reservation done (clears the banner; frees it if never written) `[--pattern] [--format]` |
+| `wt block-id <file>` | Atomically reserve the next append-log id so two windows never grab the same `NEWEST-N`. `--written N` marks a reservation done (clears the banner; frees it if never written), `--abandon N` frees one you won't write `[--pattern] [--format]`. A reservation is its session's: another session in the same checkout can't mark or abandon it (wt names whose it is), and sees it in its status banner instead |
 | `wt append <doc> --section H "txt"` | Locked, section-scoped append to a structured shared doc (parallel adds can't clobber) |
 | `wt install-hooks` | Install pre-push (base guard + collision check + base-conflict warning) + pre-commit (collision notice) `[--force]` |
 | `wt install-claude-hook` | Wire Claude Code hooks (**PreToolUse** per-edit + **UserPromptSubmit** per-turn overlaps + coordination) `[--write]` (see [Agents](#agents-claude-code--codex)) |
@@ -564,7 +569,10 @@ Desktop, Cursor, and others) rather than shell hooks, `wt mcp` runs a stdio
 server exposing wt's **read-only** surface as tools, so the agent can ask "who
 else is in this file?" mid-conversation:
 
-- **`wt_status`** — every active window + graded cross-window overlaps
+- **`wt_status`** — every active window + graded cross-window overlaps, and
+  the other sessions posting from this checkout (`other_sessions`). The server
+  reads its session once, when the client starts it: after a `/clear` (a new
+  session) it still answers as the old one, until the client restarts it.
 - **`wt_check`** — before editing given paths: is another live window in them?
   Relative paths are read from the repo root, wherever the client started the
   server.

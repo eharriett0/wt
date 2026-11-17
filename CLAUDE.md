@@ -164,6 +164,7 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   | inbox / banner / per-turn hook | hidden | hidden | shown | shown <24h (`coord.UnattributedHorizon`); older counted in `wt inbox` | shown |
   | acks (waive for self) | count | count | don't | count only for a signal older than 24h | never |
   | `wt prune-coord --legacy` | — | — | — | dropped (with -y) once nothing needs it: plain >24h, a hold past both 24h and hold_max_age (never with hold_max_age off) | kept |
+  | block-id reservation: `--written`/`--abandon`, `wt holds` (#197) | marks; listed as yours | marks; listed as yours | refused, owner named; in the status banner | refused; in the banner | refused; in the banner |
 
   Another window's records gate with hold_max_age and their acks never count, as
   before; a record carrying this session's token from another checkout still
@@ -222,8 +223,24 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   EVERY window and is suggested only for a hold `coord.HoldLooksOrphaned` (12h old,
   or its session silent for 4h), always saying so. In a single-worktree repo the
   per-turn hook shows this checkout's non-mine entries plus every other window's
-  HOLD (the gate enforces those). Block-id reservations are still keyed by window
-  only.
+  HOLD (the gate enforces those). ⚠ **Block-id reservations are owned the same
+  way (#197)**: `OwnBlockReservations`, `FindOwnReservation` and
+  `RecentBlockReservations` take a `Self` and use `Owns`. Keyed by window, a
+  second session in the checkout listed the first's reservation as its own in
+  `wt holds` and could `--abandon` it, freeing an id the first was about to
+  write; the next reservation then handed that id out twice. Now `--written` /
+  `--abandon` refuse anything self doesn't own and say whose it is
+  (`notYourReservation`: another session, no session, another window); an
+  unwritten reservation still frees its id on its own after
+  `DefaultBlockReserveTTL`, so a crashed session's never strands. The status
+  banner shows every reservation self doesn't own, another session's in this
+  checkout included.
+  `wt status --json` and MCP `wt_status` carry `session` and `other_sessions`
+  (`statusSessions`: `coord.OtherSessions` within `SharedCheckoutWindow`, the
+  banner's reading; doctor's field names). ⚠ `wt mcp` reads its session from
+  its env ONCE, at spawn: after `/clear` its `other_sessions` counts the new
+  session's records as another session's until the client restarts it. The
+  payload's `session` says which one it answered as.
 - **`ClassifyFacts` precedence:** open PR > merged PR > closed PR > dirty >
   unmerged > merged-by-ancestry. PR state outranks a dirty index (a
   merged/closed branch with leftover staged cruft is stale, not a permanent

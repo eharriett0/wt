@@ -266,6 +266,7 @@ func mcpStatus(c *config.Config, blocking bool) (string, bool) {
 	active, benign := collide.PartitionOverlaps(ov, live)
 	graded := gradeStatusOverlaps(c, ws, active)
 	p := buildStatusPayload(ws, graded, len(benign))
+	p.Session, p.OtherSessions = statusSessions(c, time.Now())
 	if blocking {
 		kept := p.Overlaps[:0]
 		for _, o := range p.Overlaps {

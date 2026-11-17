@@ -9,9 +9,11 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/eharriett0/wt/internal/collide"
 	"github.com/eharriett0/wt/internal/config"
+	"github.com/eharriett0/wt/internal/coord"
 	"github.com/eharriett0/wt/internal/gitx"
 	"github.com/eharriett0/wt/internal/ui"
 )
@@ -729,6 +731,13 @@ type StatusPayload struct {
 	Windows     []StatusWindow  `json:"windows"`
 	Overlaps    []StatusOverlap `json:"overlaps"`
 	BenignCount int             `json:"benign_count"`
+	// Session is the coordination session the reader is (doctor's `session`), and
+	// OtherSessions the other sessions that posted coordination records from this
+	// checkout in the last 24h (doctor's `other_sessions`, #163): two agents
+	// sharing one working tree, which the collision engine can't tell apart
+	// (#197). ⚠ `wt mcp` reads its session once, when the client spawns it.
+	Session       string                  `json:"session,omitempty"`
+	OtherSessions []coord.SessionActivity `json:"other_sessions,omitempty"`
 }
 
 // buildStatusPayload assembles the window list + graded overlaps + blocking
@@ -746,11 +755,28 @@ func buildStatusPayload(ws []collide.Window, graded []StatusOverlap, benignCount
 	return p
 }
 
-// renderStatusJSON emits the window list + graded overlaps as JSON.
-func renderStatusJSON(ws []collide.Window, graded []StatusOverlap, benignCount int) int {
-	b, _ := json.MarshalIndent(buildStatusPayload(ws, graded, benignCount), "", "  ")
+// renderStatusJSON emits the window list + graded overlaps as JSON, with the
+// shared-checkout signal (statusSessions).
+func renderStatusJSON(c *config.Config, ws []collide.Window, graded []StatusOverlap, benignCount int) int {
+	p := buildStatusPayload(ws, graded, benignCount)
+	p.Session, p.OtherSessions = statusSessions(c, time.Now())
+	b, _ := json.MarshalIndent(p, "", "  ")
 	fmt.Println(string(b))
 	return 0
+}
+
+// statusSessions is the shared-checkout signal for status's JSON and MCP's
+// wt_status (#197): the reader's session, and the other sessions that posted
+// from this checkout within coord.SharedCheckoutWindow, the same reading as
+// the `wt status` banner and `wt doctor --json`. An unreadable log reports no
+// other session, as the banner does (it is a hint, not a gate).
+func statusSessions(c *config.Config, now time.Time) (string, []coord.SessionActivity) {
+	path, self := coordCtx(c)
+	recs, err := coord.Load(path)
+	if err != nil {
+		return self.Session, nil
+	}
+	return self.Session, coord.OtherSessions(recs, self, now, coord.SharedCheckoutWindow)
 }
 
 // appendNewSpans appends the spans not already present (for the "overlap

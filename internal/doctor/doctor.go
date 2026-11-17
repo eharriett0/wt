@@ -424,7 +424,7 @@ func coordHealth(c *config.Config) *CoordHealth {
 	// They stay keyed by window only (#163 leaves block-id unsplit by session).
 	if home, herr := os.UserHomeDir(); herr == nil && home != "" {
 		ledger := coord.LoadBlockLedgers(home)
-		h.OwnBlockReserves = len(coord.OwnBlockReservations(ledger, self.Window))
+		h.OwnBlockReserves = len(coord.OwnBlockReservations(ledger, self))
 		_, h.Prunable = coord.PruneRecords(ledger, time.Now(), pruneBlockMaxAge)
 	}
 	if _, err := os.Stat(path); err != nil {

@@ -1152,14 +1152,16 @@ func InboxClearAmbiguous(recs []Record, self Self, now time.Time) bool {
 	return false
 }
 
-// OwnBlockReservations returns THIS window's block-id reservations, newest first
-// — the ids you hold (and may not have written yet), for `wt holds` (#34).
-func OwnBlockReservations(recs []Record, self string) []Record {
+// OwnBlockReservations returns self's block-id reservations, newest first —
+// the ids you hold (and may not have written yet), for `wt holds` (#34). Owned
+// as everything else is (#197): self.Owns, so another session in this checkout
+// (#163) or a reservation no session can be proven for (#211) is not yours.
+func OwnBlockReservations(recs []Record, self Self) []Record {
 	consumed := consumedBlocks(recs)
 	abandoned := abandonedReservationIDs(recs)
 	var out []Record
 	for _, r := range recs {
-		if r.Kind == KindBlockReserve && r.Window == self &&
+		if r.Kind == KindBlockReserve && self.Owns(r) &&
 			!consumed[r.File][r.Block] && !abandoned[r.ID] {
 			out = append(out, r) // hide reservations you've written (#35) or abandoned (#160)
 		}
@@ -1251,13 +1253,26 @@ func blockMarkers(recs []Record, kind string) map[string]map[int]bool {
 	return out
 }
 
-// FindOwnReservation returns this window's newest block-reserve for (file,
-// block), for linking a block-written record back to it. Pure.
-func FindOwnReservation(recs []Record, self, file string, block int) (Record, bool) {
+// FindOwnReservation returns self's newest block-reserve for (file, block),
+// for linking a block-written or block-abandoned record back to it. Only one
+// self.Owns (#197): marking another session's reservation abandoned freed its
+// id while that session was about to write it, and the next reservation handed
+// the same id out twice. Pure.
+func FindOwnReservation(recs []Record, self Self, file string, block int) (Record, bool) {
+	return findReservation(recs, file, block, self.Owns)
+}
+
+// FindReservation returns the newest block-reserve for (file, block), whoever
+// made it: what the refusal names when it isn't self's (#197). Pure.
+func FindReservation(recs []Record, file string, block int) (Record, bool) {
+	return findReservation(recs, file, block, func(Record) bool { return true })
+}
+
+func findReservation(recs []Record, file string, block int, keep func(Record) bool) (Record, bool) {
 	var found Record
 	ok := false
 	for _, r := range recs {
-		if r.Kind == KindBlockReserve && r.Window == self && r.File == file && r.Block == block {
+		if r.Kind == KindBlockReserve && r.File == file && r.Block == block && keep(r) {
 			found = r // log is append-order; last match is newest
 			ok = true
 		}
@@ -1265,16 +1280,17 @@ func FindOwnReservation(recs []Record, self, file string, block int) (Record, bo
 	return found, ok
 }
 
-// RecentBlockReservations returns block-reserve records from OTHER windows that
-// are younger than maxAge — the "a prepend is imminent, don't anchor on the
+// RecentBlockReservations returns block-reserve records that are not self's
+// and are younger than maxAge — the "a prepend is imminent, don't anchor on the
 // same header" signal for wt status. Self's own reservations are excluded (you
-// know your own). Newest first. Pure.
-func RecentBlockReservations(recs []Record, self string, now time.Time, maxAge time.Duration) []Record {
+// know your own); another session's in this checkout is shown (#197). Newest
+// first. Pure.
+func RecentBlockReservations(recs []Record, self Self, now time.Time, maxAge time.Duration) []Record {
 	consumed := consumedBlocks(recs)
 	abandoned := abandonedReservationIDs(recs)
 	var out []Record
 	for _, r := range recs {
-		if r.Kind != KindBlockReserve || r.Window == self {
+		if r.Kind != KindBlockReserve || self.Owns(r) {
 			continue
 		}
 		if consumed[r.File][r.Block] || abandoned[r.ID] {

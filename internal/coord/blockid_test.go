@@ -66,31 +66,31 @@ func TestBlockAbandoned(t *testing.T) {
 	fresh := now.Add(-time.Minute).Format(time.RFC3339)
 	f := "resume.md"
 	// file's real max is 3; self reserves the next id, 4.
-	recs := []Record{{ID: "res4", Kind: KindBlockReserve, Window: "self", File: f, Block: 4, TS: fresh}}
+	recs := []Record{{ID: "res4", Kind: KindBlockReserve, Window: "self", Session: tok, File: f, Block: 4, TS: fresh}}
 
 	// before abandon: 4 is taken → next is 5; holds + banner (other window) show it
 	if got := NextBlock(recs, f, 3, now, 30*time.Minute); got != 5 {
 		t.Fatalf("before abandon: NextBlock = %d, want 5 (4 reserved)", got)
 	}
-	if got := OwnBlockReservations(recs, "self"); len(got) != 1 {
+	if got := OwnBlockReservations(recs, Self{Window: "self", Session: tok}); len(got) != 1 {
 		t.Fatalf("before abandon: holds shows %d, want 1", len(got))
 	}
-	if got := RecentBlockReservations(recs, "other", now, 30*time.Minute); len(got) != 1 {
+	if got := RecentBlockReservations(recs, Self{Window: "other", Session: tok}, now, 30*time.Minute); len(got) != 1 {
 		t.Fatalf("before abandon: banner shows %d, want 1", len(got))
 	}
 
 	// abandon 4 (the abandon marker links back to the reservation's record ID)
-	recs = append(recs, Record{Kind: KindBlockAbandoned, Window: "self", File: f, Block: 4, AckOf: "res4", TS: fresh})
+	recs = append(recs, Record{Kind: KindBlockAbandoned, Window: "self", Session: tok, File: f, Block: 4, AckOf: "res4", TS: fresh})
 
 	// id 4 is FREED immediately (not waiting out the ttl) — next falls back to
 	// fileMax+1 = 4 instead of staying burned at 5. This is the #160 point vs #35.
 	if got := NextBlock(recs, f, 3, now, 30*time.Minute); got != 4 {
 		t.Errorf("after abandon: NextBlock = %d, want 4 (id freed, no longer burned)", got)
 	}
-	if got := OwnBlockReservations(recs, "self"); len(got) != 0 {
+	if got := OwnBlockReservations(recs, Self{Window: "self", Session: tok}); len(got) != 0 {
 		t.Errorf("after abandon: holds shows %d, want 0", len(got))
 	}
-	if got := RecentBlockReservations(recs, "other", now, 30*time.Minute); len(got) != 0 {
+	if got := RecentBlockReservations(recs, Self{Window: "other", Session: tok}, now, 30*time.Minute); len(got) != 0 {
 		t.Errorf("after abandon: banner shows %d, want 0", len(got))
 	}
 
@@ -116,23 +116,79 @@ func TestBlockAbandoned_ReuseNotMasked(t *testing.T) {
 	f := "r.md"
 	// A reserves 4 (fileMax 3) then abandons it → id 4 freed
 	recs := []Record{
-		{ID: "resA", Kind: KindBlockReserve, Window: "A", File: f, Block: 4, TS: fresh},
-		{Kind: KindBlockAbandoned, Window: "A", File: f, Block: 4, AckOf: "resA", TS: fresh},
+		{ID: "resA", Kind: KindBlockReserve, Window: "A", Session: tok, File: f, Block: 4, TS: fresh},
+		{Kind: KindBlockAbandoned, Window: "A", Session: tok, File: f, Block: 4, AckOf: "resA", TS: fresh},
 	}
 	// B reserves the freed id 4 — a DIFFERENT record, still live
-	recs = append(recs, Record{ID: "resB", Kind: KindBlockReserve, Window: "B", File: f, Block: 4, TS: fresh})
+	recs = append(recs, Record{ID: "resB", Kind: KindBlockReserve, Window: "B", Session: tok, File: f, Block: 4, TS: fresh})
 
 	if got := NextBlock(recs, f, 3, now, 30*time.Minute); got != 5 {
 		t.Errorf("NextBlock = %d, want 5 — B's LIVE reservation of the freed id must not be masked by A's abandon (collision)", got)
 	}
-	if got := OwnBlockReservations(recs, "B"); len(got) != 1 {
+	if got := OwnBlockReservations(recs, Self{Window: "B", Session: tok}); len(got) != 1 {
 		t.Errorf("B's holds shows %d, want 1 — the reused id is B's live reservation", len(got))
 	}
-	if got := RecentBlockReservations(recs, "other", now, 30*time.Minute); len(got) != 1 {
+	if got := RecentBlockReservations(recs, Self{Window: "other", Session: tok}, now, 30*time.Minute); len(got) != 1 {
 		t.Errorf("banner shows %d, want 1 — B's imminent reservation must still surface", len(got))
 	}
-	if got := OwnBlockReservations(recs, "A"); len(got) != 0 {
+	if got := OwnBlockReservations(recs, Self{Window: "A", Session: tok}); len(got) != 0 {
 		t.Errorf("A's holds shows %d, want 0 — A abandoned its own reservation", len(got))
+	}
+}
+
+// #197: a reservation is owned like every coordination record (#211's
+// self.Owns), not by window. Another session in this checkout can neither find
+// it as its own (so --written/--abandon refuse) nor hide it from its banner;
+// the directory fallback (two token-less readers) still counts as one party; a
+// reservation with no session at all is no one's.
+func TestBlockReservations_OwnedBySession(t *testing.T) {
+	now := time.Now()
+	fresh := now.Add(-time.Minute).Format(time.RFC3339)
+	const f = "log.md"
+	recs := []Record{
+		{ID: "mine", Kind: KindBlockReserve, Window: "co", Session: "A", File: f, Block: 4, TS: fresh},
+		{ID: "theirs", Kind: KindBlockReserve, Window: "co", Session: "B", File: f, Block: 5, TS: fresh},
+		{ID: "tokenless", Kind: KindBlockReserve, Window: "co", Session: SessionNone, File: f, Block: 6, TS: fresh},
+		{ID: "nosession", Kind: KindBlockReserve, Window: "co", File: f, Block: 7, TS: fresh},
+		{ID: "elsewhere", Kind: KindBlockReserve, Window: "other", Session: "A", File: f, Block: 8, TS: fresh},
+	}
+	ids := func(rs []Record) string {
+		var out []string
+		for _, r := range rs {
+			out = append(out, r.ID)
+		}
+		return strings.Join(out, ",")
+	}
+	cases := []struct {
+		self         Self
+		own, notMine string // OwnBlockReservations, RecentBlockReservations (newest first)
+		finds        map[int]bool
+	}{
+		{Self{Window: "co", Session: "A"}, "mine", "elsewhere,nosession,tokenless,theirs",
+			map[int]bool{4: true, 5: false, 6: false, 7: false, 8: false}},
+		{Self{Window: "co", Session: "B"}, "theirs", "elsewhere,nosession,tokenless,mine",
+			map[int]bool{4: false, 5: true, 6: false, 7: false}},
+		{Self{Window: "co", Session: SessionNone}, "tokenless", "elsewhere,nosession,theirs,mine",
+			map[int]bool{4: false, 5: false, 6: true, 7: false}},
+	}
+	for _, tc := range cases {
+		if got := ids(OwnBlockReservations(recs, tc.self)); got != tc.own {
+			t.Errorf("%s: OwnBlockReservations = %q, want %q", tc.self.Session, got, tc.own)
+		}
+		if got := ids(RecentBlockReservations(recs, tc.self, now, 30*time.Minute)); got != tc.notMine {
+			t.Errorf("%s: RecentBlockReservations = %q, want %q", tc.self.Session, got, tc.notMine)
+		}
+		for block, want := range tc.finds {
+			if _, ok := FindOwnReservation(recs, tc.self, f, block); ok != want {
+				t.Errorf("%s: FindOwnReservation(%d) = %v, want %v", tc.self.Session, block, ok, want)
+			}
+		}
+	}
+	if r, ok := FindReservation(recs, f, 5); !ok || r.ID != "theirs" {
+		t.Errorf("FindReservation(5) = %+v, %v; want B's", r, ok)
+	}
+	if _, ok := FindReservation(recs, f, 9); ok {
+		t.Error("FindReservation(9) found a reservation nobody made")
 	}
 }
 
@@ -211,24 +267,24 @@ func TestBlockWritten_ExcludesFromViews(t *testing.T) {
 	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
 	fresh := now.Add(-time.Minute).Format(time.RFC3339)
 	recs := []Record{
-		{Kind: KindBlockReserve, Window: "other", File: "r.md", Block: 3, TS: fresh},
-		{Kind: KindBlockReserve, Window: "self", File: "r.md", Block: 4, TS: fresh},
+		{Kind: KindBlockReserve, Window: "other", Session: tok, File: "r.md", Block: 3, TS: fresh},
+		{Kind: KindBlockReserve, Window: "self", Session: tok, File: "r.md", Block: 4, TS: fresh},
 	}
-	if got := RecentBlockReservations(recs, "self", now, 30*time.Minute); len(got) != 1 {
+	if got := RecentBlockReservations(recs, Self{Window: "self", Session: tok}, now, 30*time.Minute); len(got) != 1 {
 		t.Fatalf("before write: banner shows %d, want 1", len(got))
 	}
-	if got := OwnBlockReservations(recs, "self"); len(got) != 1 {
+	if got := OwnBlockReservations(recs, Self{Window: "self", Session: tok}); len(got) != 1 {
 		t.Fatalf("before write: holds shows %d, want 1", len(got))
 	}
 	// Mark both written.
 	recs = append(recs,
-		Record{Kind: KindBlockWritten, Window: "other", File: "r.md", Block: 3, TS: fresh},
-		Record{Kind: KindBlockWritten, Window: "self", File: "r.md", Block: 4, TS: fresh},
+		Record{Kind: KindBlockWritten, Window: "other", Session: tok, File: "r.md", Block: 3, TS: fresh},
+		Record{Kind: KindBlockWritten, Window: "self", Session: tok, File: "r.md", Block: 4, TS: fresh},
 	)
-	if got := RecentBlockReservations(recs, "self", now, 30*time.Minute); len(got) != 0 {
+	if got := RecentBlockReservations(recs, Self{Window: "self", Session: tok}, now, 30*time.Minute); len(got) != 0 {
 		t.Errorf("after write: banner should be empty, got %d", len(got))
 	}
-	if got := OwnBlockReservations(recs, "self"); len(got) != 0 {
+	if got := OwnBlockReservations(recs, Self{Window: "self", Session: tok}); len(got) != 0 {
 		t.Errorf("after write: holds should be empty, got %d", len(got))
 	}
 	// prune-coord GCs the written reservation + its marker.
@@ -247,7 +303,7 @@ func TestRecentBlockReservations(t *testing.T) {
 	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
 	mk := func(win string, block, ageMin int) Record {
 		return Record{
-			Kind: KindBlockReserve, Window: win, File: "resume.md", Block: block,
+			Kind: KindBlockReserve, Window: win, Session: tok, File: "resume.md", Block: block,
 			TS: now.Add(-time.Duration(ageMin) * time.Minute).Format(time.RFC3339),
 		}
 	}
@@ -258,7 +314,7 @@ func TestRecentBlockReservations(t *testing.T) {
 		mk("winA", 13, 1),  // other, recent → included (newest)
 		{Kind: KindAnnounce, Window: "winA", TS: now.Format(time.RFC3339)}, // wrong kind
 	}
-	got := RecentBlockReservations(recs, "self", now, 30*time.Minute)
+	got := RecentBlockReservations(recs, Self{Window: "self", Session: tok}, now, 30*time.Minute)
 	if len(got) != 2 {
 		t.Fatalf("got %d reservations, want 2: %+v", len(got), got)
 	}
