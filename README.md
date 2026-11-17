@@ -220,7 +220,8 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 **Window and session identity.** A *window* is a checkout: its worktree path,
 stable across branch switches (`WT_WINDOW` pins it across checkouts). Inside one
 checkout, each *session* is its own party: the Claude Code session
-(`CLAUDE_CODE_SESSION_ID`), the Codex session (`CODEX_SESSION_ID`), or the value
+(`CLAUDE_CODE_SESSION_ID`), the Codex session (`CODEX_SESSION_ID`, Codex 0.148.0
+or later; see the Codex section), or the value
 of `WT_SESSION` (the same value in several shells makes them one session; a
 distinct value per agent splits agents that export no session id of their own).
 So two agents started in the same checkout see each other's announcements in
@@ -604,6 +605,13 @@ hooks = false
 - Advisory by default. Set `WT_CODEX_HOOK_BLOCK=1` to have the edit hook `deny`
   a **confirmed** HIGH overlap (a heads-up-only file-level match never denies).
 - Fail-open; `WT_SKIP_COLLISION=1` to silence; ≤1-worktree repos skipped.
+- **Session identity needs Codex 0.148.0 or later**, the first release that
+  exports `CODEX_SESSION_ID` to the commands Codex runs (openai/codex#37848).
+  Under an older Codex your `wt` commands record no session, while the
+  per-turn hook reads the session id Codex sends it, so the banner lists this
+  session's own announcements as another session's (advisory, nothing
+  blocks). Upgrade Codex, or start it from a shell with its own `WT_SESSION`
+  set: both your commands and the hooks read that first.
 
 The awareness is proactive-but-coarse (per prompt, not per edit) because that's
 what Codex exposes — but the pre-push guard is the hard gate for both agents, so
