@@ -368,6 +368,20 @@ func TestOtherSessions_countBlockReservations(t *testing.T) {
 	if !strings.Contains(errOut, "checkout shared") || !strings.Contains(errOut, "session-A") {
 		t.Errorf("status banner doesn't warn of session-A:\n%s", errOut)
 	}
+	// Once the log exists (B posts), doctor reads both.
+	logPath, self := coordCtx(c)
+	if err := coord.Append(logPath, coord.Record{ID: "b1", Kind: coord.KindAnnounce, Window: self.Window, Session: self.Session,
+		Message: "B's note", TS: time.Now().UTC().Format(time.RFC3339)}); err != nil {
+		t.Fatal(err)
+	}
+	out, _ = captureT(t, func() { cmdDoctor([]string{"--json"}) })
+	d.Coord.OtherSessions = nil
+	if err := json.Unmarshal([]byte(out), &d); err != nil {
+		t.Fatalf("doctor --json: %v\n%s", err, out)
+	}
+	if len(d.Coord.OtherSessions) != 1 || d.Coord.OtherSessions[0].Session != "session-A" {
+		t.Errorf("doctor --json with a log = %+v, want session-A only", d.Coord.OtherSessions)
+	}
 	t.Setenv("WT_SESSION", "session-A")
 	if _, errOut := captureT(t, func() { sharedCheckoutBanner(c) }); strings.Contains(errOut, "checkout shared") {
 		t.Errorf("A's own reservation reads as another session's:\n%s", errOut)
