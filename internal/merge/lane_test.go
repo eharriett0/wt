@@ -40,18 +40,30 @@ func TestUnshippedLane_FetchesThePRHeadByNumber(t *testing.T) {
 	t.Setenv("PATH", gh+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Chdir(repo)
 	var asked []string
-	orig := fetchPRHead
-	t.Cleanup(func() { fetchPRHead = orig })
+	orig, origRepo := fetchPRHead, originRepo
+	t.Cleanup(func() { fetchPRHead, originRepo = orig, origRepo })
 	fetchPRHead = func(remote, pr string) error {
-		asked = append(asked, pr)
+		asked = append(asked, remote+" "+pr)
 		return os.ErrNotExist
 	}
+	originRepo = func() (string, string, string) { return "github.com", "acme", "repo" }
 	msg := UnshippedLane("https://github.com/acme/repo/pull/5/files", "feat-x", strings.TrimSpace(string(tip)))
-	if len(asked) != 1 || asked[0] != "5" {
-		t.Errorf("fetched %q, want PR 5's head fetched once", asked)
+	if len(asked) != 1 || asked[0] != "origin 5" {
+		t.Errorf("fetched %q, want PR 5's head fetched once, from origin", asked)
 	}
 	if !strings.Contains(msg, "`git fetch origin refs/pull/5/head`") {
 		t.Errorf("kept-lane message: %q, want the fetch command for PR 5", msg)
+	}
+	// #228 review: origin is a fork (me/repo) and the PR is upstream's, where
+	// PR 5 on origin is another PR or none.
+	asked = nil
+	originRepo = func() (string, string, string) { return "github.com", "me", "repo" }
+	msg = UnshippedLane("https://github.com/acme/repo/pull/5", "feat-x", strings.TrimSpace(string(tip)))
+	if len(asked) != 1 || asked[0] != "https://github.com/acme/repo 5" {
+		t.Errorf("fetched %q, want PR 5's head fetched from acme/repo", asked)
+	}
+	if !strings.Contains(msg, "`git fetch https://github.com/acme/repo refs/pull/5/head`") {
+		t.Errorf("kept-lane message: %q, want the fetch from acme/repo", msg)
 	}
 }
 

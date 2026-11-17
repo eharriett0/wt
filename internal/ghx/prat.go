@@ -35,19 +35,27 @@ const prAtJQ = `"\(.number) \(.url)\n\(.headRepositoryOwner.login // "")/\(.head
 // number in the cwd's repository.
 func ResolvePRIn(pr, repo string) (PRAt, error) {
 	args := []string{"pr", "view", pr, "--json", "number,url,headRepository,headRepositoryOwner", "--jq", prAtJQ}
+	if repo != "" {
+		args = append(args, "-R", repo)
+	}
+	out, err := run(args...)
+	if err != nil {
+		return PRAt{}, fmt.Errorf("cannot resolve PR %s: %w", resolveWhere(pr, repo), ghErrAt(selectorHost(pr, repo), apiGraphQL, err))
+	}
+	return parsePRAt(out)
+}
+
+// resolveWhere names what ResolvePRIn was asked for: "#5 in o/r", or a URL as
+// given, never "#<url>" (#228 review). Pure.
+func resolveWhere(pr, repo string) string {
 	where := pr
 	if !IsPRURL(pr) {
 		where = "#" + strings.TrimPrefix(pr, "#")
 	}
 	if repo != "" {
-		args = append(args, "-R", repo)
 		where += " in " + repo
 	}
-	out, err := run(args...)
-	if err != nil {
-		return PRAt{}, fmt.Errorf("cannot resolve PR %s: %w", where, ghErrAt(selectorHost(pr, repo), apiGraphQL, err))
-	}
-	return parsePRAt(out)
+	return where
 }
 
 // selectorHost is the host gh sends a PR selector to: a URL's own host, else

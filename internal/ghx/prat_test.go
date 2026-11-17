@@ -93,6 +93,19 @@ func TestWithURLHost(t *testing.T) {
 	}
 }
 
+func TestResolveWhere(t *testing.T) {
+	for _, tc := range []struct{ pr, repo, want string }{
+		{"5", "o/r", "#5 in o/r"},
+		{"#5", "o/r", "#5 in o/r"},
+		{"https://github.com/o/r/pull/5", "", "https://github.com/o/r/pull/5"},
+		{"https://github.com/o/r/pull/5", "x/y", "https://github.com/o/r/pull/5 in x/y"},
+	} {
+		if got := resolveWhere(tc.pr, tc.repo); got != tc.want {
+			t.Errorf("resolveWhere(%q, %q) = %q, want %q", tc.pr, tc.repo, got, tc.want)
+		}
+	}
+}
+
 func TestSelectorHost(t *testing.T) {
 	t.Setenv("GH_HOST", "")
 	for _, tc := range []struct{ pr, repo, want string }{
