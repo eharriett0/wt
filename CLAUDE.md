@@ -279,10 +279,18 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   `appendLocked`. Both handles are `O_APPEND`, so a writer that doesn't lock
   (an older wt mid-rollout, a no-lock build) can't be overwritten by these
   writes; a prune can still drop its record, which is #229 itself.
-  ⚠ Readers (`Load`) take no lock yet, so a read during a prune's rewrite can
-  see an empty log (#234). Pinned by
+  ⚠ **Readers take the SHARED lock (#234):** unlocked, a `Load` between the
+  prune's truncate and its rewrite read an empty log, so merge-pr's hold gate
+  (and inbox, holds, the hooks, MCP, doctor) missed a hold that never left the
+  file. `Load` waits while a prune or an append holds the log; the two callers
+  that read while holding the exclusive lock through another descriptor
+  (`withLockedLog`, `ReserveBlock`) use `loadHeld`, which takes none (it would
+  wait on itself). A lock that fails (no flock) reads unlocked, as before.
+  Pinned by
   `TestAppend_waitsForAPruneRewrite` (a prune paused between its read and its
-  rewrite; `lockedLogPause` is the seam) and
+  rewrite; `lockedLogPause` is the seam),
+  `TestLoad_waitsForAPruneRewrite` (paused right after the truncate,
+  `lockedLogTruncated`), `TestLockHolders_readWithoutSelfDeadlock` and
   `TestReserveBlock_noSelfDeadlockAndAppendsLand`. Off unix the lock is a
   no-op, as before.
 - **`ClassifyFacts` precedence:** open PR > merged PR > closed PR > dirty >

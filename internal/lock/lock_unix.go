@@ -16,6 +16,13 @@ func Exclusive(f *os.File) error {
 	return syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
 }
 
+// Shared takes a blocking shared advisory lock on f: many readers hold it at
+// once, and it waits while any Exclusive holder (a prune's rewrite, an append)
+// has the file (#234).
+func Shared(f *os.File) error {
+	return syscall.Flock(int(f.Fd()), syscall.LOCK_SH)
+}
+
 // Release drops the advisory lock on f. Errors are ignored — closing the fd
 // releases the lock regardless, and a defer'd release must not mask the real op
 // error.
