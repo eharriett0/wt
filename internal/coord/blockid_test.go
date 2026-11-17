@@ -43,9 +43,9 @@ func TestPruneBlockLedgers(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	dropped, err := PruneBlockLedgers(home, time.Now(), 24*time.Hour)
-	if err != nil {
-		t.Fatal(err)
+	dropped, locked, err := PruneBlockLedgers(home, time.Now(), 24*time.Hour)
+	if err != nil || len(locked) != 0 {
+		t.Fatal(locked, err)
 	}
 	if dropped != 1 {
 		t.Errorf("dropped = %d, want 1 (the 48h-old reservation)", dropped)
@@ -53,9 +53,9 @@ func TestPruneBlockLedgers(t *testing.T) {
 	if recs := LoadBlockLedgers(home); len(recs) != 1 || recs[0].Block != 2 {
 		t.Errorf("survivors = %+v, want only fresh block 2", recs)
 	}
-	// missing dir → (0, nil)
-	if d, err := PruneBlockLedgers(filepath.Join(t.TempDir(), "nope"), time.Now(), 24*time.Hour); d != 0 || err != nil {
-		t.Errorf("missing dir: d=%d err=%v", d, err)
+	// missing dir → (0, nil, nil)
+	if d, locked, err := PruneBlockLedgers(filepath.Join(t.TempDir(), "nope"), time.Now(), 24*time.Hour); d != 0 || locked != nil || err != nil {
+		t.Errorf("missing dir: d=%d locked=%v err=%v", d, locked, err)
 	}
 }
 
