@@ -9,6 +9,7 @@ import (
 	"github.com/eharriett0/wt/internal/config"
 	"github.com/eharriett0/wt/internal/ghx"
 	"github.com/eharriett0/wt/internal/gitx"
+	"github.com/eharriett0/wt/internal/merge"
 	"github.com/eharriett0/wt/internal/ui"
 )
 
@@ -352,12 +353,12 @@ func deployGateApplies(srcs []gateSource, pr, repo string) (fires bool, unsure s
 	fires, by := deployDecision(srcs, files, err)
 	if !fires {
 		if gateOn(srcs) {
-			ui.Info("PR #%s changes no deploy-path files (merge_is_deploy_paths) — skipping the prod gate", pr)
+			ui.Info("PR %s changes no deploy-path files (merge_is_deploy_paths) — skipping the prod gate", merge.PRLabel(pr))
 		}
 		return false, ""
 	}
 	if err != nil {
-		ui.Warn("merge_is_deploy_paths set but couldn't list PR #%s files (%v) — gating to be safe", pr, err)
+		ui.Warn("merge_is_deploy_paths set but couldn't list PR %s files (%v) — gating to be safe", merge.PRLabel(pr), err)
 	}
 	firesRead, byRead := deployDecision(read, files, err)
 	if !firesRead {
@@ -377,7 +378,7 @@ func deployGateApplies(srcs []gateSource, pr, repo string) (fires bool, unsure s
 		selfSkips = !selfSkips
 	}
 	if selfSkips && by != "" {
-		ui.Info("PR #%s gates under %s; this checkout's settings alone would skip the prod gate", pr, by)
+		ui.Info("PR %s gates under %s; this checkout's settings alone would skip the prod gate", merge.PRLabel(pr), by)
 	}
 	return true, ""
 }

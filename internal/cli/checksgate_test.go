@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -679,7 +680,13 @@ func TestCmdMergePR_checksGate(t *testing.T) {
 			case tc.merged != nil && err != nil:
 				t.Errorf("gh pr merge never ran: %v", err)
 			case tc.merged != nil:
-				want := append([]string{"pr", "merge", "99999", "--squash"}, tc.merged...)
+				// #228: with -R the merge takes the PR's URL in that repository,
+				// as every read does.
+				sel := "99999"
+				if slices.Contains(tc.args, "-R") {
+					sel = "https://github.com/other/repo/pull/99999"
+				}
+				want := append([]string{"pr", "merge", sel, "--squash"}, tc.merged...)
 				if got := strings.Split(strings.TrimSuffix(string(argv), "\n"), "\n"); !reflect.DeepEqual(got, want) {
 					t.Errorf("gh argv = %q, want %q", got, want)
 				}

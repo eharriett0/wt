@@ -428,6 +428,7 @@ func (b ForwardedBody) RedirectToStdin(args []string) []string {
 // error from gh itself wraps ErrMergeCommand (#196); a guard's refusal does
 // not.
 func Run(pr string, dryRun, bypass, mergeForeign bool, worktreeBranches []string, extraArgs []string, ghStdin io.Reader, checks string) error {
+	name := PRLabel(pr)
 	var diff DiffRead
 	diff.Files, diff.Err = ghx.PRChangedFileCount(pr)
 	subjects := ghx.PRCommitSubjects(pr)
@@ -437,29 +438,29 @@ func Run(pr string, dryRun, bypass, mergeForeign bool, worktreeBranches []string
 	case VerdictDiffUnread:
 		// #217: not an empty diff, and not a reason to spend --bypass: an
 		// exhausted REST quota is the usual cause, and it lifts on its own.
-		fmt.Fprintf(os.Stderr, "REFUSING to merge PR #%s: its diff could not be read, so wt cannot tell whether it is empty.\n", pr)
+		fmt.Fprintf(os.Stderr, "REFUSING to merge PR %s: its diff could not be read, so wt cannot tell whether it is empty.\n", name)
 		fmt.Fprintf(os.Stderr, "Why: %v\n", diff.Err)
 		if ghx.IsRateLimit(diff.Err) {
 			fmt.Fprintln(os.Stderr, "Run the merge again once the rate limit lifts.")
 		} else {
-			fmt.Fprintf(os.Stderr, "Check that gh can read it (gh pr diff %s --name-only), then run the merge again.\n", pr)
+			fmt.Fprintf(os.Stderr, "Check that gh can read it (gh pr diff %s --name-only), then run the merge again.\n", PRArg(pr))
 		}
 		if !bypass {
 			return fmt.Errorf("diff unread")
 		}
 		fmt.Fprintln(os.Stderr, "--bypass set: proceeding without the empty-diff check.")
 	case VerdictEmptyDiff:
-		fmt.Fprintf(os.Stderr, "REFUSING to merge PR #%s — diff vs base is EMPTY (no real content).\n", pr)
+		fmt.Fprintf(os.Stderr, "REFUSING to merge PR %s — diff vs base is EMPTY (no real content).\n", name)
 		fmt.Fprintln(os.Stderr, "This is the claim-work placeholder bug class: a placeholder PR merging vacuously.")
-		fmt.Fprintf(os.Stderr, "Bypass (rare — e.g. a deliberately empty change): wt merge-pr %s --bypass\n", pr)
+		fmt.Fprintf(os.Stderr, "Bypass (rare — e.g. a deliberately empty change): wt merge-pr %s --bypass\n", PRArg(pr))
 		if !bypass {
 			return fmt.Errorf("empty diff")
 		}
 		fmt.Fprintln(os.Stderr, "--bypass set — proceeding despite empty diff.")
 	case VerdictPlaceholderOnly:
-		fmt.Fprintf(os.Stderr, "REFUSING to merge PR #%s — every commit is a 'WIP: claim #' placeholder.\n", pr)
+		fmt.Fprintf(os.Stderr, "REFUSING to merge PR %s — every commit is a 'WIP: claim #' placeholder.\n", name)
 		fmt.Fprintln(os.Stderr, "The real work never landed on the branch.")
-		fmt.Fprintf(os.Stderr, "Bypass: wt merge-pr %s --bypass\n", pr)
+		fmt.Fprintf(os.Stderr, "Bypass: wt merge-pr %s --bypass\n", PRArg(pr))
 		if !bypass {
 			return fmt.Errorf("placeholder only")
 		}
@@ -474,9 +475,9 @@ func Run(pr string, dryRun, bypass, mergeForeign bool, worktreeBranches []string
 
 	// Always surface the head branch — the single line that catches a
 	// wrong-branch merge before it happens (wt#15).
-	label := "PR #" + pr
+	label := "PR " + name
 	if head != "" {
-		label = fmt.Sprintf("PR #%s from branch %q", pr, head)
+		label = fmt.Sprintf("PR %s from branch %q", name, head)
 	}
 
 	// dry-run previews (never blocks) — but flags a foreign head so the operator
@@ -495,9 +496,9 @@ func Run(pr string, dryRun, bypass, mergeForeign bool, worktreeBranches []string
 	// lane" class. --merge-foreign (or --bypass) proceeds. Fail-open via
 	// BranchIsForeign when the head / worktree set is unknown.
 	if foreign && !mergeForeign && !bypass {
-		fmt.Fprintf(os.Stderr, "REFUSING to merge PR #%s — head branch %q has no wt worktree here (foreign branch).\n", pr, head)
+		fmt.Fprintf(os.Stderr, "REFUSING to merge PR %s — head branch %q has no wt worktree here (foreign branch).\n", name, head)
 		fmt.Fprintln(os.Stderr, "In a multi-window setup this is the 'merged the wrong lane' class (wt#15).")
-		fmt.Fprintf(os.Stderr, "If intended: wt merge-pr %s --merge-foreign\n", pr)
+		fmt.Fprintf(os.Stderr, "If intended: wt merge-pr %s --merge-foreign\n", PRArg(pr))
 		return fmt.Errorf("foreign branch")
 	}
 

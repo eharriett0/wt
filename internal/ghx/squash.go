@@ -34,10 +34,10 @@ func PRCommits(pr string) ([]PRCommit, error) {
 	if err != nil || strings.TrimSpace(url) == "" {
 		return nil, fmt.Errorf("cannot resolve PR #%s's URL: %v", pr, err)
 	}
-	out, err := run("api", "graphql", "--paginate",
-		"-f", "query="+prCommitsQuery,
-		"-f", "url="+strings.TrimSpace(url),
-		"--jq", `.data.resource.commits.nodes[] | {message: .commit.message, parents: .commit.parents.totalCount}`)
+	out, err := run(withURLHost([]string{"api", "graphql", "--paginate",
+		"-f", "query=" + prCommitsQuery,
+		"-f", "url=" + strings.TrimSpace(url),
+		"--jq", `.data.resource.commits.nodes[] | {message: .commit.message, parents: .commit.parents.totalCount}`}, url)...)
 	if err != nil {
 		return nil, err
 	}
@@ -81,14 +81,27 @@ func parsePRCommits(out string) ([]PRCommit, error) {
 // viewer who is not an admin (measured on a public repo as a READ viewer), while
 // GraphQL's squashMergeCommitTitle / squashMergeCommitMessage answer any reader.
 // {owner}/{repo} resolve the way the gh pr reads do.
-func RepoSquashSettings() (title, message string) {
+func RepoSquashSettings() (title, message string) { return RepoSquashSettingsOf("", "", "") }
+
+// RepoSquashSettingsOf is RepoSquashSettings for owner/name on host (#228: a
+// forwarded -R or a PR's URL merges another repository's PR, with that
+// repository's settings); "" for owner and name is the cwd's repository, ""
+// for host gh's default.
+func RepoSquashSettingsOf(host, owner, name string) (title, message string) {
 	if !Present() || !SignedIn() {
 		return "", ""
 	}
-	out, err := run("api", "graphql",
-		"-F", "owner={owner}", "-F", "name={repo}",
+	if owner == "" || name == "" {
+		owner, name = "{owner}", "{repo}"
+	}
+	args := []string{"api", "graphql",
+		"-F", "owner=" + owner, "-F", "name=" + name,
 		"-f", "query=query($owner:String!,$name:String!){repository(owner:$owner,name:$name){squashMergeCommitTitle squashMergeCommitMessage}}",
-		"--jq", `.data.repository | {title: .squashMergeCommitTitle, message: .squashMergeCommitMessage}`)
+		"--jq", `.data.repository | {title: .squashMergeCommitTitle, message: .squashMergeCommitMessage}`}
+	if host != "" {
+		args = append(args, "--hostname", host)
+	}
+	out, err := run(args...)
 	if err != nil {
 		return "", ""
 	}

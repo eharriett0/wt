@@ -40,18 +40,60 @@ func TestUnshippedLane_FetchesThePRHeadByNumber(t *testing.T) {
 	t.Setenv("PATH", gh+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Chdir(repo)
 	var asked []string
-	orig := fetchPRHead
-	t.Cleanup(func() { fetchPRHead = orig })
+	orig, origRepo := fetchPRHead, originRepo
+	t.Cleanup(func() { fetchPRHead, originRepo = orig, origRepo })
 	fetchPRHead = func(remote, pr string) error {
-		asked = append(asked, pr)
+		asked = append(asked, remote+" "+pr)
 		return os.ErrNotExist
 	}
+	originRepo = func() (string, string, string) { return "github.com", "acme", "repo" }
 	msg := UnshippedLane("https://github.com/acme/repo/pull/5/files", "feat-x", strings.TrimSpace(string(tip)))
-	if len(asked) != 1 || asked[0] != "5" {
-		t.Errorf("fetched %q, want PR 5's head fetched once", asked)
+	if len(asked) != 1 || asked[0] != "origin 5" {
+		t.Errorf("fetched %q, want PR 5's head fetched once, from origin", asked)
 	}
 	if !strings.Contains(msg, "`git fetch origin refs/pull/5/head`") {
 		t.Errorf("kept-lane message: %q, want the fetch command for PR 5", msg)
+	}
+	// #228 review: origin is a fork (me/repo) and the PR is upstream's, where
+	// PR 5 on origin is another PR or none.
+	asked = nil
+	originRepo = func() (string, string, string) { return "github.com", "me", "repo" }
+	msg = UnshippedLane("https://github.com/acme/repo/pull/5", "feat-x", strings.TrimSpace(string(tip)))
+	if len(asked) != 1 || asked[0] != "https://github.com/acme/repo 5" {
+		t.Errorf("fetched %q, want PR 5's head fetched from acme/repo", asked)
+	}
+	if !strings.Contains(msg, "`git fetch https://github.com/acme/repo refs/pull/5/head`") {
+		t.Errorf("kept-lane message: %q, want the fetch from acme/repo", msg)
+	}
+}
+
+// A message names a PR "#5", or by the selector given, never "#<url>" (#228
+// review).
+func TestPRLabel(t *testing.T) {
+	for pr, want := range map[string]string{
+		"5":                                   "#5",
+		"#5":                                  "#5",
+		"https://github.com/acme/repo/pull/5": "https://github.com/acme/repo/pull/5",
+		"feat-x":                              "feat-x",
+		"+5":                                  "+5",
+		"0":                                   "0",
+		"":                                    "",
+	} {
+		if got := PRLabel(pr); got != want {
+			t.Errorf("PRLabel(%q) = %q, want %q", pr, got, want)
+		}
+	}
+}
+
+// A hint's command never spells a PR "#5": a shell reads "#" as a comment.
+func TestPRArg(t *testing.T) {
+	for pr, want := range map[string]string{
+		"#5": "5", "5": "5", "https://x/o/r/pull/5": "https://x/o/r/pull/5",
+		"#hotfix": "#hotfix", "#0": "#0", "#+5": "#+5", "feat-x": "feat-x",
+	} {
+		if got := PRArg(pr); got != want {
+			t.Errorf("PRArg(%q) = %q, want %q", pr, got, want)
+		}
 	}
 }
 
@@ -78,10 +120,38 @@ func TestPRNumber(t *testing.T) {
 		}
 	}
 	const head = "1111111111111111111111111111111111111111"
-	if got := KeptLaneMessage(TipUnknown, "feat-x", "https://github.com/acme/repo/pull/5", -1, "t", head); !strings.Contains(got, "`git fetch origin refs/pull/5/head`") {
+	if got := KeptLaneMessage(TipUnknown, "feat-x", "https://github.com/acme/repo/pull/5", "origin", -1, "t", head); !strings.Contains(got, "`git fetch origin refs/pull/5/head`") {
 		t.Errorf("a PR given as a URL: %q, want the fetch command for PR 5", got)
 	}
-	if got := KeptLaneMessage(TipUnknown, "feat-x", "feat-x", -1, "t", head); strings.Contains(got, "refs/pull/") {
+	if got := KeptLaneMessage(TipUnknown, "feat-x", "feat-x", "origin", -1, "t", head); strings.Contains(got, "refs/pull/") {
 		t.Errorf("no PR number: %q, want no fetch command", got)
+	}
+}
+
+// #228 review: with origin a fork and -R naming upstream, PR n on origin is
+// another PR or none, so the head is fetched, and the hint fetches it, from
+// the PR's own repository.
+func TestPRRemote(t *testing.T) {
+	orig := originRepo
+	t.Cleanup(func() { originRepo = orig })
+	originRepo = func() (string, string, string) { return "github.com", "me", "repo" }
+	for pr, want := range map[string]string{
+		"5":                                    "origin",
+		"https://github.com/me/repo/pull/5":    "origin",
+		"https://github.com/ME/Repo/pull/5":    "origin",
+		"https://github.com/up/repo/pull/5":    "https://github.com/up/repo",
+		"https://git.acme.test/up/svc/pull/12": "https://git.acme.test/up/svc",
+	} {
+		if got := prRemote(pr); got != want {
+			t.Errorf("prRemote(%q) = %q, want %q", pr, got, want)
+		}
+	}
+	originRepo = func() (string, string, string) { return "", "", "" }
+	if got := prRemote("https://github.com/up/repo/pull/5"); got != "origin" {
+		t.Errorf("an origin wt can't read: %q, want origin", got)
+	}
+	const head = "1111111111111111111111111111111111111111"
+	if got := KeptLaneMessage(TipUnknown, "feat-x", "https://github.com/up/repo/pull/5", "https://github.com/up/repo", -1, "t", head); !strings.Contains(got, "`git fetch https://github.com/up/repo refs/pull/5/head`") {
+		t.Errorf("the hint must fetch from the PR's repository: %q", got)
 	}
 }

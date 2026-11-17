@@ -128,7 +128,7 @@ func TestKeptLaneMessage(t *testing.T) {
 		{TipUnknown, -1, "t", head, "feat-x may have commits that were not in PR #5: wt could not compare its tip with the PR's head 111111111111, which is not in this clone (`git fetch origin refs/pull/5/head` brings it in; then run it again)" + unsure},
 	}
 	for _, tc := range cases {
-		if got := KeptLaneMessage(tc.v, "feat-x", "5", tc.n, tc.tip, tc.head); got != tc.want {
+		if got := KeptLaneMessage(tc.v, "feat-x", "5", "origin", tc.n, tc.tip, tc.head); got != tc.want {
 			t.Errorf("KeptLaneMessage(%q, n=%d, tip=%q, head=%q) =\n %q\nwant\n %q", tc.v, tc.n, tc.tip, tc.head, got, tc.want)
 		}
 	}
