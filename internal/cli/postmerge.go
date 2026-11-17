@@ -24,9 +24,9 @@ func mergeConfirmed(pr string) bool {
 	case merge.PostMerged:
 		return true
 	case merge.PostUnknown:
-		ui.Warn("gh exited 0 but PR #%s's state could not be read: not confirmed merged, so the worktree and branch are kept; `wt clean` removes them once it ships", pr)
+		ui.Warn("gh exited 0 but PR %s's state could not be read: not confirmed merged, so the worktree and branch are kept; `wt clean` removes them once it ships", merge.PRLabel(pr))
 	default:
-		ui.Warn("gh exited 0 but PR #%s is %s: not merged, so the worktree and branch are kept; `wt clean` removes them once it ships", pr, state)
+		ui.Warn("gh exited 0 but PR %s is %s: not merged, so the worktree and branch are kept; `wt clean` removes them once it ships", merge.PRLabel(pr), state)
 	}
 	if v == merge.PostOpen {
 		ui.Info("gh exits 0 without merging when it arms auto-merge (--auto) or hands the PR to a merge queue, and GitHub merges it later (gh's output above says which); also for --help, --disable-auto and -R <another repo>")
@@ -44,7 +44,7 @@ func mergedDespiteFailure(pr string) bool {
 	if _, v := merge.ConfirmMerged(func() string { return ghx.PRState(pr) }, postMergeSleep); v != merge.PostMerged {
 		return false
 	}
-	ui.Warn("gh pr merge exited non-zero, but PR #%s is MERGED: gh failed after the merge (its error is above; `-d` does when a wt worktree has the branch checked out), so merge-pr verifies the closes and cleans up as for any merge", pr)
+	ui.Warn("gh pr merge exited non-zero, but PR %s is MERGED: gh failed after the merge (its error is above; `-d` does when a wt worktree has the branch checked out), so merge-pr verifies the closes and cleans up as for any merge", merge.PRLabel(pr))
 	return true
 }
 

@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/eharriett0/wt/internal/config"
@@ -640,7 +641,9 @@ func allClear(c *config.Config, path string, self coord.Self, id string, notMine
 // window hasn't acked it — the coordination log acting as a real interlock, the
 // same shape as the collision guard. Best-effort: a coord read error never
 // blocks a merge (fail-open — coordination is advisory infrastructure, not a
-// gate that can wedge the user's ship path if the log is unreadable).
+// gate that can wedge the user's ship path if the log is unreadable), except
+// a log wt could not lock to read (#234, #235): read unlocked, it may be one a
+// prune has truncated and not yet rewritten, holds gone.
 func mergeCoordGate(c *config.Config) int {
 	return mergeCoordGateWith(c, c.HoldMaxAge, nonZero(c.CoordIssue))
 }
@@ -667,6 +670,16 @@ func mergeCoordGateWith(c *config.Config, holdMaxAge time.Duration, issues []int
 		// advise killing it: a prune killed after its truncate leaves the log
 		// empty for good, the very loss #234 is about.
 		ui.Err("merge blocked: %v. Find the process holding %s (`lsof %s`), RESUME it if it was stopped (`fg`, or `kill -CONT <pid>`) and let it finish, then merge again. Don't kill it: a prune killed mid-rewrite leaves the log empty.", err, path, path)
+		return 1
+	}
+	if errors.Is(err, coord.ErrLogUnlockable) {
+		// #235 review: no holder to hunt for (EIO, say); the read is still
+		// unsafe unlocked, and a retry usually takes the lock.
+		ui.Err("merge blocked: %v, and an unlocked read could miss a hold a prune is rewriting. Run the merge again.", err)
+		if errors.Is(err, syscall.ENOLCK) {
+			// Retrying won't help while this machine's lock service is down.
+			ui.Info("\"no locks available\" that keeps coming back means this machine's lock service (NFS lockd/statd) is down: start it, or move ~/.wt to a local disk")
+		}
 		return 1
 	}
 	if err != nil {
@@ -893,6 +906,10 @@ func holdersPhrase(holds []coord.Record, self coord.Self) string {
 	return strings.Join(kinds, " AND ")
 }
 
+// pruneBlockLedgers is prune-coord's ledger GC; a var so a test can make it
+// fail.
+var pruneBlockLedgers = coord.PruneBlockLedgers
+
 // cmdPruneCoord GCs the coordination log — drops completed (all-cleared)
 // announce+ack+all-clear handshakes and aged-out block reservations, keeping
 // every still-open record (#33). The log is append-only and re-parsed on every
@@ -938,14 +955,32 @@ func cmdPruneCoord(args []string) int {
 		}
 		// #152: block reservations live in per-file ledgers now — GC those too, or
 		// they'd grow append-only forever (the per-repo PruneLog never sees them).
+		skipped := false
 		if home, herr := os.UserHomeDir(); herr == nil && home != "" {
-			if bd, berr := coord.PruneBlockLedgers(home, now, dur); berr == nil {
-				dropped += bd
+			bd, locked, berr := pruneBlockLedgers(home, now, dur)
+			dropped += bd
+			// #235: a ledger another process keeps locked past the writers'
+			// deadline is skipped; say so, never prune silently less. One
+			// path a line and the advice once (#235 review).
+			if len(locked) > 0 {
+				ui.Warn("%d block ledger(s) stayed locked by another wt process, not pruned:", len(locked))
+				for _, p := range locked {
+					fmt.Fprintln(os.Stderr, "    "+p)
+				}
+				ui.Warn("find the holder with `lsof <path>`, resume it if it was stopped (`fg`, or `kill -CONT <pid>`) and let it finish, then run prune-coord again. Don't kill it: a prune killed mid-rewrite leaves the ledger empty.")
 			}
+			if berr != nil {
+				ui.Warn("block ledgers not all pruned: %v", berr)
+			}
+			skipped = len(locked) > 0 || berr != nil
 		}
-		if dropped == 0 {
+		switch {
+		case skipped:
+			// #235 review: "already tidy" under that warning contradicted it.
+			ui.Info("pruned %d resolved/expired record(s); the block ledgers named above were skipped (run it again once they are free)", dropped)
+		case dropped == 0:
 			ui.OK("coordination log already tidy — nothing to prune")
-		} else {
+		default:
 			ui.OK("pruned %d resolved/expired record(s) from the coordination log + block ledgers", dropped)
 		}
 		if recs, lerr := coord.Load(path); lerr == nil {

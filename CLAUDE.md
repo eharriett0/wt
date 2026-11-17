@@ -326,18 +326,65 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   read could be a log stopped between its truncate and its rewrite). A lock
   that fails (no flock) reads unlocked, as before. ⚠ The refusal says to
   RESUME the holder (`kill -CONT`), never to kill it: a prune killed after its
-  truncate leaves the log empty for good. Not covered here: writers (`Append`,
-  `ReserveBlock`) still wait on a stopped holder without limit (#235), and a
-  prune longer than the wait (measured 8.9s for a 1M-record log on Linux; a
-  real log is ~10k) lets a non-gate reader read unlocked mid-rewrite.
+  truncate leaves the log empty for good. ⚠ **So is the writers' wait
+  (#235):** every writer (`Append`, `ReserveBlock`, `withLockedLog`) locks
+  through `lockForWrite` (`lock.ExclusiveWithin`, polling `LOCK_EX|LOCK_NB`):
+  after `writeLockNotice` (1s) it prints "waiting for the lock on <path>"
+  once (not sooner: another append holds it for microseconds), and at
+  `writeLockWait` (30s) it fails with an error naming the log and the same
+  resume advice. Before, a stopped prune hung every announce and ack
+  silently, an agent's tool call until its own timeout. ⚠ **A filesystem
+  that can't lock at all** (`lock.Unsupported`: ENOTSUP, EOPNOTSUPP, ENOSYS;
+  macOS NFS `nolocks`, some FUSE/SMB mounts) made `Append` refuse after
+  #229, which stopped announce, ack, all-clear and block-id
+  `--written`/`--abandon`. `Append` alone writes unlocked there, `O_APPEND`
+  as before #229, warning once per process: every locker ON THIS MACHINE
+  fails the same way there, so no prune here can rewrite under it (machines
+  sharing `~/.wt` where only some can lock were never protected).
+  `ReserveBlock` (an id needs the lock across its read and write) and
+  `withLockedLog` (a rewrite without it is #229) still fail. ⚠ **ENOLCK is
+  NOT Unsupported** (#235 review; the owner chose failing closed): "no locks
+  available" is a lock service failing (NFS lockd unreachable) on a mount
+  that does lock, and it can start while a prune holding the log is stopped.
+  Read as "can't lock", a retry wrote unlocked into the prune's rewrite and
+  lost a hold (measured with a stubbed flock). So announce and ack fail
+  until lockd is back, as on main before #235. ⚠ **Nor is any failure after
+  a try found the file held**: `within` returns it as `lock.ErrSeenHeld`.
+  EINTR (a signal during an NFS lock call) is retried, never read as a
+  holder. `LoadForGate` refuses on every lock error
+  but Unsupported, not only on the timeout: a holder (`ErrLogLocked`, the
+  resume advice) or any other failure (`ErrLogUnlockable`, EIO say: retry).
+  prune-coord prunes past a locked block ledger and lists the locked ones,
+  one a line, with the advice once (`PruneBlockLedgers` returns them, and
+  the ledgers share ONE writers' deadline: each waiting its own cost 30s per
+  held ledger); it used to stop at the first and drop the error and the
+  count. `wt append`'s doc lock is bounded the same way (`appendLockWait`)
+  and still fails on a filesystem that can't lock. ⚠ Polling `LOCK_NB` gives
+  a writer no place in a queue: a near-continuous stream of readers (two in a
+  tight loop) can hold it off to the deadline, where a blocking `LOCK_EX`
+  mostly got in (measured on macOS; at per-turn hook rates neither waits).
+  Not covered: a prune longer than the readers' wait (measured 8.9s for a
+  1M-record log on Linux; a real log is ~10k) lets a non-gate reader read
+  unlocked mid-rewrite.
   Pinned by
   `TestAppend_waitsForAPruneRewrite` (a prune paused between its read and its
   rewrite; `lockedLogPause` is the seam),
   `TestLoad_waitsForAPruneRewrite` (paused right after the truncate,
   `lockedLogTruncated`), `TestLockHolders_readWithoutSelfDeadlock`,
   `TestLoad_givesUpOnAStuckHolder`,
-  `TestMergeCoordGate_RefusesALogLockedByAnotherProcess` and
-  `TestReserveBlock_noSelfDeadlockAndAppendsLand`. Off unix the lock is a
+  `TestMergeCoordGate_RefusesALogLockedByAnotherProcess`,
+  `TestReserveBlock_noSelfDeadlockAndAppendsLand`, and for #235
+  `TestAppend_givesUpOnAStuckHolder`,
+  `TestAppend_writesUnlockedWhereTheFilesystemCantLock` (`exclusiveWithin`
+  is the seam), `TestLockedWriters_sameDeadlineAndNoUnlockedFallback`,
+  `TestExclusiveWithin_unsupportedAfterHeldFailsClosed` (`lock.flock` is the
+  seam), `TestLoadForGate_refusesOnLockErrorsButUnsupported`,
+  `TestPruneBlockLedgers_prunesPastAHeldLedger`,
+  `TestPruneBlockLedgers_reportsEveryFailure`,
+  `TestPruneBlockLedgers_waitsWithinTheSharedDeadline`, `TestWriteLockDefaults`,
+  `TestExclusiveWithin_retriesEINTR`, `TestAppend_givesUpOnAStuckHolder`
+  and `TestAppend_lockDefaultsAndNoFallback` (cli) and
+  `TestPruneCoord_reportsALedgerItCouldntPrune`. Off unix the lock is a
   no-op, as before.
 - **`ClassifyFacts` precedence:** open PR > merged PR > closed PR > dirty >
   unmerged > merged-by-ancestry. PR state outranks a dirty index (a
@@ -750,7 +797,8 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   after the assign unassigns, but only an assignment this claim made.
 - **`merge-pr` auto-cleans only a PR that reads MERGED afterwards (#185).** `gh
   pr merge` exits 0 WITHOUT merging for `--help`/`-h`, `--auto` (armed),
-  `--disable-auto`, a merge queue (queued) and `-R` (another repo's PR). Taking
+  `--disable-auto` and a merge queue (queued); a forwarded `-R` read the same
+  way until #228 (merge-pr read this clone's PR of that number). Taking
   that 0 as a merge removed the lane and `git branch -D`'d unpushed commits.
   `merge.ConfirmMerged` re-reads the state (2.5s at most, for API lag); anything
   but MERGED (OPEN, CLOSED, no answer) keeps the worktree, branch and claim for
@@ -1020,7 +1068,42 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   the hold gate still applies to it, as before #223. ⚠ With `-R`,
   the deploy gate's file list and draft read are that repository's PR
   (`PRChangedFiles(pr, repo)`, `PRIsDraft(pr, repo)`); before, they read this
-  clone's PR of the same number. The `WT_*` overlay is the checkout's side, so
+  clone's PR of the same number. ⚠⚠ **And so is every other read (#228):**
+  the precheck, the guard, the close check and the post-merge reads went to
+  this clone's PR of the same number, so a merged one here skipped the merge
+  as "already merged" and auto-cleaned this clone's lane. merge-pr now
+  resolves the PR in the forwarded repository once (`ghx.ResolvePRIn` →
+  `ghx.PRAt`) and hands its URL to every read and to `gh pr merge` (gh reads a
+  URL as that PR whatever `-R` or the cwd says, measured on gh 2.87); issues
+  go by their URL there (`PRAt.IssueURL`) and the squash settings are that
+  repository's, on its host (`RepoSquashSettingsOf`, `closeReadsAt`).
+  Unresolvable: refuse. ⚠ **A PR given by its URL is resolved the same way**
+  (`ghx.IsPRURL`; #228 review): the guard's own hints print that form under
+  `-R`, and it read the issues and squash settings in the cwd's repository
+  and auto-cleaned unchecked. `IsPRURL` is gh's own reading (its finder's
+  `^/<owner>/<name>/pull/<n>`, a PREFIX match), so `…/pull/5.diff`, which gh
+  merges as PR 5, is resolved too. ⚠ **Auto-clean keys on where the lane can be**
+  (`laneMayBeHere`): the PR's repository OR its head's
+  (`headRepository`) is origin. Keyed on the repository alone, a fork origin
+  merging upstream's PR with `-R` kept its lane and said there was none; a
+  PR whose both sides are elsewhere touches nothing here (a same-named lane
+  is another lane). The host isn't compared (an ssh alias). The GraphQL
+  reads that take the PR's URL (`PRClosingIssueNumbers`, `PRCommits`) pass
+  its host (`withURLHost`), as `PRChecks` does: bare, gh asked its default
+  host. Messages name the PR with `merge.PRLabel` (`#5`, or the URL, never
+  `#<url>`). ⚠ Command hints (`prCommand`: the draft refusal's `gh pr
+  ready`, the checks gate's `gh pr checks --watch`; merge.Run's `wt merge-pr
+  … --bypass`) carry the forwarded `-R`, and spell the PR without a `#`
+  (`merge.PRArg`): pasted, `gh pr ready #5 -R o/r` is a bare `gh pr ready`
+  after the shell's comment, which marks the CURRENT branch's PR ready. With
+  origin a fork and `-R` naming upstream, #187's PR-head fetch and its hint
+  go to the PR's own repository (`merge.prRemote`), where PR n on origin is
+  another PR or none.
+  Pinned by `TestCmdMergePR_forwardedRepoReadsOnlyThatPR` (`-R` and URL),
+  whose fake gh answers only that PR and logs any other read, plus
+  `…AlreadyMergedLeavesTheLane` (the precheck's auto-clean, with a lane here
+  on the PR's head branch name), `…MergeFailureReadsThatPR` (#196's
+  post-failure state read) and `…FromAForkOriginCleansOn`. The `WT_*` overlay is the checkout's side, so
   the environment can tighten but never loosen a gate the base sets;
   `--confirm-deploy` / `--checks-ok` are the ways past it. Pinned by
   `TestCmdMergePR_gateSettingsComeFromTheBaseToo` (merges ungated on the

@@ -864,10 +864,10 @@ func PRClosingIssueNumbers(pr string) []int {
 	if err != nil || strings.TrimSpace(url) == "" {
 		return nil
 	}
-	out, err := run("api", "graphql",
+	out, err := run(withURLHost([]string{"api", "graphql",
 		"-f", "query=query($url:URI!){resource(url:$url){... on PullRequest{closingIssuesReferences(first:50){nodes{number}}}}}",
-		"-f", "url="+strings.TrimSpace(url),
-		"--jq", ".data.resource.closingIssuesReferences.nodes[].number")
+		"-f", "url=" + strings.TrimSpace(url),
+		"--jq", ".data.resource.closingIssuesReferences.nodes[].number"}, url)...)
 	if err != nil || strings.TrimSpace(out) == "" {
 		return nil
 	}
