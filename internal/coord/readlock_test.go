@@ -1,11 +1,15 @@
 package coord
 
 import (
+	"errors"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/eharriett0/wt/internal/lock"
 )
 
 // #234: a read that lands while prune-coord has truncated the log and not yet
@@ -43,6 +47,8 @@ func TestLoad_waitsForAPruneRewrite(t *testing.T) {
 	case <-truncated:
 	case err := <-pruned:
 		t.Fatalf("the prune returned (%v) without truncating the log", err)
+	case <-time.After(20 * time.Second):
+		t.Fatal("the prune never reached its truncate (withLockedLog waiting on itself?)")
 	}
 
 	type read struct {
@@ -76,6 +82,46 @@ func TestLoad_waitsForAPruneRewrite(t *testing.T) {
 	}
 }
 
+// A holder that never lets go (a prune stopped with Ctrl-Z) must not block a
+// reader forever (#234 review): Load reads unlocked after loadLockWait, as
+// before #234, and LoadForGate refuses, since what it would read may be a log
+// stopped between its truncate and its rewrite.
+func TestLoad_givesUpOnAStuckHolder(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the advisory lock is a no-op off unix")
+	}
+	path := filepath.Join(t.TempDir(), "log.jsonl")
+	if err := Append(path, Record{ID: "keep", Kind: KindAnnounce, Window: "w", Session: "s", Hold: []string{"merge-main"},
+		TS: time.Now().UTC().Format(time.RFC3339)}); err != nil {
+		t.Fatal(err)
+	}
+	orig := loadLockWait
+	loadLockWait = 300 * time.Millisecond
+	t.Cleanup(func() { loadLockWait = orig })
+	holder, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	if err := lock.Exclusive(holder); err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release(holder)
+
+	start := time.Now()
+	recs, err := Load(path)
+	if took := time.Since(start); err != nil || len(recs) != 1 || took > 5*time.Second {
+		t.Errorf("Load under a stuck holder: %d record(s), %v, in %s; want the log read unlocked after the wait", len(recs), err, took)
+	}
+	if _, err := LoadForGate(path); !errors.Is(err, ErrLogLocked) {
+		t.Errorf("LoadForGate under a stuck holder: %v, want ErrLogLocked", err)
+	}
+	lock.Release(holder)
+	if recs, err := LoadForGate(path); err != nil || len(recs) != 1 {
+		t.Errorf("LoadForGate once the holder lets go: %d record(s), %v", len(recs), err)
+	}
+}
+
 // The two callers that read while they hold the exclusive lock through
 // another descriptor must not wait on themselves (#234): a prune and a
 // reservation each finish.
@@ -99,8 +145,10 @@ func TestLockHolders_readWithoutSelfDeadlock(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-		case <-time.After(20 * time.Second):
-			t.Fatal("a lock holder waited on itself")
+		case <-time.After(loadLockWait / 2):
+			// Well inside Load's wait: a holder reading through another
+			// descriptor would sit out the whole wait on its own lock.
+			t.Fatal("a lock holder waited on its own lock")
 		}
 	}
 }

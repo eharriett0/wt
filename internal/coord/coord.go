@@ -14,10 +14,13 @@ package coord
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -531,11 +534,31 @@ func appendLocked(f *os.File, r Record) error {
 // It reads under a SHARED lock (#234): `wt prune-coord` truncates the log and
 // rewrites it under the exclusive lock, and an unlocked read in between saw an
 // empty log, so merge-pr's hold gate let a merge through past a hold that never
-// left the file. A lock that fails (a filesystem without flock) reads unlocked,
-// as before; a prune can't run there either. ⚠ Never call it while holding
-// the log's lock through another descriptor (flock locks are per open file:
-// it would wait on itself); withLockedLog and ReserveBlock use loadHeld.
-func Load(path string) ([]Record, error) {
+// left the file. The lock is held only to read the bytes; they are parsed
+// after (#234 review: a writer waited on a whole parse). It waits at most
+// loadLockWait for a writer (#234 review: a prune stopped with Ctrl-Z blocked
+// every reader, the per-turn hooks included), then reads unlocked, as it did
+// before #234; LoadForGate refuses instead. A lock that fails (a filesystem
+// without flock) reads unlocked too; a prune can't run there either.
+// ⚠ Never call it while holding the log's lock through another descriptor:
+// flock locks are per open file, so it would wait on itself. withLockedLog
+// and ReserveBlock read through their own locked handle (readHeld).
+func Load(path string) ([]Record, error) { return load(path, false) }
+
+// LoadForGate is Load for merge-pr's hold gate: when the log stays locked for
+// the whole wait, a read can't be trusted (the holder may have stopped
+// between its truncate and its rewrite), so it returns ErrLogLocked and the
+// gate refuses, instead of reading what may be an empty log (#234 review).
+func LoadForGate(path string) ([]Record, error) { return load(path, true) }
+
+// loadLockWait bounds how long Load waits for a writer. A var so a test can
+// shorten it; a prune's rewrite takes milliseconds.
+var loadLockWait = 5 * time.Second
+
+// ErrLogLocked is LoadForGate giving up on a log another process kept locked.
+var ErrLogLocked = errors.New("the coordination log stayed locked by another wt process (a prune or block reservation stopped mid-write?)")
+
+func load(path string, strict bool) ([]Record, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -544,30 +567,40 @@ func Load(path string) ([]Record, error) {
 		return nil, err
 	}
 	defer f.Close()
-	if lock.Shared(f) == nil {
-		defer lock.Release(f)
+	var data []byte
+	switch lerr := lock.SharedWithin(f, loadLockWait); {
+	case lerr == nil:
+		data, err = io.ReadAll(f)
+		lock.Release(f)
+	case strict && errors.Is(lerr, lock.ErrTimeout):
+		return nil, ErrLogLocked
+	default:
+		data, err = io.ReadAll(f)
 	}
-	return readRecords(f)
-}
-
-// loadHeld is Load for a caller that already holds the log's exclusive lock
-// through another descriptor: it takes no lock (#234).
-func loadHeld(path string) ([]Record, error) {
-	f, err := os.Open(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
 		return nil, err
 	}
-	defer f.Close()
-	return readRecords(f)
+	return parseRecords(data)
 }
 
-// readRecords reads every record from f; see Load.
-func readRecords(f *os.File) ([]Record, error) {
+// readHeld reads the log through f, the handle the caller holds the exclusive
+// lock on (#234 review): through its own handle a read can't wait on itself,
+// where a shared lock through another descriptor would.
+func readHeld(f *os.File) ([]Record, error) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, err
+	}
+	return parseRecords(data)
+}
+
+// parseRecords reads every record from a log's bytes; see Load.
+func parseRecords(data []byte) ([]Record, error) {
 	var recs []Record
-	sc := bufio.NewScanner(f)
+	sc := bufio.NewScanner(bytes.NewReader(data))
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -934,7 +967,7 @@ func withLockedLog(path string, fn func(recs []Record) (kept []Record, rewrite b
 	}
 	defer lock.Release(lf)
 
-	recs, err := loadHeld(path)
+	recs, err := readHeld(lf)
 	if err != nil {
 		return err
 	}
@@ -1486,7 +1519,7 @@ func ReserveBlock(path string, r Record, file string, fileMax func() (int, error
 	}
 	defer lock.Release(lf)
 
-	recs, err := loadHeld(path)
+	recs, err := readHeld(lf)
 	if err != nil {
 		return Record{}, err
 	}

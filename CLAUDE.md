@@ -282,15 +282,22 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   ⚠ **Readers take the SHARED lock (#234):** unlocked, a `Load` between the
   prune's truncate and its rewrite read an empty log, so merge-pr's hold gate
   (and inbox, holds, the hooks, MCP, doctor) missed a hold that never left the
-  file. `Load` waits while a prune or an append holds the log; the two callers
-  that read while holding the exclusive lock through another descriptor
-  (`withLockedLog`, `ReserveBlock`) use `loadHeld`, which takes none (it would
-  wait on itself). A lock that fails (no flock) reads unlocked, as before.
+  file. `Load` waits while a prune or an append holds the log, reads the bytes
+  under the lock and parses after releasing it; the two callers that hold the
+  exclusive lock read through their OWN handle (`readHeld`), so they can't
+  wait on themselves. ⚠ **The wait is bounded** (`loadLockWait`, 5s; #234
+  review: a prune stopped with Ctrl-Z blocked every reader, the per-turn hooks
+  included): then `Load` reads unlocked, as before #234, and `LoadForGate`
+  returns `ErrLogLocked`, which merge-pr's hold gate refuses on (an unlocked
+  read could be a log stopped between its truncate and its rewrite). A lock
+  that fails (no flock) reads unlocked, as before.
   Pinned by
   `TestAppend_waitsForAPruneRewrite` (a prune paused between its read and its
   rewrite; `lockedLogPause` is the seam),
   `TestLoad_waitsForAPruneRewrite` (paused right after the truncate,
-  `lockedLogTruncated`), `TestLockHolders_readWithoutSelfDeadlock` and
+  `lockedLogTruncated`), `TestLockHolders_readWithoutSelfDeadlock`,
+  `TestLoad_givesUpOnAStuckHolder`,
+  `TestMergeCoordGate_RefusesALogLockedByAnotherProcess` and
   `TestReserveBlock_noSelfDeadlockAndAppendsLand`. Off unix the lock is a
   no-op, as before.
 - **`ClassifyFacts` precedence:** open PR > merged PR > closed PR > dirty >

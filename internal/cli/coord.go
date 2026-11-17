@@ -6,6 +6,7 @@ package cli
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -655,7 +656,13 @@ func nonZero(n int) []int {
 // (#223: the stricter of this checkout's and the base branch's).
 func mergeCoordGateWith(c *config.Config, holdMaxAge time.Duration, issues []int) int {
 	path, self := coordCtx(c)
-	recs, err := coord.Load(path)
+	recs, err := coord.LoadForGate(path)
+	if errors.Is(err, coord.ErrLogLocked) {
+		// #234 review: what an unlocked read would see may be a log stopped
+		// between its truncate and its rewrite, holds gone. Refuse.
+		ui.Err("merge blocked: %v; it holds the lock that every hold read needs. Find and finish or stop that process (`ps aux | grep 'wt '`), or pass --bypass if you know no window holds merge-main.", err)
+		return 1
+	}
 	if err != nil {
 		return 0
 	}
