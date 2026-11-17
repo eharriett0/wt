@@ -121,9 +121,12 @@ sessions active in this checkout in the last 24h (coordination records, or
 block ids reserved from this repository), as `wt doctor --json` reports them
 (`sessions_unread` says the log could not be read, so the list is unknown
 rather than empty). Two agents sharing one working tree look like one window
-to the collision engine, so this is a sign of the second one, but only of one
-that has written something: a session that never ran a coordination command
-here does not show.
+to the collision engine, so this is a sign of the second one. An agent whose
+wt hooks are installed (`wt install-claude-hook`, `wt install-codex-hook`)
+shows from its first prompt: its per-turn hook marks the session present at
+most once an hour (a `presence` record, never shown as an announcement and
+pruned after a day). One without the hooks shows only once it runs a
+coordination command.
 
 ### Stale branches don't count
 
