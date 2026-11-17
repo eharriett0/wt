@@ -313,10 +313,30 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   `appendLocked`. Both handles are `O_APPEND`, so a writer that doesn't lock
   (an older wt mid-rollout, a no-lock build) can't be overwritten by these
   writes; a prune can still drop its record, which is #229 itself.
-  ⚠ Readers (`Load`) take no lock yet, so a read during a prune's rewrite can
-  see an empty log (#234). Pinned by
+  ⚠ **Readers take the SHARED lock (#234):** unlocked, a `Load` between the
+  prune's truncate and its rewrite read an empty log, so merge-pr's hold gate
+  (and inbox, holds, the hooks, MCP, doctor) missed a hold that never left the
+  file. `Load` waits while a prune or an append holds the log, reads the bytes
+  under the lock and parses after releasing it; the two callers that hold the
+  exclusive lock read through their OWN handle (`readHeld`), so they can't
+  wait on themselves. ⚠ **The wait is bounded** (`loadLockWait`, 5s; #234
+  review: a prune stopped with Ctrl-Z blocked every reader, the per-turn hooks
+  included): then `Load` reads unlocked, as before #234, and `LoadForGate`
+  returns `ErrLogLocked`, which merge-pr's hold gate refuses on (an unlocked
+  read could be a log stopped between its truncate and its rewrite). A lock
+  that fails (no flock) reads unlocked, as before. ⚠ The refusal says to
+  RESUME the holder (`kill -CONT`), never to kill it: a prune killed after its
+  truncate leaves the log empty for good. Not covered here: writers (`Append`,
+  `ReserveBlock`) still wait on a stopped holder without limit (#235), and a
+  prune longer than the wait (measured 8.9s for a 1M-record log on Linux; a
+  real log is ~10k) lets a non-gate reader read unlocked mid-rewrite.
+  Pinned by
   `TestAppend_waitsForAPruneRewrite` (a prune paused between its read and its
-  rewrite; `lockedLogPause` is the seam) and
+  rewrite; `lockedLogPause` is the seam),
+  `TestLoad_waitsForAPruneRewrite` (paused right after the truncate,
+  `lockedLogTruncated`), `TestLockHolders_readWithoutSelfDeadlock`,
+  `TestLoad_givesUpOnAStuckHolder`,
+  `TestMergeCoordGate_RefusesALogLockedByAnotherProcess` and
   `TestReserveBlock_noSelfDeadlockAndAppendsLand`. Off unix the lock is a
   no-op, as before.
 - **`ClassifyFacts` precedence:** open PR > merged PR > closed PR > dirty >

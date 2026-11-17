@@ -6,6 +6,7 @@ package cli
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -651,11 +652,23 @@ func nonZero(n int) []int {
 	return nil
 }
 
+// loadForGate is coord.LoadForGate; a var so a test can answer it without
+// sitting out the real wait.
+var loadForGate = coord.LoadForGate
+
 // mergeCoordGateWith is mergeCoordGate with the hold settings merge-pr resolved
 // (#223: the stricter of this checkout's and the base branch's).
 func mergeCoordGateWith(c *config.Config, holdMaxAge time.Duration, issues []int) int {
 	path, self := coordCtx(c)
-	recs, err := coord.Load(path)
+	recs, err := loadForGate(path)
+	if errors.Is(err, coord.ErrLogLocked) {
+		// #234 review: what an unlocked read would see may be a log stopped
+		// between its truncate and its rewrite, holds gone. Refuse. ⚠ Never
+		// advise killing it: a prune killed after its truncate leaves the log
+		// empty for good, the very loss #234 is about.
+		ui.Err("merge blocked: %v. Find the process holding %s (`lsof %s`), RESUME it if it was stopped (`fg`, or `kill -CONT <pid>`) and let it finish, then merge again. Don't kill it: a prune killed mid-rewrite leaves the log empty.", err, path, path)
+		return 1
+	}
 	if err != nil {
 		return 0
 	}
