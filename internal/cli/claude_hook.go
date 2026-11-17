@@ -619,7 +619,7 @@ func hookClaudeEdit(r io.Reader) int {
 	// #181: the edit target is a real repo-relative path, so it matches EXACTLY,
 	// as the pre-push guard does. A fuzzy match flagged an edit to the root
 	// README.md because another window edited pkg/svc/README.md.
-	entries := buildCheckReport(c, ws, root, collide.ExactQueries([]string{rel}), false)
+	entries := buildCheckReport(c, ws, root, collide.ExactQueries([]string{rel}))
 	if len(entries) == 0 {
 		return 0
 	}

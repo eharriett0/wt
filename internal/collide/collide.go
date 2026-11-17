@@ -734,32 +734,6 @@ func PathMatchesUpstream(worktree, base, path string) (merged, known bool) {
 	return mergedVerdict(up, upOK, wt, wtOK, staged, stagedOK)
 }
 
-// OverlapSeverity grades a status overlap on one file touched by several
-// windows, given each window's ranges (pure). append-only ⇒ FYI. Otherwise:
-// if ANY participating window has no computable ranges (untracked/binary/diff
-// error), the overlap is indeterminate → SevHigh (can't prove disjoint, so
-// don't clear — mirrors ConflictSeverity's fail-safe). Else HIGH iff any pair
-// of windows has edits git would merge as one conflict region (ConflictSpans,
-// #199); all apart ⇒ FYI.
-func OverlapSeverity(rangesByWindow [][]gitx.LineRange, appendOnly bool) Severity {
-	if appendOnly {
-		return SevFYI
-	}
-	for _, r := range rangesByWindow {
-		if len(r) == 0 {
-			return SevHigh // indeterminate — a real add/add or binary collision can't be graded disjoint
-		}
-	}
-	for i := 0; i < len(rangesByWindow); i++ {
-		for j := i + 1; j < len(rangesByWindow); j++ {
-			if len(ConflictSpans(rangesByWindow[i], rangesByWindow[j])) > 0 {
-				return SevHigh
-			}
-		}
-	}
-	return SevFYI
-}
-
 func sameWorktree(a, b string) bool {
 	return a == b || realPath(a) == realPath(b)
 }
@@ -920,7 +894,7 @@ func (wl WindowLiveness) Label() string {
 		base = "PR #" + wl.ClosedPR + " closed"
 	}
 	if wl.Age > 0 && (wl.Level == LiveUnmerged || wl.Level == LiveDormant) {
-		base += ", last commit " + HumanAge(wl.Age) + " ago"
+		base += ", last commit " + agoPhrase(wl.Age)
 	}
 	// #79 comment 2: when a shipped/closed branch ALSO has a leftover dirty index
 	// (the unresolvable false-HIGH case — `wt clean` won't remove the unshared
@@ -958,6 +932,15 @@ func (wl WindowLiveness) Badge() string {
 	default: // LiveStale, LiveDormant, LiveUnknown
 		return ui.Dim(tag)
 	}
+}
+
+// agoPhrase is HumanAge as a time in the past: "3d ago", and "just now"
+// alone, never "just now ago" (#202). Pure.
+func agoPhrase(d time.Duration) string {
+	if a := HumanAge(d); a != "just now" {
+		return a + " ago"
+	}
+	return "just now"
 }
 
 // HumanAge renders a duration coarsely: "3d", "5h", "12m", or "just now".

@@ -318,10 +318,10 @@ func gradeEntry(c *config.Config, f gradeFacts, currentWorktree, otherWt string,
 // queries. currentWorktree is the window running `check` (its own edits, if any,
 // drive overlap detection). Stale (merged/dormant/closed) entries are always
 // returned, as CatStale, for the JSON + the stale count; the renderers drop them
-// unless includeStale. Each query carries its match mode (#181): a hook's or an
+// unless --include-stale. Each query carries its match mode (#181): a hook's or an
 // agent's real path is exact; only a `wt check` argument that names no path in
 // the repo is fuzzy.
-func buildCheckReport(c *config.Config, ws []collide.Window, currentWorktree string, qs []collide.Query, includeStale bool) []CheckEntry {
+func buildCheckReport(c *config.Config, ws []collide.Window, currentWorktree string, qs []collide.Query) []CheckEntry {
 	conflicts := collide.CheckPaths(ws, currentWorktree, qs)
 	live := collide.ClassifyWindows(ws, c.Base, collide.ConflictWindowSet(conflicts), c.MaxAge)
 	return checkEntries(c, newGitGradeFacts(c.Base), ws, currentWorktree, conflicts, live)

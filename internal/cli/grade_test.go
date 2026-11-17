@@ -346,12 +346,12 @@ func TestAgentOverlaps_Issue182(t *testing.T) {
 	want := []string{
 		"  CHANGELOG.md — also being edited by e-append (same file)",
 		"  CLAUDE.md — also being edited by e-append (same file)",
-		"  api.go — also being edited by g-dirty (overlapping hunks — HIGH)", // dirty: never suppressed
-		"  code.go — also being edited by f-live (overlapping hunks — HIGH)", // a real live overlap stays HIGH
-		"  doc.md — also being edited by d-disjoint (same file)",             // was HIGH via a-merged
-		"  infra/main.tf — also being edited by d-disjoint (same file)",      // was HIGH via c-dormant
-		"  other.go — being edited by h1, h2 (overlapping hunks — HIGH)",     // not ours: h1 and h2 collide
-		"  util.go — also being edited by h1, h2 (same file)",                // was HIGH: h1×h2, not us
+		"  api.go — also being edited by g-dirty (overlapping hunks — HIGH)",         // dirty: never suppressed
+		"  code.go — also being edited by f-live (overlapping hunks — HIGH)",         // a real live overlap stays HIGH
+		"  doc.md — also being edited by d-disjoint (same file)",                     // was HIGH via a-merged
+		"  infra/main.tf — also being edited by d-disjoint (same file)",              // was HIGH via c-dormant
+		"  other.go — being edited by h1, h2 (their edits overlap each other: HIGH)", // not ours: h1 and h2 collide
+		"  util.go — also being edited by h1, h2 (same file)",                        // was HIGH: h1×h2, not us
 	}
 	got := strings.Split(msg, "\n")
 	if len(got) != len(want)+2 || !reflect.DeepEqual(got[1:len(got)-1], want) {

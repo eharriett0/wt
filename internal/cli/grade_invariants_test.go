@@ -129,7 +129,7 @@ func TestGradeOverlaps_SharedLabels(t *testing.T) {
 		{"claimed twice (r3), overlapping",
 			[2]collide.Window{claimed("/wt/fix-77-a", "fix-77-a"), claimed("/wt/fix-77-b", "fix-77-b")},
 			[2][]gitx.LineRange{{rng(10, 12)}, {rng(11, 13)}}, "HIGH",
-			"  fL.go — being edited by #77 (fix-77-a), #77 (fix-77-b) (overlapping hunks — HIGH)",
+			"  fL.go — being edited by #77 (fix-77-a), #77 (fix-77-b) (their edits overlap each other: HIGH)",
 			"  fL.go — also being edited by #77 (fix-77-b) (overlapping hunks — HIGH)"},
 		{"claimed twice, disjoint",
 			[2]collide.Window{claimed("/wt/fix-77-a", "fix-77-a"), claimed("/wt/fix-77-b", "fix-77-b")},
@@ -139,7 +139,7 @@ func TestGradeOverlaps_SharedLabels(t *testing.T) {
 		{"detached, same directory name (r2), overlapping",
 			[2]collide.Window{detached("/dupa/x"), detached("/dupb/x")},
 			[2][]gitx.LineRange{{rng(10, 12)}, {rng(11, 13)}}, "HIGH",
-			"  fL.go — being edited by x (dupa/x), x (dupb/x) (overlapping hunks — HIGH)",
+			"  fL.go — being edited by x (dupa/x), x (dupb/x) (their edits overlap each other: HIGH)",
 			"  fL.go — also being edited by x (dupb/x) (overlapping hunks — HIGH)"},
 	}
 	for _, tc := range cases {
@@ -174,7 +174,7 @@ func TestGradeOverlaps_SharedLabels(t *testing.T) {
 		ff.ranges[factKey{b.Worktree, file}] = []gitx.LineRange{rng(1, 2)}
 		ff.ranges[factKey{c.Worktree, file}] = []gitx.LineRange{rng(2, 3)}
 		got := bannerLines(t, ff, ws, map[string]collide.WindowLiveness{}, collide.Self{Label: "#77", Worktree: a.Worktree})
-		want := []string{"  fL.go — being edited by #77 (fix-77-b), c (overlapping hunks — HIGH)"}
+		want := []string{"  fL.go — being edited by #77 (fix-77-b), c (their edits overlap each other: HIGH)"}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("banner = %q, want %q", got, want)
 		}

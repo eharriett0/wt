@@ -71,17 +71,23 @@ func codexContextMessage(overlaps []StatusOverlap, currentLabel string) (msg str
 		if len(others) == 0 {
 			continue
 		}
-		grade := "same file"
-		if o.Severity == "HIGH" {
-			grade = "overlapping hunks — HIGH"
-		}
 		// "also" only when THIS window is one of the participants; otherwise it's a
 		// heads-up about a file two OTHER windows are contesting (don't imply this
 		// window is editing it — and if the current window can't be identified,
 		// currentLabel is "" and we stay with the neutral phrasing).
+		participant := currentLabel != "" && slices.Contains(o.Windows, currentLabel)
 		verb := "being edited by"
-		if currentLabel != "" && slices.Contains(o.Windows, currentLabel) {
+		if participant {
 			verb = "also being edited by"
+		}
+		grade := "same file"
+		switch {
+		case o.Severity == "HIGH" && participant:
+			grade = "overlapping hunks — HIGH"
+		case o.Severity == "HIGH":
+			// #202: not this window's overlap. Say whose, so a reader doesn't take
+			// it as "you collide".
+			grade = "their edits overlap each other: HIGH"
 		}
 		lines = append(lines, fmt.Sprintf("  %s — %s %s (%s)", o.File, verb, strings.Join(others, ", "), grade))
 	}
@@ -658,7 +664,7 @@ func hookCodexEdit(r io.Reader) int {
 
 	// #181: the patch's targets are real repo-relative paths, so they match
 	// EXACTLY, as the pre-push guard does; never by suffix or basename.
-	entries := buildCheckReport(c, ws, root, collide.ExactQueries(paths), false)
+	entries := buildCheckReport(c, ws, root, collide.ExactQueries(paths))
 	// Re-grade each path's entries the way `wt check` will grade the file once
 	// the patch is applied (regradePending, the same rule as the Claude hook):
 	// this window's ranges as they will read with the file the patch produces

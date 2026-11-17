@@ -222,7 +222,7 @@ func postEditSeverity(t *testing.T, wc, target string) bool {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, e := range buildCheckReport(c, ws, wc, collide.ExactQueries([]string{"data.txt"}), false) {
+	for _, e := range buildCheckReport(c, ws, wc, collide.ExactQueries([]string{"data.txt"})) {
 		if e.Window == "wa" {
 			return e.Category == CatBlocking
 		}
