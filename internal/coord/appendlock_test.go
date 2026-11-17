@@ -31,7 +31,10 @@ func TestAppend_waitsForAPruneRewrite(t *testing.T) {
 
 	paused, release := make(chan struct{}), make(chan struct{})
 	lockedLogPause = func() { close(paused); <-release }
-	t.Cleanup(func() { lockedLogPause = nil })
+	var releaseOnce sync.Once
+	unpause := func() { releaseOnce.Do(func() { close(release) }) }
+	// A Fatalf before the release must not leak the paused prune holding the lock.
+	t.Cleanup(func() { unpause(); lockedLogPause = nil })
 
 	pruned := make(chan error, 1)
 	go func() {
@@ -49,7 +52,7 @@ func TestAppend_waitsForAPruneRewrite(t *testing.T) {
 		t.Fatalf("Append returned (%v) while the prune held the log between its read and its rewrite", err)
 	case <-time.After(300 * time.Millisecond):
 	}
-	close(release)
+	unpause()
 	if err := <-pruned; err != nil {
 		t.Fatal(err)
 	}

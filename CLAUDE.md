@@ -276,7 +276,10 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   for its write. ⚠ flock locks are per open file, so a caller that already
   holds the lock through another descriptor must not call `Append` (it would
   wait on itself): `ReserveBlock` writes through its locked handle with
-  `appendLocked` (seek to the end, then write). Pinned by
+  `appendLocked`. Both handles are `O_APPEND`, so a writer that doesn't lock
+  (an older wt mid-rollout, a no-lock build) still can't be overwritten.
+  ⚠ Readers (`Load`) take no lock yet, so a read during a prune's rewrite can
+  see an empty log (#234). Pinned by
   `TestAppend_waitsForAPruneRewrite` (a prune paused between its read and its
   rewrite; `lockedLogPause` is the seam) and
   `TestReserveBlock_noSelfDeadlockAndAppendsLand`. Off unix the lock is a

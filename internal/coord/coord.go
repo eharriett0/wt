@@ -18,7 +18,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -511,14 +510,13 @@ func Append(path string, r Record) error {
 }
 
 // appendLocked writes r as one JSON line at the end of f, whose lock the
-// caller holds. Seeking to the end first makes it safe on a descriptor opened
-// without O_APPEND (ReserveBlock's).
+// caller holds. f must be opened O_APPEND (Append's and ReserveBlock's both
+// are), never seek-then-write: the lock only excludes other lockers, so a
+// writer that doesn't lock (an older wt, a no-lock build) could land between
+// the seek and the write and be overwritten.
 func appendLocked(f *os.File, r Record) error {
 	b, err := json.Marshal(r)
 	if err != nil {
-		return err
-	}
-	if _, err := f.Seek(0, io.SeekEnd); err != nil {
 		return err
 	}
 	_, err = f.Write(append(b, '\n'))
@@ -1424,9 +1422,13 @@ func RecentBlockReservations(recs []Record, self Self, now time.Time, maxAge tim
 //
 // It holds an EXCLUSIVE advisory lock (flock) on the coordination log across
 // the whole read-modify-write — (load reservations → evaluate fileMax → append)
-// — so two windows calling it concurrently can never allocate the same id. The
-// bare Append used by announce/ack is O_APPEND (torn-write-safe) but has no such
-// serialization; block ids need it because they're a read-then-write allocation.
+// — so two windows calling it concurrently can never allocate the same id.
+// Append takes the same lock for its one write (#229), but block ids need the
+// lock held across the read AND the write, because they're a read-then-write
+// allocation. Its record goes through this handle (appendLocked), never Append,
+// which would wait on this lock. The handle is O_APPEND, so a writer that
+// doesn't lock (an older wt, a build where the lock is a no-op) can't have its
+// record overwritten by this write.
 //
 // fileMax is a closure so the doc scan runs UNDER the lock (it sees the latest
 // on-disk content, e.g. a block another window just wrote). Nil fileMax => 0.
@@ -1436,7 +1438,7 @@ func ReserveBlock(path string, r Record, file string, fileMax func() (int, error
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return Record{}, err
 	}
-	lf, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	lf, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return Record{}, err
 	}
