@@ -237,7 +237,12 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   new one, so a hold placed before a /clear gates the session after it like
   another session's (the gate says so). Subagents share their parent's id. Codex
   exports `CODEX_SESSION_ID` (the root thread's id, openai/codex#37848) to every
-  shell command.
+  shell command, from rust-v0.148.0 on (measured with GitHub's compare: 0.148.0
+  contains the merge commit, 0.147.0 doesn't). ⚠ An older Codex stamps
+  `coord.SessionNone` from its shells while its hook reads the payload id, so
+  the per-turn banner shows that session's own records as another session's
+  (advisory only; #197 item 5). wt can't tell the Codex version, so it is
+  documented (README, Codex section), with `WT_SESSION` as the workaround.
   ⚠ **Terminal ids (`TERM_SESSION_ID`/`ITERM_SESSION_ID`) are deliberately NOT
   sessions**: every tmux pane or editor started in the tab inherits them (false
   confidence). ⚠ A session with no token stamps `coord.SessionNone`, never `""`,
