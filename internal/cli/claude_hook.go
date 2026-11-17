@@ -17,6 +17,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -683,6 +684,12 @@ func regradeSections(c *config.Config, root, rel string, content []byte, predict
 	if !structured || !collide.IsSharedDoc(rel, c.SharedDocs) {
 		return nil, entries
 	}
+	re, cerr := section.Compile(delim)
+	if cerr != nil {
+		// `wt check` can't section-grade it either (the blanket advisory),
+		// so the entries go on as they were (#226 re-review).
+		return nil, entries
+	}
 	var ranges []gitx.LineRange
 	ok := false
 	if predicted {
@@ -691,7 +698,11 @@ func regradeSections(c *config.Config, root, rel string, content []byte, predict
 	f := newGitGradeFacts(c.Base)
 	f.pendingPath = rel
 	f.pending = map[string]collide.PendingDoc{root: {Content: string(content), Ranges: ranges}}
-	present := copyHeadings(string(content), delim)
+	var before map[string]int
+	if cur, read := readForPrediction(filepath.Join(root, rel)); read == fileReadOK {
+		before = headingCounts(cur, re)
+	}
+	after := headingCounts(string(content), re)
 	for _, e := range entries {
 		switch {
 		case !sectionGraded(e):
@@ -700,7 +711,7 @@ func regradeSections(c *config.Config, root, rel string, content []byte, predict
 			graded = append(graded, pendingGrade{entry: e})
 		default:
 			shared, sok := f.SharedSections([]string{root, e.otherWorktree}, rel, delim)
-			if g, keep := sectionGrade(e, shared, sok, headingGone(e.SharedSections, present)); keep {
+			if g, keep := sectionGrade(e, shared, sok, headingGone(e.SharedSections, before, after)); keep {
 				graded = append(graded, g)
 			}
 		}
@@ -708,29 +719,23 @@ func regradeSections(c *config.Config, root, rel string, content []byte, predict
 	return graded, rest
 }
 
-// copyHeadings is the set of section headings in content, nil when delim
-// doesn't compile. Pure.
-func copyHeadings(content, delim string) map[string]bool {
-	re, err := section.Compile(delim)
-	if err != nil {
-		return nil
-	}
-	heads := map[string]bool{}
+// headingCounts counts each section heading in content. Pure.
+func headingCounts(content string, re *regexp.Regexp) map[string]int {
+	n := map[string]int{}
 	for _, s := range section.Parse(content, re) {
-		heads[s.Heading] = true
+		n[s.Heading]++
 	}
-	return heads
+	return n
 }
 
-// headingGone reports whether any of sections is missing from present, the
-// copy's headings: the edit deletes a shared section's heading (or empties or
-// deletes the file). Pure.
-func headingGone(sections []string, present map[string]bool) bool {
-	if present == nil {
-		return false
-	}
+// headingGone reports whether the edit deletes a section with one of sections'
+// headings: the copy (after) has fewer of it than the file has now (before),
+// or, when the file couldn't be read (before nil), none. Counted, not just
+// present (#226 re-review): sections are identified by heading text, so
+// deleting one of two "## Notes" left the heading present. Pure.
+func headingGone(sections []string, before, after map[string]int) bool {
 	for _, h := range sections {
-		if !present[h] {
+		if before != nil && after[h] < before[h] || before == nil && after[h] == 0 {
 			return true
 		}
 	}

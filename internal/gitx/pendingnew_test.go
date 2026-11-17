@@ -104,6 +104,13 @@ func TestChangedRangesNewWith(t *testing.T) {
 	runGit(t, dir, "add", "other.txt")
 	// No base: the uncommitted ranges, index to the copy plus what is staged.
 	sameFrom("no-such-base", dir, "new.txt", "n1\nEDIT\n", []LineRange{span(2, 2), span(1, 1)})
+	// A clean filter applies to the copy, never to the empty side, git's
+	// /dev/null (#226 re-review: one adding a header moved every range).
+	runGit(t, dir, "config", "filter.hdr.clean", "sh -c 'echo HDR; cat'")
+	writeFile(t, dir, ".gitattributes", "crlf.txt text eol=crlf\nhdr.txt filter=hdr\n")
+	writeFile(t, dir, "hdr.txt", "a\n")
+	runGit(t, dir, "add", ".gitattributes", "hdr.txt")
+	same(dir, "hdr.txt", "a\nb\n", []LineRange{span(1, 3)})
 	// A diff that fails: the whole file, never "no edits".
 	failGit(t, func(args []string) bool { return len(args) > 0 && args[0] == "diff" })
 	if got, ok := ChangedRangesNewWith(wt, "main", "other.txt", []byte("x\ny\n")); !ok || !reflect.DeepEqual(got, wholeFile) {

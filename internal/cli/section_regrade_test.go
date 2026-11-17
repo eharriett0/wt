@@ -170,6 +170,17 @@ func TestSectionGrade(t *testing.T) {
 // wc.
 func sectionHookRepo(t *testing.T) (wc string) {
 	t.Helper()
+	wc = sectionHookRepoWith(t, "shared_docs = PLAN.md\nstructured_doc.PLAN.md = ^##\\s\n", sectionPlan, "b2\n", "a1\n")
+	if e := sectionGradeOf(t, wc); e.Category != CatAdvisory {
+		t.Fatalf("precondition: Alpha vs Beta: wt check says %s %v, want advisory", e.Category, e.SharedSections)
+	}
+	return wc
+}
+
+// sectionHookRepoWith is sectionHookRepo with its .wt.conf and PLAN.md given:
+// wa edits the line waLine, wc the line wcLine (each prefixed "W").
+func sectionHookRepoWith(t *testing.T, conf, plan, waLine, wcLine string) (wc string) {
+	t.Helper()
 	offlineGH(t) // no real GitHub calls
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("WT_SKIP_COLLISION", "")
@@ -180,8 +191,8 @@ func sectionHookRepo(t *testing.T) (wc string) {
 	gitT(t, root, "init", "-q", "-b", "main")
 	gitT(t, root, "config", "user.email", "t@t.test")
 	gitT(t, root, "config", "user.name", "t")
-	writeT(t, root, ".wt.conf", "shared_docs = PLAN.md\nstructured_doc.PLAN.md = ^##\\s\n")
-	writeT(t, root, "PLAN.md", sectionPlan)
+	writeT(t, root, ".wt.conf", conf)
+	writeT(t, root, "PLAN.md", plan)
 	gitT(t, root, "add", "-A")
 	gitT(t, root, "commit", "-qm", "base")
 	gitT(t, root, "branch", "wa")
@@ -191,13 +202,10 @@ func sectionHookRepo(t *testing.T) (wc string) {
 	wc = filepath.Join(t.TempDir(), "wc")
 	gitT(t, root, "worktree", "add", "-q", wa, "wa")
 	gitT(t, root, "worktree", "add", "-q", wc, "wc")
-	writeT(t, wa, "PLAN.md", strings.Replace(sectionPlan, "b2\n", "Wb2\n", 1))
-	gitT(t, wa, "commit", "-qam", "wa edits b2")
-	writeT(t, wc, "PLAN.md", strings.Replace(sectionPlan, "a1\n", "Wa1\n", 1))
-	gitT(t, wc, "commit", "-qam", "wc edits a1")
-	if e := sectionGradeOf(t, wc); e.Category != CatAdvisory {
-		t.Fatalf("precondition: Alpha vs Beta: wt check says %s %v, want advisory", e.Category, e.SharedSections)
-	}
+	writeT(t, wa, "PLAN.md", strings.Replace(plan, waLine, "W"+waLine, 1))
+	gitT(t, wa, "commit", "-qam", "wa edits its line")
+	writeT(t, wc, "PLAN.md", strings.Replace(plan, wcLine, "W"+wcLine, 1))
+	gitT(t, wc, "commit", "-qam", "wc edits its line")
 	return wc
 }
 
@@ -324,5 +332,60 @@ func TestPreEditHooks_StructuredDocNotInBase(t *testing.T) {
 	t.Setenv("WT_CLAUDE_HOOK_BLOCK", "0")
 	if got := hookVerdict(t, runHookCapture(t, hookClaudeEdit, sectionClaudePayload(wc, "a1\n", "a1\n## Beta\nb9\n"))); got != "overlap" {
 		t.Errorf("claude says %s, want overlap, as wt check after the edit", got)
+	}
+}
+
+// headingGone counts headings (#226 re-review): sections are identified by
+// heading text, so deleting one of two "## Notes" leaves the heading present.
+func TestHeadingGone(t *testing.T) {
+	shared := []string{"## Notes"}
+	for _, tc := range []struct {
+		name          string
+		before, after map[string]int
+		want          bool
+	}{
+		{"still both", map[string]int{"## Notes": 2}, map[string]int{"## Notes": 2}, false},
+		{"one of two deleted", map[string]int{"## Notes": 2}, map[string]int{"## Notes": 1}, true},
+		{"the only one deleted", map[string]int{"## Notes": 1}, map[string]int{}, true},
+		{"one added", map[string]int{"## Notes": 1}, map[string]int{"## Notes": 2}, false},
+		{"file unread, still there", nil, map[string]int{"## Notes": 1}, false},
+		{"file unread, gone", nil, map[string]int{}, true},
+	} {
+		if got := headingGone(shared, tc.before, tc.after); got != tc.want {
+			t.Errorf("%s: headingGone = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// Deleting one of two sections that share a heading reads disjoint in `wt
+// check` (#237) while git conflicts; the hook keeps main's heads-up (#226
+// re-review: a presence check let it through).
+func TestPreEditHooks_StructuredDocDuplicateHeadingDeleted(t *testing.T) {
+	const plan = "# Plan\n## Notes\nm1\n## Alpha\na1\n## Notes\nm2\nm3\nm4\nm5\n"
+	wc := sectionHookRepoWith(t, "shared_docs = PLAN.md\nstructured_doc.PLAN.md = ^##\\s\n", plan, "m2\n", "m4\n")
+	if e := sectionGradeOf(t, wc); e.Category != CatBlocking {
+		t.Fatalf("precondition: both in the second Notes: wt check says %s, want HIGH", e.Category)
+	}
+	second := "## Notes\nm2\nm3\nWm4\nm5\n"
+	if !strings.HasSuffix(readT(t, wc, "PLAN.md"), second) {
+		t.Fatalf("precondition: wc's PLAN.md:\n%s", readT(t, wc, "PLAN.md"))
+	}
+	t.Setenv("WT_CLAUDE_HOOK_BLOCK", "1")
+	if got := hookVerdict(t, runHookCapture(t, hookClaudeEdit, sectionClaudePayload(wc, second, ""))); got != "deny" {
+		t.Errorf("the second Notes deleted: claude says %s, want the heads-up's deny (as on main)", got)
+	}
+}
+
+// A delimiter that doesn't compile can't be section-graded by `wt check`
+// either (the blanket advisory), so an advisory stays dropped even when the
+// edit can't be predicted (#226 re-review).
+func TestPreEditHooks_StructuredDocBadDelimiter(t *testing.T) {
+	wc := sectionHookRepoWith(t, "shared_docs = PLAN.md\nstructured_doc.PLAN.md = ^##(\n", sectionPlan, "b2\n", "a1\n")
+	if e := sectionGradeOf(t, wc); e.Category != CatAdvisory {
+		t.Fatalf("precondition: wt check says %s, want the blanket advisory", e.Category)
+	}
+	t.Setenv("WT_CLAUDE_HOOK_BLOCK", "1")
+	if got := hookVerdict(t, runHookCapture(t, hookClaudeEdit, sectionClaudePayload(wc, "not in the file\n", "x\n"))); got != "silent" {
+		t.Errorf("bad delimiter, unpredicted edit: claude says %s, want silent, as wt check grades it", got)
 	}
 }

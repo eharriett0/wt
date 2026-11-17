@@ -135,8 +135,13 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   ⚠ New-frame ranges can't show a deletion, so deleting the shared section,
   or emptying or deleting the file, reads disjoint in `wt check` while git
   conflicts (#237): until the grader counts deleted lines, a section HIGH
-  whose heading the copy no longer has stays a heads-up (`headingGone`), as
-  main kept it. Pinned by `TestPreEditHooks_StructuredDocSections` (into, staying
+  whose heading the copy has FEWER of than the file has now stays a heads-up
+  (`headingGone`, counted: sections are identified by heading text, so
+  deleting one of two "## Notes" left the heading present), as main kept it.
+  A delimiter that doesn't compile leaves the entries as they were (`wt
+  check` can't section-grade that doc either). The empty side of a
+  measurement is hashed `--no-filters` (git's /dev/null never sees a clean
+  filter; one adding a header moved every range). Pinned by `TestPreEditHooks_StructuredDocSections` (into, staying
   out of, past an insert into, and out of the other window's section, each held
   to `wt check` after the edit, both hooks, both block modes) and the
   `StructuredDoc*` cases beside it. Claude (`claudePendingContent`): Claude Code's Edit replayed (refused

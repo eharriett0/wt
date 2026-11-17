@@ -33,14 +33,18 @@ func ChangedRangesNewWith(dir, base, file string, content []byte) ([]LineRange, 
 	}
 	defer os.RemoveAll(tmp)
 	env := []string{"GIT_OBJECT_DIRECTORY=" + tmp, "GIT_ALTERNATE_OBJECT_DIRECTORIES=" + objects}
-	hash := func(b []byte) string {
-		out, err := gitOutput(dir, env, b, "hash-object", "-w", "--stdin", "--path", file)
+	hash := func(b []byte, args ...string) string {
+		out, err := gitOutput(dir, env, b, append([]string{"hash-object", "-w", "--stdin"}, args...)...)
 		if err != nil {
 			return ""
 		}
 		return strings.TrimSpace(string(out))
 	}
-	blob, empty := hash(content), hash(nil)
+	// The copy goes through the file's clean filters, as `git add` would put
+	// it; the empty side is git's /dev/null, which no filter ever sees (#226
+	// re-review: a filter that adds a header, or one that fails on empty
+	// input, moved or lost every range).
+	blob, empty := hash(content, "--path", file), hash(nil, "--no-filters")
 	if blob == "" || empty == "" {
 		return nil, false
 	}
