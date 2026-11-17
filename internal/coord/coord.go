@@ -607,7 +607,7 @@ func appendLocked(f *os.File, r Record) error {
 // ⚠ Never call it while holding the log's lock through another descriptor:
 // flock locks are per open file, so it would wait on itself. withLockedLog
 // and ReserveBlock read through their own locked handle (readHeld).
-func Load(path string) ([]Record, error) { return load(path, false) }
+func Load(path string) ([]Record, error) { return loadWithin(path, false, loadLockWait) }
 
 // LoadForGate is Load for merge-pr's hold gate: when the log stays locked for
 // the whole wait, a read can't be trusted (the holder may have stopped
@@ -615,7 +615,7 @@ func Load(path string) ([]Record, error) { return load(path, false) }
 // gate refuses, instead of reading what may be an empty log (#234 review). So
 // does any other lock failure but a filesystem that can't lock at all (#235
 // review).
-func LoadForGate(path string) ([]Record, error) { return load(path, true) }
+func LoadForGate(path string) ([]Record, error) { return loadWithin(path, true, loadLockWait) }
 
 // loadLockWait bounds how long Load waits for a writer. A var so a test can
 // shorten it; a prune's rewrite takes milliseconds.
@@ -628,7 +628,8 @@ var ErrLogLocked = errors.New("the coordination log stayed locked by another wt 
 // than a holder or a filesystem that can't lock (#235 review): EIO, say.
 var ErrLogUnlockable = errors.New("could not lock the coordination log to read it")
 
-func load(path string, strict bool) ([]Record, error) {
+// loadWithin is Load (strict: LoadForGate) waiting at most wait for a writer.
+func loadWithin(path string, strict bool, wait time.Duration) ([]Record, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -638,7 +639,7 @@ func load(path string, strict bool) ([]Record, error) {
 	}
 	defer f.Close()
 	var data []byte
-	switch lerr := sharedWithin(f, loadLockWait); {
+	switch lerr := sharedWithin(f, wait); {
 	case lerr == nil:
 		data, err = io.ReadAll(f)
 		lock.Release(f)
@@ -1242,17 +1243,52 @@ func OtherSessions(recs []Record, self Self, now time.Time, within time.Duration
 }
 
 // CheckoutActivity is every record that can show a session at work in a
-// checkout, for OtherSessions: the coordination log's, and every block
-// ledger's under home (#197 item 2). Block reservations live in the per-file
-// ledgers, not the log, so a session whose only records were reservations
-// was invisible to the shared-checkout warning, `wt status --json` and doctor.
-// OtherSessions keeps only self's window, so other windows' and other repos'
-// ledger records drop out there. Reads the ledgers; logRecs is not changed.
-func CheckoutActivity(logRecs []Record, home string) []Record {
-	if home == "" {
-		return logRecs
+// checkout, for OtherSessions: the coordination log's, and the block ledgers'
+// written in this repository (#197 item 2). Block reservations live in the
+// per-file ledgers, not the log, so a session whose only records were
+// reservations was invisible to the shared-checkout warning, `wt status
+// --json` and doctor. ⚠ The ledgers are machine-wide while the log is the
+// repository's, and a pinned WT_WINDOW names one window in several
+// repositories, so a ledger record counts only when its Repo is repo (#197
+// review: another repo's reservation read as this checkout's). Pure;
+// logRecs is not changed.
+func CheckoutActivity(logRecs, ledgerRecs []Record, repo string) []Record {
+	out := append([]Record(nil), logRecs...)
+	for _, r := range ledgerRecs {
+		if r.Repo == repo {
+			out = append(out, r)
+		}
 	}
-	return append(append([]Record(nil), logRecs...), LoadBlockLedgers(home)...)
+	return out
+}
+
+// RecentBlockLedgers reads the block ledgers under home touched within
+// `within` of now, for the advisory shared-checkout signal (#197 review): a
+// ledger untouched for longer can't hold a record that recent, and a ledger
+// another process holds locked is read without waiting (Load waited up to
+// loadLockWait for each, which stalled every `wt status --json` and MCP
+// wt_status by that much per stuck ledger).
+func RecentBlockLedgers(home string, now time.Time, within time.Duration) []Record {
+	if home == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(BlocksDir(home))
+	if err != nil {
+		return nil
+	}
+	var recs []Record
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		if info, ierr := e.Info(); ierr != nil || now.Sub(info.ModTime()) > within {
+			continue
+		}
+		if rs, err := loadWithin(filepath.Join(BlocksDir(home), e.Name()), false, 0); err == nil {
+			recs = append(recs, rs...)
+		}
+	}
+	return recs
 }
 
 // SharedCheckoutWarning renders the wt doctor / wt status warning for other

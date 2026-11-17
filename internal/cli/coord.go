@@ -1289,7 +1289,8 @@ func peerHoldBanner(c *config.Config) {
 }
 
 // sharedCheckoutBanner warns, at the top of `wt status`, that another session has
-// recently posted coordination records under THIS checkout's window id (#163).
+// recently been active under THIS checkout's window id: coordination records,
+// or this repository's block reservations (#163, #197).
 // Two sessions in one checkout share one working tree, and the collision engine
 // is per-worktree, so nothing else can tell them apart. Best-effort: no repo /
 // unreadable log / no other session → prints nothing.
@@ -1303,8 +1304,7 @@ func sharedCheckoutBanner(c *config.Config) {
 		return
 	}
 	now := time.Now()
-	home, _ := os.UserHomeDir()
-	if msg := coord.SharedCheckoutWarning(coord.OtherSessions(coord.CheckoutActivity(recs, home), self, now, coord.SharedCheckoutWindow), self, now); msg != "" {
+	if msg := coord.SharedCheckoutWarning(coord.OtherSessions(checkoutActivity(c, recs, now), self, now, coord.SharedCheckoutWindow), self, now); msg != "" {
 		ui.Warn("%s", msg)
 	}
 }

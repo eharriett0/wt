@@ -887,3 +887,22 @@ func TestMirroredOwnHoldAcrossClones(t *testing.T) {
 		t.Errorf("creator blocked in the clone that placed the hold: %v", ids(got))
 	}
 }
+
+// CheckoutActivity adds this repository's ledger records only (#197 review:
+// with a pinned WT_WINDOW, another repository's reservation read as this
+// checkout's), and leaves the log's records as they were.
+func TestCheckoutActivity(t *testing.T) {
+	log := []Record{{ID: "l1", Repo: "wt"}}
+	ledger := []Record{{ID: "a", Repo: "wt"}, {ID: "b", Repo: "other"}, {ID: "c", Repo: ""}}
+	got := CheckoutActivity(log, ledger, "wt")
+	var ids []string
+	for _, r := range got {
+		ids = append(ids, r.ID)
+	}
+	if strings.Join(ids, ",") != "l1,a" {
+		t.Errorf("CheckoutActivity = %v, want [l1 a]", ids)
+	}
+	if len(log) != 1 || cap(log) != 1 {
+		t.Errorf("the log's slice changed: %v", log)
+	}
+}

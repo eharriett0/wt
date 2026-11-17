@@ -126,6 +126,23 @@ func TestStatusJSON_otherSessions(t *testing.T) {
 				t.Errorf("%s as %s: session %q, other_sessions %v; want %q, %v", name, tc.session, p.Session, got, tc.session, tc.others)
 			}
 		}
+		// The banner and doctor read the log too (#197 review: with the
+		// ledgers added, nothing pinned that they still do).
+		_, banner := captureT(t, func() { sharedCheckoutBanner(c) })
+		dout, _ := captureT(t, func() { cmdDoctor([]string{"--json"}) })
+		var d struct {
+			Coord struct {
+				OtherSessions []coord.SessionActivity `json:"other_sessions"`
+			} `json:"coord"`
+		}
+		if err := json.Unmarshal([]byte(dout), &d); err != nil {
+			t.Fatalf("doctor --json: %v\n%s", err, dout)
+		}
+		warned := strings.Contains(banner, "checkout shared")
+		listed := len(d.Coord.OtherSessions) == 1 && d.Coord.OtherSessions[0].Session == "session-B"
+		if want := len(tc.others) > 0; warned != want || listed != want {
+			t.Errorf("as %s: banner warned=%v, doctor --json lists session-B=%v; want %v\n%s\n%s", tc.session, warned, listed, want, banner, dout)
+		}
 	}
 }
 
@@ -331,12 +348,22 @@ func TestOtherSessions_countBlockReservations(t *testing.T) {
 	if logPath, _ := coordCtx(c); fileExists(logPath) {
 		t.Fatalf("precondition: a reservation wrote the coordination log %s", logPath)
 	}
-	// Another window's reservation by a third session must not count here.
+	// Not this checkout's: another window's reservation (session-C); one
+	// written in ANOTHER repository under this same window id, as a pinned
+	// WT_WINDOW makes it (session-R, #197 review: the ledgers are
+	// machine-wide); and one older than 24h (session-D).
 	home, _ := os.UserHomeDir()
-	other := coord.Record{ID: "x1", Kind: coord.KindBlockReserve, Window: filepath.Join(t.TempDir(), "elsewhere"),
-		Session: "session-C", File: filepath.Join(repo, "log.md"), Block: 7, TS: time.Now().UTC().Format(time.RFC3339)}
-	if err := coord.Append(coord.BlockLedgerPath(home, filepath.Join(repo, "other.md")), other); err != nil {
-		t.Fatal(err)
+	_, self := coordCtx(c)
+	now := time.Now().UTC()
+	for _, r := range []coord.Record{
+		{ID: "x1", Window: filepath.Join(t.TempDir(), "elsewhere"), Session: "session-C", Repo: mainRepoName(c), TS: now.Format(time.RFC3339)},
+		{ID: "x2", Window: self.Window, Session: "session-R", Repo: "another-repo", TS: now.Format(time.RFC3339)},
+		{ID: "x3", Window: self.Window, Session: "session-D", Repo: mainRepoName(c), TS: now.Add(-30 * time.Hour).Format(time.RFC3339)},
+	} {
+		r.Kind, r.File, r.Block = coord.KindBlockReserve, filepath.Join(repo, "other.md"), 7
+		if err := coord.Append(coord.BlockLedgerPath(home, filepath.Join(repo, "other.md")), r); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	t.Setenv("WT_SESSION", "session-B")
@@ -349,8 +376,13 @@ func TestOtherSessions_countBlockReservations(t *testing.T) {
 		t.Errorf("status --json other_sessions = %+v, want session-A only", p.OtherSessions)
 	}
 	text, _ := mcpStatus(c, false)
-	if !strings.Contains(text, `"session": "session-A"`) || strings.Contains(text, "session-C") {
-		t.Errorf("wt_status: want session-A as another session, not session-C:\n%s", text)
+	if !strings.Contains(text, `"session": "session-A"`) || strings.Contains(text, "session-C") || strings.Contains(text, "session-R") || strings.Contains(text, "session-D") {
+		t.Errorf("wt_status: want session-A as another session, and not C, R or D:\n%s", text)
+	}
+	// The text doctor too, before any log exists (#197 review: only --json had it).
+	_, errOut := captureT(t, func() { cmdDoctor(nil) })
+	if !strings.Contains(errOut, "checkout shared") || !strings.Contains(errOut, "session-A") {
+		t.Errorf("wt doctor (text) doesn't warn of session-A:\n%s", errOut)
 	}
 	out, _ = captureT(t, func() { cmdDoctor([]string{"--json"}) })
 	var d struct {
@@ -364,7 +396,7 @@ func TestOtherSessions_countBlockReservations(t *testing.T) {
 	if len(d.Coord.OtherSessions) != 1 || d.Coord.OtherSessions[0].Session != "session-A" {
 		t.Errorf("doctor --json other_sessions = %+v, want session-A only", d.Coord.OtherSessions)
 	}
-	_, errOut := captureT(t, func() { sharedCheckoutBanner(c) })
+	_, errOut = captureT(t, func() { sharedCheckoutBanner(c) })
 	if !strings.Contains(errOut, "checkout shared") || !strings.Contains(errOut, "session-A") {
 		t.Errorf("status banner doesn't warn of session-A:\n%s", errOut)
 	}
@@ -375,7 +407,7 @@ func TestOtherSessions_countBlockReservations(t *testing.T) {
 	t.Setenv("WT_SESSION", "session-B")
 	// Once the log exists (B posts), doctor reads both.
 	logPath, self := coordCtx(c)
-	if err := coord.Append(logPath, coord.Record{ID: "b1", Kind: coord.KindAnnounce, Window: self.Window, Session: self.Session,
+	if err := coord.Append(logPath, coord.Record{ID: "b1", Kind: coord.KindAnnounce, Window: self.Window, Session: "session-B",
 		Message: "B's note", TS: time.Now().UTC().Format(time.RFC3339)}); err != nil {
 		t.Fatal(err)
 	}
