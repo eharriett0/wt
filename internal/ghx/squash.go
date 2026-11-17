@@ -81,12 +81,20 @@ func parsePRCommits(out string) ([]PRCommit, error) {
 // viewer who is not an admin (measured on a public repo as a READ viewer), while
 // GraphQL's squashMergeCommitTitle / squashMergeCommitMessage answer any reader.
 // {owner}/{repo} resolve the way the gh pr reads do.
-func RepoSquashSettings() (title, message string) {
+func RepoSquashSettings() (title, message string) { return RepoSquashSettingsOf("", "") }
+
+// RepoSquashSettingsOf is RepoSquashSettings for owner/name (#228: a forwarded
+// -R merges another repository's PR, with that repository's settings); ""
+// for both is the cwd's repository.
+func RepoSquashSettingsOf(owner, name string) (title, message string) {
 	if !Present() || !SignedIn() {
 		return "", ""
 	}
+	if owner == "" || name == "" {
+		owner, name = "{owner}", "{repo}"
+	}
 	out, err := run("api", "graphql",
-		"-F", "owner={owner}", "-F", "name={repo}",
+		"-F", "owner="+owner, "-F", "name="+name,
 		"-f", "query=query($owner:String!,$name:String!){repository(owner:$owner,name:$name){squashMergeCommitTitle squashMergeCommitMessage}}",
 		"--jq", `.data.repository | {title: .squashMergeCommitTitle, message: .squashMergeCommitMessage}`)
 	if err != nil {

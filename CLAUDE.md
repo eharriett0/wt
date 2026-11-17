@@ -1020,7 +1020,18 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   the hold gate still applies to it, as before #223. ⚠ With `-R`,
   the deploy gate's file list and draft read are that repository's PR
   (`PRChangedFiles(pr, repo)`, `PRIsDraft(pr, repo)`); before, they read this
-  clone's PR of the same number. The `WT_*` overlay is the checkout's side, so
+  clone's PR of the same number. ⚠⚠ **And so is every other read (#228):**
+  the precheck, the guard, the close check and the post-merge reads went to
+  this clone's PR of the same number, so a merged one here skipped the merge
+  as "already merged" and auto-cleaned this clone's lane. merge-pr now
+  resolves the PR in the forwarded repository once (`ghx.ResolvePRIn` →
+  `ghx.PRAt`) and hands its URL to every read and to `gh pr merge` (gh reads a
+  URL as that PR whatever `-R` or the cwd says, measured on gh 2.87); issues
+  go by their URL there (`PRAt.IssueURL`) and the squash settings are that
+  repository's (`RepoSquashSettingsOf`, `closeReadsAt`). Unresolvable:
+  refuse. Auto-clean skips a PR whose repository is not this clone's origin.
+  Pinned by `TestCmdMergePR_forwardedRepoReadsOnlyThatPR`, whose fake gh
+  answers only that PR and logs any other read. The `WT_*` overlay is the checkout's side, so
   the environment can tighten but never loosen a gate the base sets;
   `--confirm-deploy` / `--checks-ok` are the ways past it. Pinned by
   `TestCmdMergePR_gateSettingsComeFromTheBaseToo` (merges ungated on the

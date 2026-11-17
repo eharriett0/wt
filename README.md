@@ -323,7 +323,11 @@ required check or `merge_min_checks` is what makes "CI never started" refuse.
 The merge is pinned to the commit whose checks were read
 (`--match-head-commit`): push after the read and GitHub refuses it rather than
 ship a head nobody checked. A forwarded `-R`/`--repo` names the PR's
-repository, so that PR is the one read and pinned. A forwarded flag that merges
+repository, so that PR is the one read and pinned, and every other read too:
+the state, the guard, the close check (its issues and squash settings are that
+repository's) and the merge itself. merge-pr refuses when it can't resolve the
+PR there, and auto-clean leaves this clone alone for a PR in another
+repository. A forwarded flag that merges
 nothing (`--disable-auto`, `--help`) skips the gate. `--auto` gets no
 exemption: when the only checks pending or failing are ones no branch rule
 requires, gh merges at once instead of waiting for them. A dry run's verdict

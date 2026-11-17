@@ -153,6 +153,24 @@ var liveCloseReads = closeReads{
 	issueTitle:     ghx.IssueTitle,
 }
 
+// closeReadsAt is liveCloseReads for a PR a forwarded -R resolved in its
+// repository (#228): an issue is read by its URL there, and the squash
+// settings are that repository's. The PR reads already take the PR's URL. nil
+// at: the cwd's repository, liveCloseReads as is.
+func closeReadsAt(at *ghx.PRAt) closeReads {
+	r := liveCloseReads
+	if at == nil {
+		return r
+	}
+	r.issueState = func(n string) (string, error) { return ghx.IssueState(at.IssueURL(n)) }
+	r.issueTitle = func(n string) (string, error) { return ghx.IssueTitle(at.IssueURL(n)) }
+	r.squashSettings = func() merge.SquashSettings {
+		title, message := ghx.RepoSquashSettingsOf(at.Owner, at.Name)
+		return merge.SquashSettings{Title: title, Message: message}
+	}
+	return r
+}
+
 // livePRCommits reads PR pr's commits for the squash model; nil when gh fails.
 func livePRCommits(pr string) []merge.Commit {
 	cs, err := ghx.PRCommits(pr)
@@ -414,9 +432,9 @@ func renderClosePlan(p closePlan, reads closeReads) bool {
 // verifyClosings re-checks the watched issues after the merge and reports any
 // that changed state — surfacing a silent close in the SAME command instead of
 // days later (#77). Needs no keyword parsing; catches everything.
-func verifyClosings(p closePlan) {
+func verifyClosings(p closePlan, r closeReads) {
 	for _, n := range p.watch {
-		after, err := ghx.IssueState(strconv.Itoa(n))
+		after, err := r.issueState(strconv.Itoa(n))
 		if err != nil {
 			continue
 		}

@@ -431,16 +431,33 @@ func cmdMergePR(args []string) int {
 		ui.Err("cannot resolve repo config (%v) — refusing merge; can't verify merge_is_deploy", err)
 		return 1
 	}
+	// #228: a forwarded -R/--repo merges THAT repository's PR, so every read
+	// merge-pr makes about the PR must be of it, never of this clone's PR of
+	// the same number. The PR is resolved there once; its URL is the selector
+	// every gh read and the merge itself take (gh reads a URL as that PR
+	// whatever -R or the cwd says). Unresolvable: refuse, rather than read
+	// another PR.
+	repo := merge.ParseForwardedRepo(ghArgs)
+	prRef := pr
+	var at *ghx.PRAt
+	if repo != "" {
+		a, err := resolvePRIn(pr, repo)
+		if err != nil {
+			ui.Err("%v: refusing, rather than read this clone's PR #%s in its place", err, pr)
+			return 1
+		}
+		at, prRef = &a, a.URL
+	}
 	// #39: PR-state precheck. An already-merged PR shouldn't raise a confusing gh
 	// error AND orphan its worktree — skip the merge but still clean up. A
 	// closed-not-merged PR has nothing to merge. Unknown state → fall through
 	// (fail-open). Only on a real merge; dry-run still previews.
 	if !*dryRun {
-		switch merge.PreMergeVerdict(ghx.PRState(pr)) {
+		switch merge.PreMergeVerdict(ghx.PRState(prRef)) {
 		case merge.PreAlreadyMerged:
 			ui.Info("PR #%s is already merged — skipping the merge, cleaning up its worktree.", pr)
 			if !*keep {
-				autoCleanMergedWorktree(pr)
+				autoCleanMergedWorktree(prRef, at)
 			}
 			return 0
 		case merge.PreClosed:
@@ -462,7 +479,6 @@ func cmdMergePR(args []string) int {
 	// PR could turn merge_is_deploy off, and a branch cut before the base added
 	// a deploy glob skipped the gate for a path that now deploys. A passthrough
 	// that merges nothing reads neither, and no gate below needs them.
-	repo := merge.ParseForwardedRepo(ghArgs)
 	nonMerging := merge.NonMerging(ghArgs)
 	gates := []gateSource{{from: "this checkout", gate: c.Gate()}}
 	if nonMerging == "" {
@@ -546,21 +562,22 @@ func cmdMergePR(args []string) int {
 	// prepareMerge has the rules. wt's own gh flags (--admin here, the WIP
 	// --subject in merge.Run) go IN FRONT of the passthrough, so a dangling
 	// passthrough flag fails in gh instead of taking one of them as its value.
-	prep, ok := prepareMerge(pr, ghArgs, closeOpts{dryRun: *dryRun, closeOK: *closeOK, skip: *noCloseCheck},
-		os.Stdin, stdinIsTTY(), liveCloseReads)
+	reads := closeReadsAt(at)
+	prep, ok := prepareMerge(prRef, ghArgs, closeOpts{dryRun: *dryRun, closeOK: *closeOK, skip: *noCloseCheck},
+		os.Stdin, stdinIsTTY(), reads)
 	if !ok {
 		return 1
 	}
-	if err := merge.Run(pr, *dryRun, *bypass, *mergeForeign, wtBranches, merge.WithMatchHead(pin, merge.WithAdmin(*admin, prep.args)), prep.stdin, checksLabel); err != nil {
+	if err := merge.Run(prRef, *dryRun, *bypass, *mergeForeign, wtBranches, merge.WithMatchHead(pin, merge.WithAdmin(*admin, prep.args)), prep.stdin, checksLabel); err != nil {
 		// ⚠ gh can fail AFTER merging (#196): `-- -d` merges, then cannot delete a
 		// local branch that a wt worktree has checked out, and exits non-zero. So a
 		// failed `gh pr merge` reads the PR state too, and only MERGED goes on to
 		// the verify and the auto-clean (#187's shipped-tip guard included); a
 		// guard's refusal, or any other state, exits 1 as before.
-		if !errors.Is(err, merge.ErrMergeCommand) || !mergedDespiteFailure(pr) {
+		if !errors.Is(err, merge.ErrMergeCommand) || !mergedDespiteFailure(prRef) {
 			return 1
 		}
-	} else if !*dryRun && !mergeConfirmed(pr) {
+	} else if !*dryRun && !mergeConfirmed(prRef) {
 		// ⚠ gh exits 0 WITHOUT merging for --help, --auto, --disable-auto, a merge
 		// queue or -R, so only a PR that now reads MERGED is verified and
 		// auto-cleaned (#185). Still exit 0: gh did what it was asked (printed help,
@@ -570,21 +587,33 @@ func cmdMergePR(args []string) int {
 	// Post-merge verification (#77): re-check the referenced issues + report any
 	// that changed state — catches a silent close (trap 2) in the same command.
 	if !*dryRun && !*noCloseCheck {
-		verifyClosings(prep.plan)
+		verifyClosings(prep.plan, reads)
 	}
 	// Auto-clean: the PR just shipped, so its worktree is done. Only on a real
 	// merge (not dry-run) and unless -keep. Best-effort — a cleanup miss must
 	// not fail the merge that already succeeded, so we warn and return 0.
 	if !*dryRun && !*keep {
-		autoCleanMergedWorktree(pr)
+		autoCleanMergedWorktree(prRef, at)
 	}
 	return 0
 }
 
+// resolvePRIn is ghx.ResolvePRIn; a var so a test can answer it.
+var resolvePRIn = ghx.ResolvePRIn
+
 // autoCleanMergedWorktree resolves the merged PR's head branch, finds the
 // matching worktree under the configured root, and removes it (+ local branch).
-// Every failure path is a soft warning: the merge is already done.
-func autoCleanMergedWorktree(pr string) {
+// Every failure path is a soft warning: the merge is already done. at is the
+// PR as a forwarded -R resolved it (#228), nil without one: a PR in another
+// repository than this clone's origin has no worktree here, and a branch of
+// the same name here is another branch, so nothing is touched.
+func autoCleanMergedWorktree(pr string, at *ghx.PRAt) {
+	if at != nil {
+		if _, owner, name := ghx.OriginRepo(); !strings.EqualFold(owner, at.Owner) || !strings.EqualFold(name, at.Name) {
+			ui.Info("merged %s, in %s, not this clone's origin: no worktree or claim here to clean", at.URL, at.Repo())
+			return
+		}
+	}
 	c, err := config.Load()
 	if err != nil {
 		return
