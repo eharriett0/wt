@@ -268,6 +268,19 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   session's until the client restarts it, and whether a client passes its
   session id to a stdio MCP server at all is not verified. The payload's
   `session` says which one it answered as.
+- **Every write to a coordination log or block ledger holds its flock (#229).**
+  `wt prune-coord` (`withLockedLog`) reads, truncates and rewrites the file
+  under an exclusive flock, and `coord.Append` used to write with a bare
+  `O_APPEND`, so a record appended in between (a hold included) was deleted by
+  the truncate or overwritten by the rewrite. `Append` now takes the same lock
+  for its write. ⚠ flock locks are per open file, so a caller that already
+  holds the lock through another descriptor must not call `Append` (it would
+  wait on itself): `ReserveBlock` writes through its locked handle with
+  `appendLocked` (seek to the end, then write). Pinned by
+  `TestAppend_waitsForAPruneRewrite` (a prune paused between its read and its
+  rewrite; `lockedLogPause` is the seam) and
+  `TestReserveBlock_noSelfDeadlockAndAppendsLand`. Off unix the lock is a
+  no-op, as before.
 - **`ClassifyFacts` precedence:** open PR > merged PR > closed PR > dirty >
   unmerged > merged-by-ancestry. PR state outranks a dirty index (a
   merged/closed branch with leftover staged cruft is stale, not a permanent

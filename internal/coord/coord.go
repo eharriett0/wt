@@ -18,6 +18,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -487,6 +488,12 @@ func MergeByID(local, remote []Record) []Record {
 }
 
 // Append writes r as one JSON line to path, creating parent dirs as needed.
+// It holds the log's exclusive lock while it writes (#229): withLockedLog (wt
+// prune-coord) reads, truncates and rewrites the file under that lock, and an
+// unlocked append landing in between was deleted by the truncate or
+// overwritten by the rewrite, a hold included. ⚠ Never call it while holding
+// the lock on the same file through another descriptor: flock locks are per
+// open file, so it would wait on itself (ReserveBlock writes with appendLocked).
 func Append(path string, r Record) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
@@ -496,14 +503,26 @@ func Append(path string, r Record) error {
 		return err
 	}
 	defer f.Close()
+	if err := lock.Exclusive(f); err != nil {
+		return err
+	}
+	defer lock.Release(f)
+	return appendLocked(f, r)
+}
+
+// appendLocked writes r as one JSON line at the end of f, whose lock the
+// caller holds. Seeking to the end first makes it safe on a descriptor opened
+// without O_APPEND (ReserveBlock's).
+func appendLocked(f *os.File, r Record) error {
 	b, err := json.Marshal(r)
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(append(b, '\n')); err != nil {
+	if _, err := f.Seek(0, io.SeekEnd); err != nil {
 		return err
 	}
-	return nil
+	_, err = f.Write(append(b, '\n'))
+	return err
 }
 
 // Load reads every record from path in order. A missing file is not an error
@@ -864,6 +883,10 @@ func PruneLegacy(path string, now time.Time, maxAge time.Duration, apply bool) (
 // (like Append): O_CREATE makes the file but not the dir, and a block-only repo
 // may never have created ~/.wt/coordination/ (its block records live in the
 // per-file ledgers now, #152) — pruning must not error there.
+// lockedLogPause, when set, runs inside withLockedLog between the read and the
+// rewrite: a test holds a prune there to prove an Append waits (#229).
+var lockedLogPause func()
+
 func withLockedLog(path string, fn func(recs []Record) (kept []Record, rewrite bool)) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
@@ -881,6 +904,9 @@ func withLockedLog(path string, fn func(recs []Record) (kept []Record, rewrite b
 	recs, err := Load(path)
 	if err != nil {
 		return err
+	}
+	if lockedLogPause != nil {
+		lockedLogPause()
 	}
 	kept, rewrite := fn(recs)
 	if !rewrite {
@@ -1433,7 +1459,7 @@ func ReserveBlock(path string, r Record, file string, fileMax func() (int, error
 	r.Kind = KindBlockReserve
 	r.File = file
 	r.Block = NextBlock(recs, file, fm, time.Now(), DefaultBlockReserveTTL)
-	if err := Append(path, r); err != nil {
+	if err := appendLocked(lf, r); err != nil { // the lock is held: Append would wait on it (#229)
 		return Record{}, err
 	}
 	return r, nil
