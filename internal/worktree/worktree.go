@@ -83,6 +83,16 @@ func ReapVerdict(unshipped int, cherryFailed, prMerged, pushed, withinGrace, dir
 	return !cherryFailed && unshipped == 0
 }
 
+// branchDeleteCmd is the manual delete clean prints for br: at the tip it
+// checked, in one step, when it read one (#230 review: `git branch -D`
+// deletes whatever the branch points at by the time it is run). Pure.
+func branchDeleteCmd(br, tip string) string {
+	if tip == "" {
+		return "git branch -D " + br
+	}
+	return "git update-ref -d refs/heads/" + br + " " + tip
+}
+
 // prLookup is ghx.PRForBranchOrTip, Clean's PR read. A var so a test can
 // answer it: gh's auth answer is memoized process-wide, so a fake gh can't.
 var prLookup = ghx.PRForBranchOrTip
@@ -823,7 +833,7 @@ func Clean(c *config.Config, apply, staleIndex, allRoots bool, names []string) e
 				ui.Warn("%s — PR #%s merged, but this worktree has a leftover uncommitted index (%d dirty file(s)) so plain clean leaves it. INSPECT it, then if it's stale leftovers (not fresh work) remove it by hand:", br, prNum, dirtyCount(wt))
 			}
 			fmt.Printf("  git -C %s status              # confirm what's uncommitted FIRST\n", wt)
-			fmt.Printf("  git worktree remove --force %s && git branch -D %s\n", wt, br)
+			fmt.Printf("  git worktree remove --force %s && %s\n", wt, branchDeleteCmd(br, tip))
 			continue
 		}
 
@@ -862,7 +872,7 @@ func Clean(c *config.Config, apply, staleIndex, allRoots bool, names []string) e
 		}
 		if !apply {
 			ui.OK("%s — shipped (%s), safe to remove", br, reason)
-			fmt.Printf("  git worktree remove %s && git branch -D %s\n", wt, br)
+			fmt.Printf("  git worktree remove %s && %s\n", wt, branchDeleteCmd(br, tip))
 			listed = append(listed, name)
 			continue
 		}
@@ -960,17 +970,25 @@ func remove(c *config.Config, wtPath, branch, tip string, force, allowOutsideRoo
 		// At the checked tip, in one step, after git branch -D's own in-use
 		// check, as `wt discard` deletes (#177 review).
 		if err := gitx.DeleteBranchAt(home, branch, tip); err != nil {
-			ui.Warn("branch %s not deleted: %v", branch, err)
+			if now := gitx.BranchTipIn(home, branch); now != "" && now != tip {
+				ui.Warn("kept branch %s: it moved from %.12s to %.12s after it was checked (a commit landed meanwhile)", branch, tip, now)
+			} else {
+				ui.Warn("branch %s not deleted: %v", branch, err)
+			}
 		} else {
 			ui.Step("deleted local branch %s", branch)
 		}
 	}
 	if inside {
-		where := home
-		if where == "" {
-			where = "the main checkout"
+		switch {
+		case home == "":
+			ui.Step("cd to the main checkout   (you were inside the removed worktree)")
+		case gitx.IsBareRepo(home):
+			// #230 review: wt can't run in a bare repository itself.
+			ui.Step("cd to another worktree of %s   (you were inside the removed worktree)", home)
+		default:
+			ui.Step("cd %s   (you were inside the removed worktree)", home)
 		}
-		ui.Step("cd %s   (you were inside the removed worktree)", where)
 	}
 	return nil
 }

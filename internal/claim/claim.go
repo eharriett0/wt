@@ -348,9 +348,13 @@ func rollbackFailedClaim(c *config.Config, branch string, made worktree.Created,
 	if s.removeWorktree {
 		del, tip := "", ""
 		if s.deleteBranch {
-			// The branch this claim cut, at the tip it has now (#230 review:
-			// deleted only while it still points there).
-			del, tip = branch, gitx.BranchTipIn(made.Dir, branch)
+			// The branch this claim cut, deleted only while it is still at
+			// what the claim left it at (#230 review): its placeholder, or
+			// the commit it was cut at when that commit failed.
+			del, tip = branch, placeholder
+			if tip == "" {
+				tip = before
+			}
 		}
 		if err := worktree.Remove(c, made.Dir, del, tip, false); err != nil {
 			ui.Warn("rollback: couldn't remove worktree %s: %v", made.Dir, err)
@@ -442,6 +446,13 @@ func cleanAbandonedWorktree(c *config.Config, e activework.Entry) {
 		ui.Warn("--clean: worktree %s has uncommitted changes — left in place", e.Worktree)
 		return
 	}
+	// Everything below proves the CLAIM's branch abandoned, so the worktree
+	// must still hold it (#230 review): one switched to other work was removed
+	// with that work's ignored files.
+	if on, err := gitx.CurrentBranchIn(e.Worktree); err != nil || on != e.Branch {
+		ui.Warn("--clean: worktree %s is not on %s (it holds %q) — left in place", e.Worktree, e.Branch, on)
+		return
+	}
 	// The local placeholder tip is read FIRST and everything below is about
 	// that commit (#159 review, #230 review): the subjects proved abandoned,
 	// the local branch deleted only while it still points there, and the
@@ -499,7 +510,7 @@ func cleanAbandonedWorktree(c *config.Config, e activework.Entry) {
 	case remoteTip == "":
 		// no remote branch (already gone) — nothing to do
 	case remoteTip == localTip:
-		if err := gitx.DeleteRemoteBranch(home, e.Branch); err != nil {
+		if err := gitx.DeleteRemoteBranch(home, e.Branch, localTip); err != nil {
 			ui.Info("--clean: remote origin/%s not deleted: %v", e.Branch, err)
 		} else {
 			ui.OK("--clean: deleted remote branch origin/%s", e.Branch)

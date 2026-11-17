@@ -716,7 +716,15 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   `core.ignorecase` is main's loose ref).
   `release --clean` reads its placeholder tip first and origin from the main
   checkout (read from the removed lane it failed, read as "gone", and origin's
-  placeholder stayed). `wt clean` removes the cwd's lane last (`cwdLast`).
+  placeholder stayed), removes only a lane still ON the claim's branch, and
+  deletes origin's placeholder with a lease on that tip
+  (`DeleteRemoteBranch(dir, b, tip)`: `--force-with-lease`, which git applies
+  to a delete). `wt clean` removes the cwd's lane last (`cwdLast`). ⚠ The #187
+  check fetches `refs/pull/<n>/head` once when the PR's head is not in this
+  clone (updated on GitHub, then deleted with the merge: no plain fetch brings
+  it, and the lane was kept forever), and an UNKNOWN verdict never advises
+  "push them" (that recreates the deleted branch at a stale tip). A relative
+  `worktree_root` still means a different directory from each cwd (#238).
   Pinned by `remove_review_test.go`, `TestRelease_CleanFromInsideTheLane` and
   `TestCmdMergePR_keepsAnUnshippedLaneFromInsideIt`.
 - **merge-pr's checks gate never reads a failed read, or `--admin`, as green

@@ -357,7 +357,23 @@ func Fetch(remote, branch string) error {
 // git's prompt, and ssh in BatchMode unless the user set their own ssh
 // command.
 func FetchNoPrompt(remote, branch string) error {
-	cmd := exec.Command("git", "fetch", remote, "+refs/heads/"+branch+":refs/remotes/"+remote+"/"+branch)
+	return fetchNoPrompt(remote, "+refs/heads/"+branch+":refs/remotes/"+remote+"/"+branch)
+}
+
+// FetchPRHeadNoPrompt fetches GitHub's refs/pull/<pr>/head from remote into
+// FETCH_HEAD only, as FetchNoPrompt fetches (#230 review): a merged PR's head
+// can be a commit this clone never had (the branch updated on GitHub, then
+// deleted with the merge), and the #187 tip check can't compare against it
+// until its objects are here. pr must be a number. No ref is written.
+func FetchPRHeadNoPrompt(remote, pr string) error {
+	if _, err := strconv.Atoi(pr); err != nil {
+		return fmt.Errorf("not a PR number: %q", pr)
+	}
+	return fetchNoPrompt(remote, "refs/pull/"+pr+"/head")
+}
+
+func fetchNoPrompt(remote, refspec string) error {
+	cmd := exec.Command("git", "fetch", "--no-prune", remote, refspec)
 	cmd.Env = append(scopedEnv(), "GIT_TERMINAL_PROMPT=0")
 	// GIT_TERMINAL_PROMPT stops git's own (HTTPS) prompt only; ssh reads
 	// /dev/tty for a passphrase or an unknown host key. BatchMode makes ssh
@@ -777,10 +793,16 @@ func MainCheckout() string {
 	if filepath.Base(common) == ".git" {
 		return filepath.Dir(common)
 	}
-	if bare, err := RunDir(common, "rev-parse", "--is-bare-repository"); err == nil && strings.TrimSpace(bare) == "true" {
+	if IsBareRepo(common) {
 		return common
 	}
 	return ""
+}
+
+// IsBareRepo reports whether dir is a bare repository's git dir.
+func IsBareRepo(dir string) bool {
+	bare, err := RunDir(dir, "rev-parse", "--is-bare-repository")
+	return err == nil && strings.TrimSpace(bare) == "true"
 }
 
 // Cherry returns `git cherry <base> <branchRef>` output (+/- lines).
@@ -1884,10 +1906,16 @@ func PushSetUpstream(dir, branch string) error {
 // DeleteRemoteBranch deletes branch on origin, from dir. `release --clean` uses it
 // to drop the abandoned placeholder branch that claim pushed, so re-claiming the
 // same issue pushes a fresh branch cleanly instead of hitting a non-fast-forward
-// rejection (#159). Errors (e.g. the remote ref is already gone) are the caller's
-// to treat as best-effort.
-func DeleteRemoteBranch(dir, branch string) error {
-	_, err := RunDir(dir, "push", "origin", "--delete", branch)
+// rejection (#159). Errors (e.g. the remote ref is already gone, or it moved
+// from tip) are the caller's to treat as best-effort.
+func DeleteRemoteBranch(dir, branch, tip string) error {
+	// Only while origin's branch is still at tip (#230 review): a check and
+	// a separate delete let a push landing in between be deleted. git applies
+	// the lease to a delete too.
+	if tip == "" {
+		return fmt.Errorf("delete of origin/%s needs the tip it was checked at", branch)
+	}
+	_, err := RunDir(dir, "push", "origin", "--delete", "--force-with-lease=refs/heads/"+branch+":"+tip, branch)
 	return err
 }
 

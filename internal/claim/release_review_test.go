@@ -44,3 +44,28 @@ func TestRelease_CleanFromInsideTheLane(t *testing.T) {
 		})
 	}
 }
+
+// #230 review: release --clean proves the CLAIM's branch abandoned, so a lane
+// switched to other work is not its to remove: the removal took that work's
+// ignored files.
+func TestRelease_CleanKeepsALaneSwitchedToOtherWork(t *testing.T) {
+	f := newClaimFixture(t)
+	if err := f.claim(true); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	f.git(f.dir(), "switch", "-q", "-c", "real-work")
+	f.git(f.dir(), "commit", "-q", "--allow-empty", "-m", "real work")
+	out, err := capturedRelease(t, f)
+	if err != nil {
+		t.Fatalf("Release: %v\n%s", err, out)
+	}
+	if _, serr := os.Stat(f.dir()); serr != nil {
+		t.Errorf("the lane was removed: %v\n%s", serr, out)
+	}
+	if !strings.Contains(out, "is not on "+claimBranch) {
+		t.Errorf("release said:\n%s\nwant it to say the lane is on another branch", out)
+	}
+	if f.ref(f.origin, "refs/heads/"+claimBranch) == "" {
+		t.Errorf("origin's placeholder was deleted\n%s", out)
+	}
+}

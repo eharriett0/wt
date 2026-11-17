@@ -112,6 +112,9 @@ func TestLocalTipVerdict(t *testing.T) {
 func TestKeptLaneMessage(t *testing.T) {
 	const head = "1111111111111111111111111111111111111111"
 	kept := "; kept the worktree and branch (push them, or delete them yourself)"
+	// Unknown never says "push them" (#230 review): it would recreate a branch
+	// the merge deleted, at a stale tip.
+	unsure := "; kept the worktree and branch (delete them yourself once you've checked nothing is missing)"
 	cases := []struct {
 		v         TipVerdict
 		n         int
@@ -120,9 +123,9 @@ func TestKeptLaneMessage(t *testing.T) {
 	}{
 		{TipUnshipped, 2, "t", head, "feat-x has 2 commit(s) that were not in PR #5" + kept},
 		{TipUnshipped, -1, "t", head, "feat-x has commits that were not in PR #5 (wt could not count them)" + kept},
-		{TipUnknown, -1, "t", "", "feat-x may have commits that were not in PR #5: wt could not read the PR's head commit" + kept},
-		{TipUnknown, -1, "", head, "feat-x may have commits that were not in PR #5: wt could not read the branch's tip" + kept},
-		{TipUnknown, -1, "t", head, "feat-x may have commits that were not in PR #5: wt could not compare its tip with the PR's head 111111111111 (is that commit fetched here?)" + kept},
+		{TipUnknown, -1, "t", "", "feat-x may have commits that were not in PR #5: wt could not read the PR's head commit" + unsure},
+		{TipUnknown, -1, "", head, "feat-x may have commits that were not in PR #5: wt could not read the branch's tip" + unsure},
+		{TipUnknown, -1, "t", head, "feat-x may have commits that were not in PR #5: wt could not compare its tip with the PR's head 111111111111, which is not in this clone (`git fetch origin refs/pull/5/head` brings it in; then run it again)" + unsure},
 	}
 	for _, tc := range cases {
 		if got := KeptLaneMessage(tc.v, "feat-x", "5", tc.n, tc.tip, tc.head); got != tc.want {

@@ -7,6 +7,9 @@ import (
 	"github.com/eharriett0/wt/internal/gitx"
 )
 
+// fetchPRHead is gitx.FetchPRHeadNoPrompt; a var so a test can count it.
+var fetchPRHead = gitx.FetchPRHeadNoPrompt
+
 // UnshippedLane returns "" when tip, the local branch's tip as the caller read
 // it, shipped in merged PR pr (LocalTipVerdict), and otherwise the warning
 // that keeps the lane (#187). merge-pr's auto-clean and `wt clean` both ask it
@@ -19,6 +22,12 @@ func UnshippedLane(pr, branch, tip string) string {
 	var ancestorErr error
 	if tip != "" && head != "" && !strings.EqualFold(tip, head) {
 		ancestor, ancestorErr = gitx.IsAncestor(tip, head)
+		if ancestorErr != nil && fetchPRHead("origin", pr) == nil {
+			// #230 review: the head can be a commit this clone never had (the
+			// branch updated on GitHub, then deleted with the merge); no plain
+			// fetch brings it, so the lane was kept on every run. Once.
+			ancestor, ancestorErr = gitx.IsAncestor(tip, head)
+		}
 	}
 	v := LocalTipVerdict(tip, head, ancestor, ancestorErr)
 	if v == TipShipped {
