@@ -78,7 +78,7 @@ func TestRemove_RefusesEditsGitStatusHides(t *testing.T) {
 			gitW(t, dir, "add", "conf.txt")
 			f.commitHere(dir, "conf")
 			f.hideEdit(dir, mech, "conf.txt")
-			err := Remove(f.c, dir, "lane", false)
+			err := Remove(f.c, dir, "lane", f.tip(dir, "refs/heads/lane"), false)
 			if err == nil || !strings.Contains(err.Error(), "has uncommitted changes") {
 				t.Fatalf("Remove = %v, want its refusal of uncommitted changes", err)
 			}

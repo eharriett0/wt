@@ -346,11 +346,13 @@ func rollbackFailedClaim(c *config.Config, branch string, made worktree.Created,
 		}
 	}
 	if s.removeWorktree {
-		del := ""
+		del, tip := "", ""
 		if s.deleteBranch {
-			del = branch
+			// The branch this claim cut, at the tip it has now (#230 review:
+			// deleted only while it still points there).
+			del, tip = branch, gitx.BranchTipIn(made.Dir, branch)
 		}
-		if err := worktree.Remove(c, made.Dir, del, false); err != nil {
+		if err := worktree.Remove(c, made.Dir, del, tip, false); err != nil {
 			ui.Warn("rollback: couldn't remove worktree %s: %v", made.Dir, err)
 		}
 	}
@@ -440,9 +442,18 @@ func cleanAbandonedWorktree(c *config.Config, e activework.Entry) {
 		ui.Warn("--clean: worktree %s has uncommitted changes — left in place", e.Worktree)
 		return
 	}
-	subjects, serr := gitx.CommitSubjects("origin/"+c.Base, "refs/heads/"+e.Branch)
+	// The local placeholder tip is read FIRST and everything below is about
+	// that commit (#159 review, #230 review): the subjects proved abandoned,
+	// the local branch deleted only while it still points there, and the
+	// remote deleted only when it matches.
+	localTip := gitx.BranchTipIn(e.Worktree, e.Branch)
+	if localTip == "" {
+		ui.Warn("--clean: can't read the tip of %s — left in place", e.Branch)
+		return
+	}
+	subjects, serr := gitx.CommitSubjects("origin/"+c.Base, localTip)
 	if serr != nil {
-		subjects, serr = gitx.CommitSubjects(c.Base, "refs/heads/"+e.Branch)
+		subjects, serr = gitx.CommitSubjects(c.Base, localTip)
 	}
 	if serr != nil {
 		ui.Warn("--clean: can't inspect %s vs %s (%v) — left in place", e.Branch, c.Base, serr)
@@ -461,10 +472,14 @@ func cleanAbandonedWorktree(c *config.Config, e activework.Entry) {
 		}
 		return
 	}
-	// Capture the local placeholder tip BEFORE removing the branch — the remote we
-	// delete must be the SAME placeholder we just proved abandoned (#159 review).
-	localTip, _ := gitx.RunDir(c.Root, "rev-parse", "refs/heads/"+e.Branch)
-	if err := worktree.Remove(c, e.Worktree, e.Branch, false); err != nil {
+	// #230 review: run inside the lane, c.Root IS the worktree removed below,
+	// and the remote reads after it failed and read as "already gone": origin's
+	// placeholder stayed, the #159 state. Resolved while the cwd still exists.
+	home := gitx.MainCheckout()
+	if home == "" {
+		home = c.Root
+	}
+	if err := worktree.Remove(c, e.Worktree, e.Branch, localTip, false); err != nil {
 		// Kept whole, as a dirty worktree is above: the remote placeholder is
 		// what a re-claim re-attaches to (#177 review). The gate now also refuses
 		// a clean worktree (a git repository in its ignored files), so this is
@@ -478,11 +493,13 @@ func cleanAbandonedWorktree(c *config.Config, e activework.Entry) {
 	// the remote too, but ONLY when it matches the local placeholder we proved
 	// abandoned: a remote that diverged with real commits (an out-of-band push, no
 	// PR) must never be force-deleted. Best-effort — the remote may already be gone.
-	switch remoteTip, rerr := gitx.RemoteBranchTip(c.Root, e.Branch); {
-	case rerr != nil || remoteTip == "":
+	switch remoteTip, rerr := gitx.RemoteBranchTip(home, e.Branch); {
+	case rerr != nil:
+		ui.Warn("--clean: could not read origin/%s (%v) — left in place; delete it by hand if it is the placeholder (%s), or a re-claim of this issue is refused", e.Branch, rerr, abbrev(localTip))
+	case remoteTip == "":
 		// no remote branch (already gone) — nothing to do
-	case localTip != "" && remoteTip == localTip:
-		if err := gitx.DeleteRemoteBranch(c.Root, e.Branch); err != nil {
+	case remoteTip == localTip:
+		if err := gitx.DeleteRemoteBranch(home, e.Branch); err != nil {
 			ui.Info("--clean: remote origin/%s not deleted: %v", e.Branch, err)
 		} else {
 			ui.OK("--clean: deleted remote branch origin/%s", e.Branch)

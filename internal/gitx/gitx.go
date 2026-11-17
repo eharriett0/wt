@@ -762,17 +762,25 @@ func BranchDeleteIn(dir, branch string) error {
 	return err
 }
 
-// MainCheckout is the repository's main working tree: the parent of the shared
-// git dir when that is a `.git` directory, "" otherwise (a bare repository or
-// an unusual layout) or when cwd is in no repository. Resolve it BEFORE
-// removing the worktree the process sits in (#230): afterwards git can't run
-// from the cwd at all.
+// MainCheckout is where git runs for the repository once a worktree is
+// removed: the main working tree (the parent of the shared git dir when that
+// is a `.git` directory), or, in a bare repository with linked worktrees, the
+// repository itself (#230 review: there git can still remove a worktree and
+// delete a branch). "" otherwise (a submodule's git dir, an unusual layout) or
+// when cwd is in no repository. Resolve it BEFORE removing the worktree the
+// process sits in (#230): afterwards git can't run from the cwd at all.
 func MainCheckout() string {
 	common, err := CommonDir()
-	if err != nil || filepath.Base(common) != ".git" {
+	if err != nil {
 		return ""
 	}
-	return filepath.Dir(common)
+	if filepath.Base(common) == ".git" {
+		return filepath.Dir(common)
+	}
+	if bare, err := RunDir(common, "rev-parse", "--is-bare-repository"); err == nil && strings.TrimSpace(bare) == "true" {
+		return common
+	}
+	return ""
 }
 
 // Cherry returns `git cherry <base> <branchRef>` output (+/- lines).

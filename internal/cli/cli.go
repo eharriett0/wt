@@ -611,22 +611,18 @@ func autoCleanMergedWorktree(pr string) {
 		// #187: a squash merge leaves the branch unmerged in git's eyes, so
 		// Remove deletes it with -D. Only when every local commit shipped in
 		// the PR; otherwise keep the lane (and exit 0: the merge happened).
-		if msg := unshippedLane(pr, branch); msg != "" {
+		msg, tip := unshippedLane(pr, branch)
+		if msg != "" {
 			ui.Warn("%s", msg)
 			return
 		}
-		// #230: where to go, and whether we are inside the worktree, are read
-		// BEFORE it is removed. c.Root is the worktree itself when merge-pr runs
-		// in it (the usual case), so the hint named the directory just removed.
-		inside, home := cwdUnder(wt), gitx.MainCheckout()
-		if home == "" {
-			home = c.Root
-		}
-		if err := worktree.Remove(c, wt, branch, false); err != nil {
+		// #230: Remove reads where to go, and whether we are inside the
+		// worktree, BEFORE it is removed, and prints the cd hint. c.Root is the
+		// worktree itself when merge-pr runs in it (the usual case), so the old
+		// hint named the directory just removed.
+		if err := worktree.Remove(c, wt, branch, tip, false); err != nil {
 			ui.Warn("worktree for %s not auto-removed: %v", branch, err)
 			ui.Info("remove it manually once clean, or `wt clean -y`")
-		} else if inside {
-			ui.Step("cd %s   (you were inside the removed worktree)", home)
 		}
 		return
 	}
@@ -651,17 +647,6 @@ func removeActiveWorkForBranch(c *config.Config, branch string) {
 			ui.Info("removed #%s from active-work (claim resolved)", issue)
 		}
 	}
-}
-
-// cwdUnder reports whether the current dir is inside dir (so we can hint a cd
-// back to the primary checkout after removing the worktree we were sitting in).
-func cwdUnder(dir string) bool {
-	cwd, err := os.Getwd()
-	if err != nil {
-		return false
-	}
-	rel, err := filepath.Rel(dir, cwd)
-	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // anyDeployPath reports whether any changed file matches any deploy glob. Reuses

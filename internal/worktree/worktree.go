@@ -12,6 +12,7 @@ import (
 	"github.com/eharriett0/wt/internal/config"
 	"github.com/eharriett0/wt/internal/ghx"
 	"github.com/eharriett0/wt/internal/gitx"
+	"github.com/eharriett0/wt/internal/merge"
 	"github.com/eharriett0/wt/internal/ui"
 )
 
@@ -80,6 +81,28 @@ func ReapVerdict(unshipped int, cherryFailed, prMerged, pushed, withinGrace, dir
 		return false
 	}
 	return !cherryFailed && unshipped == 0
+}
+
+// prLookup is ghx.PRForBranchOrTip, Clean's PR read. A var so a test can
+// answer it: gh's auth answer is memoized process-wide, so a fake gh can't.
+var prLookup = ghx.PRForBranchOrTip
+
+// cwdLast is paths with the one that holds the cwd moved to the end (#230
+// review): `wt clean -y` run inside a lane it reaps removed that lane first,
+// and every git call after it, for the lanes that followed, failed with
+// "Unable to read current working directory". Order otherwise kept. Pure
+// given holds.
+func cwdLast(paths []string, holds func(string) bool) []string {
+	out := make([]string, 0, len(paths))
+	var last []string
+	for _, p := range paths {
+		if holds(p) {
+			last = append(last, p)
+		} else {
+			out = append(out, p)
+		}
+	}
+	return append(out, last...)
 }
 
 // PushedUpstream reports whether a branch's upstream shows it was pushed (#175).
@@ -717,7 +740,7 @@ func Clean(c *config.Config, apply, staleIndex, allRoots bool, names []string) e
 	removed := 0
 	var listed []string // what a listing-only run showed as shipped, for RerunHint
 	skippedOutOfRoot := 0
-	for _, wt := range paths[1:] { // skip primary (index 0)
+	for _, wt := range cwdLast(paths[1:], holdsCwd) { // skip primary (index 0)
 		name := ""
 		if len(names) > 0 {
 			b, _ := gitx.CurrentBranchIn(wt)
@@ -756,9 +779,16 @@ func Clean(c *config.Config, apply, staleIndex, allRoots bool, names []string) e
 		withinGrace := ageOK && age < cleanGraceWindow
 		pushed := PushedUpstream(gitx.HasUpstream(wt), gitx.UpstreamMergeRef(wt, br), c.Base)
 		dirty := !gitx.IsClean(wt) // fails closed: unreadable status counts as dirty
-		n, cerr := gitx.CountUnshipped("origin/"+c.Base, "refs/heads/"+br)
-		if cerr != nil {
-			n, cerr = gitx.CountUnshipped(c.Base, "refs/heads/"+br)
+		// #230 review: every proof below is about THIS commit, and the branch
+		// is deleted only while it still points here. A commit landing after
+		// the check is then never deleted with the branch.
+		tip := gitx.BranchTip(br)
+		n, cerr := -1, fmt.Errorf("could not read the tip of %s", br)
+		if tip != "" {
+			n, cerr = gitx.CountUnshipped("origin/"+c.Base, tip)
+			if cerr != nil {
+				n, cerr = gitx.CountUnshipped(c.Base, tip)
+			}
 		}
 		cherryFailed := cerr != nil
 		// One PR-state read (#88) shared with collide/status/check via ghx —
@@ -766,8 +796,18 @@ func Clean(c *config.Config, apply, staleIndex, allRoots bool, names []string) e
 		// #168: when no PR has this branch's name, the branch's tip commit is looked
 		// up instead, so work pushed under another name and squash-merged there is
 		// recognised as shipped. A dirty worktree is still never removed.
-		prNum, prState, viaTip, prOK := ghx.PRForBranchOrTip(br, gitx.ResolveRemoteBase(c.Base))
+		prNum, prState, viaTip, prOK := prLookup(br, gitx.ResolveRemoteBase(c.Base))
 		prMerged := prOK && prState == "MERGED"
+		// #230 review: a merged PR proves only the commits it had shipped. A
+		// commit made in the lane after the merge is not in it, and clean
+		// deleted it with the branch (merge-pr's auto-clean has kept such a
+		// lane since #187). So a merged PR reaps only a tip that IS its head
+		// or an ancestor of it; otherwise the cherry proof still can.
+		prShipped, keptLane := false, ""
+		if prMerged {
+			keptLane = merge.UnshippedLane(prNum, br, tip)
+			prShipped = keptLane == ""
+		}
 
 		// #88 --stale-index: REPORT (never auto-remove) a MERGED-PR worktree that
 		// holds a leftover uncommitted index a plain clean silently leaves forever
@@ -787,7 +827,7 @@ func Clean(c *config.Config, apply, staleIndex, allRoots bool, names []string) e
 			continue
 		}
 
-		if !ReapVerdict(n, cherryFailed, prMerged, pushed, withinGrace, dirty) {
+		if !ReapVerdict(n, cherryFailed, prShipped, pushed, withinGrace, dirty) {
 			switch {
 			case withinGrace:
 				ui.Info("%s — created %s ago, within grace window, leave alone", br, age.Round(time.Second))
@@ -795,6 +835,8 @@ func Clean(c *config.Config, apply, staleIndex, allRoots bool, names []string) e
 				ui.Info("%s — PR #%s merged, but has uncommitted changes (%d file(s)), leave alone; `wt clean --stale-index` reports it with the manual remove", br, prNum, dirtyCount(wt))
 			case dirty:
 				ui.Info("%s — has uncommitted changes (%d file(s)), leave alone", br, dirtyCount(wt))
+			case prMerged && !prShipped:
+				ui.Info("%s — PR #%s merged, but %s", br, prNum, keptLane)
 			case !pushed:
 				ui.Info("%s — never pushed (no upstream of its own), leave alone", br)
 			case cherryFailed:
@@ -812,7 +854,7 @@ func Clean(c *config.Config, apply, staleIndex, allRoots bool, names []string) e
 			continue
 		}
 		reason := fmt.Sprintf("patch-equivalent on %s", c.Base)
-		if prMerged {
+		if prShipped {
 			reason = "PR merged"
 			if viaTip {
 				reason = fmt.Sprintf("PR #%s merged, found by the branch's tip commit", prNum)
@@ -827,7 +869,7 @@ func Clean(c *config.Config, apply, staleIndex, allRoots bool, names []string) e
 		// apply: remove it (never force — refuse to discard uncommitted work).
 		// allRoots relaxes ONLY the under-root guard; every data-loss guard above
 		// (grace window, upstream, cherry/PR-merged proof, clean tree) still ran.
-		if err := remove(c, wt, br, false, allRoots); err != nil {
+		if err := remove(c, wt, br, tip, false, allRoots); err != nil {
 			ui.Warn("skipped %s: %v", br, err)
 			continue
 		}
@@ -859,10 +901,14 @@ func Clean(c *config.Config, apply, staleIndex, allRoots bool, names []string) e
 //     extracted binary),
 //   - unless force, refuses one holding a git repository in its ignored files
 //     or a checked-out submodule (removalBlocked: git status shows neither),
+//   - deletes the branch only while it still points at tip, the commit the
+//     caller checked (#230 review): `git branch -D` deleted whatever the
+//     branch pointed at by then, so a commit landing after the check went
+//     with it. No tip keeps the branch.
 //   - a failed branch delete is a warning, not an error (the worktree is
-//     already gone; a lingering local branch is harmless).
-func Remove(c *config.Config, wtPath, branch string, force bool) error {
-	return remove(c, wtPath, branch, force, false)
+//     already gone).
+func Remove(c *config.Config, wtPath, branch, tip string, force bool) error {
+	return remove(c, wtPath, branch, tip, force, false)
 }
 
 // remove is Remove with the under-root guard optionally relaxed for `wt clean
@@ -870,7 +916,13 @@ func Remove(c *config.Config, wtPath, branch string, force bool) error {
 // scope — it never relaxes the uncommitted-work guard, and callers must still
 // have proven the branch shipped. Kept unexported so the safe Remove stays the
 // only entry point everything else can reach.
-func remove(c *config.Config, wtPath, branch string, force, allowOutsideRoot bool) error {
+func remove(c *config.Config, wtPath, branch, tip string, force, allowOutsideRoot bool) error {
+	// #230 review: git runs from the main checkout below, so a relative path
+	// is made absolute HERE, from the cwd every guard reads it from; resolved
+	// there instead, the guards checked one directory and git removed another.
+	if abs, err := filepath.Abs(wtPath); err == nil {
+		wtPath = abs
+	}
 	if !ManagedByClean(wtPath, c.WorktreeRoot, allowOutsideRoot) {
 		return fmt.Errorf("not under worktree root %s — refusing to remove", c.WorktreeRoot)
 	}
@@ -885,24 +937,40 @@ func remove(c *config.Config, wtPath, branch string, force, allowOutsideRoot boo
 	// #230: git runs from the main checkout, resolved while the cwd still
 	// exists. merge-pr usually runs inside the worktree it removes, and the
 	// branch delete that followed ran in the removed directory and failed.
+	// Whether the cwd is inside it, and case folding, are read now too.
 	home := gitx.MainCheckout()
+	inside := holdsCwd(wtPath)
+	fold := gitx.IgnoreCaseIn(home)
 	if err := gitx.WorktreeRemoveIn(home, wtPath, force); err != nil {
 		return fmt.Errorf("git worktree remove: %w", err)
 	}
 	ui.OK("removed worktree %s", filepath.Base(wtPath))
-	if branch == c.Base {
+	switch {
+	case branch == "" || branch == "HEAD":
+	case sameBranch(branch, c.Base, fold):
 		// Defense in depth alongside Clean's own guard: removing a base checkout
 		// is fine, deleting the base branch is not. `wt release --clean` reaches
 		// here too, so the refusal belongs at the delete, not only at the caller.
+		// Case folded (#230 review): under core.ignorecase `Main` is main's
+		// loose ref file, and deleting it deleted main.
 		ui.Info("kept branch %s — it is the base branch", branch)
-		return nil
-	}
-	if branch != "" && branch != "HEAD" {
-		if err := gitx.BranchDeleteIn(home, branch); err != nil {
-			ui.Warn("branch %s not deleted (harmless): %v", branch, err)
+	case tip == "":
+		ui.Warn("kept branch %s: its tip was not read when it was checked, so wt can't tell what it would delete", branch)
+	default:
+		// At the checked tip, in one step, after git branch -D's own in-use
+		// check, as `wt discard` deletes (#177 review).
+		if err := gitx.DeleteBranchAt(home, branch, tip); err != nil {
+			ui.Warn("branch %s not deleted: %v", branch, err)
 		} else {
 			ui.Step("deleted local branch %s", branch)
 		}
+	}
+	if inside {
+		where := home
+		if where == "" {
+			where = "the main checkout"
+		}
+		ui.Step("cd %s   (you were inside the removed worktree)", where)
 	}
 	return nil
 }
@@ -961,11 +1029,14 @@ func under(path, root string) bool {
 // which otherwise makes the env-supplied worktree root mismatch git's resolved
 // paths), falling back to an absolute path.
 func realPath(p string) string {
+	// Absolute first (#230 review): EvalSymlinks keeps a relative path relative
+	// and never resolves the cwd's own symlinks, so a relative root never
+	// compared with an absolute path in under().
+	if a, err := filepath.Abs(p); err == nil {
+		p = a
+	}
 	if r, err := filepath.EvalSymlinks(p); err == nil {
 		return r
-	}
-	if a, err := filepath.Abs(p); err == nil {
-		return a
 	}
 	return p
 }

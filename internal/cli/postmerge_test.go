@@ -185,6 +185,53 @@ func TestCmdMergePR_keepsTheLaneUnlessMerged(t *testing.T) {
 // branch stayed), and told the operator to cd into that same directory. The
 // branch now goes too, and the hint names the main checkout.
 func TestCmdMergePR_autoCleanFromInsideTheLane(t *testing.T) {
+	gitBin, repo, lane := inLaneMergeRepo(t, false)
+	var code int
+	out, errOut := captureT(t, func() { code = cmdMergePR([]string{"99999"}) })
+	if code != 0 {
+		t.Fatalf("cmdMergePR = %d\n%s%s", code, out, errOut)
+	}
+	if _, err := os.Stat(lane); err == nil {
+		t.Errorf("the lane was kept\n%s%s", out, errOut)
+	}
+	if exec.Command(gitBin, "-C", repo, "rev-parse", "-q", "--verify", "refs/heads/feat-x").Run() == nil {
+		t.Errorf("the merged branch was kept (deleted from the removed directory?)\n%s%s", out, errOut)
+	}
+	if strings.Contains(out+errOut, "not deleted") || !strings.Contains(out+errOut, "cd "+repo+" ") {
+		t.Errorf("want the branch deleted and the hint to name the main checkout %s:\n%s%s", repo, out, errOut)
+	}
+}
+
+// #187 from inside the lane (#230 review): since #230 the branch delete works
+// there, so a lane with a commit the PR doesn't have must still be kept, as it
+// is from the main checkout.
+func TestCmdMergePR_keepsAnUnshippedLaneFromInsideIt(t *testing.T) {
+	gitBin, repo, lane := inLaneMergeRepo(t, true)
+	tip, err := exec.Command(gitBin, "-C", lane, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var code int
+	out, errOut := captureT(t, func() { code = cmdMergePR([]string{"99999"}) })
+	if code != 0 {
+		t.Fatalf("cmdMergePR = %d\n%s%s", code, out, errOut)
+	}
+	if _, err := os.Stat(lane); err != nil {
+		t.Errorf("the lane was removed: %v\n%s%s", err, out, errOut)
+	}
+	got, _ := exec.Command(gitBin, "-C", repo, "rev-parse", "-q", "--verify", "refs/heads/feat-x").Output()
+	if strings.TrimSpace(string(got)) != strings.TrimSpace(string(tip)) {
+		t.Errorf("feat-x at %q, want kept at its follow-up %s\n%s%s", got, tip, out, errOut)
+	}
+	if !strings.Contains(out+errOut, "feat-x has 1 commit(s) that were not in PR #99999") {
+		t.Errorf("want the kept-lane warning:\n%s%s", out, errOut)
+	}
+}
+
+// inLaneMergeRepo is a repo with lane feat-x, PR 99999's head, behind the fake
+// gh, and the cwd inside the lane. followUp adds a commit the PR doesn't have.
+func inLaneMergeRepo(t *testing.T, followUp bool) (gitBin, repo, lane string) {
+	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("the fake gh is a shell script")
 	}
@@ -210,8 +257,8 @@ func TestCmdMergePR_autoCleanFromInsideTheLane(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	repo := filepath.Join(parent, "repo")
-	lane := filepath.Join(parent, "repo-worktrees", "feat-x")
+	repo = filepath.Join(parent, "repo")
+	lane = filepath.Join(parent, "repo-worktrees", "feat-x")
 	for _, args := range [][]string{
 		{"init", "-q", "-b", "main", repo},
 		{"-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base"},
@@ -231,20 +278,11 @@ func TestCmdMergePR_autoCleanFromInsideTheLane(t *testing.T) {
 		}
 	}
 	_ = os.Remove(filepath.Join(ghDir, "fails"))
+	if followUp {
+		if out, err := exec.Command(gitBin, "-C", lane, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "follow-up").CombinedOutput(); err != nil {
+			t.Fatalf("follow-up commit: %v\n%s", err, out)
+		}
+	}
 	t.Chdir(lane)
-
-	var code int
-	out, errOut := captureT(t, func() { code = cmdMergePR([]string{"99999"}) })
-	if code != 0 {
-		t.Fatalf("cmdMergePR = %d\n%s%s", code, out, errOut)
-	}
-	if _, err := os.Stat(lane); err == nil {
-		t.Errorf("the lane was kept\n%s%s", out, errOut)
-	}
-	if exec.Command(gitBin, "-C", repo, "rev-parse", "-q", "--verify", "refs/heads/feat-x").Run() == nil {
-		t.Errorf("the merged branch was kept (deleted from the removed directory?)\n%s%s", out, errOut)
-	}
-	if strings.Contains(out+errOut, "not deleted") || !strings.Contains(out+errOut, "cd "+repo+" ") {
-		t.Errorf("want the branch deleted and the hint to name the main checkout %s:\n%s%s", repo, out, errOut)
-	}
+	return gitBin, repo, lane
 }

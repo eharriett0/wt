@@ -483,6 +483,14 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   on the BASE branch** (`ReapableBranch`): "patch-equivalent on base" is
   trivially true for the base itself, so every downstream verdict says shipped
   and the printed command becomes `git branch -D main` (#101).
+  ⚠ **A merged PR reaps only a tip that shipped in it (#230 review).** It
+  proves only the commits it had: clean reaped a merged PR's lane without
+  asking, and a commit made there after the merge went with the branch.
+  `merge.UnshippedLane` (merge-pr's #187 check, one function for both) must
+  find the tip at the PR's `headRefOid` or an ancestor of it; otherwise the
+  merged PR proves nothing and only the cherry proof can reap. Every proof is
+  about the tip read at decision time, and the branch is deleted only there.
+  `prLookup` is the test seam (gh's auth answer is memoized process-wide).
   ⚠ **Untracked files count whatever `status.showUntrackedFiles` says (#208).**
   A repo set to `no` hid them from a plain porcelain status AND from `git
   worktree remove`'s own check, so `clean -y`, merge-pr's auto-clean and
@@ -691,10 +699,26 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   runs INSIDE the worktree it removes; `git branch -D` then ran in the removed
   directory, exited 128, and the merged branch stayed, while the hint said to
   cd into that same directory (`c.Root` is the cwd's worktree). `worktree.remove`
-  resolves `gitx.MainCheckout()` (the shared `.git`'s parent) before removing
-  and runs `WorktreeRemoveIn`/`BranchDeleteIn` there; auto-clean reads
-  `cwdUnder` and the main checkout before the removal too, and the hint names
-  it. A bare repository has no main checkout: git runs from the cwd, as before.
+  resolves `gitx.MainCheckout()` (the shared `.git`'s parent; in a bare
+  repository, the repository itself) before removing, runs the removal and the
+  delete there, and prints the cd hint itself (`holdsCwd`, read before, so a
+  symlinked or differently-cased cwd still gets it). ⚠⚠ **That fix made the
+  delete WORK where it used to fail, which armed guards that failure had been
+  hiding (#230 review; "scope-widening" below):** every remover now
+  (1) makes the path absolute from the cwd first, since the guards read it
+  there and git, run from the main checkout, read a relative one there (`release
+  --clean` from a subdirectory checked one lane and removed another);
+  (2) deletes the branch only at the tip its caller CHECKED
+  (`gitx.DeleteBranchAt`, as discard does; `Remove(c, path, branch, tip,
+  force)`, no tip keeps the branch), since `git branch -D` deleted a commit that
+  landed after the check;
+  (3) keeps a case twin of the base (`sameBranch`, `Main` under
+  `core.ignorecase` is main's loose ref).
+  `release --clean` reads its placeholder tip first and origin from the main
+  checkout (read from the removed lane it failed, read as "gone", and origin's
+  placeholder stayed). `wt clean` removes the cwd's lane last (`cwdLast`).
+  Pinned by `remove_review_test.go`, `TestRelease_CleanFromInsideTheLane` and
+  `TestCmdMergePR_keepsAnUnshippedLaneFromInsideIt`.
 - **merge-pr's checks gate never reads a failed read, or `--admin`, as green
   (#179).** It reads the head commit's statusCheckRollup (one GraphQL query,
   paged: `ghx.PRChecks`) and what the base branch requires, from the PR's own
