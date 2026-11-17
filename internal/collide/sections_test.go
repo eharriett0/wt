@@ -71,3 +71,91 @@ func TestSharedSectionsAcrossWith(t *testing.T) {
 		t.Error("bad delimiter: want graded=false")
 	}
 }
+
+// #237: a window's sections include the ones holding the lines it DELETED,
+// read in the copy it diffed from; a window whose doc is gone counts its
+// deletions; a failed measurement (All) edits every section, its own copy's
+// and the old one's. A window without the doc that deleted nothing is still
+// skipped, as before.
+func TestSharedSectionsAcross_CountsDeletions(t *testing.T) {
+	const old = "# Plan\n## Alpha\na1\na2\n## Beta\nb1\nb2\nb3\n"
+	const delim = `^##\s`
+	write := func(t *testing.T, dir, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, "PLAN.md"), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	betaEdit := gitx.DocEdits{New: []gitx.LineRange{{Start: 7, End: 7}}} // b2 in the full copy
+	for _, tc := range []struct {
+		name     string
+		cContent *string // nil: wc has no PLAN.md
+		cEdits   gitx.DocEdits
+		graded   bool
+		shared   []string
+	}{
+		{"wc deleted Beta", sp("# Plan\n## Alpha\na1\na2\n"),
+			gitx.DocEdits{New: []gitx.LineRange{{Start: 4, End: 5}}, Deleted: []gitx.LineRange{{Start: 5, End: 8}}, Old: old},
+			true, []string{"## Beta"}},
+		// a1 deleted: the gap sits between "## Alpha" and a2, all Alpha. (Deleting
+		// Alpha's LAST lines puts the gap against "## Beta", which counts Beta
+		// too: git conflicts with an edit of that heading line.)
+		{"wc deleted a line of Alpha only", sp("# Plan\n## Alpha\na2\n## Beta\nb1\nb2\nb3\n"),
+			gitx.DocEdits{New: []gitx.LineRange{{Start: 2, End: 3}}, Deleted: []gitx.LineRange{{Start: 3, End: 3}}, Old: old},
+			true, nil},
+		{"wc deleted the doc", nil,
+			gitx.DocEdits{New: []gitx.LineRange{{Start: 0, End: 1}}, Deleted: []gitx.LineRange{{Start: 1, End: 8}}, Old: old},
+			true, []string{"## Beta"}},
+		{"wc's measurement failed", sp("# Plan\n## Alpha\na1\na2\n"),
+			gitx.DocEdits{All: true},
+			true, []string{"## Beta"}},
+		{"wc lacks the doc and deleted nothing", nil, gitx.DocEdits{}, true, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wa, wc := t.TempDir(), t.TempDir()
+			write(t, wa, old)
+			if tc.cContent != nil {
+				write(t, wc, *tc.cContent)
+			}
+			edits := func(wt, base, path string) gitx.DocEdits {
+				if wt == wa {
+					return betaEdit
+				}
+				return tc.cEdits
+			}
+			shared, graded := SharedSectionsAcross("main", []string{wa, wc}, "PLAN.md", delim, edits)
+			if graded != tc.graded || !reflect.DeepEqual(shared, tc.shared) {
+				t.Errorf("shared = %v, graded = %v; want %v, %v", shared, graded, tc.shared, tc.graded)
+			}
+			// The same edits as a pending copy grade the same (the hooks).
+			if tc.cContent != nil {
+				pending := map[string]PendingDoc{wc: {Content: *tc.cContent, Edits: tc.cEdits}}
+				if got, ok := SharedSectionsAcrossWith("main", []string{wa, wc}, "PLAN.md", delim, edits, pending); ok != graded || !reflect.DeepEqual(got, shared) {
+					t.Errorf("pending: %v, %v; want %v, %v", got, ok, shared, graded)
+				}
+			}
+		})
+	}
+	// Two windows whose measurements failed share every section either has.
+	wa, wc := t.TempDir(), t.TempDir()
+	write(t, wa, old)
+	write(t, wc, old)
+	all := func(string, string, string) gitx.DocEdits { return gitx.DocEdits{All: true} }
+	if shared, _ := SharedSectionsAcross("main", []string{wa, wc}, "PLAN.md", delim, all); !reflect.DeepEqual(shared, []string{"", "## Alpha", "## Beta"}) {
+		t.Errorf("both All: %v, want every section", shared)
+	}
+	// One failed window alone shares nothing with a window that edited
+	// nothing. A failed diff comes with the whole file as its new side; it
+	// counts once, as every section, never twice.
+	none := func(wt, _, _ string) gitx.DocEdits {
+		if wt == wa {
+			return gitx.DocEdits{}
+		}
+		return gitx.DocEdits{All: true, New: []gitx.LineRange{{Start: 1, End: 1 << 30}}}
+	}
+	if shared, _ := SharedSectionsAcross("main", []string{wa, wc}, "PLAN.md", delim, none); len(shared) != 0 {
+		t.Errorf("All against no edits: %v, want none", shared)
+	}
+}
+
+func sp(s string) *string { return &s }

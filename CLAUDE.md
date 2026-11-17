@@ -118,7 +118,7 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   `regradeSections` re-grades its entries first (#226): the same
   `SharedSections` call `gradeEntry` makes, with this window's copy as the edit
   leaves it (`collide.PendingDoc`) and its ranges in that copy's OWN line
-  numbers (`gitx.ChangedRangesNewWith`; the base frame put an edit past an
+  numbers (`gitx.ChangedDocEditsWith`; the base frame put an edit past an
   insert in the wrong section). Advisory or section-HIGH: HIGH, naming the
   section, iff the copy now shares one with the other window, else dropped.
   Before #226 an advisory was never re-graded, so an edit moving INTO the other
@@ -132,20 +132,40 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   a blob may still read HIGH in `wt check`, so every section-graded entry
   stays a file-level heads-up, an advisory included; only an ungradable doc
   (a bad delimiter, where `wt check` is the blanket advisory too) drops one.
-  ⚠ New-frame ranges can't show a deletion, so deleting the shared section,
-  or emptying or deleting the file, reads disjoint in `wt check` while git
-  conflicts (#237): until the grader counts deleted lines, a section HIGH
-  whose heading the copy has FEWER of than the file has now stays a heads-up
-  (`headingGone`, counted: sections are identified by heading text, so
-  deleting one of two "## Notes" left the heading present), as main kept it.
+  ⚠ **Deleted lines count too (#237).** New-frame ranges can't show a
+  deletion (a deleted line has no line in the window's copy), so deleting
+  another window's section, or emptying or deleting the doc, read disjoint
+  in `wt check`, pre-push and both hooks while git conflicts. Every section
+  grade measures `gitx.DocEdits` (`ChangedDocEdits`; `ChangedDocEditsWith`
+  for a pending copy, the same measurement once written): the one diff's new
+  side as before, plus the lines it removed or replaced, numbered in the copy
+  it diffed from (the merge base's for a behind branch, else base's), read as
+  stored (`cat-file blob`) only when something was deleted.
+  `collide.SharedSectionsAcrossWith` counts both: a window's sections are the
+  ones its edits touch in its own copy AND the ones holding its deleted lines
+  in that old copy. A window whose doc is gone counts its deletions; a
+  measurement that failed (the diff, or the old copy unreadable) is
+  `DocEdits.All`: every section of both copies, never fewer. Heading text
+  stays the identity (by position, a deletion renumbers a duplicate heading
+  in one window's copy and a conflict goes missing), so a rename counts the
+  old heading's section and deleting one "## Notes" counts every "## Notes":
+  coarser than git, on purpose. ⚠ A pure deletion's new-frame gap still
+  claims the lines on both sides, so deleting a section's LAST lines counts
+  the next section too, and must: git conflicts with an edit of that next
+  heading line. The hooks' stopgap (`headingGone`) is gone. Not counted: a
+  base-less repo (its uncommitted ranges share no frame to delete from).
+  Pinned by `TestSectionDeletions_MatchMergeTree` (deleting a section,
+  emptying or deleting the doc, a heading deleted or renamed, duplicate
+  headings, the two-step history, a behind branch: each held against `git
+  merge-tree` in `wt check` and pre-push from both windows),
+  `TestPreEditHooks_StructuredDocDeletionsGradeHIGH`,
+  `TestSharedSectionsAcross_CountsDeletions` and `TestChangedDocEdits*`.
   A delimiter that doesn't compile leaves the entries as they were (`wt
   check` can't section-grade that doc either). The empty side of a
   measurement is hashed `--no-filters` (git's /dev/null never sees a clean
   filter; one adding a header moved every range of a file measured against it:
-  one new since the measured revision, or an untracked copy). Known gap, for
-  #237: a two-step history (a same-named heading renamed earlier, then
-  restored while the shared one is deleted) keeps the count equal, and the
-  stopgap misses it. Pinned by `TestPreEditHooks_StructuredDocSections` (into, staying
+  one new since the measured revision, or an untracked copy). Pinned by
+  `TestPreEditHooks_StructuredDocSections` (into, staying
   out of, past an insert into, and out of the other window's section, each held
   to `wt check` after the edit, both hooks, both block modes) and the
   `StructuredDoc*` cases beside it. Claude (`claudePendingContent`): Claude Code's Edit replayed (refused
