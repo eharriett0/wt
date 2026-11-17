@@ -781,17 +781,18 @@ func renderStatusJSON(c *config.Config, ws []collide.Window, graded []StatusOver
 // wt_status (#197): the reader's session, and the other sessions that posted
 // from this checkout within coord.SharedCheckoutWindow, the same reading as
 // the `wt status` banner and `wt doctor --json`. An unreadable log says so
-// (unread), so "no other session" is never a log nobody could read. ⚠ It sees
-// only sessions that wrote to the coordination log: a block reservation lives
-// in its file's ledger, and a session that never wrote is invisible (#197
-// item 2).
+// (unread), so "no other session" is never a log nobody could read. It reads
+// the block ledgers too (coord.CheckoutActivity, #197 item 2): a session whose
+// only records were block reservations was invisible. ⚠ A session that never
+// wrote anything is still invisible.
 func statusSessions(c *config.Config, now time.Time) (session string, others []coord.SessionActivity, unread string) {
 	path, self := coordCtx(c)
 	recs, err := coord.Load(path)
 	if err != nil {
 		return self.Session, nil, err.Error()
 	}
-	return self.Session, coord.OtherSessions(recs, self, now, coord.SharedCheckoutWindow), ""
+	home, _ := os.UserHomeDir()
+	return self.Session, coord.OtherSessions(coord.CheckoutActivity(recs, home), self, now, coord.SharedCheckoutWindow), ""
 }
 
 // appendNewSpans appends the spans not already present (for the "overlap

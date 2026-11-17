@@ -307,3 +307,74 @@ func TestCmdBlockID_reReviewCases(t *testing.T) {
 		t.Errorf("an expired own reservation isn't flagged in wt holds:\n%s%s", out, errOut)
 	}
 }
+
+// #197 item 2, step one: a session whose only records are block-id
+// reservations (they live in the per-file ledgers, not the coordination log)
+// was invisible to the shared-checkout signal. Now `wt status --json`,
+// wt_status, `wt doctor --json` and the status banner all see it, before any
+// coordination log exists; another window's reservation is not this
+// checkout's.
+func TestOtherSessions_countBlockReservations(t *testing.T) {
+	repo := sessionTestRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, "log.md"), []byte("## NEWEST-1\nolder\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WT_SESSION", "session-A")
+	var code int
+	if out, errOut := captureT(t, func() { code = cmdBlockID([]string{"log.md"}) }); code != 0 {
+		t.Fatalf("A reserves: code %d\n%s%s", code, out, errOut)
+	}
+	c, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if logPath, _ := coordCtx(c); fileExists(logPath) {
+		t.Fatalf("precondition: a reservation wrote the coordination log %s", logPath)
+	}
+	// Another window's reservation by a third session must not count here.
+	home, _ := os.UserHomeDir()
+	other := coord.Record{ID: "x1", Kind: coord.KindBlockReserve, Window: filepath.Join(t.TempDir(), "elsewhere"),
+		Session: "session-C", File: filepath.Join(repo, "log.md"), Block: 7, TS: time.Now().UTC().Format(time.RFC3339)}
+	if err := coord.Append(coord.BlockLedgerPath(home, filepath.Join(repo, "other.md")), other); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("WT_SESSION", "session-B")
+	out, _ := captureT(t, func() { cmdStatus([]string{"--json"}) })
+	var p StatusPayload
+	if err := json.Unmarshal([]byte(out), &p); err != nil {
+		t.Fatalf("status --json: %v\n%s", err, out)
+	}
+	if len(p.OtherSessions) != 1 || p.OtherSessions[0].Session != "session-A" {
+		t.Errorf("status --json other_sessions = %+v, want session-A only", p.OtherSessions)
+	}
+	text, _ := mcpStatus(c, false)
+	if !strings.Contains(text, `"session": "session-A"`) || strings.Contains(text, "session-C") {
+		t.Errorf("wt_status: want session-A as another session, not session-C:\n%s", text)
+	}
+	out, _ = captureT(t, func() { cmdDoctor([]string{"--json"}) })
+	var d struct {
+		Coord struct {
+			OtherSessions []coord.SessionActivity `json:"other_sessions"`
+		} `json:"coord"`
+	}
+	if err := json.Unmarshal([]byte(out), &d); err != nil {
+		t.Fatalf("doctor --json: %v\n%s", err, out)
+	}
+	if len(d.Coord.OtherSessions) != 1 || d.Coord.OtherSessions[0].Session != "session-A" {
+		t.Errorf("doctor --json other_sessions = %+v, want session-A only", d.Coord.OtherSessions)
+	}
+	_, errOut := captureT(t, func() { sharedCheckoutBanner(c) })
+	if !strings.Contains(errOut, "checkout shared") || !strings.Contains(errOut, "session-A") {
+		t.Errorf("status banner doesn't warn of session-A:\n%s", errOut)
+	}
+	t.Setenv("WT_SESSION", "session-A")
+	if _, errOut := captureT(t, func() { sharedCheckoutBanner(c) }); strings.Contains(errOut, "checkout shared") {
+		t.Errorf("A's own reservation reads as another session's:\n%s", errOut)
+	}
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
+}

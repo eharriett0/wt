@@ -422,11 +422,15 @@ func coordHealth(c *config.Config) *CoordHealth {
 	// log), so count them regardless of whether the per-repo log exists yet — else a
 	// block-only repo reports 0 while `wt holds` shows the reservation (#152).
 	// Owned by session like every coordination record (#197).
+	var ledger []coord.Record
 	if home, herr := os.UserHomeDir(); herr == nil && home != "" {
-		ledger := coord.LoadBlockLedgers(home)
+		ledger = coord.LoadBlockLedgers(home)
 		h.OwnBlockReserves = len(coord.OwnBlockReservations(ledger, self))
 		_, h.Prunable = coord.PruneRecords(ledger, time.Now(), pruneBlockMaxAge)
 	}
+	// #197 item 2: another session's block reservations in this checkout are
+	// evidence it shares the checkout, with or without a coordination log.
+	h.OtherSessions = coord.OtherSessions(ledger, self, time.Now(), coord.SharedCheckoutWindow)
 	if _, err := os.Stat(path); err != nil {
 		return h // per-repo coord log not created yet — ledger reserves already counted
 	}
@@ -439,7 +443,7 @@ func coordHealth(c *config.Config) *CoordHealth {
 	h.Readable = true
 	h.Records = len(recs)
 	h.OwnOpen = len(coord.OwnOpenAnnouncements(recs, self))
-	h.OtherSessions = coord.OtherSessions(recs, self, time.Now(), coord.SharedCheckoutWindow)
+	h.OtherSessions = coord.OtherSessions(append(recs, ledger...), self, time.Now(), coord.SharedCheckoutWindow)
 	if _, p := coord.PruneRecords(recs, time.Now(), pruneBlockMaxAge); p > 0 {
 		h.Prunable += p
 	}

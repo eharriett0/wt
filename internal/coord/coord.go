@@ -1241,6 +1241,20 @@ func OtherSessions(recs []Record, self Self, now time.Time, within time.Duration
 	return out
 }
 
+// CheckoutActivity is every record that can show a session at work in a
+// checkout, for OtherSessions: the coordination log's, and every block
+// ledger's under home (#197 item 2). Block reservations live in the per-file
+// ledgers, not the log, so a session whose only records were reservations
+// was invisible to the shared-checkout warning, `wt status --json` and doctor.
+// OtherSessions keeps only self's window, so other windows' and other repos'
+// ledger records drop out there. Reads the ledgers; logRecs is not changed.
+func CheckoutActivity(logRecs []Record, home string) []Record {
+	if home == "" {
+		return logRecs
+	}
+	return append(append([]Record(nil), logRecs...), LoadBlockLedgers(home)...)
+}
+
 // SharedCheckoutWarning renders the wt doctor / wt status warning for other
 // sessions using self's checkout (#163): two lines, who and the remedy. "" when
 // there are none. others is OtherSessions' output (most recent first). The only

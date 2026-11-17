@@ -1303,7 +1303,8 @@ func sharedCheckoutBanner(c *config.Config) {
 		return
 	}
 	now := time.Now()
-	if msg := coord.SharedCheckoutWarning(coord.OtherSessions(recs, self, now, coord.SharedCheckoutWindow), self, now); msg != "" {
+	home, _ := os.UserHomeDir()
+	if msg := coord.SharedCheckoutWarning(coord.OtherSessions(coord.CheckoutActivity(recs, home), self, now, coord.SharedCheckoutWindow), self, now); msg != "" {
 		ui.Warn("%s", msg)
 	}
 }
