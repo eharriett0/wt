@@ -894,7 +894,7 @@ func statusReport(c *config.Config, asJSON, blocking bool) int {
 		return renderBlockingGate(graded, ws, live)
 	}
 	if asJSON {
-		return renderStatusJSON(ws, graded, len(benign))
+		return renderStatusJSON(c, ws, graded, len(benign))
 	}
 
 	ui.Banner("wt status — " + filepath.Base(c.Root) + " (" + fmt.Sprintf("%d window(s)", len(ws)) + ")")

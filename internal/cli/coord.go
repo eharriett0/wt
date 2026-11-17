@@ -1034,14 +1034,13 @@ func cmdHolds(args []string) int {
 		// #211: ones wt can't attribute to any session are not yours either.
 		defer unattributedHoldsSection(coord.UnattributedOpen(recs, self), coord.GatingHolds(recs, self, now, c.HoldMaxAge), v, now, c.HoldMaxAge)
 		// #152: block reservations live in per-file ledgers (cross-repo shared), not
-		// the per-repo announce/ack log. They stay keyed by window only — splitting
-		// them by session is out of scope for #163/#211.
+		// the per-repo announce/ack log. Owned by session like the rest (#197).
 		var reserves []coord.Record
 		if home, herr := os.UserHomeDir(); herr == nil && home != "" {
-			reserves = coord.OwnBlockReservations(coord.LoadBlockLedgers(home), self.Window)
+			reserves = coord.OwnBlockReservations(coord.LoadBlockLedgers(home), self)
 		}
 		if len(own) == 0 && len(reserves) == 0 {
-			ui.OK("no outstanding holds/announcements of yours, and no block reservations for this window (%s)", selfLabel(self))
+			ui.OK("no outstanding holds/announcements of yours, and no block reservations of yours (%s)", selfLabel(self))
 			return 0
 		}
 		if len(own) > 0 {
@@ -1066,10 +1065,27 @@ func cmdHolds(args []string) int {
 		}
 		if len(reserves) > 0 {
 			ui.Banner("your block-id reservations")
+			fallback := 0
 			for _, r := range reserves {
-				fmt.Printf("  block %s on %s  %s\n",
+				tag := ""
+				switch {
+				case v.Attribute(r) == coord.AttrMineFallback:
+					fallback++
+					tag = " " + ui.Dim("(no session token: see below)")
+				case r.Window != self.Window:
+					tag = " " + ui.Dim("(yours, placed from checkout "+r.Window+")")
+				}
+				if coord.Age(r, now) > coord.DefaultBlockReserveTTL {
+					// #197 re-review: past the TTL its id is free again, and may
+					// have been handed out and written by someone else.
+					tag += " " + ui.Yellow("(expired: its id may have been handed out again; check the file before marking it)")
+				}
+				fmt.Printf("  block %s on %s  %s%s\n",
 					ui.Bold(fmt.Sprintf("%d", r.Block)), filepath.Base(r.File),
-					ui.Dim(humanAge(coord.Age(r, now))))
+					ui.Dim(humanAge(coord.Age(r, now))), tag)
+			}
+			if fallback > 0 {
+				ui.Warn("%d of these reservations carry no session token, like this shell: wt counts them as yours but can't prove it, so `wt block-id --abandon` asks first (without a terminal it needs --not-mine). Set WT_SESSION to a value unique to each shell or agent.", fallback)
 			}
 		}
 		return 0

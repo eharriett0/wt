@@ -288,7 +288,7 @@ func TestOwnOpenAnnouncements(t *testing.T) {
 	if len(own) != 1 || own[0].ID != "1" {
 		t.Errorf("OwnOpenAnnouncements = %+v, want just id 1 (2=other, 3=cleared)", own)
 	}
-	res := OwnBlockReservations(recs, "me")
+	res := OwnBlockReservations(recs, Self{Window: "me", Session: tok})
 	if len(res) != 1 || res[0].Block != 5 {
 		t.Errorf("OwnBlockReservations = %+v, want [block 5]", res)
 	}

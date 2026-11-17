@@ -421,10 +421,10 @@ func coordHealth(c *config.Config) *CoordHealth {
 	// Block reservations live in per-file ledgers (independent of THIS repo's coord
 	// log), so count them regardless of whether the per-repo log exists yet — else a
 	// block-only repo reports 0 while `wt holds` shows the reservation (#152).
-	// They stay keyed by window only (#163 leaves block-id unsplit by session).
+	// Owned by session like every coordination record (#197).
 	if home, herr := os.UserHomeDir(); herr == nil && home != "" {
 		ledger := coord.LoadBlockLedgers(home)
-		h.OwnBlockReserves = len(coord.OwnBlockReservations(ledger, self.Window))
+		h.OwnBlockReserves = len(coord.OwnBlockReservations(ledger, self))
 		_, h.Prunable = coord.PruneRecords(ledger, time.Now(), pruneBlockMaxAge)
 	}
 	if _, err := os.Stat(path); err != nil {

@@ -141,7 +141,8 @@ func mcpToolDescriptors() []map[string]any {
 			"description": "Every active window in this repo (worktree, branch, claimed issue, files touched) " +
 				"plus graded cross-window overlaps. An overlap lists only live windows (merged, closed-PR and dormant ones are left out) " +
 				"and is HIGH when some pair of them would each block in wt_check (hunks git would merge as one conflict: overlapping, or touching with no unchanged line between; or the same section of a structured doc); " +
-				"a window whose copy is already on base, already landed, or untracked contests nothing. Read-only.",
+				"a window whose copy is already on base, already landed, or untracked contests nothing. " +
+				"Also `session` (the session this server reads as, fixed when the client started it) and `other_sessions`: other sessions that posted coordination records from this checkout in the last 24h (sessions_unread says the log could not be read). Read-only.",
 			"inputSchema": obj(map[string]any{
 				"blocking": map[string]any{"type": "boolean", "description": "return only HIGH-risk overlaps"},
 			}),
@@ -266,6 +267,7 @@ func mcpStatus(c *config.Config, blocking bool) (string, bool) {
 	active, benign := collide.PartitionOverlaps(ov, live)
 	graded := gradeStatusOverlaps(c, ws, active)
 	p := buildStatusPayload(ws, graded, len(benign))
+	p.Session, p.OtherSessions, p.SessionsUnread = statusSessions(c, time.Now())
 	if blocking {
 		kept := p.Overlaps[:0]
 		for _, o := range p.Overlaps {
