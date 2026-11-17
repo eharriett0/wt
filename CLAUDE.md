@@ -916,7 +916,16 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   clone (updated on GitHub, then deleted with the merge: no plain fetch brings
   it, and the lane was kept forever), and an UNKNOWN verdict never advises
   "push them" (that recreates the deleted branch at a stale tip). A PR given
-  as a URL is fetched by its number (`merge.PRNumber`). ⚠ **A no-prompt
+  as a URL is fetched by its number (`merge.PRNumber`). ⚠ **`wt clean` hands
+  the check the PR's URL** (`prURL`, #243): its number is gh's resolved
+  repository's PR, and in a fork clone whose gh default is upstream,
+  `refs/pull/<n>/head` on origin is another PR, so the head never arrived and
+  the lane was kept on every run, its hint naming the wrong PR. With the URL,
+  `merge.prRemote` fetches from the PR's own repository; no URL from gh keeps
+  the number (origin), as before. Pinned end to end with real git by
+  `TestClean_ForkCloneFetchesThePRHeadFromThePRsRepository` (origin through a
+  fake ssh: git expands `insteadOf` in `remote get-url`, so a rewritten origin
+  reads as a local path). ⚠ **A no-prompt
   fetch has a deadline** (`fetchTimeout` 30s for the PR head,
   `baseFetchTimeout` 120s for #223's base fetch; ssh `ConnectTimeout=10`,
   HTTPS `lowSpeedTime=15`): an origin that took the connection and never

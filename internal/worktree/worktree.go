@@ -97,6 +97,13 @@ func branchDeleteCmd(br, tip string) string {
 // answer it: gh's auth answer is memoized process-wide, so a fake gh can't.
 var prLookup = ghx.PRForBranchOrTip
 
+// prURL and unshippedLane are ghx.PRURL and merge.UnshippedLane; vars so a
+// test can see which PR selector clean hands the #187 check (#243).
+var (
+	prURL         = ghx.PRURL
+	unshippedLane = merge.UnshippedLane
+)
+
 // cwdLast is paths with the one that holds the cwd moved to the end (#230
 // review): `wt clean -y` run inside a lane it reaps removed that lane first,
 // and every git call after it, for the lanes that followed, failed with
@@ -815,7 +822,16 @@ func Clean(c *config.Config, apply, staleIndex, allRoots bool, names []string) e
 		// or an ancestor of it; otherwise the cherry proof still can.
 		prShipped, keptLane := false, ""
 		if prMerged {
-			keptLane = merge.UnshippedLane(prNum, br, tip)
+			// #243: by its URL, so the check's PR-head fetch and its hint go to
+			// the PR's own repository (merge.prRemote). The number is gh's
+			// resolved repository's PR: in a fork clone whose gh default is
+			// upstream, refs/pull/<n>/head on origin (the fork) is another PR,
+			// or none. A URL gh can't give keeps the number, as before.
+			sel := prNum
+			if u := prURL(prNum); u != "" {
+				sel = u
+			}
+			keptLane = unshippedLane(sel, br, tip)
 			prShipped = keptLane == ""
 		}
 
