@@ -7,10 +7,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
+	"github.com/eharriett0/wt/internal/config"
 	"github.com/eharriett0/wt/internal/coord"
 	"github.com/eharriett0/wt/internal/lock"
 )
@@ -67,8 +67,30 @@ func TestOtherSessions_linkedWorktreeAndHeldLedger(t *testing.T) {
 		t.Errorf("status --json in the lane: other_sessions = %+v, want session-A", p.OtherSessions)
 	}
 	lock.Release(h)
-	dout, _ := captureT(t, func() { cmdDoctor([]string{"--json"}) })
-	if !strings.Contains(dout, `"other_sessions"`) || !strings.Contains(dout, "session-A") {
-		t.Errorf("doctor --json in the lane doesn't list session-A:\n%s", dout)
+	// doctor, before and after the coordination log exists (two call sites).
+	for _, when := range []string{"no log", "with a log"} {
+		if when == "with a log" {
+			c, err := config.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			logPath, self := coordCtx(c)
+			if err := coord.Append(logPath, coord.Record{ID: "b1", Kind: coord.KindAnnounce, Window: self.Window, Session: "session-B",
+				Message: "B's note", TS: time.Now().UTC().Format(time.RFC3339)}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		dout, _ := captureT(t, func() { cmdDoctor([]string{"--json"}) })
+		var d struct {
+			Coord struct {
+				OtherSessions []coord.SessionActivity `json:"other_sessions"`
+			} `json:"coord"`
+		}
+		if err := json.Unmarshal([]byte(dout), &d); err != nil {
+			t.Fatalf("doctor --json: %v\n%s", err, dout)
+		}
+		if len(d.Coord.OtherSessions) != 1 || d.Coord.OtherSessions[0].Session != "session-A" {
+			t.Errorf("doctor --json in the lane, %s: other_sessions = %+v, want session-A", when, d.Coord.OtherSessions)
+		}
 	}
 }
