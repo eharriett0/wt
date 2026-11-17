@@ -109,7 +109,7 @@ func checkEntryFor(t *testing.T, dir, other string) CheckEntry {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, e := range buildCheckReport(c, ws, dir, collide.ExactQueries([]string{"data.txt"}), false) {
+	for _, e := range buildCheckReport(c, ws, dir, collide.ExactQueries([]string{"data.txt"})) {
 		if e.Window == other {
 			return e
 		}

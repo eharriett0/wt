@@ -311,7 +311,7 @@ func mcpCheck(c *config.Config, paths []string, includeStale, allowMissing bool)
 				" (typo? or a path you're about to CREATE — re-call with include_missing:true).", true
 		}
 	}
-	entries := buildCheckReport(c, ws, root, checkQueries(args), includeStale)
+	entries := buildCheckReport(c, ws, root, checkQueries(args))
 	return jsonText(buildCheckPayload(entries, includeStale)), false
 }
 

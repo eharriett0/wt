@@ -1460,7 +1460,7 @@ func cmdCheck(args []string) int {
 				return 64
 			}
 		}
-		entries := buildCheckReport(c, ws, root, checkQueries(args), includeStale)
+		entries := buildCheckReport(c, ws, root, checkQueries(args))
 		if asJSON {
 			return renderCheckJSON(entries, includeStale)
 		}

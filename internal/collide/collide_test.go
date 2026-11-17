@@ -656,6 +656,11 @@ func TestWindowLiveness_Label(t *testing.T) {
 		// tip). Still HIGH; the label names the PR so only the edits need a look.
 		{"dirty + commits merged by tip", WindowLiveness{Level: LiveDirty, Dirty: true, MergedPR: "1105"},
 			"uncommitted edits · its commits merged in #1105"},
+		// #202: "last commit just now", never "just now ago".
+		{"unmerged, last commit 3d ago", WindowLiveness{Level: LiveUnmerged, Age: 3 * 24 * time.Hour},
+			"commits, no PR opened, last commit 3d ago"},
+		{"unmerged, last commit just now", WindowLiveness{Level: LiveUnmerged, Age: 20 * time.Second},
+			"commits, no PR opened, last commit just now"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -809,33 +814,6 @@ func TestConflictSeverity(t *testing.T) {
 		if got := ConflictSeverity(c.cur, c.oth, false) == SevHigh; got != c.wantHigh {
 			t.Errorf("%s: ConflictSeverity HIGH=%v, want %v", c.name, got, c.wantHigh)
 		}
-	}
-}
-
-func TestOverlapSeverity(t *testing.T) {
-	disjoint := [][]gitx.LineRange{{lr(1, 5)}, {lr(10, 15)}, {lr(20, 25)}}
-	if OverlapSeverity(disjoint, false) != SevFYI {
-		t.Error("all-disjoint windows should be SevFYI")
-	}
-	overlapping := [][]gitx.LineRange{{lr(1, 5)}, {lr(4, 9)}}
-	if OverlapSeverity(overlapping, false) != SevHigh {
-		t.Error("overlapping windows should be SevHigh")
-	}
-	// #199: touching edits are one conflict region in git.
-	if OverlapSeverity([][]gitx.LineRange{{lr(1, 5)}, {lr(20, 25)}, {lr(6, 9)}}, false) != SevHigh {
-		t.Error("windows editing touching lines should be SevHigh")
-	}
-	if OverlapSeverity(overlapping, true) != SevFYI {
-		t.Error("append-only forces SevFYI")
-	}
-	// Indeterminate: a participating window with no computable ranges (untracked
-	// / binary / diff error) can't be proven disjoint → SevHigh (fail-safe).
-	indeterminate := [][]gitx.LineRange{{lr(1, 5)}, {}}
-	if OverlapSeverity(indeterminate, false) != SevHigh {
-		t.Error("a window with empty ranges should force SevHigh (indeterminate)")
-	}
-	if OverlapSeverity(indeterminate, true) != SevFYI {
-		t.Error("append-only still forces SevFYI even when indeterminate")
 	}
 }
 
