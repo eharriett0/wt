@@ -87,7 +87,7 @@ func Load() (*Config, error) {
 	}
 	common, _ := gitx.CommonDir() // "" on error; absolute (…/<main>/.git) when present
 	name, parent := worktreeRootAnchor(root, common)
-	mainRoot := mainWorkTree(filepath.Join(parent, name))
+	mainRoot := mainWorkTree(common, root)
 
 	activeWork := filepath.Join(root, ".git", "wt-active-work.md")
 	if common != "" {
@@ -119,17 +119,23 @@ func Load() (*Config, error) {
 	return c, nil
 }
 
-// mainWorkTree is the repository's main work tree as git lists it first, the
-// same from every worktree. In a bare layout that is the repository itself
-// (#238 review: each lane read itself as MainRoot, so a relative root meant a
-// directory per lane). ⚠ Under `--separate-git-dir` git lists the git dir's
-// parent, from the work tree too (measured, git 2.39): not the work tree, but
-// still one directory from every worktree. fallback when git can't list them.
-func mainWorkTree(fallback string) string {
-	if wts, err := gitx.WorktreeList(); err == nil && len(wts) > 0 && wts[0].Path != "" {
-		return wts[0].Path
+// mainWorkTree is the repository's main work tree as `git worktree list`
+// gives it first, the same from every worktree, derived from the shared git
+// dir Load already has (#238 re-review: an extra `git worktree list` cost every
+// command and hook ~10ms, and matched this in every layout measured): the git
+// dir's parent when it is a `.git`, else the git dir itself. In a bare layout
+// that is the repository (#238 review: each lane read itself as MainRoot, so a
+// relative root meant a directory per lane). ⚠ Under `--separate-git-dir` it
+// is not the work tree: git itself lists that same directory (measured, git
+// 2.39), one directory from every worktree. root when there is no git dir.
+func mainWorkTree(common, root string) string {
+	switch {
+	case common == "":
+		return root
+	case filepath.Base(common) == ".git":
+		return filepath.Dir(common)
 	}
-	return fallback
+	return common
 }
 
 // anchorPath reads a relative path from the main checkout (#238): kept

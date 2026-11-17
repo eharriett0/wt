@@ -311,6 +311,11 @@ func Release(c *config.Config, issue string, clean bool) error {
 		} else {
 			ui.Info("no active-work entry for #%s", issue)
 		}
+	} else {
+		// Say where it looked (#238 re-review): a relative active_work used to
+		// mean a file per cwd, and a claim recorded in another one was skipped
+		// without a word.
+		ui.Info("no active-work file at %s (no entry for #%s)", c.ActiveWork, issue)
 	}
 	if user, err := ghx.CurrentUser(); err == nil && user != "" {
 		if err := ghx.IssueRemoveAssignee(issue, user); err == nil {
@@ -442,14 +447,19 @@ func abbrev(sha string) string {
 // the main checkout.
 func relativeRecord(c *config.Config, e activework.Entry) string {
 	if e.Branch != "" {
-		if wts, err := gitx.WorktreeList(); err == nil {
-			for _, w := range wts {
-				if w.Branch == e.Branch && !w.Bare {
+		if wts, err := gitx.WorktreeList(); err == nil && len(wts) > 1 {
+			// Never the first entry, the main worktree (#238 re-review): a
+			// claim's lane is never it, and only git's own refusal stood
+			// between a root that contains it and its removal.
+			for _, w := range wts[1:] {
+				if w.Branch == e.Branch {
 					return w.Path
 				}
 			}
 		}
 	}
+	// A miss (a detached lane, a case twin) reads from the main checkout; a
+	// worktree there on another branch is refused by --clean's branch check.
 	return filepath.Join(c.MainRoot, e.Worktree)
 }
 

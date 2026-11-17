@@ -1056,16 +1056,21 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   guards were load-bearing *by luck*.
 - **A relative `worktree_root` or `active_work` is read from the MAIN
   checkout (#238).** `config.Load` anchors either (`.wt.conf` or the env var)
-  at `Config.MainRoot` (`anchorPath`): `git worktree list`'s first entry, the
-  same from every worktree (in a bare layout, the repository; ⚠ under
-  `--separate-git-dir` git lists the git dir's parent, not the work tree,
-  measured). Kept relative, it meant a different directory from each cwd: a
-  claim recorded a path only its own cwd could find, `release --clean` from
-  elsewhere read it as "already gone", and `under()` matched from one window
-  and refused from another. A claim recorded relative before #238 is found by
-  its BRANCH in `git worktree list` (`relativeRecord`): read from the main
-  checkout, it missed a lane claimed from a subdirectory, and a decoy worktree
-  at that path was removed.
+  at `Config.MainRoot` (`anchorPath`), the same from every worktree:
+  `mainWorkTree`, the shared git dir's parent when it is a `.git`, else the git
+  dir itself (a bare repository; ⚠ a `--separate-git-dir`, which is not the
+  work tree), which is what `git worktree list` gives first in every layout
+  measured, without its ~10ms on every command. Kept relative, it meant a
+  different directory from each cwd: a claim recorded a path only its own cwd
+  could find, `release --clean` from elsewhere read it as "already gone", and
+  `under()` matched from one window and refused from another. A claim recorded
+  relative before #238 is found by its BRANCH in `git worktree list`, never
+  the main worktree (`relativeRecord`): read from the main checkout, it missed
+  a lane claimed from a subdirectory, and a decoy worktree at that path was
+  removed. On a miss it is read from the main checkout, and `--clean`'s
+  branch check (#230) refuses a worktree there on another branch. Release
+  names the active-work file when there is none (an entry recorded under a
+  cwd-relative `active_work` is not migrated).
 - **`clean`'s reach and the collision engine's reach must not drift apart.** The
   engine scans EVERY worktree git knows about; if `clean` manages fewer, the
   difference is a set of worktrees that can hard-block a push with no in-tool way
