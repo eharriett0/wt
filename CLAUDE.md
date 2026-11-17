@@ -750,7 +750,8 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   after the assign unassigns, but only an assignment this claim made.
 - **`merge-pr` auto-cleans only a PR that reads MERGED afterwards (#185).** `gh
   pr merge` exits 0 WITHOUT merging for `--help`/`-h`, `--auto` (armed),
-  `--disable-auto`, a merge queue (queued) and `-R` (another repo's PR). Taking
+  `--disable-auto` and a merge queue (queued); a forwarded `-R` read the same
+  way until #228 (merge-pr read this clone's PR of that number). Taking
   that 0 as a merge removed the lane and `git branch -D`'d unpushed commits.
   `merge.ConfirmMerged` re-reads the state (2.5s at most, for API lag); anything
   but MERGED (OPEN, CLOSED, no answer) keeps the worktree, branch and claim for
@@ -1028,10 +1029,25 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   `ghx.PRAt`) and hands its URL to every read and to `gh pr merge` (gh reads a
   URL as that PR whatever `-R` or the cwd says, measured on gh 2.87); issues
   go by their URL there (`PRAt.IssueURL`) and the squash settings are that
-  repository's (`RepoSquashSettingsOf`, `closeReadsAt`). Unresolvable:
-  refuse. Auto-clean skips a PR whose repository is not this clone's origin.
-  Pinned by `TestCmdMergePR_forwardedRepoReadsOnlyThatPR`, whose fake gh
-  answers only that PR and logs any other read. The `WT_*` overlay is the checkout's side, so
+  repository's, on its host (`RepoSquashSettingsOf`, `closeReadsAt`).
+  Unresolvable: refuse. ⚠ **A PR given by its URL is resolved the same way**
+  (`ghx.IsPRURL`; #228 review): the guard's own hints print that form under
+  `-R`, and it read the issues and squash settings in the cwd's repository
+  and auto-cleaned unchecked. ⚠ **Auto-clean keys on where the lane can be**
+  (`laneMayBeHere`): the PR's repository OR its head's
+  (`headRepository`) is origin. Keyed on the repository alone, a fork origin
+  merging upstream's PR with `-R` kept its lane and said there was none; a
+  PR whose both sides are elsewhere touches nothing here (a same-named lane
+  is another lane). The host isn't compared (an ssh alias). The GraphQL
+  reads that take the PR's URL (`PRClosingIssueNumbers`, `PRCommits`) pass
+  its host (`withURLHost`), as `PRChecks` does: bare, gh asked its default
+  host. Messages name the PR with `merge.PRLabel` (`#5`, or the URL, never
+  `#<url>`), and the draft refusal's `gh pr ready` hint carries the `-R`.
+  Pinned by `TestCmdMergePR_forwardedRepoReadsOnlyThatPR` (`-R` and URL),
+  whose fake gh answers only that PR and logs any other read, plus
+  `…AlreadyMergedLeavesTheLane` (the precheck's auto-clean, with a lane here
+  on the PR's head branch name), `…MergeFailureReadsThatPR` (#196's
+  post-failure state read) and `…FromAForkOriginCleansOn`. The `WT_*` overlay is the checkout's side, so
   the environment can tighten but never loosen a gate the base sets;
   `--confirm-deploy` / `--checks-ok` are the ways past it. Pinned by
   `TestCmdMergePR_gateSettingsComeFromTheBaseToo` (merges ungated on the
