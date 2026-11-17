@@ -138,7 +138,7 @@ var prRemote = func(pr string) string {
 		return "origin"
 	}
 	for _, r := range remoteNames() {
-		if _, owner, name := remoteRepo(r); r != "origin" && owner != "" && names(owner, name) {
+		if _, owner, name := remoteRepo(r); owner != "" && names(owner, name) {
 			return r
 		}
 	}
