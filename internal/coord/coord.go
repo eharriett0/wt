@@ -535,9 +535,9 @@ var (
 // lockNotices is where a writer's lock notices go; exclusiveWithin is the
 // lock call. Vars for tests.
 var (
-	lockNotices    io.Writer = os.Stderr
-	exclusiveWithin          = lock.ExclusiveWithin
-	noLockOnce     sync.Once
+	lockNotices     io.Writer = os.Stderr
+	exclusiveWithin           = lock.ExclusiveWithin
+	noLockOnce      sync.Once
 )
 
 // lockForWrite takes f's exclusive lock for a writer (Append, ReserveBlock,
