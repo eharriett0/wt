@@ -711,10 +711,10 @@ func TestSharedCheckoutWarning(t *testing.T) {
 		wantNone []string
 	}{
 		{"one tagged session", one, Self{"/w", "aaaaaaaa-1111-2222-3333-444444444444"},
-			[]string{"another session posted", "latest: session b0c1d2e3…, 5m ago", "you: session aaaaaaaa…", "wt new <branch>", "wt inbox"},
+			[]string{"another session was active", "latest: session b0c1d2e3…, 5m ago", "you: session aaaaaaaa…", "wt new <branch>", "wt inbox"},
 			[]string{"WT_SESSION"}},
 		{"two sessions, newest named", two, Self{"/w", "A"},
-			[]string{"2 other sessions posted", "latest: session b0c1d2e3…"}, nil},
+			[]string{"2 other sessions were active", "latest: session b0c1d2e3…"}, nil},
 		{"token-less self is told to set WT_SESSION", one, Self{"/w", SessionNone},
 			[]string{"you: no session token", "set WT_SESSION"}, nil},
 	}

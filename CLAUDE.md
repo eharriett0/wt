@@ -300,9 +300,13 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   `wt status --json` and MCP `wt_status` carry `session`, `other_sessions`
   (`statusSessions`: `coord.OtherSessions` within `SharedCheckoutWindow`, the
   banner's reading; doctor's field names) and `sessions_unread` (the log could
-  not be read: unknown, not empty). It sees only sessions that wrote to the
-  coordination log: a block reservation lives in its file's ledger (#197
-  item 2). ⚠ `wt mcp` reads its session from its env ONCE, at spawn: after
+  not be read: unknown, not empty). ⚠ **It reads the block ledgers too**
+  (`coord.CheckoutActivity`, #197 item 2): a reservation lives in its file's
+  ledger, not the log, so a session whose only records were reservations was
+  invisible to `other_sessions`, the status banner and doctor (doctor counts
+  them even before the log exists). A session that never wrote anything is
+  still invisible. Pinned by `TestOtherSessions_countBlockReservations`.
+  ⚠ `wt mcp` reads its session from its env ONCE, at spawn: after
   `/clear` its `other_sessions` counts the new session's records as another
   session's until the client restarts it, and whether a client passes its
   session id to a stdio MCP server at all is not verified. The payload's

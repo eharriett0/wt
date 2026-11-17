@@ -1265,16 +1265,16 @@ func SharedCheckoutWarning(others []SessionActivity, self Self, now time.Time) s
 	if len(others) == 0 {
 		return ""
 	}
-	who := "another session"
+	who := "another session was"
 	if len(others) > 1 {
-		who = fmt.Sprintf("%d other sessions", len(others))
+		who = fmt.Sprintf("%d other sessions were", len(others))
 	}
 	latest := others[0]
 	you := ShortSession(self.Session)
 	if self.Session == SessionNone {
 		you += " (set WT_SESSION)"
 	}
-	return fmt.Sprintf("checkout shared — %s posted from THIS checkout in the last %dh (latest: %s, %s); you: %s.\n"+
+	return fmt.Sprintf("checkout shared — %s active in THIS checkout in the last %dh (latest: %s, %s); you: %s.\n"+
 		"  One working tree, no file-level warning between you: give one session its own worktree (`wt new <branch>`); its holds: `wt inbox`.",
 		who, int(SharedCheckoutWindow.Hours()), ShortSession(latest.Session), ago(now.Sub(latest.Last)), you)
 }
