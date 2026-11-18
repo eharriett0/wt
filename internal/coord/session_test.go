@@ -721,6 +721,17 @@ func TestSharedCheckoutWarning(t *testing.T) {
 		{"a long live name is cut", []SessionActivity{{Session: "b0c1d2e3-ffff-4444-8888-000000000000", Name: strings.Repeat("n", 64), Status: "idle", Records: 1, Last: now.Add(-5 * time.Minute)}},
 			Self{"/w", "aaaaaaaa-1111-2222-3333-444444444444"},
 			[]string{"latest: live session `" + strings.Repeat("n", 23) + "…`"}, nil},
+		{"an older unlisted session keeps the hint when the latest is live", []SessionActivity{
+			{Session: "b0c1d2e3-ffff-4444-8888-000000000000", Name: "api-worker", Records: 1, Last: now.Add(-5 * time.Minute)},
+			{Session: "c1d2e3f4-ffff-4444-8888-000000000000", Records: 1, Last: now.Add(-3 * time.Hour)}},
+			Self{"/w", "aaaaaaaa-1111-2222-3333-444444444444"},
+			[]string{"2 other sessions were active", "latest: live session `api-worker`", "one may be you, before a /clear"}, nil},
+		{"all others live or untagged: no hint", []SessionActivity{
+			{Session: "b0c1d2e3-ffff-4444-8888-000000000000", Name: "api-worker", Records: 1, Last: now.Add(-5 * time.Minute)},
+			{Session: "c1d2e3f4-ffff-4444-8888-000000000000", Name: "docs-worker", Records: 1, Last: now.Add(-time.Hour)},
+			{Session: SessionNone, Records: 1, Last: now.Add(-3 * time.Hour)}},
+			Self{"/w", "aaaaaaaa-1111-2222-3333-444444444444"},
+			[]string{"3 other sessions were active"}, []string{"/clear"}},
 		{"token-less self is told to set WT_SESSION", one, Self{"/w", SessionNone},
 			[]string{"you: no session token", "set WT_SESSION"}, []string{"/clear"}},
 		{"a token-less latest session is no /clear of yours", []SessionActivity{{Session: SessionNone, Records: 1, Last: now.Add(-time.Minute)}}, Self{"/w", "A"},

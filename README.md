@@ -278,8 +278,11 @@ session is running on this machine:
   presence mark. A presence mark comes from the per-turn hook and follows
   that hook's working directory, which is where the session was started
   unless it changed directory; a session started outside any repository
-  writes none, and is named only through the wt commands it runs. Not the
-  directory Claude Code lists either: that is where the session was started.
+  writes none, and is named only through the wt commands it runs. A newer
+  mark in another window wins over a command's record only when the session
+  also marked presence in that record's window that day: its hook followed
+  it there, so it has moved on. Not the directory Claude Code lists either:
+  that is where the session was started.
   This session is never named, and a session with no recent record in the
   repository is named on no collision.
 - **An announcement or hold** (`inbox`, the per-turn hook, `merge-pr`'s hold

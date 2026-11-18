@@ -29,6 +29,8 @@ func TestSessionsByWindow(t *testing.T) {
 		"self":            {SessionID: "self", Name: "me", PID: 4},
 		"stale":           {SessionID: "stale", Name: "old", PID: 5},
 		"started-in-main": {SessionID: "started-in-main", Name: "path-worker", PID: 6},
+		"went-back":       {SessionID: "went-back", Name: "returner", PID: 7},
+		"by-path":         {SessionID: "by-path", Name: "reacher", PID: 8},
 	}
 	recs := []coord.Record{
 		{Kind: coord.KindPresence, Window: "/r/a", Session: "moved", TS: at(3 * time.Hour)},
@@ -44,14 +46,24 @@ func TestSessionsByWindow(t *testing.T) {
 		// working in /r/b by path (its wt commands run there).
 		{Kind: coord.KindAnnounce, Window: "/r/b", Session: "started-in-main", TS: at(2 * time.Hour)},
 		{Kind: coord.KindPresence, Window: "/r/main", Session: "started-in-main", TS: at(5 * time.Minute)},
+		// #251 round 3: its presence followed it into /r/a, where it
+		// announced, then into /r/b: it works in /r/b now.
+		{Kind: coord.KindPresence, Window: "/r/a", Session: "went-back", TS: at(4 * time.Hour)},
+		{Kind: coord.KindAnnounce, Window: "/r/a", Session: "went-back", TS: at(3 * time.Hour)},
+		{Kind: coord.KindPresence, Window: "/r/b", Session: "went-back", TS: at(20 * time.Minute)},
+		// Left /r/b for /r/main, then ran a wt command in /r/b by path: the
+		// command is newer than its last mark, so it still works in /r/b.
+		{Kind: coord.KindPresence, Window: "/r/b", Session: "by-path", TS: at(5 * time.Hour)},
+		{Kind: coord.KindPresence, Window: "/r/main", Session: "by-path", TS: at(4 * time.Hour)},
+		{Kind: coord.KindAnnounce, Window: "/r/b", Session: "by-path", TS: at(time.Hour)},
 	}
 	by := sessionsByWindow(recs, live, map[string]bool{"self": true, "my-shell": true}, now)
 	var b []string
 	for _, p := range by["/r/b"] {
 		b = append(b, p.Name)
 	}
-	if strings.Join(b, ",") != "mover,one,path-worker,two" || len(by["/r/a"]) != 0 || len(by["/r/main"]) != 0 || len(by) != 1 {
-		t.Errorf("sessionsByWindow = %v, want mover (moved to /r/b), one, path-worker (works there, marks /r/main) and two in /r/b", by)
+	if strings.Join(b, ",") != "reacher,mover,one,path-worker,two,returner" || len(by["/r/a"]) != 0 || len(by["/r/main"]) != 0 || len(by) != 1 {
+		t.Errorf("sessionsByWindow = %v, want, by session id, reacher (its command is newer), mover (moved to /r/b), one, path-worker (works there, marks /r/main), two and returner (its marks followed it to /r/b) in /r/b", by)
 	}
 }
 

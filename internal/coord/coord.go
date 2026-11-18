@@ -1466,15 +1466,18 @@ func SharedCheckoutWarning(others []SessionActivity, self Self, now time.Time) s
 	// #250: a session live on this machine is named as SendMessage addresses
 	// it, in place of its id; a long name is cut to keep line 1 within its
 	// budget. A live session is not this one before a /clear (the listing keys
-	// a session by its current id), so it gets no /clear hint.
+	// a session by its current id), so the hint needs a tagged session that
+	// isn't listed live (#251 round 3: an older one, when the latest is).
 	latestName := ShortSession(latest.Session)
 	if latest.Name != "" {
 		latestName = "live session `" + cutRunes(latest.Name, 24) + "`"
 	}
 	end := "."
-	if self.Session != SessionNone && latest.Session != SessionNone && latest.Name == "" {
+	if self.Session != SessionNone && len(others) == 1 && latest.Session != SessionNone && latest.Name == "" {
 		end = "; or it was you, before a /clear."
-		if len(others) > 1 {
+	}
+	for _, o := range others {
+		if len(others) > 1 && self.Session != SessionNone && o.Session != SessionNone && o.Name == "" {
 			end = "; one may be you, before a /clear."
 		}
 	}

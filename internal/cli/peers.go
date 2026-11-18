@@ -65,7 +65,10 @@ func worktreeSessionNotes(c *config.Config) sessionNote {
 // works), else of its latest presence mark. A presence mark follows the
 // per-turn hook's cwd, where the session was started unless it cd'd (#251
 // round 2: a session started in a main checkout and working in a worktree by
-// path marked main hourly, and "latest record" credited it there). Not the
+// path marked main hourly, and "latest record" credited it there). A newer
+// mark in another window still wins when the session also marked presence in
+// its command's window that day: its hook's cwd followed it there, so presence
+// tracks it (#251 round 3: it moved back, or was resumed elsewhere). Not the
 // listing's cwd either: that is where a session was STARTED, and sessions
 // started in a parent folder (5 of 6 on the owner's machine) are in no
 // worktree. A session with no recent record here is named on no collision.
@@ -76,6 +79,7 @@ func sessionsByWindow(recs []coord.Record, live map[string]peers.Peer, self map[
 		at     time.Time
 	}
 	worked, marked := map[string]seen{}, map[string]seen{}
+	markedIn := map[string]map[string]bool{} // the windows each session marked
 	for _, r := range recs {
 		if r.Session == "" || r.Session == coord.SessionNone || self[r.Session] || r.Window == "" {
 			continue
@@ -90,13 +94,18 @@ func sessionsByWindow(recs []coord.Record, live map[string]peers.Peer, self map[
 		m := worked
 		if r.Kind == coord.KindPresence {
 			m = marked
+			if markedIn[r.Session] == nil {
+				markedIn[r.Session] = map[string]bool{}
+			}
+			markedIn[r.Session][r.Window] = true
 		}
 		if l, ok := m[r.Session]; !ok || !t.Before(l.at) {
 			m[r.Session] = seen{r.Window, t}
 		}
 	}
 	for id, w := range marked {
-		if _, ok := worked[id]; !ok {
+		c, ok := worked[id]
+		if !ok || (w.at.After(c.at) && markedIn[id][c.window]) {
 			worked[id] = w
 		}
 	}
