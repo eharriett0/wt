@@ -399,7 +399,13 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   session's marks told the session after its /clear (a new id) that another
   shared its checkout, for a day. A session with any other record keeps the
   day's window, and its marks still date it; the warning adds "or it was
-  you, before a /clear" between two tagged sessions. ⚠ A mark also sets the
+  you, before a /clear" between two tagged sessions ("one may be you" for
+  several). ⚠ Marks come only from the per-turn hooks (UserPromptSubmit),
+  so a session in one long autonomous turn with no prompt for 2h drops out
+  until its next prompt (round-3 review, accepted: main had no signal for
+  it at all, and any other record keeps a session for the day). An older
+  wt, and a `wt mcp` started before the upgrade, still list marks-only
+  sessions for 24h. ⚠ A mark also sets the
   log's session epoch (#211 `SessionEpoch`, any kind), so a session-less
   hold written after it reads as a still-running older wt's, not history:
   the safe direction, and prune-coord's drop of the mark puts it back. A

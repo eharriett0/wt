@@ -714,7 +714,7 @@ func TestSharedCheckoutWarning(t *testing.T) {
 			[]string{"another session was active", "latest: session b0c1d2e3…, 5m ago", "you: session aaaaaaaa…", "wt new <branch>", "wt inbox", "or it was you, before a /clear"},
 			[]string{"WT_SESSION"}},
 		{"two sessions, newest named", two, Self{"/w", "A"},
-			[]string{"2 other sessions were active", "latest: session b0c1d2e3…", "/clear"}, nil},
+			[]string{"2 other sessions were active", "latest: session b0c1d2e3…", "one may be you, before a /clear"}, []string{"or it was you"}},
 		{"token-less self is told to set WT_SESSION", one, Self{"/w", SessionNone},
 			[]string{"you: no session token", "set WT_SESSION"}, []string{"/clear"}},
 		{"a token-less latest session is no /clear of yours", []SessionActivity{{Session: SessionNone, Records: 1, Last: now.Add(-time.Minute)}}, Self{"/w", "A"},
@@ -1009,27 +1009,25 @@ func TestOtherSessions_presenceAloneCountsWhileLive(t *testing.T) {
 	now := time.Now()
 	at := func(d time.Duration) string { return now.Add(-d).UTC().Format(time.RFC3339) }
 	self := Self{Window: "/w", Session: "new"}
+	// Record order puts the dropped session last (round-3 review: sorting the
+	// unfiltered list then returned it as "latest"), and the marks sit either
+	// side of PresenceLive (2h) to pin it.
 	recs := []Record{
-		{ID: "1", Kind: KindPresence, Window: "/w", Session: "cleared", TS: at(3 * time.Hour)},
-		{ID: "2", Kind: KindPresence, Window: "/w", Session: "cleared", TS: at(4 * time.Hour)},
-		{ID: "3", Kind: KindPresence, Window: "/w", Session: "prompting", TS: at(90 * time.Minute)},
 		{ID: "4", Kind: KindAnnounce, Window: "/w", Session: "announced", Message: "x", TS: at(10 * time.Hour)},
 		{ID: "5", Kind: KindPresence, Window: "/w", Session: "announced", TS: at(5 * time.Hour)},
+		{ID: "3", Kind: KindPresence, Window: "/w", Session: "prompting", TS: at(119 * time.Minute)},
+		{ID: "2", Kind: KindPresence, Window: "/w", Session: "cleared", TS: at(4 * time.Hour)},
+		{ID: "1", Kind: KindPresence, Window: "/w", Session: "cleared", TS: at(121 * time.Minute)},
 	}
-	got := map[string]SessionActivity{}
-	for _, s := range OtherSessions(recs, self, now, SharedCheckoutWindow) {
-		got[s.Session] = s
+	got := OtherSessions(recs, self, now, SharedCheckoutWindow)
+	var order []string
+	for _, s := range got {
+		order = append(order, s.Session)
 	}
-	if _, ok := got["cleared"]; ok {
-		t.Errorf("a session whose latest mark is 3h old still shares the checkout")
+	if strings.Join(order, ",") != "prompting,announced" {
+		t.Fatalf("OtherSessions = %v, want prompting (marked 119m ago) then announced; not cleared (121m)", order)
 	}
-	if _, ok := got["prompting"]; !ok {
-		t.Errorf("a session that marked 90m ago doesn't share the checkout")
-	}
-	if a, ok := got["announced"]; !ok || a.Records != 2 || now.Sub(a.Last) > 5*time.Hour+time.Minute {
-		t.Errorf("an announcing session = %+v (listed %v), want both records, last 5h ago", a, ok)
-	}
-	if len(got) != 2 {
-		t.Errorf("listed %v, want prompting and announced", got)
+	if a := got[1]; a.Records != 2 || now.Sub(a.Last) > 5*time.Hour+time.Minute {
+		t.Errorf("an announcing session = %+v, want both records, last 5h ago", a)
 	}
 }

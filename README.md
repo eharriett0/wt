@@ -124,10 +124,15 @@ rather than empty). Two agents sharing one working tree look like one window
 to the collision engine, so this is a sign of the second one. An agent whose
 wt hooks are installed (`wt install-claude-hook`, `wt install-codex-hook`)
 shows from its first prompt: its per-turn hook marks the session present at
-most once an hour (a `presence` record, never shown as an announcement; only
-the last day's are read, and `wt prune-coord` drops older ones, which `wt
-doctor` lists without a warning). One without the hooks shows only once it
-runs a coordination command.
+most once an hour (a `presence` record, never shown as an announcement). A
+session seen only through those marks is listed while its latest is under 2h
+old, so the session after a `/clear` (a new id) isn't warned about its own
+past for a day. Marks are written per prompt, so a session in one long turn
+with no prompt for 2h drops out until its next; a session with any other
+record (an announcement, a reservation) stays listed for 24h. `wt
+prune-coord` drops marks older than a day, which `wt doctor` lists without a
+warning. One without the hooks shows only once it runs a coordination
+command.
 
 ### Stale branches don't count
 

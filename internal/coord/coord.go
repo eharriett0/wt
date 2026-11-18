@@ -1435,6 +1435,9 @@ func SharedCheckoutWarning(others []SessionActivity, self Self, now time.Time) s
 	end := "."
 	if self.Session != SessionNone && latest.Session != SessionNone {
 		end = "; or it was you, before a /clear."
+		if len(others) > 1 {
+			end = "; one may be you, before a /clear."
+		}
 	}
 	return fmt.Sprintf("checkout shared — %s active in THIS checkout in the last %dh (latest: %s, %s); you: %s.\n"+
 		"  One working tree, no file-level warning between you: give one its own worktree (`wt new <branch>`); its holds: `wt inbox`%s",
