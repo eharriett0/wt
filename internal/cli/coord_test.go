@@ -310,7 +310,7 @@ func TestHoldAdvice(t *testing.T) {
 		{"a future-dated hold: says why it keeps gating, no all-clear", []coord.Record{future}, nil, false},
 	}
 	for _, tc := range cases {
-		lines := holdAdvice(tc.holds, tc.holds, coord.ViewOf(tc.holds, self), now)
+		lines := holdAdvice(tc.holds, tc.holds, coord.ViewOf(tc.holds, self), now, nil)
 		if len(lines) == 0 || !strings.HasPrefix(lines[0], "ack it first: wt ack <id>") || !strings.Contains(lines[0], "for YOU only") {
 			t.Errorf("%s: advice must lead with `wt ack` (waives for you only), got %q", tc.name, lines)
 			continue
@@ -335,16 +335,16 @@ func TestHoldAdvice(t *testing.T) {
 	// #211: an unattributable holder gets the can't-tell-whose note (it may be
 	// yours: ack it); a holder wt can attribute does not.
 	unattr := coord.Record{ID: "legacy", Window: "/w", TS: at(time.Hour), Hold: []string{"merge-main"}}
-	if all := strings.Join(holdAdvice([]coord.Record{unattr}, nil, coord.ViewOf(nil, self), now), "\n"); !strings.Contains(all, "can't tell whose") {
+	if all := strings.Join(holdAdvice([]coord.Record{unattr}, nil, coord.ViewOf(nil, self), now, nil), "\n"); !strings.Contains(all, "can't tell whose") {
 		t.Errorf("an unattributable holder must get the can't-tell-whose note:\n%s", all)
 	}
-	if all := strings.Join(holdAdvice([]coord.Record{liveSame, liveOther}, nil, coord.ViewOf(nil, self), now), "\n"); strings.Contains(all, "can't tell whose") {
+	if all := strings.Join(holdAdvice([]coord.Record{liveSame, liveOther}, nil, coord.ViewOf(nil, self), now, nil), "\n"); strings.Contains(all, "can't tell whose") {
 		t.Errorf("attributable holders must not get the can't-tell-whose note:\n%s", all)
 	}
-	if all := strings.Join(holdAdvice([]coord.Record{mineElsewhere}, nil, coord.ViewOf(nil, self), now), "\n"); !strings.Contains(all, "carries this session's own token, placed from checkout /elsewhere") {
+	if all := strings.Join(holdAdvice([]coord.Record{mineElsewhere}, nil, coord.ViewOf(nil, self), now, nil), "\n"); !strings.Contains(all, "carries this session's own token, placed from checkout /elsewhere") {
 		t.Errorf("own hold from another checkout must be named:\n%s", all)
 	}
-	if all := strings.Join(holdAdvice([]coord.Record{future}, nil, coord.ViewOf(nil, self), now), "\n"); !strings.Contains(all, "dated 2d ahead of this clock") {
+	if all := strings.Join(holdAdvice([]coord.Record{future}, nil, coord.ViewOf(nil, self), now, nil), "\n"); !strings.Contains(all, "dated 2d ahead of this clock") {
 		t.Errorf("future-dated hold note missing:\n%s", all)
 	}
 }

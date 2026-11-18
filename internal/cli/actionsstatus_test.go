@@ -25,6 +25,10 @@ import (
 // test that wants a page sets its own.
 func TestMain(m *testing.M) {
 	os.Setenv(githubStatusURLEnv, "wt-test://no-network/summary.json")
+	// #250: nor the real `claude agents` (a test run inside a Claude Code
+	// session finds it through CLAUDE_CODE_EXECPATH); a test that wants live
+	// sessions sets livePeers.
+	os.Setenv("WT_PEERS", "0")
 	os.Exit(m.Run())
 }
 

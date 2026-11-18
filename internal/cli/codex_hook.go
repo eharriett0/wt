@@ -376,11 +376,12 @@ func hookInbox(box []coord.Record, v coord.View, otherWorktrees bool) []coord.Re
 // coordContextMessage shows each entry's Window as who posted it, and an entry
 // from another session in THIS checkout carries the reader's own window id — so
 // it is relabelled "same checkout, another session (…)" (#163), or "can't tell
-// whose (…)" (#211). Returns copies. Pure.
+// whose (…)" (#211), and another party's live session is named (#250,
+// postedByLive). Returns copies.
 func labelForContext(box []coord.Record, v coord.View) []coord.Record {
 	out := make([]coord.Record, len(box))
 	for i, r := range box {
-		r.Window = postedBy(r, v)
+		r.Window = postedByLive(r, v)
 		out[i] = r
 	}
 	return out

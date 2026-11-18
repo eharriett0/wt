@@ -20,6 +20,7 @@ import (
 	"github.com/eharriett0/wt/internal/coord"
 	"github.com/eharriett0/wt/internal/ghx"
 	"github.com/eharriett0/wt/internal/gitx"
+	"github.com/eharriett0/wt/internal/peers"
 	"github.com/eharriett0/wt/internal/ui"
 )
 
@@ -373,7 +374,7 @@ func cmdInbox(args []string) int {
 			if a.Issue > 0 {
 				tags += ui.Dim(fmt.Sprintf("  #%d", a.Issue))
 			}
-			fmt.Printf("  %s  %s  %s%s\n    %s\n", ui.Bold(a.ID), ui.Cyan(postedBy(a, v)), ui.Dim(recordAge(a, now)), tags, a.Message)
+			fmt.Printf("  %s  %s  %s%s\n    %s\n", ui.Bold(a.ID), ui.Cyan(postedByLive(a, v)), ui.Dim(recordAge(a, now)), tags, a.Message)
 		}
 		if hedged {
 			ui.Warn("note: %s", tokenlessCaveat())
@@ -712,9 +713,9 @@ func mergeCoordGateWith(c *config.Config, holdMaxAge time.Duration, issues []int
 		if h.Issue > 0 {
 			iss = fmt.Sprintf("  #%d", h.Issue)
 		}
-		fmt.Fprintf(os.Stderr, "    %s  %s  %s%s\n      %s\n", ui.Bold(h.ID), ui.Cyan(postedBy(h, v)), ui.Dim(recordAge(h, now)), iss, h.Message)
+		fmt.Fprintf(os.Stderr, "    %s  %s  %s%s\n      %s\n", ui.Bold(h.ID), ui.Cyan(postedByLive(h, v)), ui.Dim(recordAge(h, now)), iss, h.Message)
 	}
-	for _, line := range holdAdvice(fresh, recs, v, now) {
+	for _, line := range holdAdvice(fresh, recs, v, now, livePeerOf) {
 		ui.Info("%s", line)
 	}
 	ui.Info("or override with --bypass if you've confirmed the merge is safe alongside it.")
@@ -739,8 +740,14 @@ func warnStaleHolds(stale []coord.Record, v coord.View, now time.Time, maxAge ti
 	list := func(hs []coord.Record) {
 		shown, more := newestHolds(hs, staleHoldsShown)
 		for _, h := range shown {
-			fmt.Fprintf(os.Stderr, "    %s  %s  %s  (all-clear: wt all-clear %s)\n",
-				ui.Bold(h.ID), ui.Cyan(postedBy(h, v)), ui.Dim(recordAge(h, now)), h.ID)
+			// #250: a live holder is asked, not cleared over (all-clear
+			// releases the hold for every window).
+			hint := "(all-clear: wt all-clear " + h.ID + ")"
+			if _, ok := otherPeer(h, v, livePeerOf); ok {
+				hint = "(its session is live: ask it before any all-clear)"
+			}
+			fmt.Fprintf(os.Stderr, "    %s  %s  %s  %s\n",
+				ui.Bold(h.ID), ui.Cyan(postedByLive(h, v)), ui.Dim(recordAge(h, now)), hint)
 		}
 		if more > 0 {
 			fmt.Fprintf(os.Stderr, "    %s\n", ui.Dim(fmt.Sprintf("…and %d older (wt holds lists this checkout's)", more)))
@@ -785,8 +792,10 @@ func fmtLimit(d time.Duration) string {
 // reason it reads as someone else's: its session id changed (/clear,
 // --fork-session or a fresh start each mint a new one). A hold carrying this
 // session's own token from another checkout is named as such, and one whose age
-// can't be measured says why it keeps gating. Pure.
-func holdAdvice(holds, recs []coord.Record, v coord.View, now time.Time) []string {
+// can't be measured says why it keeps gating. A hold whose session is live on
+// this machine (lookup, #250) is never called orphaned: it says to ask that
+// session instead. Pure given lookup (nil: none looked up).
+func holdAdvice(holds, recs []coord.Record, v coord.View, now time.Time, lookup peerLookup) []string {
 	lines := []string{"ack it first: wt ack <id> --state \"…\"   (waives the hold for YOU only; it keeps gating every other window)"}
 	if sameCheckoutHolder(holds, v.Self) {
 		lines = append(lines, "a \"same checkout, another session\" hold may be your own from before a /clear, --fork-session or fresh start (each mints a new session id); if so, ack it")
@@ -797,6 +806,10 @@ func holdAdvice(holds, recs []coord.Record, v coord.View, now time.Time) []strin
 	for _, h := range holds {
 		if v.Attribute(h) == coord.AttrOtherWindow && v.ProvablyWrote(h) {
 			lines = append(lines, fmt.Sprintf("%s carries this session's own token, placed from checkout %s (you before a cd, or a subagent of this session): `wt all-clear %s` releases it for EVERY window; ack it instead if it still guards work there (WT_WINDOW keeps one identity across checkouts)", h.ID, h.Window, h.ID))
+			continue
+		}
+		if p, ok := otherPeer(h, v, lookup); ok {
+			lines = append(lines, fmt.Sprintf("%s: its session is %s to release it", h.ID, peers.Describe(p)))
 			continue
 		}
 		if note := undatedNote(h, now); note != "" {
@@ -1248,7 +1261,7 @@ func sameCheckoutHoldsNote(others, recs []coord.Record, v coord.View, now time.T
 	}
 	ui.Warn("%d open announcement(s) (%d with a hold) in THIS checkout are another session's, so they are not listed as yours — `wt inbox` shows them. If it is still running you share one working tree (separate with `wt new <branch>`).", len(others), len(held))
 	if len(held) > 0 {
-		for _, line := range holdAdvice(held, recs, v, now) {
+		for _, line := range holdAdvice(held, recs, v, now, livePeerOf) {
 			ui.Info("%s", line)
 		}
 	}
@@ -1281,7 +1294,7 @@ func peerHoldBanner(c *config.Config) {
 			iss = fmt.Sprintf("  #%d", h.Issue)
 		}
 		fmt.Fprintf(os.Stderr, "  %s  %s  %s  %s%s\n    %s\n",
-			ui.Bold(h.ID), ui.Cyan(postedBy(h, v)),
+			ui.Bold(h.ID), ui.Cyan(postedByLive(h, v)),
 			ui.Yellow("[hold: "+strings.Join(h.Hold, ",")+"]"),
 			ui.Dim(recordAge(h, now)), iss, h.Message)
 	}
