@@ -121,9 +121,19 @@ sessions active in this checkout in the last 24h (coordination records, or
 block ids reserved from this repository), as `wt doctor --json` reports them
 (`sessions_unread` says the log could not be read, so the list is unknown
 rather than empty). Two agents sharing one working tree look like one window
-to the collision engine, so this is a sign of the second one, but only of one
-that has written something: a session that never ran a coordination command
-here does not show.
+to the collision engine, so this is a sign of the second one. An agent whose
+wt hooks are installed (`wt install-claude-hook`, `wt install-codex-hook`)
+shows from its first prompt: its per-turn hook marks the session present at
+most once an hour (a `presence` record, never shown as an announcement). A
+session seen only through those marks is listed while its latest is under 2h
+old, so the session after a `/clear` (a new id) isn't warned about its own
+past for a day. Marks are written per prompt, at most hourly, so a session
+drops out 1 to 2h after its last prompt (2h after its last mark), as in one
+long turn, until it prompts again; a session with any other
+record (an announcement, a reservation) stays listed for 24h. `wt
+prune-coord` drops marks older than a day, which `wt doctor` lists without a
+warning. One without the hooks shows only once it runs a coordination
+command.
 
 ### Stale branches don't count
 
@@ -208,7 +218,7 @@ set, it prints a loud, non-blocking notice naming the files and the window.
 | `wt ack <id>` | Acknowledge one `[--state "what this window is touching"]` |
 | `wt all-clear <id>` | Release your hold — for EVERY window. A hold carrying this session's own token is released at once (also one placed from another checkout); anything else (another session's or window's, one with no session recorded, and a shell's own hold when it has no session token, which wt can't prove) asks first on a terminal, and otherwise refuses unless you pass `--not-mine` |
 | `wt holds` | YOUR outstanding announcements/holds + block reservations, with copy-pasteable all-clear lines (a token-less shell's own are marked: wt can't prove them); this checkout's records wt can't attribute to any session are listed apart, without them, every hold that still gates included. Reads the mirror like `inbox` `[--issue N]` |
-| `wt prune-coord` | GC the coordination log — drop resolved handshakes + aged block reservations `[--block-max-age D]`. `--legacy` lists the open announcements written before wt recorded sessions that gate or show nothing for anyone any more; `--legacy -y` drops them with their acks (a one-time cleanup after upgrading) |
+| `wt prune-coord` | GC the coordination log: drop resolved handshakes, aged block reservations `[--block-max-age D]` and presence marks older than a day. `--legacy` lists the open announcements written before wt recorded sessions that gate or show nothing for anyone any more; `--legacy -y` drops them with their acks (a one-time cleanup after upgrading) |
 | `wt block-id <file>` | Atomically reserve the next append-log id so two windows never grab the same `NEWEST-N`. `--written N` marks a reservation done once block N is in the file (clears the banner), `--abandon N` frees one you won't write; a reservation never marked frees its id by itself after 30m `[--pattern] [--format]`. A reservation is its session's, from any checkout: another session can't mark or abandon it (wt names whose it is) and sees it in its status banner instead. One made with no session token (a plain shell) can be abandoned by any token-less shell in the checkout, so `--abandon` asks first, or needs `--not-mine`. After upgrading, a reservation made by an older wt has no session: no one can mark it, and it frees itself after 30m |
 | `wt append <doc> --section H "txt"` | Locked, section-scoped append to a structured shared doc (parallel adds can't clobber) |
 | `wt install-hooks` | Install pre-push (base guard + collision check + base-conflict warning) + pre-commit (collision notice) `[--force]` |
@@ -625,8 +635,10 @@ hooks = false
   Under an older Codex your `wt` commands record no session, while the
   per-turn hook reads the session id Codex sends it, so the banner lists this
   session's own announcements as another session's (advisory, nothing
-  blocks). Upgrade Codex, or start it from a shell with its own `WT_SESSION`
-  set: both your commands and the hooks read that first.
+  blocks). The hook's presence mark carries that id too, so `wt status`
+  and `wt doctor` in this session's shell warn that another session shares
+  the checkout: it is this one. Upgrade Codex, or start it from a shell with
+  its own `WT_SESSION` set: both your commands and the hooks read that first.
 
 The awareness is proactive-but-coarse (per prompt, not per edit) because that's
 what Codex exposes — but the pre-push guard is the hard gate for both agents, so

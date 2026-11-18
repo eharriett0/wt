@@ -419,3 +419,38 @@ func TestRecentBlockLedgers(t *testing.T) {
 		t.Error("no home: want nothing")
 	}
 }
+
+// AppendIfFree never waits (#197 item 2: the per-turn hook marks presence
+// with it): a held lock writes nothing and returns at once; a filesystem that
+// can't lock gets the unlocked write, silently; any other lock error writes
+// nothing and is returned.
+func TestAppendIfFree(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "log.jsonl")
+	notes := shortWriteLock(t, 30*time.Second, 0)
+	if ok, err := AppendIfFree(path, lockRec("free")); !ok || err != nil {
+		t.Fatalf("free lock: %v, %v", ok, err)
+	}
+	release := holdLog(t, path)
+	start := time.Now()
+	if ok, err := AppendIfFree(path, lockRec("held")); ok || err != nil {
+		t.Errorf("held lock: %v, %v; want not written, no error", ok, err)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("took %s on a held lock, want no wait", took)
+	}
+	release()
+	stubLock(t, syscall.ENOTSUP)
+	if ok, err := AppendIfFree(path, lockRec("unsupported")); !ok || err != nil {
+		t.Errorf("can't lock: %v, %v; want written", ok, err)
+	}
+	stubLock(t, syscall.EIO)
+	if ok, err := AppendIfFree(path, lockRec("eio")); ok || !errors.Is(err, syscall.EIO) {
+		t.Errorf("EIO: %v, %v; want not written, EIO", ok, err)
+	}
+	if got := strings.Join(logIDs(t, path), ","); got != "free,unsupported" {
+		t.Errorf("records = %s, want free,unsupported", got)
+	}
+	if notes.Len() != 0 {
+		t.Errorf("AppendIfFree printed: %q", notes)
+	}
+}

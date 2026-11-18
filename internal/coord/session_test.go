@@ -711,12 +711,14 @@ func TestSharedCheckoutWarning(t *testing.T) {
 		wantNone []string
 	}{
 		{"one tagged session", one, Self{"/w", "aaaaaaaa-1111-2222-3333-444444444444"},
-			[]string{"another session was active", "latest: session b0c1d2e3…, 5m ago", "you: session aaaaaaaa…", "wt new <branch>", "wt inbox"},
+			[]string{"another session was active", "latest: session b0c1d2e3…, 5m ago", "you: session aaaaaaaa…", "wt new <branch>", "wt inbox", "or it was you, before a /clear"},
 			[]string{"WT_SESSION"}},
 		{"two sessions, newest named", two, Self{"/w", "A"},
-			[]string{"2 other sessions were active", "latest: session b0c1d2e3…"}, nil},
+			[]string{"2 other sessions were active", "latest: session b0c1d2e3…", "one may be you, before a /clear"}, []string{"or it was you"}},
 		{"token-less self is told to set WT_SESSION", one, Self{"/w", SessionNone},
-			[]string{"you: no session token", "set WT_SESSION"}, nil},
+			[]string{"you: no session token", "set WT_SESSION"}, []string{"/clear"}},
+		{"a token-less latest session is no /clear of yours", []SessionActivity{{Session: SessionNone, Records: 1, Last: now.Add(-time.Minute)}}, Self{"/w", "A"},
+			[]string{"another session was active"}, []string{"/clear"}},
 	}
 	for _, tc := range cases {
 		msg := SharedCheckoutWarning(tc.others, tc.self, now)
@@ -925,4 +927,127 @@ func TestNameLive(t *testing.T) {
 		t.Errorf("NameLive = %+v (asked %d), want B named only", others, asked)
 	}
 	NameLive(others, nil) // no lookup: nothing changes, no panic
+}
+
+// PresenceDue (#197 item 2): a session with a real token marks presence when
+// nothing of its own (this window AND session, any kind) is in the log from
+// the last PresenceEvery.
+func TestPresenceDue(t *testing.T) {
+	now := time.Now()
+	self := Self{Window: "/w", Session: "A"}
+	at := func(d time.Duration) string { return now.Add(-d).UTC().Format(time.RFC3339) }
+	for _, tc := range []struct {
+		name string
+		self Self
+		recs []Record
+		want bool
+	}{
+		{"nothing yet", self, nil, true},
+		{"no token", Self{Window: "/w", Session: SessionNone}, nil, false},
+		{"zero session", Self{Window: "/w"}, nil, false},
+		{"own announce 30m ago", self, []Record{{Window: "/w", Session: "A", Kind: KindAnnounce, TS: at(30 * time.Minute)}}, false},
+		{"own presence 59m ago", self, []Record{{Window: "/w", Session: "A", Kind: KindPresence, TS: at(59 * time.Minute)}}, false},
+		{"own presence 61m ago", self, []Record{{Window: "/w", Session: "A", Kind: KindPresence, TS: at(61 * time.Minute)}}, true},
+		{"another session's, just now", self, []Record{{Window: "/w", Session: "B", Kind: KindPresence, TS: at(0)}}, true},
+		{"own session, another window", self, []Record{{Window: "/x", Session: "A", Kind: KindPresence, TS: at(0)}}, true},
+		{"undatable", self, []Record{{Window: "/w", Session: "A", Kind: KindPresence, TS: "?"}}, true},
+		{"an hour in the future (clock skew)", self, []Record{{Window: "/w", Session: "A", Kind: KindPresence, TS: at(-time.Hour)}}, true},
+	} {
+		if got := PresenceDue(tc.recs, tc.self, now); got != tc.want {
+			t.Errorf("%s: PresenceDue = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// prune-coord drops presence past SharedCheckoutWindow, the only span it is
+// read for, and an undatable one (#197 item 2).
+func TestPruneRecords_presence(t *testing.T) {
+	now := time.Now()
+	at := func(d time.Duration) string { return now.Add(-d).UTC().Format(time.RFC3339) }
+	recs := []Record{
+		{ID: "fresh", Kind: KindPresence, TS: at(time.Hour)},
+		{ID: "day-old", Kind: KindPresence, TS: at(23 * time.Hour)},
+		{ID: "old", Kind: KindPresence, TS: at(25 * time.Hour)},
+		{ID: "undatable", Kind: KindPresence, TS: "?"},
+		{ID: "ack", Kind: KindAck, AckOf: "gone", TS: at(48 * time.Hour)},
+	}
+	kept, dropped := PruneRecords(recs, now, 24*time.Hour)
+	var ids []string
+	for _, r := range kept {
+		ids = append(ids, r.ID)
+	}
+	if dropped != 2 || strings.Join(ids, ",") != "fresh,day-old,ack" {
+		t.Errorf("kept %v (dropped %d), want fresh, day-old and the ack", ids, dropped)
+	}
+	// doctor lists these apart from the prunable records it warns about.
+	if n := ExpiredPresence(recs, now); n != 2 {
+		t.Errorf("ExpiredPresence = %d, want 2 (old, undatable)", n)
+	}
+	// Presence is no announcement: inbox never shows it.
+	if in := Inbox([]Record{{ID: "p", Kind: KindPresence, Window: "/w", Session: "B", TS: at(0)}}, Self{Window: "/w", Session: "A"}, now); len(in) != 0 {
+		t.Errorf("inbox shows a presence record: %v", in)
+	}
+}
+
+// A presence record is its session's activity (#197 item 2 review: claimed,
+// untested): a prompting session's hold doesn't look orphaned, and a
+// token-less inbox hedges when another session was active here.
+func TestPresence_countsAsTheSessionsActivity(t *testing.T) {
+	now := time.Now()
+	at := func(d time.Duration) string { return now.Add(-d).UTC().Format(time.RFC3339) }
+	hold := Record{ID: "h", Kind: KindAnnounce, Window: "/w", Session: "A", Hold: []string{"merge-main"}, TS: at(5 * time.Hour)}
+	if orphaned, why := HoldLooksOrphaned([]Record{hold}, hold, now); !orphaned {
+		t.Fatalf("control: a hold whose session wrote nothing for 5h reads live (%q)", why)
+	}
+	mark := Record{ID: "p", Kind: KindPresence, Window: "/w", Session: "A", TS: at(time.Hour)}
+	if orphaned, why := HoldLooksOrphaned([]Record{hold, mark}, hold, now); orphaned {
+		t.Errorf("a hold whose session marked presence an hour ago reads orphaned: %s", why)
+	}
+	other := Record{ID: "q", Kind: KindPresence, Window: "/w", Session: "B", TS: at(time.Hour)}
+	if orphaned, _ := HoldLooksOrphaned([]Record{hold, other}, hold, now); !orphaned {
+		t.Errorf("another session's presence kept A's hold alive")
+	}
+
+	tokenless := Self{Window: "/w", Session: SessionNone}
+	if InboxClearAmbiguous(nil, tokenless, now) {
+		t.Fatal("control: an empty log hedges")
+	}
+	if !InboxClearAmbiguous([]Record{other}, tokenless, now) {
+		t.Errorf("a token-less inbox doesn't hedge for another session's presence in this checkout")
+	}
+	if InboxClearAmbiguous([]Record{{ID: "q", Kind: KindPresence, Window: "/w", Session: "B", TS: at(3 * time.Hour)}}, tokenless, now) {
+		t.Errorf("a presence mark past PresenceLive still hedges")
+	}
+}
+
+// #197 item 2 round-2 review: every hooked session leaves a mark, and the
+// session after a /clear (a new id) was told for a day that another shared
+// its checkout. A session whose only evidence is marks counts while its
+// latest is within PresenceLive; any other record keeps the day's window, and
+// its marks still date its activity.
+func TestOtherSessions_presenceAloneCountsWhileLive(t *testing.T) {
+	now := time.Now()
+	at := func(d time.Duration) string { return now.Add(-d).UTC().Format(time.RFC3339) }
+	self := Self{Window: "/w", Session: "new"}
+	// Record order puts the dropped session last (round-3 review: sorting the
+	// unfiltered list then returned it as "latest"), and the marks sit either
+	// side of PresenceLive (2h) to pin it.
+	recs := []Record{
+		{ID: "4", Kind: KindAnnounce, Window: "/w", Session: "announced", Message: "x", TS: at(10 * time.Hour)},
+		{ID: "5", Kind: KindPresence, Window: "/w", Session: "announced", TS: at(5 * time.Hour)},
+		{ID: "3", Kind: KindPresence, Window: "/w", Session: "prompting", TS: at(119 * time.Minute)},
+		{ID: "2", Kind: KindPresence, Window: "/w", Session: "cleared", TS: at(4 * time.Hour)},
+		{ID: "1", Kind: KindPresence, Window: "/w", Session: "cleared", TS: at(121 * time.Minute)},
+	}
+	got := OtherSessions(recs, self, now, SharedCheckoutWindow)
+	var order []string
+	for _, s := range got {
+		order = append(order, s.Session)
+	}
+	if strings.Join(order, ",") != "prompting,announced" {
+		t.Fatalf("OtherSessions = %v, want prompting (marked 119m ago) then announced; not cleared (121m)", order)
+	}
+	if a := got[1]; a.Records != 2 || now.Sub(a.Last) > 5*time.Hour+time.Minute {
+		t.Errorf("an announcing session = %+v, want both records, last 5h ago", a)
+	}
 }

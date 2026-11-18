@@ -229,7 +229,16 @@ func hookAgentContext(r io.Reader, codex bool) int {
 		return 0
 	}
 	run, overlaps := hookPlan(len(paths), coordLogExists)
-	if !run {
+	envSession, _ := coord.SessionToken(os.Getenv)
+	if envSession == "" {
+		envSession = coord.SessionNone // as coordCtx's CurrentSelf records it
+	}
+	session := agentHookSession(envSession, codex, parseHookSessionID(b))
+	// #197 item 2: a session with a real token still marks its presence where
+	// hookPlan would skip the turn (one worktree, no coordination log yet: the
+	// #163 case of two agents in one checkout), so the first mark creates the
+	// log. A token-less shell names no party and costs nothing here.
+	if !run && session == coord.SessionNone {
 		return 0
 	}
 	c, err := config.Load()
@@ -247,21 +256,38 @@ func hookAgentContext(r io.Reader, codex bool) int {
 	// and from another session sharing this checkout (#163). The session is the
 	// one this agent's own `wt` commands stamp on their records: the hook's env
 	// (coordCtx), with Codex's payload fallback (agentHookSession). Fail-open: a
-	// coord read error just omits this block (never breaks the turn).
+	// coord read error just omits this block (never breaks the turn), and the
+	// read waits at most a second for a writer (coord.LoadForHook).
 	if logPath, self := coordCtx(c); logPath != "" {
-		self.Session = agentHookSession(self.Session, codex, parseHookSessionID(b))
-		if recs, rerr := coord.Load(logPath); rerr == nil {
+		self.Session = session
+		if recs, rerr := coord.LoadForHook(logPath); rerr == nil {
 			now := time.Now()
-			box := hookInbox(coord.Inbox(recs, self, now), coord.ViewOf(recs, self), overlaps)
-			if msg, has := coordContextMessage(box, c.MaxAge, now); has {
-				parts = append(parts, msg)
+			if run {
+				box := hookInbox(coord.Inbox(recs, self, now), coord.ViewOf(recs, self), overlaps)
+				if msg, has := coordContextMessage(box, c.MaxAge, now); has {
+					parts = append(parts, msg)
+				}
 			}
+			markPresence(c, logPath, self, recs, now)
 		}
 	}
 	if len(parts) > 0 {
 		emitAgentContext(strings.Join(parts, "\n\n"))
 	}
 	return 0
+}
+
+// markPresence writes this session's presence record when it is due
+// (coord.PresenceDue: a real token, nothing of its own in this checkout for
+// coord.PresenceEvery), so a session that never runs a coordination command
+// still shows in other sessions' shared-checkout warning, other_sessions and
+// doctor (#197 item 2). Never waits on the log's lock (coord.AppendIfFree: a
+// held lock skips this turn) and never fails the hook.
+func markPresence(c *config.Config, logPath string, self coord.Self, recs []coord.Record, now time.Time) {
+	if !coord.PresenceDue(recs, self, now) {
+		return
+	}
+	_, _ = coord.AppendIfFree(logPath, stampRecord(self, mainRepoName(c), coord.KindPresence, now))
 }
 
 // hookPlan decides what the per-turn hook does, staying cheap on the common case.
