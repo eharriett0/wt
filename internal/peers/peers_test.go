@@ -81,6 +81,12 @@ func fakeClaude(t *testing.T, body string) (runs string) {
 	t.Setenv("WT_PEERS", "")
 	Reset()
 	t.Cleanup(Reset)
+	// A fresh script's first exec can take seconds on a loaded macOS (it is
+	// scanned): a listing expected to answer gets room, not the 2s.
+	// The timeout tests set their own after this.
+	orig := Timeout
+	Timeout = 30 * time.Second
+	t.Cleanup(func() { Timeout = orig })
 	return runs
 }
 
@@ -197,6 +203,11 @@ func TestLive_execPathFallback(t *testing.T) {
 	}
 	t.Setenv("PATH", t.TempDir())
 	t.Setenv("WT_PEERS", "")
+	// A fresh script's first exec can take seconds on a loaded macOS (it is
+	// scanned): a listing expected to answer gets room, not the 2s.
+	orig := Timeout
+	Timeout = 30 * time.Second
+	t.Cleanup(func() { Timeout = orig })
 	for _, tc := range []struct {
 		execPath string
 		ok       bool

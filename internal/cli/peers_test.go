@@ -149,6 +149,11 @@ func TestLiveHolderNamed_hookAndGate(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// A fresh script's first exec can take seconds on a loaded macOS (it is
+	// scanned): a listing expected to answer gets room, not the 2s.
+	origTimeout := peers.Timeout
+	peers.Timeout = 30 * time.Second
+	t.Cleanup(func() { peers.Timeout = origTimeout })
 	ran := func() int {
 		b, _ := os.ReadFile(runs)
 		return strings.Count(string(b), "\n")
