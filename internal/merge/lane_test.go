@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/eharriett0/wt/internal/gitx"
 )
 
 // UnshippedLane fetches a PR head this clone lacks by the PR's NUMBER, from a
@@ -40,8 +42,9 @@ func TestUnshippedLane_FetchesThePRHeadByNumber(t *testing.T) {
 	t.Setenv("PATH", gh+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Chdir(repo)
 	var asked []string
-	orig, origRepo := fetchPRHead, originRepo
-	t.Cleanup(func() { fetchPRHead, originRepo = orig, origRepo })
+	orig, origRepo, origNames, origRemote := fetchPRHead, originRepo, remoteNames, remoteRepo
+	t.Cleanup(func() { fetchPRHead, originRepo, remoteNames, remoteRepo = orig, origRepo, origNames, origRemote })
+	remoteNames = func() []string { return []string{"origin"} }
 	fetchPRHead = func(remote, pr string) error {
 		asked = append(asked, remote+" "+pr)
 		return os.ErrNotExist
@@ -59,11 +62,99 @@ func TestUnshippedLane_FetchesThePRHeadByNumber(t *testing.T) {
 	asked = nil
 	originRepo = func() (string, string, string) { return "github.com", "me", "repo" }
 	msg = UnshippedLane("https://github.com/acme/repo/pull/5", "feat-x", strings.TrimSpace(string(tip)))
-	if len(asked) != 1 || asked[0] != "https://github.com/acme/repo 5" {
-		t.Errorf("fetched %q, want PR 5's head fetched from acme/repo", asked)
+	// #243 review: that fetch failing (no https credentials; origin the PR's
+	// own repository under an old name), origin is asked next.
+	if strings.Join(asked, ",") != "https://github.com/acme/repo 5,origin 5" {
+		t.Errorf("fetched %q, want PR 5's head from acme/repo, then from origin", asked)
 	}
 	if !strings.Contains(msg, "`git fetch https://github.com/acme/repo refs/pull/5/head`") {
 		t.Errorf("kept-lane message: %q, want the fetch from acme/repo", msg)
+	}
+	// A configured remote naming acme/repo is used: the user's own transport.
+	asked = nil
+	remoteNames = func() []string { return []string{"origin", "upstream"} }
+	remoteRepo = func(r string) (string, string, string) {
+		if r == "upstream" {
+			return "github-work", "Acme", "repo"
+		}
+		return "github.com", "me", "repo"
+	}
+	msg = UnshippedLane("https://github.com/acme/repo/pull/5", "feat-x", strings.TrimSpace(string(tip)))
+	if strings.Join(asked, ",") != "upstream 5,https://github.com/acme/repo 5,origin 5" {
+		t.Errorf("fetched %q, want PR 5's head from upstream, its URL, then origin", asked)
+	}
+	if !strings.Contains(msg, "`git fetch upstream refs/pull/5/head`") {
+		t.Errorf("kept-lane message: %q, want the fetch from upstream", msg)
+	}
+	// #243 round 2: a fetch that works but leaves the head missing (a
+	// mirror's own PR 5, origin's other PR) goes on to the next.
+	asked = nil
+	fetchPRHead = func(remote, pr string) error {
+		asked = append(asked, remote+" "+pr)
+		return nil
+	}
+	UnshippedLane("https://github.com/acme/repo/pull/5", "feat-x", strings.TrimSpace(string(tip)))
+	if strings.Join(asked, ",") != "upstream 5,https://github.com/acme/repo 5,origin 5" {
+		t.Errorf("fetched %q, want every candidate while the head stays missing", asked)
+	}
+	// A fetch that ran out of time ends the walk: each costs the whole budget.
+	asked = nil
+	fetchPRHead = func(remote, pr string) error {
+		asked = append(asked, remote+" "+pr)
+		return &gitx.FetchTimeoutError{}
+	}
+	UnshippedLane("https://github.com/acme/repo/pull/5", "feat-x", strings.TrimSpace(string(tip)))
+	if strings.Join(asked, ",") != "upstream 5" {
+		t.Errorf("fetched %q, want only upstream once it timed out", asked)
+	}
+}
+
+// #243 round 2: `git remote` lists alphabetically, so a mirror elsewhere with
+// the same owner/name (a GHE copy, Codeberg) was picked before `upstream` on
+// the PR's own host, and the URL never tried. Remotes on the URL's host come
+// first, then the others (an ssh alias), then the URL. A remote with the same
+// owner and another name, or the same name and another owner, is no match.
+func TestPRRemotes_order(t *testing.T) {
+	orig, origNames, origRemote := originRepo, remoteNames, remoteRepo
+	t.Cleanup(func() { originRepo, remoteNames, remoteRepo = orig, origNames, origRemote })
+	originRepo = func() (string, string, string) { return "github.com", "me", "repo" }
+	repos := map[string][3]string{
+		"aghe":       {"ghe.example", "up", "repo"},
+		"alias":      {"github-work", "Up", "Repo"},
+		"origin":     {"github.com", "me", "repo"},
+		"othername":  {"github.com", "up", "other"},
+		"otherowner": {"github.com", "down", "repo"},
+		"upstream":   {"github.com", "up", "repo"},
+	}
+	repos["--upload-pack=x"] = [3]string{"github.com", "up", "repo"} // a name git reads as an option
+	remoteNames = func() []string {
+		return []string{"--upload-pack=x", "aghe", "alias", "origin", "othername", "otherowner", "upstream"}
+	}
+	remoteRepo = func(r string) (string, string, string) { x := repos[r]; return x[0], x[1], x[2] }
+	got := strings.Join(prRemotes("https://github.com/up/repo/pull/5"), ",")
+	if want := "upstream,aghe,alias,https://github.com/up/repo"; got != want {
+		t.Errorf("prRemotes = %s, want %s", got, want)
+	}
+	if got := prRemote("https://github.com/up/repo/pull/5"); got != "upstream" {
+		t.Errorf("prRemote = %s, want upstream (the hint)", got)
+	}
+}
+
+// #243: `wt clean` passes the URL only for another repository's PR, so its
+// message says "#5" for origin's own, as every other clean line does.
+func TestLaneSelector(t *testing.T) {
+	orig, origNames := originRepo, remoteNames
+	t.Cleanup(func() { originRepo, remoteNames = orig, origNames })
+	originRepo = func() (string, string, string) { return "github.com", "me", "repo" }
+	remoteNames = func() []string { return nil }
+	for _, tc := range []struct{ url, want string }{
+		{"https://github.com/me/repo/pull/5", "5"},
+		{"https://github.com/up/repo/pull/5", "https://github.com/up/repo/pull/5"},
+		{"", "5"},
+	} {
+		if got := LaneSelector("5", tc.url); got != tc.want {
+			t.Errorf("LaneSelector(5, %q) = %q, want %q", tc.url, got, tc.want)
+		}
 	}
 }
 
@@ -132,9 +223,12 @@ func TestPRNumber(t *testing.T) {
 // another PR or none, so the head is fetched, and the hint fetches it, from
 // the PR's own repository.
 func TestPRRemote(t *testing.T) {
-	orig := originRepo
-	t.Cleanup(func() { originRepo = orig })
+	orig, origNames, origRemote := originRepo, remoteNames, remoteRepo
+	t.Cleanup(func() { originRepo, remoteNames, remoteRepo = orig, origNames, origRemote })
 	originRepo = func() (string, string, string) { return "github.com", "me", "repo" }
+	// A remote naming no repository wt can read (a local path) is never picked.
+	remoteNames = func() []string { return []string{"origin", "mirror"} }
+	remoteRepo = func(string) (string, string, string) { return "", "", "" }
 	for pr, want := range map[string]string{
 		"5":                                    "origin",
 		"https://github.com/me/repo/pull/5":    "origin",
