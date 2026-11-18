@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/eharriett0/wt/internal/gitx"
 )
 
 // UnshippedLane fetches a PR head this clone lacks by the PR's NUMBER, from a
@@ -78,21 +80,60 @@ func TestUnshippedLane_FetchesThePRHeadByNumber(t *testing.T) {
 		return "github.com", "me", "repo"
 	}
 	msg = UnshippedLane("https://github.com/acme/repo/pull/5", "feat-x", strings.TrimSpace(string(tip)))
-	if strings.Join(asked, ",") != "upstream 5,origin 5" {
-		t.Errorf("fetched %q, want PR 5's head from upstream, then from origin", asked)
+	if strings.Join(asked, ",") != "upstream 5,https://github.com/acme/repo 5,origin 5" {
+		t.Errorf("fetched %q, want PR 5's head from upstream, its URL, then origin", asked)
 	}
 	if !strings.Contains(msg, "`git fetch upstream refs/pull/5/head`") {
 		t.Errorf("kept-lane message: %q, want the fetch from upstream", msg)
 	}
-	// A fetch that works is the only one.
+	// #243 round 2: a fetch that works but leaves the head missing (a
+	// mirror's own PR 5, origin's other PR) goes on to the next.
 	asked = nil
 	fetchPRHead = func(remote, pr string) error {
 		asked = append(asked, remote+" "+pr)
 		return nil
 	}
 	UnshippedLane("https://github.com/acme/repo/pull/5", "feat-x", strings.TrimSpace(string(tip)))
+	if strings.Join(asked, ",") != "upstream 5,https://github.com/acme/repo 5,origin 5" {
+		t.Errorf("fetched %q, want every candidate while the head stays missing", asked)
+	}
+	// A fetch that ran out of time ends the walk: each costs the whole budget.
+	asked = nil
+	fetchPRHead = func(remote, pr string) error {
+		asked = append(asked, remote+" "+pr)
+		return &gitx.FetchTimeoutError{}
+	}
+	UnshippedLane("https://github.com/acme/repo/pull/5", "feat-x", strings.TrimSpace(string(tip)))
 	if strings.Join(asked, ",") != "upstream 5" {
-		t.Errorf("fetched %q, want PR 5's head from upstream only", asked)
+		t.Errorf("fetched %q, want only upstream once it timed out", asked)
+	}
+}
+
+// #243 round 2: `git remote` lists alphabetically, so a mirror elsewhere with
+// the same owner/name (a GHE copy, Codeberg) was picked before `upstream` on
+// the PR's own host, and the URL never tried. Remotes on the URL's host come
+// first, then the others (an ssh alias), then the URL. A remote with the same
+// owner and another name, or the same name and another owner, is no match.
+func TestPRRemotes_order(t *testing.T) {
+	orig, origNames, origRemote := originRepo, remoteNames, remoteRepo
+	t.Cleanup(func() { originRepo, remoteNames, remoteRepo = orig, origNames, origRemote })
+	originRepo = func() (string, string, string) { return "github.com", "me", "repo" }
+	repos := map[string][3]string{
+		"aghe":       {"ghe.example", "up", "repo"},
+		"alias":      {"github-work", "Up", "Repo"},
+		"origin":     {"github.com", "me", "repo"},
+		"othername":  {"github.com", "up", "other"},
+		"otherowner": {"github.com", "down", "repo"},
+		"upstream":   {"github.com", "up", "repo"},
+	}
+	remoteNames = func() []string { return []string{"aghe", "alias", "origin", "othername", "otherowner", "upstream"} }
+	remoteRepo = func(r string) (string, string, string) { x := repos[r]; return x[0], x[1], x[2] }
+	got := strings.Join(prRemotes("https://github.com/up/repo/pull/5"), ",")
+	if want := "upstream,aghe,alias,https://github.com/up/repo"; got != want {
+		t.Errorf("prRemotes = %s, want %s", got, want)
+	}
+	if got := prRemote("https://github.com/up/repo/pull/5"); got != "upstream" {
+		t.Errorf("prRemote = %s, want upstream (the hint)", got)
 	}
 }
 

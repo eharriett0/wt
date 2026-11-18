@@ -1,6 +1,7 @@
 package merge
 
 import (
+	"errors"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -76,18 +77,22 @@ func isPRNumber(s string) bool {
 // at that same tip.
 func UnshippedLane(pr, branch, tip string) string {
 	head, _ := ghx.PRHeadOid(pr)
-	remote := prRemote(pr)
+	remotes := prRemotes(pr)
 	var ancestor bool
 	var ancestorErr error
 	if tip != "" && head != "" && !strings.EqualFold(tip, head) {
 		ancestor, ancestorErr = gitx.IsAncestor(tip, head)
-		if ancestorErr != nil && fetchHeadFrom(remote, PRNumber(pr)) {
+		if ancestorErr != nil {
 			// #230 review: the head can be a commit this clone never had (the
 			// branch updated on GitHub, then deleted with the merge); no plain
-			// fetch brings it, so the lane was kept on every run. Once.
-			ancestor, ancestorErr = gitx.IsAncestor(tip, head)
+			// fetch brings it, so the lane was kept on every run.
+			fetchHead(remotes, PRNumber(pr), func() bool {
+				ancestor, ancestorErr = gitx.IsAncestor(tip, head)
+				return ancestorErr == nil
+			})
 		}
 	}
+	remote := remotes[0]
 	v := LocalTipVerdict(tip, head, ancestor, ancestorErr)
 	if v == TipShipped {
 		return ""
@@ -99,35 +104,51 @@ func UnshippedLane(pr, branch, tip string) string {
 	return KeptLaneMessage(v, branch, pr, remote, n, tip, head)
 }
 
-// fetchHeadFrom fetches PR n's head from remote and, when that fails and
-// remote is not origin, from origin (#243 review), reporting whether either
-// fetch worked. origin can be the PR's own repository under a name prRemote
-// can't match: a renamed or transferred repository, which GitHub's URL names
-// by its new name. In a fork clone origin's PR n is another PR, whose
-// commits change nothing: the check compares with the head gh named.
-func fetchHeadFrom(remote, n string) bool {
-	if fetchPRHead(remote, n) == nil {
-		return true
+// fetchHead brings PR n's head into this clone (#243 review): it fetches
+// refs/pull/<n>/head from each of remotes in turn, then origin, until here()
+// says the head arrived. A fetch that works but brings another PR (a mirror's
+// own PR n; origin's, in a fork clone) goes on to the next, and so does one
+// that fails. origin last, because it can be the PR's own repository under a
+// name prRemotes can't match: a renamed or transferred one, which GitHub's
+// URL names by its new name. A fetch that ran out of time ends the walk (each
+// costs fetchTimeout; the lane is only kept). Where the commits come from
+// can't change the check's answer: it compares with the head gh named.
+func fetchHead(remotes []string, n string, here func() bool) {
+	tried := map[string]bool{}
+	for _, r := range append(remotes, "origin") {
+		if tried[r] {
+			continue
+		}
+		tried[r] = true
+		err := fetchPRHead(r, n)
+		var late *gitx.FetchTimeoutError
+		if errors.As(err, &late) {
+			return
+		}
+		if err == nil && here() {
+			return
+		}
 	}
-	return remote != "origin" && fetchPRHead("origin", n) == nil
 }
 
-// prRemote is where pr's refs/pull/<n>/head can be fetched from: origin,
-// unless pr is the URL of a PR in another repository than origin's (origin a
-// fork, -R naming upstream, #228 review), where that number on origin is
-// another PR or none. Then a configured remote whose URL names that
-// repository (`upstream`), so the fetch and its hint use the user's own
-// transport and credentials (#243 review: an ssh-only user has no https
-// ones), else the repository's URL, which git fetches from directly. The
-// host is not compared (an ssh alias names it differently). An origin wt
-// can't read as owner/name keeps "origin".
-var prRemote = func(pr string) string {
+// prRemotes are where pr's refs/pull/<n>/head can be fetched from, best
+// first: origin, unless pr is the URL of a PR in another repository than
+// origin's (origin a fork, -R naming upstream, #228 review), where that
+// number on origin is another PR or none. Then the configured remotes whose
+// URL names that repository (`upstream`), so the fetch and its hint use the
+// user's own transport and credentials (#243 review: an ssh-only user has no
+// https ones): those on the URL's host first, since `git remote` lists
+// alphabetically and a mirror elsewhere can carry the same owner/name (round
+// 2), then the others (an ssh alias names the host differently); then the
+// repository's URL, which git fetches from directly. An origin wt can't read
+// as owner/name keeps "origin".
+var prRemotes = func(pr string) []string {
 	if !ghx.IsPRURL(pr) {
-		return "origin"
+		return []string{"origin"}
 	}
 	u, err := url.Parse(strings.TrimSpace(pr))
 	if err != nil {
-		return "origin"
+		return []string{"origin"}
 	}
 	parts := strings.Split(strings.TrimPrefix(u.Path, "/"), "/")
 	names := func(owner, name string) bool {
@@ -135,15 +156,24 @@ var prRemote = func(pr string) string {
 	}
 	_, owner, name := originRepo()
 	if owner == "" || names(owner, name) {
-		return "origin"
+		return []string{"origin"}
 	}
+	var onHost, elsewhere []string
 	for _, r := range remoteNames() {
-		if _, owner, name := remoteRepo(r); owner != "" && names(owner, name) {
-			return r
+		host, owner, name := remoteRepo(r)
+		switch {
+		case owner == "" || !names(owner, name):
+		case strings.EqualFold(host, u.Hostname()):
+			onHost = append(onHost, r)
+		default:
+			elsewhere = append(elsewhere, r)
 		}
 	}
-	return u.Scheme + "://" + u.Host + "/" + parts[0] + "/" + parts[1]
+	return append(append(onHost, elsewhere...), u.Scheme+"://"+u.Host+"/"+parts[0]+"/"+parts[1])
 }
+
+// prRemote is the first of prRemotes: where the kept lane's hint fetches from.
+func prRemote(pr string) string { return prRemotes(pr)[0] }
 
 // LaneSelector is how `wt clean` names PR n to UnshippedLane, given the URL gh
 // gave for it (#243): the URL when it is another repository's PR than

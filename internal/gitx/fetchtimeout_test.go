@@ -1,6 +1,7 @@
 package gitx
 
 import (
+	"errors"
 	"net"
 	"os/exec"
 	"strings"
@@ -50,6 +51,10 @@ func TestFetchNoPrompt_GivesUpOnASilentOrigin(t *testing.T) {
 	}
 	if err == nil || !strings.Contains(err.Error(), "did not finish in") {
 		t.Errorf("FetchPRHeadNoPrompt = %v, want the deadline error", err)
+	}
+	var late *FetchTimeoutError
+	if !errors.As(err, &late) {
+		t.Errorf("FetchPRHeadNoPrompt = %T, want a *FetchTimeoutError", err)
 	}
 	// Nothing of that fetch is left running while the origin still holds the
 	// connection (#230 re-review: killing only the started git left the real

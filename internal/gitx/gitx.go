@@ -383,6 +383,13 @@ var fetchTimeout = 30 * time.Second
 // as last fetched.
 var baseFetchTimeout = 120 * time.Second
 
+// FetchTimeoutError is a no-prompt fetch that ran out of its budget: the
+// remote took the connection and never finished. A caller with somewhere else
+// to fetch from stops there (#243 review: each try costs the whole budget).
+type FetchTimeoutError struct{ msg string }
+
+func (e *FetchTimeoutError) Error() string { return e.msg }
+
 func fetchNoPrompt(remote, refspec string, budget time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
@@ -409,7 +416,7 @@ func fetchNoPrompt(remote, refspec string, budget time.Duration) error {
 	cmd.Stderr = &stderr
 	if _, err := cmd.Output(); err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			return fmt.Errorf("git fetch %s %s did not finish in %s", remote, refspec, budget)
+			return &FetchTimeoutError{fmt.Sprintf("git fetch %s %s did not finish in %s", remote, refspec, budget)}
 		}
 		if msg := gitStderr(stderr.String()); msg != "" {
 			return fmt.Errorf("%w: %s", err, msg)

@@ -31,17 +31,20 @@ func TestClean_ForkCloneFetchesThePRHeadFromThePRsRepository(t *testing.T) {
 		url      string // what gh gives for PR 5's URL; "" when it can't
 		onOrigin bool   // origin holds the PR's head (else upstream does)
 		remote   bool   // upstream is a configured remote, over ssh
+		mirror   bool   // aghe, a same-path mirror on another host with its own PR 5
 		https    bool   // upstream's https URL can be fetched
 		reaped   bool
 		says     string // in the kept lane's warning
 	}{
-		{"upstream's PR, over https", "https://github.com/up/repo/pull/5", false, false, true, true, ""},
-		{"upstream's PR, from the configured remote (ssh only)", "https://github.com/up/repo/pull/5", false, true, false, true, ""},
-		{"upstream's PR, no remote and no https: kept, naming its repository", "https://github.com/up/repo/pull/5", false, false, false, false,
+		{"upstream's PR, over https", "https://github.com/up/repo/pull/5", false, false, false, true, true, ""},
+		{"upstream's PR, from the configured remote (ssh only)", "https://github.com/up/repo/pull/5", false, true, false, false, true, ""},
+		{"upstream's PR, no remote and no https: kept, naming its repository", "https://github.com/up/repo/pull/5", false, false, false, false, false,
 			"not in PR https://github.com/up/repo/pull/5: wt could not compare its tip with the PR's head"},
-		{"origin under a renamed repository's old name: origin, after the URL", "https://github.com/me/newname/pull/5", true, false, false, true, ""},
-		{"control: origin's own PR", "https://github.com/me/repo/pull/5", true, false, false, true, ""},
-		{"no URL from gh: origin, as before, and the lane is kept", "", false, false, true, false,
+		{"a same-path mirror sorts first, but upstream on the PR's host is asked first", "https://github.com/up/repo/pull/5", false, true, true, false, true, ""},
+		{"only a mirror: its own PR 5 arrives, so the URL is asked next", "https://github.com/up/repo/pull/5", false, false, true, true, true, ""},
+		{"origin under a renamed repository's old name: origin, after the URL", "https://github.com/me/newname/pull/5", true, false, false, false, true, ""},
+		{"control: origin's own PR", "https://github.com/me/repo/pull/5", true, false, false, false, true, ""},
+		{"no URL from gh: origin, as before, and the lane is kept", "", false, false, false, true, false,
 			"not in PR #5: wt could not compare its tip with the PR's head"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -67,7 +70,13 @@ func TestClean_ForkCloneFetchesThePRHeadFromThePRsRepository(t *testing.T) {
 			headGh(t, head)
 
 			ssh := filepath.Join(tmp, "ssh")
+			// A same-path mirror on another host, holding its own PR 5.
+			mirror := filepath.Join(tmp, "mirror.git")
+			gitW(t, tmp, "init", "-q", "--bare", "-b", "main", mirror)
+			gitW(t, f.repo, "push", "-q", mirror, "main")
+			gitW(t, mirror, "update-ref", "refs/pull/5/head", f.commitIn(mirror, f.base, "the mirror's PR 5"))
 			script := "#!/bin/sh\ncase \"$*\" in\n" +
+				"*ghe.example*) exec git upload-pack '" + mirror + "' ;;\n" +
 				"*\"'me/repo.git'\"*) exec git upload-pack '" + f.origin + "' ;;\n" +
 				"*\"'up/repo.git'\"*) exec git upload-pack '" + up + "' ;;\n" +
 				"esac\necho \"fake ssh: $*\" >&2\nexit 1\n"
@@ -79,6 +88,9 @@ func TestClean_ForkCloneFetchesThePRHeadFromThePRsRepository(t *testing.T) {
 			gitW(t, f.repo, "remote", "set-url", "origin", "git@github.com:me/repo.git")
 			if tc.remote {
 				gitW(t, f.repo, "remote", "add", "upstream", "git@github.com:up/repo.git")
+			}
+			if tc.mirror {
+				gitW(t, f.repo, "remote", "add", "aghe", "git@ghe.example:up/repo.git")
 			}
 			gitW(t, f.repo, "config", "url."+filepath.Join(tmp, "nowhere")+"/.insteadOf", "https://github.com/")
 			if tc.https {

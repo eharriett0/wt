@@ -922,15 +922,22 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   and in a fork clone whose gh default is upstream, `refs/pull/<n>/head` on
   origin is another PR, so the head never arrived and the lane was kept on
   every run, its hint naming the wrong PR. origin's own PR, or one gh gives no
-  URL for, keeps the number (and "#5" in the message). ⚠ **Where
-  `merge.prRemote` fetches another repository's PR from** (#243 review): a
-  configured remote whose URL names that repository (`upstream`; owner and
-  name, not the host), else the repository's https URL, and when that fetch
-  fails, origin (`fetchHeadFrom`). The bare https URL ignored the user's own
-  transport (an ssh-only user has no https credentials), and an origin still
-  on a renamed repository's old name, which GitHub's URL names by its new
-  one, was kept where the number had reaped it. Fetching origin's PR n when
-  it is another PR is harmless: the check compares with the head gh named.
+  URL for, keeps the number (and "#5" in the message). ⚠ **Where another
+  repository's PR head is fetched from** (`merge.prRemotes`, #243 reviews),
+  in turn until the head gh named is in the clone (`fetchHead`): configured
+  remotes whose URL names that owner/name, those on the PR URL's host first
+  (`git remote` lists alphabetically, and a same-path mirror elsewhere, a GHE
+  copy or Codeberg, was picked before `upstream`), then the others (an ssh
+  alias names the host differently); then the repository's https URL; then
+  origin. The bare https URL alone ignored the user's own transport (an
+  ssh-only user has no https credentials), and an origin still on a renamed
+  repository's old name, which GitHub's URL names by its new one, was kept
+  where the number had reaped it. A fetch that WORKS but leaves the head
+  missing (a mirror's own PR n, origin's other PR) goes on to the next; any
+  fetch's commits are harmless, since the check compares with gh's head. A
+  fetch that hits `fetchTimeout` (`gitx.FetchTimeoutError`) ends the walk,
+  so a hung remote costs one timeout per lane, not one per candidate. The
+  hint names the first candidate (`prRemote`).
   Pinned end to end with real git by
   `TestClean_ForkCloneFetchesThePRHeadFromThePRsRepository` (remotes through
   a fake ssh, https through `insteadOf` with a catch-all so nothing reaches
