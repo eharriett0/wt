@@ -394,9 +394,11 @@ func fetchNoPrompt(remote, refspec string, budget time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	// A stalled HTTPS transfer gives up after 15s below 1 byte/s; ssh's
-	// connect after 10s (below).
+	// connect after 10s (below). `--end-of-options` (git 2.24+): git accepts a
+	// remote named `--upload-pack=<cmd>`, and as an option that ran <cmd>
+	// (#243 review).
 	cmd := exec.CommandContext(ctx, "git", "-c", "http.lowSpeedLimit=1", "-c", "http.lowSpeedTime=15",
-		"fetch", "--no-prune", remote, refspec)
+		"fetch", "--no-prune", "--end-of-options", remote, refspec)
 	stopGroupOnCancel(cmd)
 	// A transport helper (git-remote-http, ssh) can hold the output pipe
 	// past the cancel: stop waiting on it, and SIGKILL the leader (measured:

@@ -162,7 +162,9 @@ var prRemotes = func(pr string) []string {
 	for _, r := range remoteNames() {
 		host, owner, name := remoteRepo(r)
 		switch {
-		case owner == "" || !names(owner, name):
+		case strings.HasPrefix(r, "-"), owner == "" || !names(owner, name):
+			// A name git would read as an option is never a candidate (#243
+			// review; fetchNoPrompt also passes --end-of-options).
 		case strings.EqualFold(host, u.Hostname()):
 			onHost = append(onHost, r)
 		default:

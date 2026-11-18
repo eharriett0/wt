@@ -912,8 +912,8 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   deletes origin's placeholder with a lease on that tip
   (`DeleteRemoteBranch(dir, b, tip)`: `--force-with-lease`, which git applies
   to a delete). `wt clean` removes the cwd's lane last (`cwdLast`). ⚠ The #187
-  check fetches `refs/pull/<n>/head` once when the PR's head is not in this
-  clone (updated on GitHub, then deleted with the merge: no plain fetch brings
+  check fetches `refs/pull/<n>/head` (from each candidate in turn, below)
+  when the PR's head is not in this clone (updated on GitHub, then deleted with the merge: no plain fetch brings
   it, and the lane was kept forever), and an UNKNOWN verdict never advises
   "push them" (that recreates the deleted branch at a stale tip). A PR given
   as a URL is fetched by its number (`merge.PRNumber`). ⚠ **`wt clean` hands
@@ -936,13 +936,19 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   missing (a mirror's own PR n, origin's other PR) goes on to the next; any
   fetch's commits are harmless, since the check compares with gh's head. A
   fetch that hits `fetchTimeout` (`gitx.FetchTimeoutError`) ends the walk,
-  so a hung remote costs one timeout per lane, not one per candidate. The
+  so a hung remote costs one timeout per lane, not one per candidate (an ssh
+  remote that never answers fails at `ConnectTimeout=10` with an ordinary
+  error and the walk goes on: ~10s per matching ssh remote, on a dead
+  network, and the lane is only kept). A remote named like an option
+  (`--upload-pack=<cmd>`, which git accepts) is never a candidate, and
+  every no-prompt fetch passes `--end-of-options`. The
   hint names the first candidate (`prRemote`).
   Pinned end to end with real git by
   `TestClean_ForkCloneFetchesThePRHeadFromThePRsRepository` (remotes through
   a fake ssh, https through `insteadOf` with a catch-all so nothing reaches
   the network; origin can't use `insteadOf`: git expands it in `remote
   get-url`, so wt would read a local path), and `TestPRRemote`,
+  `TestPRRemotes_order`, `TestFetchNoPrompt_remoteIsNeverAnOption`,
   `TestLaneSelector` and `TestUnshippedLane_FetchesThePRHeadByNumber`.
   ⚠ **A no-prompt
   fetch has a deadline** (`fetchTimeout` 30s for the PR head,
@@ -1198,7 +1204,7 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   (`merge.PRArg`): pasted, `gh pr ready #5 -R o/r` is a bare `gh pr ready`
   after the shell's comment, which marks the CURRENT branch's PR ready. With
   origin a fork and `-R` naming upstream, #187's PR-head fetch and its hint
-  go to the PR's own repository (`merge.prRemote`), where PR n on origin is
+  go to the PR's own repository (`merge.prRemotes` + `fetchHead`), where PR n on origin is
   another PR or none.
   Pinned by `TestCmdMergePR_forwardedRepoReadsOnlyThatPR` (`-R` and URL),
   whose fake gh answers only that PR and logs any other read, plus

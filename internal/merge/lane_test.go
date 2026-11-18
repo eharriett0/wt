@@ -126,7 +126,10 @@ func TestPRRemotes_order(t *testing.T) {
 		"otherowner": {"github.com", "down", "repo"},
 		"upstream":   {"github.com", "up", "repo"},
 	}
-	remoteNames = func() []string { return []string{"aghe", "alias", "origin", "othername", "otherowner", "upstream"} }
+	repos["--upload-pack=x"] = [3]string{"github.com", "up", "repo"} // a name git reads as an option
+	remoteNames = func() []string {
+		return []string{"--upload-pack=x", "aghe", "alias", "origin", "othername", "otherowner", "upstream"}
+	}
 	remoteRepo = func(r string) (string, string, string) { x := repos[r]; return x[0], x[1], x[2] }
 	got := strings.Join(prRemotes("https://github.com/up/repo/pull/5"), ",")
 	if want := "upstream,aghe,alias,https://github.com/up/repo"; got != want {
