@@ -152,6 +152,7 @@ func TestCollisions_nameTheLiveSessionInTheOtherWindow(t *testing.T) {
 		{"sessionId": "s-b", "name": "api-worker", "status": "idle", "pid": 11, "cwd": base},
 		{"sessionId": "s-out", "name": "elsewhere", "status": "busy", "pid": 12, "cwd": wb},
 		{"sessionId": "s-self", "name": "me", "status": "busy", "pid": 13, "cwd": base},
+		{"sessionId": "s-c", "name": "ledger-worker", "status": "idle", "pid": 14, "cwd": base},
 	})
 	now := time.Now().UTC().Format(time.RFC3339)
 	for _, r := range []coord.Record{
@@ -254,6 +255,22 @@ func TestCollisions_nameTheLiveSessionInTheOtherWindow(t *testing.T) {
 	}
 	if n := ran() - before; n != 1 {
 		t.Errorf("a turn ran claude %d times, want once", n)
+	}
+
+	// A session whose only record is a block-id reservation (in its file's
+	// ledger, not the log) is credited to that window too.
+	if strings.Contains(out+errOut, "ledger-worker") {
+		t.Fatalf("a session with no record was named:\n%s%s", out, errOut)
+	}
+	if err := coord.Append(coord.BlockLedgerPath(os.Getenv("HOME"), filepath.Join(wb, "notes.txt")), coord.Record{
+		ID: "b1", Kind: coord.KindBlockReserve, Window: realPath(wb), Session: "s-c", Repo: filepath.Base(root),
+		TS: time.Now().UTC().Format(time.RFC3339)}); err != nil {
+		t.Fatal(err)
+	}
+	peers.Reset()
+	out, errOut = captureOutputForTest(t, func() { cmdCheck([]string{"notes.txt"}) })
+	if !strings.Contains(out+errOut, "`ledger-worker`, idle") {
+		t.Errorf("a session whose record is a block reservation in wb wasn't named:\n%s%s", out, errOut)
 	}
 
 	// WT_PEERS=0: nothing named, claude never run.

@@ -44,10 +44,15 @@ func worktreeSessionNotes(c *config.Config) sessionNote {
 			if err != nil {
 				return
 			}
+			// A block-id reservation lives in its file's ledger, not the log:
+			// the same evidence other_sessions reads (checkoutActivity, this
+			// repository's ledger records only).
+			now := time.Now()
+			recs = checkoutActivity(c, recs, now)
 			// This session by its wt token (WT_SESSION first) AND the Claude
 			// id the listing keys it by (#250 review: with WT_SESSION set it
 			// was named on its own old window).
-			by = sessionsByWindow(recs, live, map[string]bool{self.Session: true, os.Getenv("CLAUDE_CODE_SESSION_ID"): true}, time.Now())
+			by = sessionsByWindow(recs, live, map[string]bool{self.Session: true, os.Getenv("CLAUDE_CODE_SESSION_ID"): true}, now)
 		})
 		return collisionNote(by[realPath(wt)])
 	}
