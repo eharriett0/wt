@@ -102,8 +102,11 @@ func TestChangedRangesNewWith(t *testing.T) {
 	runGit(t, dir, "rm", "-q", "--cached", "other.txt")
 	same(dir, "other.txt", "x\ny\n", []LineRange{span(0, 1)}) // NEW frame: never a Gap
 	runGit(t, dir, "add", "other.txt")
-	// No base: the uncommitted ranges, index to the copy plus what is staged.
-	sameFrom("no-such-base", dir, "new.txt", "n1\nEDIT\n", []LineRange{span(2, 2), span(1, 1)})
+	// No base: one diff from HEAD (#247), as from a base: new.txt is new
+	// since HEAD, so all of it.
+	sameFrom("no-such-base", dir, "new.txt", "n1\nEDIT\n", []LineRange{span(1, 2)})
+	head := "top\n" + replaceLine("line10", "line10 changed-on-main")(base) // main's data.txt now
+	sameFrom("no-such-base", dir, "data.txt", replaceLine("line05", "line05 EDITED")(head), []LineRange{span(6, 6)})
 	// A clean filter applies to the copy, never to the empty side, git's
 	// /dev/null (#226 re-review: one adding a header moved every range).
 	runGit(t, dir, "config", "filter.hdr.clean", "sh -c 'echo HDR; cat'")

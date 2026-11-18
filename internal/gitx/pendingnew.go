@@ -17,7 +17,8 @@ import (
 //     base, as `git diff <rev> -- file` reads it: a side that doesn't have the
 //     file is empty, and an untracked file is not the working tree's (a file
 //     base has reads as deleted, one it lacks as no edits);
-//   - no base: the uncommitted ranges (index to the copy, plus what is staged);
+//   - no base: from HEAD (#247), and with no HEAD either the uncommitted
+//     ranges (index to the copy, plus what is staged);
 //   - a diff that fails: the whole file.
 //
 // ok=false only when the copy can't be put in as a blob at all; the caller
@@ -29,7 +30,8 @@ func ChangedRangesNewWith(dir, base, file string, content []byte) ([]LineRange, 
 
 // ChangedDocEditsWith is ChangedDocEdits for the copy a pending edit will
 // leave (#237): ChangedRangesNewWith's measurement, both sides of its diff,
-// so the edit hooks see the lines the edit deletes as `wt check` will.
+// so the edit hooks see the lines the edit deletes as `wt check` will, and a
+// behind branch's edits in base's frame (#247).
 func ChangedDocEditsWith(dir, base, file string, content []byte) (DocEdits, bool) {
 	objects, err := run(dir, "rev-parse", "--path-format=absolute", "--git-path", "objects")
 	if err != nil || objects == "" || strings.ContainsAny(objects, ":\"") {
@@ -57,12 +59,12 @@ func ChangedDocEditsWith(dir, base, file string, content []byte) (DocEdits, bool
 		return DocEdits{}, false
 	}
 	failed := DocEdits{New: wholeFile, All: true}
-	diff := func(old, new string) (DocEdits, error) {
+	diff := func(old, new string) (DocEdits, string, error) {
 		out, err := gitOutput(dir, env, nil, gradeDiff([]string{old, new}, "")...)
 		if err != nil {
-			return DocEdits{}, err
+			return DocEdits{}, "", err
 		}
-		return docEditsFrom(dir, old, string(out), old == empty), nil
+		return docEditsFrom(dir, old, string(out), old == empty), string(out), nil
 	}
 	// The working tree's side of `git diff <rev> -- file`: the copy when the
 	// index tracks the file, else nothing.
@@ -79,11 +81,18 @@ func ChangedDocEditsWith(dir, base, file string, content []byte) (DocEdits, bool
 
 	ref, sha, hasBase := resolveBaseRef(dir, base)
 	if !hasBase {
-		// uncommittedRangesNew: index to working tree, plus HEAD to index;
-		// the new side only, as ChangedDocEdits reads it there.
+		if headResolves(dir) {
+			e, _, err := diff(revSide("HEAD"), copySide)
+			if err != nil {
+				return failed, true
+			}
+			return e, true
+		}
+		// No HEAD: uncommittedRangesNew, index to working tree plus HEAD to
+		// index; the new side only, as ChangedDocEdits reads it there.
 		var ranges []LineRange
 		if copySide == blob {
-			e, err := diff(revSide(":0"), blob)
+			e, _, err := diff(revSide(":0"), blob)
 			if err != nil {
 				return failed, true
 			}
@@ -96,11 +105,11 @@ func ChangedDocEditsWith(dir, base, file string, content []byte) (DocEdits, bool
 		return DocEdits{New: append(ranges, parseHunkRanges(staged)...)}, true
 	}
 	if mb := behindMergeBase(dir, ref, sha, file); mb != "" {
-		if e, err := diff(revSide(mb), copySide); err == nil {
-			return e, true
+		if e, out, err := diff(revSide(mb), copySide); err == nil {
+			return withBaseClaims(dir, ref, mb, file, out, e), true
 		}
 	}
-	e, err := diff(revSide(ref), copySide)
+	e, _, err := diff(revSide(ref), copySide)
 	if err != nil {
 		return failed, true
 	}

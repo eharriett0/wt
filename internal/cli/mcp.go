@@ -312,7 +312,9 @@ func mcpCheck(c *config.Config, paths []string, includeStale, allowMissing bool)
 		}
 	}
 	entries := buildCheckReport(c, ws, root, checkQueries(args))
-	return jsonText(buildCheckPayload(entries, includeStale)), false
+	p := buildCheckPayload(entries, includeStale)
+	p.BaseUnresolved = !gitx.BaseResolves(root, c.Base) // #247
+	return jsonText(p), false
 }
 
 func mcpWhere(c *config.Config, target string) (string, bool) {

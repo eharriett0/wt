@@ -161,6 +161,83 @@ func TestSharedSectionsAcross_CountsDeletions(t *testing.T) {
 
 func sp(s string) *string { return &s }
 
+// #247: a window BEHIND base also counts the sections of base's copy its
+// edits land in. Its own copy keeps the headings it forked with, so where
+// base renamed, split or merged a section since, the same line sits under
+// different headings in the two windows' copies, and they read disjoint
+// while git conflicts.
+func TestSharedSectionsAcross_BehindCountsBasesSections(t *testing.T) {
+	const forked = "# Plan\n## Alpha\na1\na2\n## Beta\nb1\nb2\nb3\n" // wa's merge base
+	const delim = `^##\s`
+	write := func(t *testing.T, dir, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, "PLAN.md"), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r := func(a int) []gitx.LineRange { return []gitx.LineRange{{Start: a, End: a}} }
+	for _, tc := range []struct {
+		name     string
+		baseCopy string
+		aLine    int // wa's edit, in its own copy (= the merge base's lines)
+		aBase    int // the same edit in base's lines
+		bLine    int // wb's edit, in base's lines (wb is current)
+		shared   []string
+	}{
+		{"base renamed Beta; both edit b2", "# Plan\n## Alpha\na1\na2\n## Beta two\nb1\nb2\nb3\n", 7, 7, 7, []string{"## Beta two"}},
+		{"base split Beta before b2; both edit b3", "# Plan\n## Alpha\na1\na2\n## Beta\nb1\n## Split\nb2\nb3\n", 8, 9, 9, []string{"## Split"}},
+		{"base merged Beta into Alpha; both edit b3", "# Plan\n## Alpha\na1\na2\nb1\nb2\nb3\n", 8, 7, 7, []string{"## Alpha"}},
+		{"base renamed Beta; wa edits a2, wb b2", "# Plan\n## Alpha\na1\na2\n## Beta two\nb1\nb2\nb3\n", 4, 4, 7, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wa, wb := t.TempDir(), t.TempDir()
+			write(t, wa, forked)
+			write(t, wb, tc.baseCopy)
+			behind := gitx.DocEdits{New: r(tc.aLine), Base: r(tc.aBase), BaseCopy: tc.baseCopy}
+			edits := func(wt, base, path string) gitx.DocEdits {
+				if wt == wa {
+					return behind
+				}
+				return gitx.DocEdits{New: r(tc.bLine)}
+			}
+			shared, graded := SharedSectionsAcross("main", []string{wa, wb}, "PLAN.md", delim, edits)
+			if !graded || !reflect.DeepEqual(shared, tc.shared) {
+				t.Errorf("shared = %v, %v; want %v, graded", shared, graded, tc.shared)
+			}
+			if tc.shared != nil {
+				behind.Base, behind.BaseCopy = nil, ""
+				if shared, _ := SharedSectionsAcross("main", []string{wa, wb}, "PLAN.md", delim, edits); len(shared) != 0 {
+					t.Errorf("precondition: without base's frame %v, want none (the #247 miss)", shared)
+				}
+			}
+		})
+	}
+}
+
+// baseClaims: base-copy lines a behind window's base-frame edits claim
+// (#247), by oldClaims' rules.
+func TestBaseClaims(t *testing.T) {
+	re, _ := section.Compile(`^##\s`)
+	secs := section.Parse("# Plan\n## Alpha\na1\na2\n## Beta two\nb1\nb2\n", re) // the heading is line 5
+	r := func(a, b int) gitx.LineRange { return gitx.LineRange{Start: a, End: b} }
+	gap := func(k int) gitx.LineRange { return gitx.LineRange{Start: k, End: k + 1, Gap: true} }
+	for _, tc := range []struct {
+		name string
+		base []gitx.LineRange
+		want []gitx.LineRange
+	}{
+		{"a body line changed", []gitx.LineRange{r(6, 7)}, []gitx.LineRange{r(6, 7)}},
+		{"a change starting at a heading: the line above too", []gitx.LineRange{r(5, 6)}, []gitx.LineRange{r(5, 6), r(4, 4)}},
+		{"the first line: nothing above", []gitx.LineRange{r(1, 1)}, []gitx.LineRange{r(1, 1)}},
+		{"an insertion: the line it lands after, never both neighbours", []gitx.LineRange{gap(4)}, []gitx.LineRange{r(4, 4)}},
+		{"an insertion at the top: the first line", []gitx.LineRange{gap(0)}, []gitx.LineRange{r(1, 1)}},
+	} {
+		if got := baseClaims(secs, gitx.DocEdits{Base: tc.base}); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("%s: baseClaims = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 // oldClaims: the old-copy lines a window's edit claims (#237 review).
 func TestOldClaims(t *testing.T) {
 	re, _ := section.Compile(`^##\s`)

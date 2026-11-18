@@ -1547,18 +1547,39 @@ func ChangedRangesNew(dir, base, file string) []LineRange {
 // section it was added to read "disjoint"). All: count every section,
 // because the measurement failed (a diff git couldn't run, or an Old it
 // couldn't read), never "no edits".
+//
+// Base and BaseCopy are a branch BEHIND base's edits in base's own line
+// numbers and base's copy to read them in (#247; empty otherwise, and when
+// base has no such file). Its copy and its merge base's still carry the
+// headings it forked with, so where base renamed, added or removed a
+// heading since, its edits counted under other sections than a current
+// window's edits of the same lines, and read disjoint while git conflicts.
+// They are ChangedRanges' claims (mapHunksToBase), with an insertion's
+// shape (Gap).
 type DocEdits struct {
 	New, Deleted, Gaps []LineRange
 	Old                string
 	All                bool
+	Base               []LineRange
+	BaseCopy           string
 }
 
 // ChangedDocEdits is the section grade's measurement of file in the worktree
-// at dir: ChangedRangesNew's one diff, both of its sides (#237). Without a
-// base it is the uncommitted ranges alone (no shared frame to delete from).
+// at dir: ChangedRangesNew's one diff, both of its sides (#237), plus a
+// behind branch's edits in base's frame (#247). Without a base it is one
+// diff from HEAD, both sides too (#247: the uncommitted ranges' new side
+// alone counted no deletion), and with no HEAD either the uncommitted
+// ranges.
 func ChangedDocEdits(dir, base, file string) DocEdits {
 	ref, sha, hasBase := resolveBaseRef(dir, base)
 	if !hasBase {
+		if headResolves(dir) {
+			out, err := runRaw(dir, gradeDiff([]string{"HEAD"}, file)...)
+			if err != nil {
+				return DocEdits{New: wholeFile, All: true}
+			}
+			return docEditsFrom(dir, "HEAD:"+file, out, false)
+		}
 		if r, ok := uncommittedRangesNew(dir, file); ok {
 			return DocEdits{New: r}
 		}
@@ -1566,7 +1587,7 @@ func ChangedDocEdits(dir, base, file string) DocEdits {
 	}
 	if mb := behindMergeBase(dir, ref, sha, file); mb != "" {
 		if out, err := runRaw(dir, gradeDiff([]string{mb}, file)...); err == nil {
-			return docEditsFrom(dir, mb+":"+file, out, false)
+			return withBaseClaims(dir, ref, mb, file, out, docEditsFrom(dir, mb+":"+file, out, false))
 		}
 	}
 	out, err := runRaw(dir, gradeDiff([]string{ref}, file)...)
@@ -1603,6 +1624,44 @@ func docEditsFrom(dir, old, diff string, oldMissing bool) DocEdits {
 		e.Old = content
 	}
 	return e
+}
+
+// withBaseClaims adds to e a behind branch's edits in base's frame (#247):
+// its own hunks (own, the -U0 diff from its merge base mb) moved into base's
+// line numbers through base's hunks since mb, as ChangedRanges moves them,
+// and base's copy of file. Base without the file adds nothing (there is no
+// section of base's to claim); a diff that fails is All.
+func withBaseClaims(dir, ref, mb, file, own string, e DocEdits) DocEdits {
+	hunks := parseHunks(own)
+	if len(hunks) == 0 || e.All {
+		return e
+	}
+	baseCopy, err := runRaw(dir, "cat-file", "blob", ref+":"+file)
+	if err != nil {
+		return e
+	}
+	moved, err := runRaw(dir, gradeDiff([]string{mb, ref}, file)...)
+	if err != nil {
+		e.All = true
+		return e
+	}
+	e.Base, e.BaseCopy = mapHunksToBase(hunks, parseHunks(moved)), baseCopy
+	return e
+}
+
+// BaseResolves reports whether origin/<base> or <base> names a commit in
+// dir, the frame every window's committed changes are measured in. Without
+// one, windows' uncommitted edits alone are compared (#247).
+func BaseResolves(dir, base string) bool {
+	_, _, ok := resolveBaseRef(dir, base)
+	return ok
+}
+
+// headResolves reports whether HEAD names a commit in dir (not an unborn
+// branch).
+func headResolves(dir string) bool {
+	s, err := RunDir(dir, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+	return err == nil && s != ""
 }
 
 // parseInsertGaps extracts the OLD-side gap of each pure insertion (#237
