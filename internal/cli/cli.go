@@ -1530,6 +1530,9 @@ func cmdCheck(args []string) int {
 		if asJSON {
 			return renderCheckJSON(entries, includeStale)
 		}
+		if len(entries) > 0 {
+			annotateLive(entries, worktreeSessionNotes(c)) // #250
+		}
 		if blocking {
 			return renderCheckBlocking(entries, paths)
 		}

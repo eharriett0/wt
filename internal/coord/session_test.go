@@ -703,6 +703,10 @@ func TestSharedCheckoutWarning(t *testing.T) {
 	}
 	one := []SessionActivity{{Session: "b0c1d2e3-ffff-4444-8888-000000000000", Records: 2, Last: now.Add(-5 * time.Minute)}}
 	two := append(one, SessionActivity{Session: SessionNone, Records: 1, Last: now.Add(-2 * time.Hour)})
+	many := []SessionActivity{{Session: "b0c1d2e3-ffff-4444-8888-000000000000", Name: strings.Repeat("n", 64), Records: 1, Last: now.Add(-23 * time.Hour)}}
+	for i := 0; i < 11; i++ {
+		many = append(many, SessionActivity{Session: SessionNone, Records: 1, Last: now.Add(-23 * time.Hour)})
+	}
 	cases := []struct {
 		name     string
 		others   []SessionActivity
@@ -715,6 +719,30 @@ func TestSharedCheckoutWarning(t *testing.T) {
 			[]string{"WT_SESSION"}},
 		{"two sessions, newest named", two, Self{"/w", "A"},
 			[]string{"2 other sessions were active", "latest: session b0c1d2e3…", "one may be you, before a /clear"}, []string{"or it was you"}},
+		{"a live latest session is named", []SessionActivity{{Session: "b0c1d2e3-ffff-4444-8888-000000000000", Name: "payments-api-worker1", Status: "idle", Records: 1, Last: now.Add(-5 * time.Minute)}},
+			Self{"/w", "aaaaaaaa-1111-2222-3333-444444444444"},
+			[]string{"latest: live `payments-api-worker1`, 5m ago"}, []string{"b0c1d2e3", "/clear"}},
+		{"a long live name is cut", []SessionActivity{{Session: "b0c1d2e3-ffff-4444-8888-000000000000", Name: strings.Repeat("n", 64), Status: "idle", Records: 1, Last: now.Add(-5 * time.Minute)}},
+			Self{"/w", "aaaaaaaa-1111-2222-3333-444444444444"},
+			[]string{"latest: live `" + strings.Repeat("n", 23) + "…`"}, nil},
+		{"line 1 cuts a long name to fit the longest who and you", many, Self{"/w", SessionNone},
+			[]string{"12 other sessions were", "latest: live `nnnnnnn", "…`, 23h ago"}, []string{"/clear"}},
+		{"several others and a token-less self: no /clear hint", []SessionActivity{
+			{Session: "b0c1d2e3-ffff-4444-8888-000000000000", Records: 1, Last: now.Add(-5 * time.Minute)},
+			{Session: "c1d2e3f4-ffff-4444-8888-000000000000", Records: 1, Last: now.Add(-time.Hour)}},
+			Self{"/w", SessionNone},
+			[]string{"2 other sessions were active", "set WT_SESSION"}, []string{"/clear"}},
+		{"an older unlisted session keeps the hint when the latest is live", []SessionActivity{
+			{Session: "b0c1d2e3-ffff-4444-8888-000000000000", Name: "api-worker", Records: 1, Last: now.Add(-5 * time.Minute)},
+			{Session: "c1d2e3f4-ffff-4444-8888-000000000000", Records: 1, Last: now.Add(-3 * time.Hour)}},
+			Self{"/w", "aaaaaaaa-1111-2222-3333-444444444444"},
+			[]string{"2 other sessions were active", "latest: live `api-worker`", "one may be you, before a /clear"}, nil},
+		{"all others live or untagged: no hint", []SessionActivity{
+			{Session: "b0c1d2e3-ffff-4444-8888-000000000000", Name: "api-worker", Records: 1, Last: now.Add(-5 * time.Minute)},
+			{Session: "c1d2e3f4-ffff-4444-8888-000000000000", Name: "docs-worker", Records: 1, Last: now.Add(-time.Hour)},
+			{Session: SessionNone, Records: 1, Last: now.Add(-3 * time.Hour)}},
+			Self{"/w", "aaaaaaaa-1111-2222-3333-444444444444"},
+			[]string{"3 other sessions were active"}, []string{"/clear"}},
 		{"token-less self is told to set WT_SESSION", one, Self{"/w", SessionNone},
 			[]string{"you: no session token", "set WT_SESSION"}, []string{"/clear"}},
 		{"a token-less latest session is no /clear of yours", []SessionActivity{{Session: SessionNone, Records: 1, Last: now.Add(-time.Minute)}}, Self{"/w", "A"},
@@ -907,6 +935,26 @@ func TestCheckoutActivity(t *testing.T) {
 	if len(log) != 1 || log[0].ID != "l1" {
 		t.Errorf("the log's records changed: %v", log)
 	}
+}
+
+// #250: NameLive names the sessions its lookup finds live, and only those.
+func TestNameLive(t *testing.T) {
+	others := []SessionActivity{{Session: "B"}, {Session: "C"}, {Session: SessionNone}}
+	asked := 0
+	NameLive(others, func(s string) (string, string, bool) {
+		asked++
+		if s == SessionNone {
+			t.Errorf("a token-less session was looked up")
+		}
+		if s == "B" {
+			return "api-worker", "idle", true
+		}
+		return "", "", false
+	})
+	if others[0].Name != "api-worker" || others[0].Status != "idle" || others[1].Name != "" || others[2].Name != "" || asked != 2 {
+		t.Errorf("NameLive = %+v (asked %d), want B named only", others, asked)
+	}
+	NameLive(others, nil) // no lookup: nothing changes, no panic
 }
 
 // PresenceDue (#197 item 2): a session with a real token marks presence when

@@ -1311,6 +1311,28 @@ type SessionActivity struct {
 	Session string    `json:"session"`
 	Records int       `json:"records"`
 	Last    time.Time `json:"last"`
+	// Name and Status: the session's, when it is live on this machine
+	// (NameLive, #250); empty when it isn't listed, or the listing is unread.
+	Name   string `json:"name,omitempty"`
+	Status string `json:"status,omitempty"`
+}
+
+// NameLive fills Name and Status for each of others that lookup finds live
+// (#250: the caller's `claude agents` listing). A token-less session is never
+// looked up, and nil names none. Annotation only: a session lookup doesn't
+// find stays listed.
+func NameLive(others []SessionActivity, lookup func(session string) (name, status string, ok bool)) {
+	if lookup == nil {
+		return
+	}
+	for i := range others {
+		if others[i].Session == "" || others[i].Session == SessionNone {
+			continue
+		}
+		if name, status, ok := lookup(others[i].Session); ok {
+			others[i].Name, others[i].Status = name, status
+		}
+	}
 }
 
 // OtherSessions reports the sessions OTHER than self's that wrote records under
@@ -1410,6 +1432,15 @@ func RecentBlockLedgers(home string, now time.Time, within time.Duration) []Reco
 	return recs
 }
 
+// cutRunes is s cut to at most n runes, the cut marked with "…". Pure.
+func cutRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n-1]) + "…"
+}
+
 // SharedCheckoutWarning renders the wt doctor / wt status warning for other
 // sessions using self's checkout (#163): two lines, who and the remedy. "" when
 // there are none. others is OtherSessions' output (most recent first). The only
@@ -1432,16 +1463,31 @@ func SharedCheckoutWarning(others []SessionActivity, self Self, now time.Time) s
 	// #197 item 2 review: a /clear, --fork-session or restart mints a new id,
 	// so the session before it reads as another one. Said only between two
 	// tagged sessions, as the hold gate's hint is.
+	// #250: a session live on this machine is named as SendMessage addresses
+	// it, in place of its id; the name gets what line 1's 160 runes leave, 8
+	// to 24 (#251 round 4: a token-less self and a 24-rune name ran it to
+	// 181). A live session is not this one before a /clear (the listing keys
+	// a session by its current id), so the hint needs a tagged session that
+	// isn't listed live (#251 round 3: an older one, when the latest is).
+	line1 := func(latestName string) string {
+		return fmt.Sprintf("checkout shared — %s active in THIS checkout in the last %dh (latest: %s, %s); you: %s.",
+			who, int(SharedCheckoutWindow.Hours()), latestName, ago(now.Sub(latest.Last)), you)
+	}
+	latestName := ShortSession(latest.Session)
+	if latest.Name != "" {
+		room := 160 - len([]rune(line1("live ``")))
+		latestName = "live `" + cutRunes(latest.Name, max(8, min(24, room))) + "`"
+	}
 	end := "."
-	if self.Session != SessionNone && latest.Session != SessionNone {
+	if self.Session != SessionNone && len(others) == 1 && latest.Session != SessionNone && latest.Name == "" {
 		end = "; or it was you, before a /clear."
-		if len(others) > 1 {
+	}
+	for _, o := range others {
+		if len(others) > 1 && self.Session != SessionNone && o.Session != SessionNone && o.Name == "" {
 			end = "; one may be you, before a /clear."
 		}
 	}
-	return fmt.Sprintf("checkout shared — %s active in THIS checkout in the last %dh (latest: %s, %s); you: %s.\n"+
-		"  One working tree, no file-level warning between you: give one its own worktree (`wt new <branch>`); its holds: `wt inbox`%s",
-		who, int(SharedCheckoutWindow.Hours()), ShortSession(latest.Session), ago(now.Sub(latest.Last)), you, end)
+	return line1(latestName) + "\n  One working tree, no file-level warning between you: give one its own worktree (`wt new <branch>`); its holds: `wt inbox`" + end
 }
 
 // Thresholds for HoldLooksOrphaned (#163). A hold this old, or whose session has

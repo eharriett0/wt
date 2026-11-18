@@ -425,6 +425,108 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   session's until the client restarts it, and whether a client passes its
   session id to a stdio MCP server at all is not verified. The payload's
   `session` says which one it answered as.
+- **wt detects, Claude talks: a live Claude Code session is named, never
+  presumed gone (#250).** Claude Code's cross-session messaging (2.1.224+)
+  lets an agent pick and message another session itself (current versions
+  show it each session's working directory), so wt sends nothing; what an
+  agent can't see is a collision, or which of two sessions in one checkout
+  placed a hold. So wt names the session to talk to where it reports one:
+  (1) **a collision** (`wt check` text, both edit hooks advisory and deny,
+  the per-turn banner): the live sessions working in the other window's
+  worktree (`CheckEntry.liveNote` via `annotateLive`, or the banner's
+  label map `labelSessionNotes`; `worktreeSessionNotes` reads the listing
+  and this repository's log (`coord.LoadForHook`) once, on first use).
+  ⚠ **A session is credited by its records** in the log from the last
+  `SharedCheckoutWindow` (`sessionsByWindow`): the window of its latest
+  record from a wt COMMAND (announce, ack, all-clear, a block id: run where
+  the agent works), else of its latest presence mark. ⚠ #251 round 2: a
+  presence mark follows the per-turn hook's payload cwd, which is where the
+  session was started unless it cd'd, so a session started in a main
+  checkout and working in a worktree by path marked main hourly, and
+  "latest record" credited it there. A session started outside any
+  repository writes no mark at all (the hook returns before it), so it is
+  named only through its wt commands' records. ⚠ Accepted (rounds 3-5):
+  a session that moved after its last wt command stays credited to that
+  command's window until its next one, for up to a day; at worst a wrong
+  name, the collision still shows. Two rules that let a later mark win
+  were tried and dropped: marks are hourly per window, and `PresenceDue`
+  skips one where the session wrote anything in the last hour. "Any mark
+  in the command's window that day" sent a session started in /r/b that
+  cd'd to main and works in /r/b by path to main hourly; "its last mark
+  before the command was there" sent one that cd'd to main, ran `wt ack`
+  there (its main mark skipped), then announced in /r/b by path, to main.
+  A later mark can't be told from by-path work elsewhere, or from a mark
+  skipped for an hour. A shorter horizon for records would credit path
+  workers to main again. **Never by the listing's
+  `cwd`** either: that is where the session was STARTED. Measured on the
+  owner's machine: 5 of 6 live sessions started in a parent folder outside
+  every repository and work in worktrees by path, so the first version
+  (deepest worktree holding the cwd) named nobody, or the wrong window. A
+  session with no recent record here is named on no collision, self never;
+  `realPath` resolves a window's deepest existing ancestor, so a window id
+  and a worktree path compare however they were spelled. Checked against
+  the real listing and log in another repository: a real collision named
+  the session whose latest record is in that worktree, and a window with no
+  recent live session stayed unnamed. Known cost: with another process
+  holding the log's lock, the per-turn hook waits for it twice (its own
+  coordination block, then the note), ~1s more. (2) **an
+  announcement or hold** (`postedByLive`: inbox, the per-turn hook through
+  `labelForContext`, merge-pr's hold gate and its stale-hold warning, the
+  status banner), by the record's raw session id ("live as `api-worker`,
+  idle: ask it with SendMessage"): the one case a directory can't settle,
+  two sessions in one checkout; (3) **`other_sessions`** (`coord.NameLive`:
+  `status --json`, doctor, MCP; the `wt status` banner too, round 4)
+  carries `name`/`status`, and `SharedCheckoutWarning` names a live latest
+  session as live `name` in place of its id, cut to what line 1's 160 runes
+  leave (8 to 24; round 4: a token-less self and a 24-rune name ran it to
+  181); its /clear hint needs a tagged session not listed live (round 3:
+  an older one keeps it when the latest is live). An unnamed latest with a
+  token-less self can still reach 163, or 170 with a mirrored id (round 6;
+  not new). The push
+  phase first planned (wt posting into sessions' inbox sockets) was
+  dropped: it duplicated `SendMessage`, woke idle sessions, and relied on
+  an undocumented line format. `internal/peers` reads `claude agents
+  --json`, which Claude Code documents as the supported way to read
+  session state from outside (`peers.Live`: `claude` on PATH, else
+  `CLAUDE_CODE_EXECPATH`, the binary running the session, since the VS Code
+  extension puts none on PATH; `Timeout` 2s; memoized 10s, so a command reads
+  it once; an entry counts only with a `pid`, which the listing gives "while
+  the process is alive"). ⚠ **Annotation only.** A session missing from the
+  listing is never treated as gone (the agent-view docs say interactive
+  sessions in other terminals appear only once backgrounded; 2.1.322 lists
+  them), and a listing wt can't read (no binary, an error, the timeout, not
+  the documented array) is unknown and changes nothing. The one decision it
+  changes is in the safe direction: `holdAdvice` never offers a global `wt
+  all-clear` for a hold whose session is listed live (`otherPeer`), and says
+  to ask it; the stale-hold warning likewise. Only another session or window
+  is looked up (`otherPeer`: never a record this session provably wrote, never
+  `SessionNone`). `livePeerOf` runs the listing only when a record is shown,
+  so a turn with nothing of another party's runs no `claude` (measured: a
+  turn showing one costs ~195 ms against ~58 ms; a listing is 135-297 ms).
+  ⚠ #251 review: names go into another agent's context, so `peers.Parse`
+  drops control characters and backticks and caps a name at 64 runes; the
+  read is capped at 1 MiB (`maxListing`) and its whole process group goes at
+  the deadline (`gitx.StopGroupOnCancel`); this session is excluded by its wt
+  token AND by `CLAUDE_CODE_SESSION_ID`, the id the listing keys it by (with
+  `WT_SESSION` set it was named on its own old window). `WT_PEERS=0`
+  disables it, and the cli and doctor packages' `TestMain`s set it, since a
+  test run inside a Claude Code session would otherwise reach the real binary
+  through `CLAUDE_CODE_EXECPATH`; a test that wants live sessions sets
+  `livePeers`.
+  Pinned by `TestCollisions_nameTheLiveSessionInTheOtherWindow` (real git,
+  a fake `claude`: check, both edit hooks in both modes and the per-turn
+  hook name the other window's session and never self or an outside one;
+  read once a command; never for a file no window contests; nothing under
+  `WT_PEERS=0`; the listing's cwds point elsewhere, and a session started
+  inside wb is not named), `TestSessionsByWindow`,
+  `TestSessionsByWindow_recordWins` (rounds 3-5), `TestLabelSessionNotes`,
+  `TestCollisionNote`, `TestHoldAdvice_liveHolderIsAskedNotCleared`,
+  `TestPostedByLive`, `TestWarnStaleHolds_liveHolderIsAsked`,
+  `TestLiveHolderNamed_hookAndGate` (a fake `claude`: named in the hook, the
+  gate's listing and advice, inbox and the banner; read once, never for a
+  turn with only its own records) and
+  `internal/peers`' tests (every failure is unknown; the timeout; the
+  execpath fallback).
 - **Every write to a coordination log or block ledger holds its flock (#229).**
   `wt prune-coord` (`withLockedLog`) reads, truncates and rewrites the file
   under an exclusive flock, and `coord.Append` used to write with a bare

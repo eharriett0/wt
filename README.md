@@ -263,6 +263,44 @@ wt without session support still running next to an upgraded one), it is
 treated like another party's: its hold gates for `hold_max_age`, it stays in
 `inbox`, and its acks waive nothing for anyone.
 
+**wt detects, Claude talks.** Claude Code sessions on one machine can message
+each other (cross-session messaging, Claude Code 2.1.224+), and pick the
+session to message themselves. What an agent can't see is that another window
+is editing the same lines, or which of two sessions in one checkout placed a
+hold. So where wt reports one, it names the session to talk to, when that
+session is running on this machine:
+
+- **A collision** (`wt check`, both edit hooks, the per-turn hook) names the
+  live sessions working in the other window: `notes.txt ← wb [active] (live:
+  \`api-worker\`, idle; coordinate with SendMessage)`. A session counts as
+  working in the window of its latest record from a wt command run there in
+  the last day (announce, ack, all-clear, a block id), else of its latest
+  presence mark. A presence mark comes from the per-turn hook and follows
+  that hook's working directory, which is where the session was started
+  unless it changed directory; a session started outside any repository
+  writes none, and is named only through the wt commands it runs. A
+  session that moved after its last wt command is named on that command's
+  window until it runs another, for up to a day: a later mark can't be told
+  from work elsewhere by path. Not the directory Claude Code lists either:
+  that is where the session was started.
+  This session is never named, and a session with no recent record in the
+  repository is named on no collision.
+- **An announcement or hold** (`inbox`, the per-turn hook, `merge-pr`'s hold
+  gate, the status banner) names the live session that placed it, by its
+  session id: `(live as \`api-worker\`, idle: ask it with SendMessage)`. A
+  hold whose session is live is never called orphaned: wt says to ask that
+  session, not to `wt all-clear` it.
+- **`other_sessions`** (`status --json`, `doctor --json`, MCP `wt_status`)
+  carries `name` and `status`, and the "checkout shared" warning names a live
+  session in place of its id.
+
+wt sends nothing itself. It reads `claude agents --json` (the documented
+listing; the `claude` on PATH, else the one running the session), at most
+once per command and only when it has another window's collision or record
+to show, which costs about 140 ms. A session the listing doesn't show is never
+treated as gone, and a listing wt can't read changes nothing. `WT_PEERS=0`
+turns it off.
+
 **Rollout.** Windows still running wt v0.1.33 or v0.1.34 behave as before until
 they are upgraded: v0.1.33 records no session and exempts itself from every hold
 placed in its own checkout; v0.1.34 treats a record with no session as every

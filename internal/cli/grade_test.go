@@ -339,7 +339,7 @@ func TestAgentOverlaps_Issue182(t *testing.T) {
 	c := gradeTestConfig()
 	ws := scenarioWindows()
 	graded := agentOverlaps(c, scenarioFacts().factory(), ws, collide.Overlaps(ws), scenarioLive(), curSelf)
-	msg, has := codexContextMessage(graded, "cur")
+	msg, has := codexContextMessage(graded, "cur", nil)
 	if !has {
 		t.Fatal("expected a banner")
 	}
