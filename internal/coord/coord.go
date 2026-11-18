@@ -60,7 +60,54 @@ const (
 	// (the id is not in the file), so NextBlock stops counting it immediately
 	// rather than waiting out DefaultBlockReserveTTL.
 	KindBlockAbandoned = "block-abandoned"
+	// KindPresence marks a session at work in a checkout (#197 item 2): the
+	// per-turn agent hooks write one for a session that has written nothing
+	// there for PresenceEvery, so a session that never runs a coordination
+	// command still shows in OtherSessions (the shared-checkout warning,
+	// other_sessions, doctor). It is no announcement: inbox, holds and the
+	// gate select announcements by kind, so they never see it (an older wt's
+	// too). prune-coord drops it after SharedCheckoutWindow.
+	KindPresence = "presence"
 )
+
+// PresenceEvery bounds how often a session marks presence in a checkout: at
+// most one record per session per checkout per hour, so the log grows by at
+// most 24 a day per window and session, and prune-coord drops them after a
+// day.
+const PresenceEvery = time.Hour
+
+// PresenceLive is how long a presence mark alone shows its session at work
+// (#197 item 2 review): a prompting session marks again within PresenceEvery,
+// so one whose latest mark is older than two of them has stopped prompting,
+// or became a new session id (/clear, --fork-session, a restart). Counted for
+// the whole SharedCheckoutWindow, a session's marks warned the session after
+// its /clear that another shared its checkout, for a day.
+const PresenceLive = 2 * PresenceEvery
+
+// presenceStale reports whether r, dated t, is a presence mark too old to
+// show its session at work now (PresenceLive). Pure.
+func presenceStale(r Record, t, now time.Time) bool {
+	return r.Kind == KindPresence && now.Sub(t) > PresenceLive
+}
+
+// PresenceDue reports whether self should mark presence in its checkout now
+// (#197 item 2): it has a real session token (a token-less shell names no
+// party), and the log holds no record of self's, this window AND this
+// session, of any kind, from the last PresenceEvery. Pure.
+func PresenceDue(recs []Record, self Self, now time.Time) bool {
+	if self.Session == "" || self.Session == SessionNone {
+		return false
+	}
+	for _, r := range recs {
+		if r.Window != self.Window || r.Session != self.Session {
+			continue
+		}
+		if t, err := time.Parse(time.RFC3339, r.TS); err == nil && now.Sub(t) < PresenceEvery && now.Sub(t) > -time.Minute {
+			return false
+		}
+	}
+	return true
+}
 
 // DefaultBlockReserveTTL bounds how long an UN-written block reservation is
 // honored: after this it's assumed written-or-abandoned, so it stops surfacing
@@ -576,6 +623,33 @@ type lockTimeoutError struct{ msg string }
 func (e *lockTimeoutError) Error() string { return e.msg }
 func (e *lockTimeoutError) Unwrap() error { return lock.ErrTimeout }
 
+// AppendIfFree is Append that never waits on the lock (#197 item 2): one
+// try, and written=false when another process holds it, so a per-turn hook
+// returns at once and marks presence next turn instead. Silent: a filesystem
+// that can't lock gets the unlocked O_APPEND write Append makes there, without
+// Append's warning (a hook's stderr is the session's). Any other lock error
+// writes nothing and is returned.
+func AppendIfFree(path string, r Record) (written bool, err error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return false, err
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	// The lock call itself, with no waiting notice: a hook never prints.
+	switch lerr := exclusiveWithin(f, 0, 0, nil); {
+	case lerr == nil:
+		defer lock.Release(f)
+	case errors.Is(lerr, lock.ErrTimeout) || errors.Is(lerr, lock.ErrSeenHeld):
+		return false, nil // held: next turn
+	case !lock.Unsupported(lerr):
+		return false, fmt.Errorf("cannot lock %s: %w", path, lerr)
+	}
+	return true, appendLocked(f, r)
+}
+
 // appendLocked writes r as one JSON line at the end of f, whose lock the
 // caller holds. f must be opened O_APPEND (Append's and ReserveBlock's both
 // are), never seek-then-write: the lock only excludes other lockers, so a
@@ -617,9 +691,20 @@ func Load(path string) ([]Record, error) { return loadWithin(path, false, loadLo
 // review).
 func LoadForGate(path string) ([]Record, error) { return loadWithin(path, true, loadLockWait) }
 
-// loadLockWait bounds how long Load waits for a writer. A var so a test can
-// shorten it; a prune's rewrite takes milliseconds.
-var loadLockWait = 5 * time.Second
+// LoadForHook is Load for the per-turn agent hooks, which wait at most
+// hookLoadWait (#197 item 2 review): a hook must return promptly, and the
+// presence mark gives far more repositories a log, so a prune stopped
+// mid-rewrite (Ctrl-Z) stalled every prompt there for Load's 5s. What it
+// reads is advisory, as Load's unlocked read after its wait is.
+func LoadForHook(path string) ([]Record, error) { return loadWithin(path, false, hookLoadWait) }
+
+// loadLockWait bounds how long Load waits for a writer, hookLoadWait how long
+// LoadForHook does. Vars so a test can shorten them; a prune's rewrite takes
+// milliseconds.
+var (
+	loadLockWait = 5 * time.Second
+	hookLoadWait = time.Second
+)
 
 // ErrLogLocked is LoadForGate giving up on a log another process kept locked.
 var ErrLogLocked = errors.New("the coordination log stayed locked by another wt process (a prune-coord or an append stopped mid-write?)")
@@ -909,6 +994,27 @@ func ActiveHolds(recs []Record, self Self, op string, now time.Time) []Record {
 	return out
 }
 
+// presenceExpired is PruneRecords' rule for a presence record: only the last
+// SharedCheckoutWindow is ever read (#197 item 2), and an undatable one says
+// nothing about when. Pure.
+func presenceExpired(r Record, now time.Time) bool {
+	t, err := time.Parse(time.RFC3339, r.TS)
+	return err != nil || now.Sub(t) > SharedCheckoutWindow
+}
+
+// ExpiredPresence counts the presence records PruneRecords would drop. doctor
+// lists them apart from the prunable records it warns about (#197 item 2
+// review): a prompting session writes one an hour, so some expire every day,
+// and a warning that never goes away teaches people to ignore it. Pure.
+func ExpiredPresence(recs []Record, now time.Time) (n int) {
+	for _, r := range recs {
+		if r.Kind == KindPresence && presenceExpired(r, now) {
+			n++
+		}
+	}
+	return n
+}
+
 // PruneRecords returns the log with resolved + expired records removed (#33):
 // (a) every announcement that has been all-cleared, together with its acks and
 // the all-clear record itself (a completed handshake — no longer live); and (b)
@@ -933,6 +1039,8 @@ func PruneRecords(recs []Record, now time.Time, blockMaxAge time.Duration) (kept
 			drop = !open(r) || (blockMaxAge > 0 && Age(r, now) > blockMaxAge)
 		case KindBlockWritten, KindBlockAbandoned:
 			drop = true // the marker is only needed while its reservation lives
+		case KindPresence:
+			drop = presenceExpired(r, now)
 		}
 		if !drop {
 			kept = append(kept, r)
@@ -1209,13 +1317,16 @@ type SessionActivity struct {
 // self's window within `within` of now (within <= 0 → any age) — evidence that
 // another session shares this checkout (#163). A pre-#163 record carries no
 // session and names no party, so it is skipped; so is everything when self has
-// no session (a zero Self). One entry per session, most recent first. Pure.
+// no session (a zero Self). A session whose only evidence is presence marks
+// counts while its latest is within PresenceLive. One entry per session, most
+// recent first. Pure.
 func OtherSessions(recs []Record, self Self, now time.Time, within time.Duration) []SessionActivity {
 	if self.Session == "" {
 		return nil
 	}
 	idx := map[string]int{}
 	var out []SessionActivity
+	var live []bool
 	for _, r := range recs {
 		if !self.SharesCheckout(r) {
 			continue // another window, self's own session, or a pre-#163 record
@@ -1231,15 +1342,23 @@ func OtherSessions(recs []Record, self Self, now time.Time, within time.Duration
 		if !ok {
 			idx[r.Session] = len(out)
 			out = append(out, SessionActivity{Session: r.Session, Last: t})
+			live = append(live, false)
 			i = len(out) - 1
 		}
 		out[i].Records++
+		live[i] = live[i] || !presenceStale(r, t, now)
 		if t.After(out[i].Last) {
 			out[i].Last = t
 		}
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Last.After(out[j].Last) })
-	return out
+	kept := out[:0]
+	for i, s := range out {
+		if live[i] {
+			kept = append(kept, s)
+		}
+	}
+	sort.SliceStable(kept, func(i, j int) bool { return kept[i].Last.After(kept[j].Last) })
+	return kept
 }
 
 // CheckoutActivity is every record that can show a session at work in a
@@ -1310,9 +1429,19 @@ func SharedCheckoutWarning(others []SessionActivity, self Self, now time.Time) s
 	if self.Session == SessionNone {
 		you += " (set WT_SESSION)"
 	}
+	// #197 item 2 review: a /clear, --fork-session or restart mints a new id,
+	// so the session before it reads as another one. Said only between two
+	// tagged sessions, as the hold gate's hint is.
+	end := "."
+	if self.Session != SessionNone && latest.Session != SessionNone {
+		end = "; or it was you, before a /clear."
+		if len(others) > 1 {
+			end = "; one may be you, before a /clear."
+		}
+	}
 	return fmt.Sprintf("checkout shared — %s active in THIS checkout in the last %dh (latest: %s, %s); you: %s.\n"+
-		"  One working tree, no file-level warning between you: give one session its own worktree (`wt new <branch>`); its holds: `wt inbox`.",
-		who, int(SharedCheckoutWindow.Hours()), ShortSession(latest.Session), ago(now.Sub(latest.Last)), you)
+		"  One working tree, no file-level warning between you: give one its own worktree (`wt new <branch>`); its holds: `wt inbox`%s",
+		who, int(SharedCheckoutWindow.Hours()), ShortSession(latest.Session), ago(now.Sub(latest.Last)), you, end)
 }
 
 // Thresholds for HoldLooksOrphaned (#163). A hold this old, or whose session has
@@ -1384,7 +1513,7 @@ func InboxClearAmbiguous(recs []Record, self Self, now time.Time) bool {
 		if !self.SharesCheckout(r) {
 			continue // another window, a token-less writer (indistinguishable), or pre-#163
 		}
-		if t, err := time.Parse(time.RFC3339, r.TS); err == nil && now.Sub(t) <= SharedCheckoutWindow {
+		if t, err := time.Parse(time.RFC3339, r.TS); err == nil && now.Sub(t) <= SharedCheckoutWindow && !presenceStale(r, t, now) {
 			return true
 		}
 	}

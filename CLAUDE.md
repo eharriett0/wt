@@ -366,8 +366,58 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   another repo's reservation read as this checkout's (#197 review). The
   read is advisory (`coord.RecentBlockLedgers`): a ledger untouched for 24h
   is skipped, and a locked one is read without waiting (`Load` waited 5s per
-  stuck ledger on every `status --json`). A session that never wrote
-  anything is still invisible. Pinned by
+  stuck ledger on every `status --json`). ⚠ **A session that never runs a
+  coordination command marks its presence** (#197 item 2, step two): the
+  per-turn hooks (`hookAgentContext` → `markPresence`) write a
+  `coord.KindPresence` record for a session with a real token when
+  `coord.PresenceDue` (nothing of its own, this window AND session, any kind,
+  in the last `PresenceEvery`, an hour): at most 24 a day per window and
+  session. `coord.AppendIfFree` never waits (one lock try; a held lock skips
+  the turn) and never prints. In a single-worktree repo with no log, a turn
+  with a token no longer returns before `config.Load`: its mark creates the
+  log (the #163 case, two agents in one checkout), and later turns read the
+  coordination block there as any repo with a log does. ⚠ So the hook reads
+  the log with `coord.LoadForHook`, which waits a second for a writer, not
+  Load's 5s (review: far more repos now have a log, and a prune stopped
+  mid-rewrite stalled every prompt there; what it reads is advisory). Inbox,
+  holds, acks and the gate select announcements by kind, so a presence
+  record never reads as one (an older wt's included); `PruneRecords` drops
+  it after `SharedCheckoutWindow`, or undatable (`presenceExpired`). Nothing
+  prunes on its own, so doctor lists expired marks
+  (`coord.ExpiredPresence`, `presence_expired`) apart from the `prunable`
+  records it warns about: some expire every day wherever agents prompt, and
+  a daily warning gets ignored (measured: 50k marks, 14 MB, cost the hook
+  114 ms against 66 ms). ⚠ Under a Codex older than 0.148.0 the mark carries
+  the payload id while the session's shells stamp none, so its own `wt
+  status` warns that another session shares the checkout (README, Codex
+  section). It does count as the session's
+  activity elsewhere, on purpose: `OtherSessions`, the token-less inbox
+  hedge (`InboxClearAmbiguous`) and `HoldLooksOrphaned`'s "silent for 4h"
+  (a prompting session's hold is not orphaned). ⚠ **But a mark alone shows
+  its session at work only for `PresenceLive`** (two `PresenceEvery`;
+  `presenceStale`, round-2 review): counted for the whole day, every hooked
+  session's marks told the session after its /clear (a new id) that another
+  shared its checkout, for a day. A session with any other record keeps the
+  day's window, and its marks still date it; the warning adds "or it was
+  you, before a /clear" between two tagged sessions ("one may be you" for
+  several). ⚠ Marks come only from the per-turn hooks (UserPromptSubmit),
+  at most hourly, so a session drops out 1 to 2h after its last prompt (2h
+  after its last mark), as in one long autonomous turn, until it prompts
+  again (round-3 and round-4 reviews, accepted: main had no signal for
+  it at all, and any other record keeps a session for the day). An older
+  wt, and a `wt mcp` started before the upgrade, still list marks-only
+  sessions for 24h. ⚠ A mark also sets the
+  log's session epoch (#211 `SessionEpoch`, any kind), so a session-less
+  hold written after it reads as a still-running older wt's, not history:
+  the safe direction, and prune-coord's drop of the mark puts it back. A
+  session with no wt hooks that never runs a coordination command is still
+  invisible. Pinned by
+  `TestHookPresence_marksASilentSession`, `TestPresenceDue`,
+  `TestPruneRecords_presence`, `TestAppendIfFree`,
+  `TestPresence_countsAsTheSessionsActivity`,
+  `TestOtherSessions_presenceAloneCountsWhileLive`,
+  `TestHookPresence_neverStallsOnAHeldLog`,
+  `TestDoctor_listsExpiredPresenceWithoutWarning`, and
   `TestOtherSessions_countBlockReservations`, `TestCheckoutActivity` and
   `TestRecentBlockLedgers`.
   ⚠ `wt mcp` reads its session from its env ONCE, at spawn: after
@@ -1284,7 +1334,8 @@ hook` (NOT `wt _hook` — the quoted path renders `wt" _hook`, which broke
 detection in v0.1.8, #91). `runHook` dispatches: git hooks (`pre-push`,
 `pre-commit`), Claude Code hooks (`todo-write` PostToolUse, `claude-edit`
 PreToolUse), and the Codex hooks (`codex-context` UserPromptSubmit, `codex-edit`
-PreToolUse). Agent hooks derive the repo from the payload's `cwd` and **always
+PreToolUse). The per-turn hooks also mark the session's presence in the
+coordination log (#197; never waiting on its lock). Agent hooks derive the repo from the payload's `cwd` and **always
 exit 0** (advisory / fail-open; a coordination nicety must never break the session).
 
 **Codex now gets BOTH a per-turn hook AND a per-edit hook (#117).** Codex's

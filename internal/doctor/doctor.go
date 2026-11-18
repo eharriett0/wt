@@ -94,8 +94,11 @@ type CoordHealth struct {
 	Records          int    `json:"records"`
 	OwnOpen          int    `json:"own_open_announcements"`
 	OwnBlockReserves int    `json:"own_block_reservations"`
-	Prunable         int    `json:"prunable"`
-	Err              string `json:"err,omitempty"`
+	Prunable         int    `json:"prunable"` // presence marks not included: PresenceExpired
+	// Presence marks older than a day (#197 item 2): `wt prune-coord` drops
+	// them too, but they are listed, not warned about.
+	PresenceExpired int    `json:"presence_expired"`
+	Err             string `json:"err,omitempty"`
 
 	// #163: this process's identity, and any OTHER session recently active
 	// under the same window id (coordination records, or this repository's
@@ -446,8 +449,12 @@ func coordHealth(c *config.Config) *CoordHealth {
 	h.Records = len(recs)
 	h.OwnOpen = len(coord.OwnOpenAnnouncements(recs, self))
 	h.OtherSessions = coord.OtherSessions(coord.CheckoutActivity(recs, ledger, repoName(c)), self, time.Now(), coord.SharedCheckoutWindow)
-	if _, p := coord.PruneRecords(recs, time.Now(), pruneBlockMaxAge); p > 0 {
-		h.Prunable += p
+	// One clock for both reads: a mark crossing the day between them made
+	// prunable one short (#197 item 2 review).
+	now := time.Now()
+	if _, p := coord.PruneRecords(recs, now, pruneBlockMaxAge); p > 0 {
+		h.PresenceExpired = coord.ExpiredPresence(recs, now)
+		h.Prunable += p - h.PresenceExpired
 	}
 	return h
 }
@@ -550,6 +557,9 @@ func render(rep *Report) {
 			extra := ""
 			if h.OwnOpen > 0 || h.OwnBlockReserves > 0 {
 				extra = fmt.Sprintf(" — YOU have %d open announcement(s), %d block reservation(s) (see `wt holds`)", h.OwnOpen, h.OwnBlockReserves)
+			}
+			if h.PresenceExpired > 0 {
+				extra += " " + ui.Dim(fmt.Sprintf("(%d presence mark(s) older than a day; `wt prune-coord` drops them)", h.PresenceExpired))
 			}
 			ui.OK("coord log — %d record(s)%s", h.Records, extra)
 			if h.Prunable > 0 {
