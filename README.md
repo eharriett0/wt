@@ -280,9 +280,9 @@ session is running on this machine:
   unless it changed directory; a session started outside any repository
   writes none, and is named only through the wt commands it runs. A
   session that moved after its last wt command is named on that command's
-  window until it runs another, for up to a day: marks are hourly and can't
-  track a move. Not the directory Claude Code lists either: that is where
-  the session was started.
+  window until it runs another, for up to a day: a later mark can't be told
+  from work elsewhere by path. Not the directory Claude Code lists either:
+  that is where the session was started.
   This session is never named, and a session with no recent record in the
   repository is named on no collision.
 - **An announcement or hold** (`inbox`, the per-turn hook, `merge-pr`'s hold

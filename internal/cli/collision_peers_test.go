@@ -15,10 +15,11 @@ import (
 	"github.com/eharriett0/wt/internal/peers"
 )
 
-// #250 (reshaped): a live session is credited to the window of its latest
-// record in this repository's log from the last day, not to the listing's
-// cwd (where it was started). Self, a session the listing doesn't show, a
-// token-less record and a stale one are never credited.
+// #250 (reshaped): a live session is credited, from this repository's log
+// over the last day, to the window of its latest wt-command record, else of
+// its latest presence mark; not to the listing's cwd (where it was started).
+// Self, a session the listing doesn't show, a token-less record and a stale
+// one are never credited.
 func TestSessionsByWindow(t *testing.T) {
 	now := time.Now()
 	at := func(d time.Duration) string { return now.Add(-d).UTC().Format(time.RFC3339) }

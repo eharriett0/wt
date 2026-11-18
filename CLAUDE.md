@@ -453,9 +453,11 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   skips one where the session wrote anything in the last hour. "Any mark
   in the command's window that day" sent a session started in /r/b that
   cd'd to main and works in /r/b by path to main hourly; "its last mark
-  before the command was there" sent one that cd'd to main and ran
-  `wt ack` there (its main mark skipped) to main. A shorter horizon for
-  records would credit path workers to main again. **Never by the listing's
+  before the command was there" sent one that cd'd to main, ran `wt ack`
+  there (its main mark skipped), then announced in /r/b by path, to main.
+  A later mark can't be told from by-path work elsewhere, or from a mark
+  skipped for an hour. A shorter horizon for records would credit path
+  workers to main again. **Never by the listing's
   `cwd`** either: that is where the session was STARTED. Measured on the
   owner's machine: 5 of 6 live sessions started in a parent folder outside
   every repository and work in worktrees by path, so the first version
@@ -479,7 +481,8 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   leave (8 to 24; round 4: a token-less self and a 24-rune name ran it to
   181); its /clear hint needs a tagged session not listed live (round 3:
   an older one keeps it when the latest is live). An unnamed latest with a
-  token-less self can still run a few past 160 (round 5; not new). The push
+  token-less self can still reach 163, or 170 with a mirrored id (round 6;
+  not new). The push
   phase first planned (wt posting into sessions' inbox sockets) was
   dropped: it duplicated `SendMessage`, woke idle sessions, and relied on
   an undocumented line format. `internal/peers` reads `claude agents
@@ -515,9 +518,10 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   hook name the other window's session and never self or an outside one;
   read once a command; never for a file no window contests; nothing under
   `WT_PEERS=0`; the listing's cwds point elsewhere, and a session started
-  inside wb is not named), `TestSessionsByWindow`, `TestLabelSessionNotes`,
-  `TestCollisionNote`, `TestHoldAdvice_liveHolderIsAskedNotCleared`, `TestPostedByLive`,
-  `TestWarnStaleHolds_liveHolderIsAsked`,
+  inside wb is not named), `TestSessionsByWindow`,
+  `TestSessionsByWindow_recordWins` (rounds 3-5), `TestLabelSessionNotes`,
+  `TestCollisionNote`, `TestHoldAdvice_liveHolderIsAskedNotCleared`,
+  `TestPostedByLive`, `TestWarnStaleHolds_liveHolderIsAsked`,
   `TestLiveHolderNamed_hookAndGate` (a fake `claude`: named in the hook, the
   gate's listing and advice, inbox and the banner; read once, never for a
   turn with only its own records) and

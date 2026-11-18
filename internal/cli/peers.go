@@ -68,10 +68,11 @@ func worktreeSessionNotes(c *config.Config) sessionNote {
 // path marked main hourly, and "latest record" credited it there). So a
 // session that moved after its last wt command stays credited to that
 // command's window until its next one, for up to a day (#251 rounds 3-5,
-// accepted: at worst a wrong name, the collision still shows). Marks can't
-// track a move: they are hourly per window and skipped where the session
-// wrote anything in the last hour, and each rule that let a later mark win
-// misplaced another realistic sequence. Not the listing's cwd either: that
+// accepted: at worst a wrong name, the collision still shows). A later mark
+// can't be told from by-path work elsewhere, or from a mark skipped for an
+// hour where the session wrote anything, and each rule that let a later
+// mark win misplaced another realistic sequence. Not the listing's cwd
+// either: that
 // is where a session was STARTED, and sessions started in a parent folder
 // (5 of 6 on the owner's machine) are in no worktree. A session with no
 // recent record here is named on no collision. Keyed by realPath of the
