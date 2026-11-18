@@ -246,6 +246,11 @@ func TestLiveHolderNamed_hookAndGate(t *testing.T) {
 			t.Errorf("%s doesn't name the live holder:\n%s%s", name, out, errOut)
 		}
 	}
+	// So does the status banner's checkout-shared warning (#251 round 4).
+	peers.Reset()
+	if _, errOut := captureT(t, func() { sharedCheckoutBanner(c) }); !strings.Contains(errOut, "latest: live `api-worker`") {
+		t.Errorf("the checkout-shared banner doesn't name the live session:\n%s", errOut)
+	}
 }
 
 // listingLine is the line of out that lists record id (`<id>  <who> …`),

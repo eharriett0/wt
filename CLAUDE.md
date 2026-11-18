@@ -445,16 +445,19 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   checkout and working in a worktree by path marked main hourly, and
   "latest record" credited it there. A session started outside any
   repository writes no mark at all (the hook returns before it), so it is
-  named only through its wt commands' records. ⚠ Round 3: a newer mark in
-  another window still outranks the command's record when the session also
-  marked presence in that record's window within the day (`markedIn`: its
-  hook's cwd followed it there, so it moved back or was resumed elsewhere).
-  Without such a mark, a session started in one checkout whose last
+  named only through its wt commands' records. ⚠ Rounds 3-4: a later mark
+  in another window outranks the command's record only when the session's
+  latest mark at or before the command was in the command's window
+  (`hookAt`: its hook was there when it ran the command, so it moved back
+  or was resumed elsewhere). Round 3's rule (any mark there that day) sent
+  a session started in /r/b that cd'd to main and works in /r/b by path to
+  main on every hourly mark. Accepted costs, a wrong name at worst (the
+  collision still shows): a session started in one checkout whose last
   command ran in another stays credited to the command's window for up to
-  a day (accepted: a wrong name at worst, the collision still shows; a
-  shorter horizon would credit path workers to main again). **Never by
-  the listing's
-  `cwd`** either: that is where the session was STARTED. Measured on the
+  a day (a shorter horizon would credit path workers to main again); one
+  that worked in /r/b, cd'd to main and works in /r/b by path with no
+  command since reads as a move. **Never by the listing's `cwd`** either:
+  that is where the session was STARTED. Measured on the
   owner's machine: 5 of 6 live sessions started in a parent folder outside
   every repository and work in worktrees by path, so the first version
   (deepest worktree holding the cwd) named nobody, or the wrong window. A
@@ -471,13 +474,16 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   status banner), by the record's raw session id ("live as `api-worker`,
   idle: ask it with SendMessage"): the one case a directory can't settle,
   two sessions in one checkout; (3) **`other_sessions`** (`coord.NameLive`:
-  `status --json`, doctor, MCP) carries `name`/`status`, and
-  `SharedCheckoutWarning` names a live latest session in place of its id
-  (line 1's budget); its /clear hint needs a tagged session not listed live
-  (round 3: an older one keeps it when the latest is live). The push phase first planned (wt posting into sessions'
-  inbox sockets) was dropped: it duplicated `SendMessage`, woke idle
-  sessions, and relied on an undocumented line format. `internal/peers` reads `claude
-  agents --json`, which Claude Code documents as the supported way to read
+  `status --json`, doctor, MCP; the `wt status` banner too, round 4)
+  carries `name`/`status`, and `SharedCheckoutWarning` names a live latest
+  session as live `name` in place of its id, cut to what line 1's 160 runes
+  leave (8 to 24; round 4: a token-less self, ten others and a day-old
+  latest ran it to 178); its /clear hint needs a tagged session not listed
+  live (round 3: an older one keeps it when the latest is live). The push
+  phase first planned (wt posting into sessions' inbox sockets) was
+  dropped: it duplicated `SendMessage`, woke idle sessions, and relied on
+  an undocumented line format. `internal/peers` reads `claude agents
+  --json`, which Claude Code documents as the supported way to read
   session state from outside (`peers.Live`: `claude` on PATH, else
   `CLAUDE_CODE_EXECPATH`, the binary running the session, since the VS Code
   extension puts none on PATH; `Timeout` 2s; memoized 10s, so a command reads

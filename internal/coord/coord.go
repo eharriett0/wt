@@ -1464,13 +1464,19 @@ func SharedCheckoutWarning(others []SessionActivity, self Self, now time.Time) s
 	// so the session before it reads as another one. Said only between two
 	// tagged sessions, as the hold gate's hint is.
 	// #250: a session live on this machine is named as SendMessage addresses
-	// it, in place of its id; a long name is cut to keep line 1 within its
-	// budget. A live session is not this one before a /clear (the listing keys
+	// it, in place of its id; the name gets what line 1's 160 runes leave, 8
+	// to 24 (#251 round 4: a token-less self, ten others and a day-old latest
+	// ran a 24-rune name to 178). A live session is not this one before a /clear (the listing keys
 	// a session by its current id), so the hint needs a tagged session that
 	// isn't listed live (#251 round 3: an older one, when the latest is).
+	line1 := func(latestName string) string {
+		return fmt.Sprintf("checkout shared — %s active in THIS checkout in the last %dh (latest: %s, %s); you: %s.",
+			who, int(SharedCheckoutWindow.Hours()), latestName, ago(now.Sub(latest.Last)), you)
+	}
 	latestName := ShortSession(latest.Session)
 	if latest.Name != "" {
-		latestName = "live session `" + cutRunes(latest.Name, 24) + "`"
+		room := 160 - len([]rune(line1("live ``")))
+		latestName = "live `" + cutRunes(latest.Name, max(8, min(24, room))) + "`"
 	}
 	end := "."
 	if self.Session != SessionNone && len(others) == 1 && latest.Session != SessionNone && latest.Name == "" {
@@ -1481,9 +1487,7 @@ func SharedCheckoutWarning(others []SessionActivity, self Self, now time.Time) s
 			end = "; one may be you, before a /clear."
 		}
 	}
-	return fmt.Sprintf("checkout shared — %s active in THIS checkout in the last %dh (latest: %s, %s); you: %s.\n"+
-		"  One working tree, no file-level warning between you: give one its own worktree (`wt new <branch>`); its holds: `wt inbox`%s",
-		who, int(SharedCheckoutWindow.Hours()), latestName, ago(now.Sub(latest.Last)), you, end)
+	return line1(latestName) + "\n  One working tree, no file-level warning between you: give one its own worktree (`wt new <branch>`); its holds: `wt inbox`" + end
 }
 
 // Thresholds for HoldLooksOrphaned (#163). A hold this old, or whose session has

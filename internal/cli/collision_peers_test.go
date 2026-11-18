@@ -67,6 +67,41 @@ func TestSessionsByWindow(t *testing.T) {
 	}
 }
 
+// #251 rounds 3-4: a later mark in another window outranks a wt command's
+// record only when the session's latest mark at or before the command was in
+// the command's window (its hook was there when it ran it).
+func TestSessionsByWindow_laterMark(t *testing.T) {
+	now := time.Now()
+	at := func(d time.Duration) string { return now.Add(-d).UTC().Format(time.RFC3339) }
+	mark := func(w string, d time.Duration) coord.Record {
+		return coord.Record{Kind: coord.KindPresence, Window: w, Session: "s", TS: at(d)}
+	}
+	cmd := func(w string, d time.Duration) coord.Record {
+		return coord.Record{Kind: coord.KindAnnounce, Window: w, Session: "s", TS: at(d)}
+	}
+	h, m := time.Hour, time.Minute
+	cases := []struct {
+		name string
+		recs []coord.Record
+		want string
+	}{
+		{"moved on after its command", []coord.Record{mark("/r/a", 4*h), cmd("/r/a", 3*h), mark("/r/b", 20*m)}, "/r/b"},
+		{"a mark the same second as its command counts", []coord.Record{mark("/r/a", 2*h), cmd("/r/a", 2*h), mark("/r/b", h)}, "/r/b"},
+		{"marks in three windows: the latest", []coord.Record{mark("/r/a", 5*h), cmd("/r/a", 4*h), mark("/r/c", 2*h), mark("/r/b", h)}, "/r/b"},
+		{"started in main, works by path", []coord.Record{cmd("/r/b", 2*h), mark("/r/main", 5*m)}, "/r/b"},
+		{"started in b, cd'd to main, works in b by path", []coord.Record{mark("/r/b", 8*h), mark("/r/main", 7*h), cmd("/r/b", 2*h), mark("/r/main", 5*m)}, "/r/b"},
+		{"its command is newer than its marks", []coord.Record{mark("/r/b", 5*h), mark("/r/main", 4*h), cmd("/r/b", h)}, "/r/b"},
+		{"a mark elsewhere the same second: its hook was there, the record wins", []coord.Record{mark("/r/a", 3*h), cmd("/r/a", 2*h), mark("/r/b", 2*h)}, "/r/a"},
+		{"a mark from yesterday doesn't count", []coord.Record{mark("/r/a", 25*h), cmd("/r/a", 3*h), mark("/r/b", h)}, "/r/a"},
+	}
+	live := map[string]peers.Peer{"s": {SessionID: "s", Name: "n", PID: 1}}
+	for _, tc := range cases {
+		if by := sessionsByWindow(tc.recs, live, nil, now); len(by) != 1 || len(by[tc.want]) != 1 {
+			t.Errorf("%s: sessionsByWindow = %v, want s in %s", tc.name, by, tc.want)
+		}
+	}
+}
+
 func TestCollisionNote(t *testing.T) {
 	if got := collisionNote(nil); got != "" {
 		t.Errorf("no sessions: %q", got)

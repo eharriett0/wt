@@ -1329,7 +1329,9 @@ func sharedCheckoutBanner(c *config.Config) {
 		return
 	}
 	now := time.Now()
-	if msg := coord.SharedCheckoutWarning(coord.OtherSessions(checkoutActivity(c, recs, now), self, now, coord.SharedCheckoutWindow), self, now); msg != "" {
+	others := coord.OtherSessions(checkoutActivity(c, recs, now), self, now, coord.SharedCheckoutWindow)
+	coord.NameLive(others, livePeerName) // #250 round 4: as doctor does
+	if msg := coord.SharedCheckoutWarning(others, self, now); msg != "" {
 		ui.Warn("%s", msg)
 	}
 }
