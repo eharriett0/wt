@@ -196,7 +196,12 @@ func parseBaseConf(out string) (BaseConf, error) {
 
 // OriginRepo is the host, owner and name origin's URL points at ("" each when
 // there is no origin or it is a local path).
-func OriginRepo() (host, owner, name string) { return parseRemoteRepo(gitx.RemoteURL("origin")) }
+func OriginRepo() (host, owner, name string) { return RemoteRepo("origin") }
+
+// RemoteRepo is OriginRepo for any configured remote.
+func RemoteRepo(remote string) (host, owner, name string) {
+	return parseRemoteRepo(gitx.RemoteURL(remote))
+}
 
 // parseRemoteRepo reads a git remote URL's host and <owner>/<name> path (a
 // trailing .git and slash dropped): scp-style `git@host:owner/name.git`, and

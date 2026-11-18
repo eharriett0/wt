@@ -383,13 +383,22 @@ var fetchTimeout = 30 * time.Second
 // as last fetched.
 var baseFetchTimeout = 120 * time.Second
 
+// FetchTimeoutError is a no-prompt fetch that ran out of its budget: the
+// remote took the connection and never finished. A caller with somewhere else
+// to fetch from stops there (#243 review: each try costs the whole budget).
+type FetchTimeoutError struct{ msg string }
+
+func (e *FetchTimeoutError) Error() string { return e.msg }
+
 func fetchNoPrompt(remote, refspec string, budget time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	// A stalled HTTPS transfer gives up after 15s below 1 byte/s; ssh's
-	// connect after 10s (below).
+	// connect after 10s (below). `--end-of-options` (git 2.24+): git accepts a
+	// remote named `--upload-pack=<cmd>`, and as an option that ran <cmd>
+	// (#243 review).
 	cmd := exec.CommandContext(ctx, "git", "-c", "http.lowSpeedLimit=1", "-c", "http.lowSpeedTime=15",
-		"fetch", "--no-prune", remote, refspec)
+		"fetch", "--no-prune", "--end-of-options", remote, refspec)
 	stopGroupOnCancel(cmd)
 	// A transport helper (git-remote-http, ssh) can hold the output pipe
 	// past the cancel: stop waiting on it, and SIGKILL the leader (measured:
@@ -409,7 +418,7 @@ func fetchNoPrompt(remote, refspec string, budget time.Duration) error {
 	cmd.Stderr = &stderr
 	if _, err := cmd.Output(); err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			return fmt.Errorf("git fetch %s %s did not finish in %s", remote, refspec, budget)
+			return &FetchTimeoutError{fmt.Sprintf("git fetch %s %s did not finish in %s", remote, refspec, budget)}
 		}
 		if msg := gitStderr(stderr.String()); msg != "" {
 			return fmt.Errorf("%w: %s", err, msg)
@@ -1124,6 +1133,16 @@ func RemoteURL(remote string) string {
 		return ""
 	}
 	return strings.TrimSpace(out)
+}
+
+// Remotes lists the configured remotes' names, in `git remote` order; nil on
+// error.
+func Remotes() []string {
+	out, err := Run("remote")
+	if err != nil {
+		return nil
+	}
+	return strings.Fields(out)
 }
 
 // BehindCount returns how many commits base is ahead of head (`git rev-list
