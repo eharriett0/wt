@@ -127,8 +127,9 @@ shows from its first prompt: its per-turn hook marks the session present at
 most once an hour (a `presence` record, never shown as an announcement). A
 session seen only through those marks is listed while its latest is under 2h
 old, so the session after a `/clear` (a new id) isn't warned about its own
-past for a day. Marks are written per prompt, so a session in one long turn
-with no prompt for 2h drops out until its next; a session with any other
+past for a day. Marks are written per prompt, at most hourly, so a session
+drops out 1 to 2h after its last prompt (2h after its last mark), as in one
+long turn, until it prompts again; a session with any other
 record (an announcement, a reservation) stays listed for 24h. `wt
 prune-coord` drops marks older than a day, which `wt doctor` lists without a
 warning. One without the hooks shows only once it runs a coordination

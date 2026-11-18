@@ -401,8 +401,9 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   day's window, and its marks still date it; the warning adds "or it was
   you, before a /clear" between two tagged sessions ("one may be you" for
   several). ⚠ Marks come only from the per-turn hooks (UserPromptSubmit),
-  so a session in one long autonomous turn with no prompt for 2h drops out
-  until its next prompt (round-3 review, accepted: main had no signal for
+  at most hourly, so a session drops out 1 to 2h after its last prompt (2h
+  after its last mark), as in one long autonomous turn, until it prompts
+  again (round-3 and round-4 reviews, accepted: main had no signal for
   it at all, and any other record keeps a session for the day). An older
   wt, and a `wt mcp` started before the upgrade, still list marks-only
   sessions for 24h. ⚠ A mark also sets the
