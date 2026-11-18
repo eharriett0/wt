@@ -185,6 +185,34 @@ func TestLiveHolderNamed_hookAndGate(t *testing.T) {
 		!strings.Contains(errOut, "bhold: its session is live as `api-worker`, idle: ask it with SendMessage to release it") {
 		t.Errorf("merge gate (code %d) doesn't name the live holder in its listing and advice:\n%s", code, errOut)
 	}
+	// status --json, MCP wt_status and doctor --json carry its name and status
+	// in other_sessions.
+	peers.Reset()
+	stOut, _ := captureT(t, func() { cmdStatus([]string{"--json"}) })
+	var st StatusPayload
+	if err := json.Unmarshal([]byte(stOut), &st); err != nil {
+		t.Fatalf("status --json: %v\n%s", err, stOut)
+	}
+	if len(st.OtherSessions) != 1 || st.OtherSessions[0].Name != "api-worker" || st.OtherSessions[0].Status != "idle" {
+		t.Errorf("status --json other_sessions = %+v, want claude-B named api-worker, idle", st.OtherSessions)
+	}
+	peers.Reset()
+	if text, _ := mcpStatus(c, false); !strings.Contains(text, `"name": "api-worker"`) {
+		t.Errorf("wt_status doesn't name the live session:\n%s", text)
+	}
+	peers.Reset()
+	dOut, _ := captureT(t, func() { cmdDoctor([]string{"--json"}) })
+	var d struct {
+		Coord struct {
+			OtherSessions []coord.SessionActivity `json:"other_sessions"`
+		} `json:"coord"`
+	}
+	if err := json.Unmarshal([]byte(dOut), &d); err != nil {
+		t.Fatalf("doctor --json: %v\n%s", err, dOut)
+	}
+	if len(d.Coord.OtherSessions) != 1 || d.Coord.OtherSessions[0].Name != "api-worker" {
+		t.Errorf("doctor --json other_sessions = %+v, want claude-B named api-worker", d.Coord.OtherSessions)
+	}
 	// `wt inbox` and the status banner list it the same way.
 	for name, show := range map[string]func(){
 		"inbox":  func() { cmdInbox(nil) },

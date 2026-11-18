@@ -1203,6 +1203,28 @@ type SessionActivity struct {
 	Session string    `json:"session"`
 	Records int       `json:"records"`
 	Last    time.Time `json:"last"`
+	// Name and Status: the session's, when it is live on this machine
+	// (NameLive, #250); empty when it isn't listed, or the listing is unread.
+	Name   string `json:"name,omitempty"`
+	Status string `json:"status,omitempty"`
+}
+
+// NameLive fills Name and Status for each of others that lookup finds live
+// (#250: the caller's `claude agents` listing). A token-less session is never
+// looked up, and nil names none. Annotation only: a session lookup doesn't
+// find stays listed.
+func NameLive(others []SessionActivity, lookup func(session string) (name, status string, ok bool)) {
+	if lookup == nil {
+		return
+	}
+	for i := range others {
+		if others[i].Session == "" || others[i].Session == SessionNone {
+			continue
+		}
+		if name, status, ok := lookup(others[i].Session); ok {
+			others[i].Name, others[i].Status = name, status
+		}
+	}
 }
 
 // OtherSessions reports the sessions OTHER than self's that wrote records under

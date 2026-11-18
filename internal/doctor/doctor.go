@@ -17,8 +17,24 @@ import (
 	"github.com/eharriett0/wt/internal/ghx"
 	"github.com/eharriett0/wt/internal/gitx"
 	"github.com/eharriett0/wt/internal/hooks"
+	"github.com/eharriett0/wt/internal/peers"
 	"github.com/eharriett0/wt/internal/ui"
 )
+
+// livePeers is peers.Live; a var so a test can say which sessions are live
+// (#250).
+var livePeers = peers.Live
+
+// livePeerName is coord.NameLive's lookup: the `claude agents` listing, where
+// a listing wt can't read names nobody.
+func livePeerName(session string) (name, status string, ok bool) {
+	live, read := livePeers()
+	if !read {
+		return "", "", false
+	}
+	p, ok := live[session]
+	return p.Name, p.Status, ok
+}
 
 // pruneBlockMaxAge mirrors `wt prune-coord`'s default so the prunable-record
 // preview in `wt doctor` matches what a prune would actually drop.
@@ -433,6 +449,7 @@ func coordHealth(c *config.Config) *CoordHealth {
 	// repository's, coord.CheckoutActivity) are evidence it shares the
 	// checkout, with or without a coordination log.
 	h.OtherSessions = coord.OtherSessions(coord.CheckoutActivity(nil, ledger, repoName(c)), self, time.Now(), coord.SharedCheckoutWindow)
+	coord.NameLive(h.OtherSessions, livePeerName) // #250
 	if _, err := os.Stat(path); err != nil {
 		return h // per-repo coord log not created yet — ledger reserves already counted
 	}
@@ -446,6 +463,7 @@ func coordHealth(c *config.Config) *CoordHealth {
 	h.Records = len(recs)
 	h.OwnOpen = len(coord.OwnOpenAnnouncements(recs, self))
 	h.OtherSessions = coord.OtherSessions(coord.CheckoutActivity(recs, ledger, repoName(c)), self, time.Now(), coord.SharedCheckoutWindow)
+	coord.NameLive(h.OtherSessions, livePeerName) // #250
 	if _, p := coord.PruneRecords(recs, time.Now(), pruneBlockMaxAge); p > 0 {
 		h.Prunable += p
 	}

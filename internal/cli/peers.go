@@ -26,6 +26,12 @@ func livePeerOf(session string) (peers.Peer, bool) {
 	return p, ok
 }
 
+// livePeerName is coord.NameLive's lookup, through livePeerOf.
+func livePeerName(session string) (name, status string, ok bool) {
+	p, ok := livePeerOf(session)
+	return p.Name, p.Status, ok
+}
+
 // postedByLive is postedBy plus, for another party's record whose session is
 // live on this machine, its name and status and how to reach it (#250): an
 // agent blocked by a hold can ask the holder with SendMessage. Yours, and a

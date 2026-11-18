@@ -906,3 +906,23 @@ func TestCheckoutActivity(t *testing.T) {
 		t.Errorf("the log's records changed: %v", log)
 	}
 }
+
+// #250: NameLive names the sessions its lookup finds live, and only those.
+func TestNameLive(t *testing.T) {
+	others := []SessionActivity{{Session: "B"}, {Session: "C"}, {Session: SessionNone}}
+	asked := 0
+	NameLive(others, func(s string) (string, string, bool) {
+		asked++
+		if s == SessionNone {
+			t.Errorf("a token-less session was looked up")
+		}
+		if s == "B" {
+			return "api-worker", "idle", true
+		}
+		return "", "", false
+	})
+	if others[0].Name != "api-worker" || others[0].Status != "idle" || others[1].Name != "" || others[2].Name != "" || asked != 2 {
+		t.Errorf("NameLive = %+v (asked %d), want B named only", others, asked)
+	}
+	NameLive(others, nil) // no lookup: nothing changes, no panic
+}

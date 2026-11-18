@@ -798,7 +798,9 @@ func statusSessions(c *config.Config, now time.Time) (session string, others []c
 	if err != nil {
 		return self.Session, nil, err.Error()
 	}
-	return self.Session, coord.OtherSessions(checkoutActivity(c, recs, now), self, now, coord.SharedCheckoutWindow), ""
+	others = coord.OtherSessions(checkoutActivity(c, recs, now), self, now, coord.SharedCheckoutWindow)
+	coord.NameLive(others, livePeerName) // #250
+	return self.Session, others, ""
 }
 
 // checkoutActivity is the log's records plus this repository's recent block
