@@ -148,6 +148,34 @@ func TestSectionDeletions_MatchMergeTree(t *testing.T) {
 			wa:       []func(*testing.T, string){edit("## Beta\nb1\nb2\nb3\nb4\nb5\nb6\nb7\n", "")},
 			wb:       []func(*testing.T, string){edit("b6\n", "Xb6\n")},
 			conflict: true, high: true},
+		// #247: main changes a heading after wa forks, so wa's own copies put
+		// its edit under the heading it forked with, while wb's copy (current)
+		// has main's. Each held against git from both windows.
+		{name: "R1: main renames Beta; behind wa and current wb edit b2", plan: deletePlan,
+			main:     edit("## Beta\n", "## Beta v2\n"),
+			wa:       []func(*testing.T, string){edit("b2\n", "Xb2\n")},
+			wb:       []func(*testing.T, string){edit("b2\n", "Yb2\n")},
+			conflict: true, high: true},
+		{name: "R2: main renames Beta; behind wa deletes b2-b3, wb edits b2", plan: deletePlan,
+			main:     edit("## Beta\n", "## Beta v2\n"),
+			wa:       []func(*testing.T, string){edit("b2\nb3\n", "")},
+			wb:       []func(*testing.T, string){edit("b2\n", "Yb2\n")},
+			conflict: true, high: true},
+		{name: "SPLIT: main adds a heading before b2; wa and wb edit b3", plan: deletePlan,
+			main:     edit("b2\n", "## Split\nb2\n"),
+			wa:       []func(*testing.T, string){edit("b3\n", "Xb3\n")},
+			wb:       []func(*testing.T, string){edit("b3\n", "Yb3\n")},
+			conflict: true, high: true},
+		{name: "MERGE: main removes ## Beta; wa and wb edit b3", plan: deletePlan,
+			main:     edit("## Beta\n", ""),
+			wa:       []func(*testing.T, string){edit("b3\n", "Xb3\n")},
+			wb:       []func(*testing.T, string){edit("b3\n", "Yb3\n")},
+			conflict: true, high: true},
+		// And base's frame claims no more than the edit's own section there.
+		{name: "main renames Beta; behind wa edits Alpha, wb edits Beta", plan: deletePlan,
+			main: edit("## Beta\n", "## Beta v2\n"),
+			wa:   []func(*testing.T, string){edit("a2\n", "Xa2\n")},
+			wb:   []func(*testing.T, string){edit("b5\n", "Yb5\n")}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -168,6 +196,79 @@ func TestSectionDeletions_MatchMergeTree(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// #247: with no base branch (the default branch is neither main nor master,
+// no origin/HEAD, no `base` in .wt.conf), a window's uncommitted edits are
+// read from HEAD, deletions included (B2: deleting the section the other
+// window edits read advisory). Committed changes aren't compared there at
+// all (B1: no entry), and `wt check` says so instead of a silent clear.
+func TestSectionGrade_NoBase(t *testing.T) {
+	offlineGH(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("WT_SKIP_COLLISION", "")
+	t.Chdir(t.TempDir())
+	root := t.TempDir()
+	gitT(t, root, "init", "-q", "-b", "trunk")
+	gitT(t, root, "config", "user.email", "t@t.test")
+	gitT(t, root, "config", "user.name", "t")
+	conf := "shared_docs = PLAN.md\nstructured_doc.PLAN.md = ^##\\s\n"
+	writeT(t, root, ".wt.conf", conf)
+	writeT(t, root, "PLAN.md", deletePlan)
+	gitT(t, root, "add", "-A")
+	gitT(t, root, "commit", "-qm", "base")
+	dirs := t.TempDir()
+	wa, wb := filepath.Join(dirs, "wa"), filepath.Join(dirs, "wb")
+	gitT(t, root, "worktree", "add", "-q", "-b", "wa", wa, "trunk")
+	gitT(t, root, "worktree", "add", "-q", "-b", "wb", wb, "trunk")
+	writeT(t, wa, "PLAN.md", strings.Replace(deletePlan, "b2\n", "Xb2\n", 1))
+	writeT(t, wb, "PLAN.md", strings.Replace(deletePlan, "## Beta\nb1\nb2\nb3\nb4\nb5\nb6\nb7\n", "", 1))
+
+	// B2: both uncommitted.
+	for _, w := range []struct{ dir, branch, other string }{{wa, "wa", "wb"}, {wb, "wb", "wa"}} {
+		if e := planEntry(t, w.dir, w.other); e.Category != CatBlocking {
+			t.Errorf("B2, wt check from %s: %s %v, want HIGH", w.branch, e.Category, e.SharedSections)
+		}
+	}
+
+	// B1: both committed. git conflicts; wt has no base to compare commits
+	// against, so it says so (text and JSON) rather than a bare clear.
+	for _, w := range []string{wa, wb} {
+		gitT(t, w, "commit", "-qam", "change")
+	}
+	if !mergeTreeConflicts(t, root, false) {
+		t.Fatal("precondition: git merge-tree doesn't conflict wa and wb")
+	}
+	t.Chdir(wa)
+	_, errOut := captureOutputForTest(t, func() { cmdCheck([]string{"PLAN.md"}) })
+	if !strings.Contains(errOut, "no base branch resolves here") {
+		t.Errorf("B1: wt check doesn't say committed changes aren't compared:\n%s", errOut)
+	}
+	out, _ := captureOutputForTest(t, func() { cmdCheck([]string{"--json", "PLAN.md"}) })
+	if !strings.Contains(out, `"base_unresolved": true`) {
+		t.Errorf("B1: wt check --json lacks base_unresolved:\n%s", out)
+	}
+	c, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text, isErr := mcpCheck(c, []string{"PLAN.md"}, false, false); isErr || !strings.Contains(text, `"base_unresolved": true`) {
+		t.Errorf("B1: MCP wt_check lacks base_unresolved (isError %v):\n%s", isErr, text)
+	}
+
+	// With a base, no note, and the committed shape grades HIGH.
+	writeT(t, wa, ".wt.conf", conf+"base = trunk\n")
+	writeT(t, wb, ".wt.conf", conf+"base = trunk\n")
+	_, errOut = captureOutputForTest(t, func() { cmdCheck([]string{"PLAN.md"}) })
+	if strings.Contains(errOut, "no base branch") {
+		t.Errorf("with base = trunk, wt check still says no base:\n%s", errOut)
+	}
+	if out, _ := captureOutputForTest(t, func() { cmdCheck([]string{"--json", "PLAN.md"}) }); strings.Contains(out, "base_unresolved") {
+		t.Errorf("with base = trunk, --json carries base_unresolved:\n%s", out)
+	}
+	if e := planEntry(t, wa, "wb"); e.Category != CatBlocking {
+		t.Errorf("with base = trunk, committed: %s %v, want HIGH", e.Category, e.SharedSections)
 	}
 }
 

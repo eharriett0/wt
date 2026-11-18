@@ -507,6 +507,16 @@ func printOtherHunks(e CheckEntry) {
 type CheckPayload struct {
 	Blocking bool         `json:"blocking"`
 	Entries  []CheckEntry `json:"entries"`
+	// BaseUnresolved: no base branch resolves, so windows' committed changes
+	// were not compared, only their uncommitted edits (#247). A file another
+	// window only committed is then absent, not clear.
+	BaseUnresolved bool `json:"base_unresolved,omitempty"`
+}
+
+// noBaseNote is the one line `wt check` prints when no base branch
+// resolves (#247).
+func noBaseNote(base string) string {
+	return fmt.Sprintf("no base branch resolves here (neither origin/%s nor %s): windows' committed changes are not compared, only their uncommitted edits, so a file another window only committed reads clear. Set `base` in .wt.conf to the branch windows start from.", base, base)
 }
 
 // buildCheckPayload filters stale entries (unless includeStale) and computes the
@@ -525,8 +535,9 @@ func buildCheckPayload(entries []CheckEntry, includeStale bool) CheckPayload {
 	return p
 }
 
-func renderCheckJSON(entries []CheckEntry, includeStale bool) int {
+func renderCheckJSON(entries []CheckEntry, includeStale, baseUnresolved bool) int {
 	p := buildCheckPayload(entries, includeStale)
+	p.BaseUnresolved = baseUnresolved
 	b, _ := json.MarshalIndent(p, "", "  ")
 	fmt.Println(string(b))
 	if p.Blocking {

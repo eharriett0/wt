@@ -132,6 +132,108 @@ func TestChangedDocEdits_BehindReadsTheMergeBase(t *testing.T) {
 	}
 }
 
+// A window behind base also carries its edits in base's frame, with base's
+// copy (#247): base renamed or added a heading after it forked, so its own
+// copies put its edits under headings a current window's copy lacks. The
+// claims are ChangedRanges' (mapHunksToBase), an insertion as a Gap.
+func TestChangedDocEdits_BehindAlsoInBasesFrame(t *testing.T) {
+	for _, tc := range []struct {
+		name, main, mine string
+		base             []LineRange
+	}{
+		{"main renames Beta; wa edits b2",
+			"# Plan\n## Alpha\na1\na2\n## Beta two\nb1\nb2\nb3\n",
+			"# Plan\n## Alpha\na1\na2\n## Beta\nb1\nXb2\nb3\n",
+			[]LineRange{{Start: 7, End: 7}}},
+		{"main splits Beta before b2; wa edits b3",
+			"# Plan\n## Alpha\na1\na2\n## Beta\nb1\n## Split\nb2\nb3\n",
+			"# Plan\n## Alpha\na1\na2\n## Beta\nb1\nb2\nXb3\n",
+			[]LineRange{{Start: 9, End: 9}}},
+		{"main splits Beta; wa inserts after b3",
+			"# Plan\n## Alpha\na1\na2\n## Beta\nb1\n## Split\nb2\nb3\n",
+			"# Plan\n## Alpha\na1\na2\n## Beta\nb1\nb2\nb3\nb4\n",
+			[]LineRange{{Start: 9, End: 10, Gap: true}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := docRepo(t)
+			wt := filepath.Join(t.TempDir(), "wa")
+			runGit(t, dir, "worktree", "add", "-q", "-b", "wa", wt)
+			writeFile(t, dir, "PLAN.md", tc.main)
+			runGit(t, dir, "commit", "-qam", "main moves on")
+			writeFile(t, wt, "PLAN.md", tc.mine)
+			e := ChangedDocEdits(wt, "main", "PLAN.md")
+			if !reflect.DeepEqual(e.Base, tc.base) || e.BaseCopy != tc.main || e.All {
+				t.Errorf("Base = %v, BaseCopy = %q, All = %v; want %v, main's copy, false", e.Base, e.BaseCopy, e.All, tc.base)
+			}
+			if e.Old != docBase {
+				t.Errorf("Old = %q, want the merge base's copy still", e.Old)
+			}
+			if p, ok := ChangedDocEditsWith(wt, "main", "PLAN.md", []byte(tc.mine)); !ok || !reflect.DeepEqual(p, e) {
+				t.Errorf("pending: %+v, want %+v", p, e)
+			}
+		})
+	}
+}
+
+// Only a behind window gets base-frame claims, and only while base has the
+// doc; base's own diff failing is All (#247).
+func TestChangedDocEdits_BaseClaimsOnlyWhenBehind(t *testing.T) {
+	dir := docRepo(t)
+	writeFile(t, dir, "PLAN.md", "# Plan\n## Alpha\nXa1\na2\n## Beta\nb1\nb2\nb3\n")
+	if e := ChangedDocEdits(dir, "main", "PLAN.md"); e.Base != nil || e.BaseCopy != "" {
+		t.Errorf("up to date with base: Base = %v, BaseCopy = %q; want none", e.Base, e.BaseCopy)
+	}
+	writeFile(t, dir, "PLAN.md", docBase)
+	wt := filepath.Join(t.TempDir(), "wa")
+	runGit(t, dir, "worktree", "add", "-q", "-b", "wa", wt)
+	runGit(t, dir, "rm", "-q", "PLAN.md")
+	runGit(t, dir, "commit", "-qm", "main deletes the doc")
+	writeFile(t, wt, "PLAN.md", "# Plan\n## Alpha\nXa1\na2\n## Beta\nb1\nb2\nb3\n")
+	if e := ChangedDocEdits(wt, "main", "PLAN.md"); e.Base != nil || e.All || len(e.New) == 0 {
+		t.Errorf("base deleted the doc: %+v; want the window's own edits, no base claims, not All", e)
+	}
+	runGit(t, dir, "checkout", "-q", "HEAD~1", "--", "PLAN.md")
+	writeFile(t, dir, "PLAN.md", "# Plan\n## Alpha\na1\na2\n## Beta two\nb1\nb2\nb3\n")
+	runGit(t, dir, "add", "PLAN.md")
+	runGit(t, dir, "commit", "-qm", "main restores it, renamed")
+	failGit(t, func(args []string) bool { return len(args) > 3 && args[0] == "diff" && args[3] == "main" })
+	if e := ChangedDocEdits(wt, "main", "PLAN.md"); !e.All {
+		t.Errorf("base's diff failing: %+v, want All", e)
+	}
+}
+
+// With no base, the section grade reads one diff from HEAD, both sides
+// (#247): deletions count, in HEAD's copy, staged and unstaged alike.
+func TestChangedDocEdits_NoBaseCountsDeletions(t *testing.T) {
+	dir := docRepo(t)
+	writeFile(t, dir, "PLAN.md", "# Plan\n## Alpha\nXa1\na2\n## Beta\nb1\nb2\nb3\n")
+	runGit(t, dir, "add", "PLAN.md")
+	const content = "# Plan\n## Alpha\nXa1\na2\n"
+	writeFile(t, dir, "PLAN.md", content) // Beta deleted, unstaged
+	e := ChangedDocEdits(dir, "no-such-base", "PLAN.md")
+	want := []LineRange{{Start: 3, End: 3}, {Start: 5, End: 8}}
+	if !reflect.DeepEqual(e.Deleted, want) || e.Old != docBase || e.All {
+		t.Errorf("no base: Deleted = %v, Old = %q, All = %v; want %v, HEAD's copy, false", e.Deleted, e.Old, e.All, want)
+	}
+	if p, ok := ChangedDocEditsWith(dir, "no-such-base", "PLAN.md", []byte(content)); !ok || !reflect.DeepEqual(p, e) {
+		t.Errorf("pending, no base: %+v, want %+v", p, e)
+	}
+	// A doc new since HEAD is added whole, as from a base (#244).
+	writeFile(t, dir, "NEW.md", "# New\n## A\na1\n")
+	runGit(t, dir, "add", "NEW.md")
+	if e := ChangedDocEdits(dir, "no-such-base", "NEW.md"); !e.All {
+		t.Errorf("a doc new since HEAD: %+v, want All", e)
+	}
+	// No HEAD either (an unborn branch): the uncommitted ranges, as before.
+	unborn := t.TempDir()
+	runGit(t, unborn, "init", "-q", "-b", "main")
+	writeFile(t, unborn, "PLAN.md", docBase)
+	runGit(t, unborn, "add", "PLAN.md")
+	if e := ChangedDocEdits(unborn, "no-such-base", "PLAN.md"); e.All || !reflect.DeepEqual(e.New, []LineRange{{Start: 1, End: 8}}) {
+		t.Errorf("no HEAD: %+v, want the staged ranges [1-8]", e)
+	}
+}
+
 // parseInsertGaps reads each pure insertion's old-side gap (#237 review).
 func TestParseInsertGaps(t *testing.T) {
 	diff := "@@ -0,0 +1 @@\n+top\n@@ -2 +3 @@\n-a\n+A\n@@ -9,0 +10,2 @@\n+e\n+f\n"
