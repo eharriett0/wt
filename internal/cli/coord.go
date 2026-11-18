@@ -797,7 +797,7 @@ func fmtLimit(d time.Duration) string {
 // session instead. Pure given lookup (nil: none looked up).
 func holdAdvice(holds, recs []coord.Record, v coord.View, now time.Time, lookup peerLookup) []string {
 	lines := []string{"ack it first: wt ack <id> --state \"…\"   (waives the hold for YOU only; it keeps gating every other window)"}
-	if sameCheckoutHolder(holds, v.Self) {
+	if sameCheckoutHolder(holds, v.Self, lookup) {
 		lines = append(lines, "a \"same checkout, another session\" hold may be your own from before a /clear, --fork-session or fresh start (each mints a new session id); if so, ack it")
 	}
 	if unattributedHolder(holds, v.Self) {
@@ -871,11 +871,19 @@ func newestHolds(recs []coord.Record, n int) (shown []coord.Record, more int) {
 
 // sameCheckoutHolder reports whether any hold comes from another session in
 // THIS checkout (#163). Pure.
-func sameCheckoutHolder(holds []coord.Record, self coord.Self) bool {
+func sameCheckoutHolder(holds []coord.Record, self coord.Self, lookup peerLookup) bool {
 	for _, h := range holds {
-		if self.SharesCheckout(h) {
-			return true
+		if !self.SharesCheckout(h) {
+			continue
 		}
+		// #251 review: a holder listed live is another session, not this one
+		// before a /clear (the listing keys a session by its current id).
+		if lookup != nil {
+			if _, live := lookup(h.Session); live {
+				continue
+			}
+		}
+		return true
 	}
 	return false
 }

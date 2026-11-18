@@ -273,11 +273,15 @@ session is running on this machine:
 - **A collision** (`wt check`, both edit hooks, the per-turn hook) names the
   live sessions working in the other window: `notes.txt ← wb [active] (live:
   \`api-worker\`, idle; coordinate with SendMessage)`. A session counts as
-  working in the window its latest wt record from the last day came from
-  (with the hooks installed, a session marks presence there at most hourly),
-  not the directory Claude Code reports, which is where the session was
-  started. This session is never named, and a session with no recent record
-  in the repository is named on no collision.
+  working in the window of its latest record from a wt command run there in
+  the last day (announce, ack, all-clear, a block id), else of its latest
+  presence mark. A presence mark comes from the per-turn hook and follows
+  that hook's working directory, which is where the session was started
+  unless it changed directory; a session started outside any repository
+  writes none, and is named only through the wt commands it runs. Not the
+  directory Claude Code lists either: that is where the session was started.
+  This session is never named, and a session with no recent record in the
+  repository is named on no collision.
 - **An announcement or hold** (`inbox`, the per-turn hook, `merge-pr`'s hold
   gate, the status banner) names the live session that placed it, by its
   session id: `(live as \`api-worker\`, idle: ask it with SendMessage)`. A

@@ -436,20 +436,28 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   worktree (`CheckEntry.liveNote` via `annotateLive`, or the banner's
   label map `labelSessionNotes`; `worktreeSessionNotes` reads the listing
   and this repository's log (`coord.LoadForHook`) once, on first use).
-  ⚠ **A session is credited to the window of its latest record** in the log
-  from the last `SharedCheckoutWindow` (`sessionsByWindow`; a hooked
-  session marks presence in the window it prompts from, at most hourly,
-  #197), **never by the listing's `cwd`**: that is where the session was
-  STARTED. Measured on the owner's machine: 5 of 6 live sessions started in
-  a parent folder outside every repository and work in worktrees by path,
-  and one started in a main checkout works elsewhere, so the first version
+  ⚠ **A session is credited by its records** in the log from the last
+  `SharedCheckoutWindow` (`sessionsByWindow`): the window of its latest
+  record from a wt COMMAND (announce, ack, all-clear, a block id: run where
+  the agent works), else of its latest presence mark. ⚠ #251 round 2: a
+  presence mark follows the per-turn hook's payload cwd, which is where the
+  session was started unless it cd'd, so a session started in a main
+  checkout and working in a worktree by path marked main hourly, and
+  "latest record" credited it there. A session started outside any
+  repository writes no mark at all (the hook returns before it), so it is
+  named only through its wt commands' records. **Never by the listing's
+  `cwd`** either: that is where the session was STARTED. Measured on the
+  owner's machine: 5 of 6 live sessions started in a parent folder outside
+  every repository and work in worktrees by path, so the first version
   (deepest worktree holding the cwd) named nobody, or the wrong window. A
   session with no recent record here is named on no collision, self never;
-  `realPath` resolves a window's deepest existing ancestor (git reports
-  /private/var where a record may say /var). Checked against the real
-  listing and log in another repository: a real collision named the
-  session whose latest record is in that worktree, and a window with no
-  recent live session stayed unnamed. (2) **an
+  `realPath` resolves a window's deepest existing ancestor, so a window id
+  and a worktree path compare however they were spelled. Checked against
+  the real listing and log in another repository: a real collision named
+  the session whose latest record is in that worktree, and a window with no
+  recent live session stayed unnamed. Known cost: with another process
+  holding the log's lock, the per-turn hook waits for it twice (its own
+  coordination block, then the note), ~1s more. (2) **an
   announcement or hold** (`postedByLive`: inbox, the per-turn hook through
   `labelForContext`, merge-pr's hold gate and its stale-hold warning, the
   status banner), by the record's raw session id ("live as `api-worker`,

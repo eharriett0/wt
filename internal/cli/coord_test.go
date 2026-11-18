@@ -14,6 +14,7 @@ import (
 
 	"github.com/eharriett0/wt/internal/config"
 	"github.com/eharriett0/wt/internal/coord"
+	"github.com/eharriett0/wt/internal/peers"
 )
 
 // #163: an entry from another session in THIS checkout carries the reader's own
@@ -267,8 +268,14 @@ func TestHoldersPhrase(t *testing.T) {
 	}
 	// The gate's "may be your own from before a /clear" note fires only for a
 	// same-checkout holder.
-	if !sameCheckoutHolder([]coord.Record{other, same}, self) || sameCheckoutHolder([]coord.Record{other}, self) {
+	if !sameCheckoutHolder([]coord.Record{other, same}, self, nil) || sameCheckoutHolder([]coord.Record{other}, self, nil) {
 		t.Error("sameCheckoutHolder must be true iff a holder shares this checkout")
+	}
+	// #251 review: a same-checkout holder listed live is another session, not
+	// this one before a /clear.
+	everyoneLive := func(string) (peers.Peer, bool) { return peers.Peer{Name: "x"}, true }
+	if sameCheckoutHolder([]coord.Record{other, same}, self, everyoneLive) {
+		t.Error("a live same-checkout holder still gets the /clear note")
 	}
 	if !unattributedHolder([]coord.Record{other, {Window: "/w"}}, self) || unattributedHolder([]coord.Record{other, same}, self) {
 		t.Error("unattributedHolder must be true iff a holder is unattributable in this checkout")

@@ -1432,6 +1432,15 @@ func RecentBlockLedgers(home string, now time.Time, within time.Duration) []Reco
 	return recs
 }
 
+// cutRunes is s cut to at most n runes, the cut marked with "…". Pure.
+func cutRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n-1]) + "…"
+}
+
 // SharedCheckoutWarning renders the wt doctor / wt status warning for other
 // sessions using self's checkout (#163): two lines, who and the remedy. "" when
 // there are none. others is OtherSessions' output (most recent first). The only
@@ -1455,13 +1464,15 @@ func SharedCheckoutWarning(others []SessionActivity, self Self, now time.Time) s
 	// so the session before it reads as another one. Said only between two
 	// tagged sessions, as the hold gate's hint is.
 	// #250: a session live on this machine is named as SendMessage addresses
-	// it, in place of its id (line 1 keeps its length).
+	// it, in place of its id; a long name is cut to keep line 1 within its
+	// budget. A live session is not this one before a /clear (the listing keys
+	// a session by its current id), so it gets no /clear hint.
 	latestName := ShortSession(latest.Session)
 	if latest.Name != "" {
-		latestName = "live session `" + latest.Name + "`"
+		latestName = "live session `" + cutRunes(latest.Name, 24) + "`"
 	}
 	end := "."
-	if self.Session != SessionNone && latest.Session != SessionNone {
+	if self.Session != SessionNone && latest.Session != SessionNone && latest.Name == "" {
 		end = "; or it was you, before a /clear."
 		if len(others) > 1 {
 			end = "; one may be you, before a /clear."

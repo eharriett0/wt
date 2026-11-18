@@ -23,11 +23,12 @@ func TestSessionsByWindow(t *testing.T) {
 	now := time.Now()
 	at := func(d time.Duration) string { return now.Add(-d).UTC().Format(time.RFC3339) }
 	live := map[string]peers.Peer{
-		"moved": {SessionID: "moved", Name: "mover", Cwd: "/parent", PID: 1},
-		"one":   {SessionID: "one", Name: "one", Cwd: "/parent", PID: 2},
-		"two":   {SessionID: "two", Name: "two", Cwd: "/r/b", PID: 3},
-		"self":  {SessionID: "self", Name: "me", PID: 4},
-		"stale": {SessionID: "stale", Name: "old", PID: 5},
+		"moved":           {SessionID: "moved", Name: "mover", Cwd: "/parent", PID: 1},
+		"one":             {SessionID: "one", Name: "one", Cwd: "/parent", PID: 2},
+		"two":             {SessionID: "two", Name: "two", Cwd: "/r/b", PID: 3},
+		"self":            {SessionID: "self", Name: "me", PID: 4},
+		"stale":           {SessionID: "stale", Name: "old", PID: 5},
+		"started-in-main": {SessionID: "started-in-main", Name: "path-worker", PID: 6},
 	}
 	recs := []coord.Record{
 		{Kind: coord.KindPresence, Window: "/r/a", Session: "moved", TS: at(3 * time.Hour)},
@@ -39,14 +40,18 @@ func TestSessionsByWindow(t *testing.T) {
 		{Kind: coord.KindPresence, Window: "/r/a", Session: "gone", TS: at(time.Minute)},
 		{Kind: coord.KindPresence, Window: "/r/a", Session: coord.SessionNone, TS: at(time.Minute)},
 		{Kind: coord.KindPresence, Window: "/r/a", Session: "one", TS: "undated"},
+		// #251 round 2: started in /r/main (its turns mark presence there),
+		// working in /r/b by path (its wt commands run there).
+		{Kind: coord.KindAnnounce, Window: "/r/b", Session: "started-in-main", TS: at(2 * time.Hour)},
+		{Kind: coord.KindPresence, Window: "/r/main", Session: "started-in-main", TS: at(5 * time.Minute)},
 	}
 	by := sessionsByWindow(recs, live, map[string]bool{"self": true, "my-shell": true}, now)
 	var b []string
 	for _, p := range by["/r/b"] {
 		b = append(b, p.Name)
 	}
-	if strings.Join(b, ",") != "mover,one,two" || len(by["/r/a"]) != 0 || len(by) != 1 {
-		t.Errorf("sessionsByWindow = %v, want mover (moved to /r/b), one and two in /r/b, nothing in /r/a", by)
+	if strings.Join(b, ",") != "mover,one,path-worker,two" || len(by["/r/a"]) != 0 || len(by["/r/main"]) != 0 || len(by) != 1 {
+		t.Errorf("sessionsByWindow = %v, want mover (moved to /r/b), one, path-worker (works there, marks /r/main) and two in /r/b", by)
 	}
 }
 
@@ -124,6 +129,7 @@ func TestCollisions_nameTheLiveSessionInTheOtherWindow(t *testing.T) {
 	}
 	writeT(t, root, "notes.txt", b.String())
 	writeT(t, root, "quiet.txt", "nobody edits this\n")
+	writeT(t, root, "fyi.txt", b.String())
 	gitT(t, root, "add", "-A")
 	gitT(t, root, "commit", "-qm", "base")
 	wb, wd := filepath.Join(base, "wb"), filepath.Join(base, "wd")
@@ -132,8 +138,10 @@ func TestCollisions_nameTheLiveSessionInTheOtherWindow(t *testing.T) {
 		gitT(t, root, "worktree", "add", "-q", filepath.Join(base, w), w)
 	}
 	writeT(t, wb, "notes.txt", strings.Replace(b.String(), "line 5\n", "EDITED line 5\n", 1))
+	writeT(t, wb, "fyi.txt", strings.Replace(b.String(), "line 5\n", "EDITED line 5\n", 1))
 	gitT(t, wb, "commit", "-qam", "wb edits line 5")
 	writeT(t, wd, "notes.txt", strings.Replace(b.String(), "line 6\n", "EDITED line 6\n", 1))
+	writeT(t, wd, "fyi.txt", strings.Replace(b.String(), "line 30\n", "EDITED line 30\n", 1)) // disjoint: FYI
 
 	bin := t.TempDir()
 	runs := filepath.Join(bin, "runs")
@@ -186,6 +194,14 @@ func TestCollisions_nameTheLiveSessionInTheOtherWindow(t *testing.T) {
 	}
 	if n := ran() - before; n != 1 {
 		t.Errorf("wt check ran claude %d times, want once", n)
+	}
+	// #251 round 2: the --blocking and the FYI (low) lines carry it too.
+	for _, args := range [][]string{{"--blocking", "notes.txt"}, {"fyi.txt"}} {
+		peers.Reset()
+		out, errOut := captureOutputForTest(t, func() { cmdCheck(args) })
+		if !strings.Contains(out+errOut, named) {
+			t.Errorf("wt check %v doesn't name wb's live session:\n%s%s", args, out, errOut)
+		}
 	}
 	peers.Reset()
 	before = ran()

@@ -361,17 +361,17 @@ func FetchNoPrompt(remote, branch string) error {
 	return fetchNoPrompt(remote, "+refs/heads/"+branch+":refs/remotes/"+remote+"/"+branch, baseFetchTimeout)
 }
 
-// FetchPRHeadNoPrompt fetches GitHub's refs/pull/<pr>/head from remote into
-// FETCH_HEAD only, as FetchNoPrompt fetches (#230 review): a merged PR's head
-// can be a commit this clone never had (the branch updated on GitHub, then
-// deleted with the merge), and the #187 tip check can't compare against it
-// until its objects are here. pr must be a number. No ref is written.
 // StopGroupOnCancel runs cmd in its own process group and, when its context
 // ends, signals the whole group (unix; a no-op elsewhere), so a helper the
 // command started doesn't outlive the deadline. For peers' `claude agents`
 // read too (#250 review).
 func StopGroupOnCancel(cmd *exec.Cmd) { stopGroupOnCancel(cmd) }
 
+// FetchPRHeadNoPrompt fetches GitHub's refs/pull/<pr>/head from remote into
+// FETCH_HEAD only, as FetchNoPrompt fetches (#230 review): a merged PR's head
+// can be a commit this clone never had (the branch updated on GitHub, then
+// deleted with the merge), and the #187 tip check can't compare against it
+// until its objects are here. pr must be a number. No ref is written.
 func FetchPRHeadNoPrompt(remote, pr string) error {
 	if _, err := strconv.Atoi(pr); err != nil {
 		return fmt.Errorf("not a PR number: %q", pr)

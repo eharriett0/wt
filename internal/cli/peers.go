@@ -53,21 +53,24 @@ func worktreeSessionNotes(c *config.Config) sessionNote {
 	}
 }
 
-// sessionsByWindow credits each live session, but self's, to the window of its
-// latest record in this repository's log from the last SharedCheckoutWindow:
-// where it works now (a hooked session marks presence in the window it
-// prompts from, at most hourly, #197). Not the listing's cwd: that is where a
-// session was STARTED, and sessions started in a parent folder and working in
-// worktrees by path read as outside every worktree (measured: 5 of 6 on the
-// owner's machine), or one started in a main checkout read as working there.
-// A session with no recent record here is named on no collision. Keyed by
-// realPath of the window. Pure but for resolving symlinks.
+// sessionsByWindow credits each live session, but self's, to the window it
+// works in, read from this repository's log over the last
+// SharedCheckoutWindow: the window of its latest record written by a wt
+// command (announce, ack, all-clear, a block reservation: run where the agent
+// works), else of its latest presence mark. A presence mark follows the
+// per-turn hook's cwd, where the session was started unless it cd'd (#251
+// round 2: a session started in a main checkout and working in a worktree by
+// path marked main hourly, and "latest record" credited it there). Not the
+// listing's cwd either: that is where a session was STARTED, and sessions
+// started in a parent folder (5 of 6 on the owner's machine) are in no
+// worktree. A session with no recent record here is named on no collision.
+// Keyed by realPath of the window. Pure but for resolving symlinks.
 func sessionsByWindow(recs []coord.Record, live map[string]peers.Peer, self map[string]bool, now time.Time) map[string][]peers.Peer {
 	type seen struct {
 		window string
 		at     time.Time
 	}
-	latest := map[string]seen{}
+	worked, marked := map[string]seen{}, map[string]seen{}
 	for _, r := range recs {
 		if r.Session == "" || r.Session == coord.SessionNone || self[r.Session] || r.Window == "" {
 			continue
@@ -79,26 +82,36 @@ func sessionsByWindow(recs []coord.Record, live map[string]peers.Peer, self map[
 		if err != nil || now.Sub(t) > coord.SharedCheckoutWindow {
 			continue
 		}
-		if l, ok := latest[r.Session]; !ok || !t.Before(l.at) {
-			latest[r.Session] = seen{r.Window, t}
+		m := worked
+		if r.Kind == coord.KindPresence {
+			m = marked
+		}
+		if l, ok := m[r.Session]; !ok || !t.Before(l.at) {
+			m[r.Session] = seen{r.Window, t}
 		}
 	}
-	ids := make([]string, 0, len(latest))
-	for id := range latest {
+	for id, w := range marked {
+		if _, ok := worked[id]; !ok {
+			worked[id] = w
+		}
+	}
+	ids := make([]string, 0, len(worked))
+	for id := range worked {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
 	by := map[string][]peers.Peer{}
 	for _, id := range ids {
-		w := realPath(latest[id].window)
+		w := realPath(worked[id].window)
 		by[w] = append(by[w], live[id])
 	}
 	return by
 }
 
 // realPath is p with the symlinks of its deepest existing ancestor resolved
-// and the rest kept (macOS's /var is /private/var, which is how git reports a
-// worktree there), or p cleaned when nothing of it exists.
+// and the rest kept, or p cleaned when nothing of it exists: a window id and
+// a worktree path name one directory however they were spelled (macOS's /var
+// is /private/var).
 func realPath(p string) string {
 	p = filepath.Clean(p)
 	rest := ""
