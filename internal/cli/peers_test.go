@@ -92,6 +92,12 @@ func TestPostedByLive(t *testing.T) {
 	if got := postedByLive(recs[4], v); strings.Contains(got, "live") {
 		t.Errorf("a token-less record was looked up: %q", got)
 	}
+	// This session's own token, placed from another checkout, is never
+	// "another party", live as it is.
+	own := coord.Record{ID: "e", Window: "/elsewhere", Session: "A"}
+	if got := postedByLive(own, coord.ViewOf(append(recs, own), self)); got != "yours (this session's token), placed from checkout /elsewhere" {
+		t.Errorf("this session's own record from another checkout: %q", got)
+	}
 	// A listing wt couldn't read names nobody.
 	listed = false
 	if got := postedByLive(recs[0], v); strings.Contains(got, "live") {

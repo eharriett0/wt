@@ -161,6 +161,10 @@ func TestLive_execPathFallback(t *testing.T) {
 	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho '[{\"sessionId\":\"s-9\",\"name\":\"ext\",\"pid\":9}]'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// The same program under another name: only a binary named claude is run.
+	if err := os.WriteFile(filepath.Join(dir, "other"), []byte("#!/bin/sh\necho '[{\"sessionId\":\"s-9\",\"name\":\"ext\",\"pid\":9}]'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("PATH", t.TempDir())
 	t.Setenv("WT_PEERS", "")
 	for _, tc := range []struct {
