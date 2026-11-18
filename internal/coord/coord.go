@@ -1454,6 +1454,12 @@ func SharedCheckoutWarning(others []SessionActivity, self Self, now time.Time) s
 	// #197 item 2 review: a /clear, --fork-session or restart mints a new id,
 	// so the session before it reads as another one. Said only between two
 	// tagged sessions, as the hold gate's hint is.
+	// #250: a session live on this machine is named as SendMessage addresses
+	// it, in place of its id (line 1 keeps its length).
+	latestName := ShortSession(latest.Session)
+	if latest.Name != "" {
+		latestName = "live session `" + latest.Name + "`"
+	}
 	end := "."
 	if self.Session != SessionNone && latest.Session != SessionNone {
 		end = "; or it was you, before a /clear."
@@ -1463,7 +1469,7 @@ func SharedCheckoutWarning(others []SessionActivity, self Self, now time.Time) s
 	}
 	return fmt.Sprintf("checkout shared — %s active in THIS checkout in the last %dh (latest: %s, %s); you: %s.\n"+
 		"  One working tree, no file-level warning between you: give one its own worktree (`wt new <branch>`); its holds: `wt inbox`%s",
-		who, int(SharedCheckoutWindow.Hours()), ShortSession(latest.Session), ago(now.Sub(latest.Last)), you, end)
+		who, int(SharedCheckoutWindow.Hours()), latestName, ago(now.Sub(latest.Last)), you, end)
 }
 
 // Thresholds for HoldLooksOrphaned (#163). A hold this old, or whose session has

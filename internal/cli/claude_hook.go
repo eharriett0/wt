@@ -89,7 +89,7 @@ func claudeDecision(file string, graded []pendingGrade, block bool) (string, boo
 	mixed := anyConfirmed && !allConfirmed
 	var who []string
 	for _, g := range kept {
-		w := fmt.Sprintf("%s [%s]", g.entry.Window, g.entry.Liveness)
+		w := fmt.Sprintf("%s [%s]%s", g.entry.Window, g.entry.Liveness, g.entry.liveNote)
 		switch {
 		case g.confirmed && len(g.entry.SharedSections) > 0:
 			w += " (" + sectionsString(g.entry.SharedSections) + ")" // #226: name the section, as `wt check` does
@@ -655,6 +655,12 @@ func hookClaudeEdit(r io.Reader) int {
 		return subsumedByBase(e.otherWorktree, c.Base, rel) // that window's, not a namesake's (#193)
 	})...)
 
+	if len(graded) > 0 { // #250: name the live sessions in the other windows
+		note := worktreeSessionNotes()
+		for i := range graded {
+			graded[i].entry.liveNote = note(graded[i].entry.otherWorktree)
+		}
+	}
 	if out, has := claudeDecision(rel, graded, os.Getenv("WT_CLAUDE_HOOK_BLOCK") == "1"); has {
 		fmt.Println(out)
 	}

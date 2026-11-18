@@ -253,11 +253,11 @@ func TestWindowsExcluding(t *testing.T) {
 
 func TestCodexContextMessage(t *testing.T) {
 	// no overlaps → nothing
-	if _, has := codexContextMessage(nil, "#1"); has {
+	if _, has := codexContextMessage(nil, "#1", nil); has {
 		t.Error("no overlaps → no message")
 	}
 	// an overlap whose only window IS the current one → skipped (nothing to say)
-	if _, has := codexContextMessage([]StatusOverlap{{File: "a", Windows: []string{"#1"}}}, "#1"); has {
+	if _, has := codexContextMessage([]StatusOverlap{{File: "a", Windows: []string{"#1"}}}, "#1", nil); has {
 		t.Error("overlap containing only the current window should be skipped")
 	}
 
@@ -266,7 +266,7 @@ func TestCodexContextMessage(t *testing.T) {
 		{File: "bar.go", Windows: []string{"feat/y", "#1"}, Severity: "low"},     // #1 participates → "also"
 		{File: "baz.go", Windows: []string{"feat/y", "feat/z"}, Severity: "low"}, // #1 NOT a participant → no "also"
 	}
-	msg, has := codexContextMessage(ov, "#1")
+	msg, has := codexContextMessage(ov, "#1", nil)
 	if !has {
 		t.Fatal("expected a message")
 	}
@@ -299,7 +299,7 @@ func TestCodexContextMessage_Caps(t *testing.T) {
 	for i := 0; i < codexMaxOverlapLines+5; i++ {
 		ov = append(ov, StatusOverlap{File: fmt.Sprintf("f%d.go", i), Windows: []string{"other"}, Severity: "HIGH"})
 	}
-	msg, has := codexContextMessage(ov, "#1")
+	msg, has := codexContextMessage(ov, "#1", nil)
 	if !has {
 		t.Fatal("expected a message")
 	}

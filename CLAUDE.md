@@ -425,13 +425,30 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   session's until the client restarts it, and whether a client passes its
   session id to a stdio MCP server at all is not verified. The payload's
   `session` says which one it answered as.
-- **A live Claude Code session is named, never presumed gone (#250).** Claude
-  Code's cross-session messaging (2.1.224+) addresses a session by name with
-  `SendMessage`, and wt knows each record's raw session id, so where it shows
-  another party's record (`postedByLive`: inbox, the per-turn hook through
+- **wt detects, Claude talks: a live Claude Code session is named, never
+  presumed gone (#250).** Claude Code's cross-session messaging (2.1.224+)
+  lets an agent pick and message another session itself (current versions
+  show it each session's working directory), so wt sends nothing; what an
+  agent can't see is a collision, or which of two sessions in one checkout
+  placed a hold. So wt names the session to talk to where it reports one:
+  (1) **a collision** (`wt check` text, both edit hooks advisory and deny,
+  the per-turn banner): the live sessions working in the other window's
+  worktree (`CheckEntry.liveNote` via `annotateLive`, or the banner's
+  label map `labelSessionNotes`; `worktreeSessionNotes` reads the listing
+  and `gitx.WorktreePaths` once, on first use; `assignPeers` credits a
+  session to the DEEPEST worktree holding its cwd, since worktrees nest,
+  never to self, and `realPath` resolves the deepest existing ancestor,
+  since git reports /private/var where a cwd may say /var); (2) **an
+  announcement or hold** (`postedByLive`: inbox, the per-turn hook through
   `labelForContext`, merge-pr's hold gate and its stale-hold warning, the
-  status banner) it adds a live session's name and status ("live as
-  `api-worker`, idle: ask it with SendMessage"). `internal/peers` reads `claude
+  status banner), by the record's raw session id ("live as `api-worker`,
+  idle: ask it with SendMessage"): the one case a directory can't settle,
+  two sessions in one checkout; (3) **`other_sessions`** (`coord.NameLive`:
+  `status --json`, doctor, MCP) carries `name`/`status`, and
+  `SharedCheckoutWarning` names a live latest session in place of its id
+  (line 1's budget). The push phase first planned (wt posting into sessions'
+  inbox sockets) was dropped: it duplicated `SendMessage`, woke idle
+  sessions, and relied on an undocumented line format. `internal/peers` reads `claude
   agents --json`, which Claude Code documents as the supported way to read
   session state from outside (`peers.Live`: `claude` on PATH, else
   `CLAUDE_CODE_EXECPATH`, the binary running the session, since the VS Code
@@ -452,7 +469,12 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   and the cli package's `TestMain` sets it, since a test run inside a Claude
   Code session would otherwise reach the real binary through
   `CLAUDE_CODE_EXECPATH`; a test that wants live sessions sets `livePeers`.
-  Pinned by `TestHoldAdvice_liveHolderIsAskedNotCleared`, `TestPostedByLive`,
+  Pinned by `TestCollisions_nameTheLiveSessionInTheOtherWindow` (real git,
+  a fake `claude`: check, both edit hooks in both modes and the per-turn
+  hook name the other window's session and never self or an outside one;
+  read once a command; never for a file no window contests; nothing under
+  `WT_PEERS=0`), `TestAssignPeers`, `TestLabelSessionNotes`,
+  `TestCollisionNote`, `TestHoldAdvice_liveHolderIsAskedNotCleared`, `TestPostedByLive`,
   `TestWarnStaleHolds_liveHolderIsAsked`,
   `TestLiveHolderNamed_hookAndGate` (a fake `claude`: named in the hook, the
   gate's listing and advice, inbox and the banner; read once, never for a

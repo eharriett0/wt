@@ -64,12 +64,15 @@ func windowsExcluding(labels []string, current string) []string {
 // active cross-window overlaps, EXCLUDING the current window from each "also
 // being edited by" list. Empty (has=false) when nothing another live window is
 // touching would collide. Pure — the testable core.
-func codexContextMessage(overlaps []StatusOverlap, currentLabel string) (msg string, has bool) {
+func codexContextMessage(overlaps []StatusOverlap, currentLabel string, notes map[string]string) (msg string, has bool) {
 	var lines []string
 	for _, o := range overlaps {
 		others := windowsExcluding(o.Windows, currentLabel)
 		if len(others) == 0 {
 			continue
+		}
+		for i, w := range others {
+			others[i] = w + notes[w] // #250: the live sessions in that window
 		}
 		// "also" only when THIS window is one of the participants; otherwise it's a
 		// heads-up about a file two OTHER windows are contesting (don't imply this
@@ -318,7 +321,8 @@ func hookOverlapMessage(c *config.Config) (string, bool) {
 	}
 	// Graded the way `wt check` grades from THIS window (#182) — the banner used
 	// to run its own all-windows grade and said HIGH where check said low.
-	return codexContextMessage(agentContextOverlaps(c, ws, root), collide.LabelForWorktree(ws, root))
+	overlaps, current := agentContextOverlaps(c, ws, root), collide.LabelForWorktree(ws, root)
+	return codexContextMessage(overlaps, current, labelSessionNotes(ws, current, overlaps, worktreeSessionNotes()))
 }
 
 // coordLogExists reports whether this repo has a coordination log yet — the
@@ -725,6 +729,12 @@ func hookCodexEdit(r io.Reader) int {
 			anyConfirmed = anyConfirmed || g.confirmed
 		}
 	}
+	if len(high) > 0 { // #250: name the live sessions in the other windows
+		note := worktreeSessionNotes()
+		for i := range high {
+			high[i].entry.liveNote = note(high[i].entry.otherWorktree)
+		}
+	}
 	if out, has := codexEditDecision(high, os.Getenv("WT_CODEX_HOOK_BLOCK") == "1" && anyConfirmed); has {
 		fmt.Println(out)
 	}
@@ -876,7 +886,7 @@ func codexEditDecision(high []codexGradedEntry, deny bool) (string, bool) {
 		if _, ok := who[e.Path]; !ok {
 			paths = append(paths, e.Path)
 		}
-		who[e.Path] = append(who[e.Path], fmt.Sprintf("%s [%s] (%s)", e.Window, e.Liveness, tag))
+		who[e.Path] = append(who[e.Path], fmt.Sprintf("%s [%s]%s (%s)", e.Window, e.Liveness, e.liveNote, tag))
 	}
 	var lines []string
 	for _, p := range paths {

@@ -18,7 +18,7 @@ import (
 func bannerLines(t *testing.T, ff *fakeFacts, ws []collide.Window, live map[string]collide.WindowLiveness, self collide.Self) []string {
 	t.Helper()
 	graded := agentOverlaps(gradeTestConfig(), ff.factory(), ws, collide.Overlaps(ws), live, self)
-	msg, has := codexContextMessage(graded, self.Label)
+	msg, has := codexContextMessage(graded, self.Label, nil)
 	if !has {
 		return nil
 	}

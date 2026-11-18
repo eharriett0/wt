@@ -88,6 +88,9 @@ type CheckEntry struct {
 	// the pre-edit hooks' #122 re-check: Window is a label, and a label can name
 	// two windows. Not in the JSON.
 	otherWorktree string
+	// liveNote names the live sessions working in that worktree (#250,
+	// annotateLive), shown after the window. Not in the JSON.
+	liveNote string
 }
 
 // subsumedByBase reports whether the other window's change to path is already
@@ -406,7 +409,7 @@ func renderCheckText(entries []CheckEntry, paths []string, includeStale, showDif
 
 	ui.Collision("%d path(s) with a HIGH-risk collision (overlapping edits by an active window):", len(blocking))
 	for _, e := range blocking {
-		line := fmt.Sprintf("   %s  %s %s [%s]", ui.Bold(e.Path), ui.Dim("←"), e.Window, e.Liveness)
+		line := fmt.Sprintf("   %s  %s %s [%s]%s", ui.Bold(e.Path), ui.Dim("←"), e.Window, e.Liveness, e.liveNote)
 		if s := spansString(e.OverlapSpans); s != "" {
 			line += "  " + ui.Yellow("overlap "+s)
 		} else if s := sectionsString(e.SharedSections); s != "" {
@@ -442,7 +445,7 @@ func renderCheckBlocking(entries []CheckEntry, paths []string) int {
 	}
 	ui.Collision("%d path(s) with a HIGH-risk collision (overlapping edits by an active window):", len(blocking))
 	for _, e := range blocking {
-		line := fmt.Sprintf("   %s  %s %s [%s]", ui.Bold(e.Path), ui.Dim("←"), e.Window, e.Liveness)
+		line := fmt.Sprintf("   %s  %s %s [%s]%s", ui.Bold(e.Path), ui.Dim("←"), e.Window, e.Liveness, e.liveNote)
 		if s := spansString(e.OverlapSpans); s != "" {
 			line += "  " + ui.Yellow("overlap "+s)
 		} else if s := sectionsString(e.SharedSections); s != "" {
@@ -455,7 +458,7 @@ func renderCheckBlocking(entries []CheckEntry, paths []string) int {
 
 func printCheckAdvisories(advisory, fyi []CheckEntry, showDiff bool) {
 	for _, e := range advisory {
-		fmt.Fprintln(os.Stderr, "   "+ui.Dim(fmt.Sprintf("%s ← %s [%s] · shared doc, advisory — coordinate sections", e.Path, e.Window, e.Liveness)))
+		fmt.Fprintln(os.Stderr, "   "+ui.Dim(fmt.Sprintf("%s ← %s [%s]%s · shared doc, advisory — coordinate sections", e.Path, e.Window, e.Liveness, e.liveNote)))
 		if showDiff {
 			printOtherHunks(e)
 		}
@@ -485,7 +488,7 @@ func printCheckAdvisories(advisory, fyi []CheckEntry, showDiff bool) {
 		if len(e.OtherRanges) == 0 {
 			msg = "append-only / low-risk"
 		}
-		fmt.Fprintln(os.Stderr, "   "+ui.Dim(fmt.Sprintf("%s ← %s [%s] · %s → low (FYI)", e.Path, e.Window, e.Liveness, msg)))
+		fmt.Fprintln(os.Stderr, "   "+ui.Dim(fmt.Sprintf("%s ← %s [%s]%s · %s → low (FYI)", e.Path, e.Window, e.Liveness, e.liveNote, msg)))
 		if showDiff {
 			printOtherHunks(e)
 		}
