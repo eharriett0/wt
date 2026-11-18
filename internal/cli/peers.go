@@ -65,23 +65,23 @@ func worktreeSessionNotes(c *config.Config) sessionNote {
 // works), else of its latest presence mark. A presence mark follows the
 // per-turn hook's cwd, where the session was started unless it cd'd (#251
 // round 2: a session started in a main checkout and working in a worktree by
-// path marked main hourly, and "latest record" credited it there). A later
-// mark in another window still wins when the session's latest mark at or
-// before that command was in the command's window: its hook was there when it
-// ran the command, so presence tracks it (#251 round 3: it moved back, or was
-// resumed elsewhere; round 4: not any mark there that day, which sent a
-// session started there, working there by path from main, to main hourly).
-// Not the listing's cwd either: that is where a session was STARTED, and sessions
-// started in a parent folder (5 of 6 on the owner's machine) are in no
-// worktree. A session with no recent record here is named on no collision.
-// Keyed by realPath of the window. Pure but for resolving symlinks.
+// path marked main hourly, and "latest record" credited it there). So a
+// session that moved after its last wt command stays credited to that
+// command's window until its next one, for up to a day (#251 rounds 3-5,
+// accepted: at worst a wrong name, the collision still shows). Marks can't
+// track a move: they are hourly per window and skipped where the session
+// wrote anything in the last hour, and each rule that let a later mark win
+// misplaced another realistic sequence. Not the listing's cwd either: that
+// is where a session was STARTED, and sessions started in a parent folder
+// (5 of 6 on the owner's machine) are in no worktree. A session with no
+// recent record here is named on no collision. Keyed by realPath of the
+// window. Pure but for resolving symlinks.
 func sessionsByWindow(recs []coord.Record, live map[string]peers.Peer, self map[string]bool, now time.Time) map[string][]peers.Peer {
 	type seen struct {
 		window string
 		at     time.Time
 	}
 	worked, marked := map[string]seen{}, map[string]seen{}
-	marks := map[string][]seen{} // each session's marks, in log order
 	for _, r := range recs {
 		if r.Session == "" || r.Session == coord.SessionNone || self[r.Session] || r.Window == "" {
 			continue
@@ -96,28 +96,13 @@ func sessionsByWindow(recs []coord.Record, live map[string]peers.Peer, self map[
 		m := worked
 		if r.Kind == coord.KindPresence {
 			m = marked
-			marks[r.Session] = append(marks[r.Session], seen{r.Window, t})
 		}
 		if l, ok := m[r.Session]; !ok || !t.Before(l.at) {
 			m[r.Session] = seen{r.Window, t}
 		}
 	}
-	// hookAt is where a session's hook was at t: the window of its latest
-	// mark at or before t, "" if none.
-	hookAt := func(id string, t time.Time) string {
-		var last seen
-		for _, s := range marks[id] {
-			if !s.at.After(t) && !s.at.Before(last.at) {
-				last = s
-			}
-		}
-		return last.window
-	}
-	// No time check: a latest mark no later than the command is itself where
-	// the hook was then, so it wins only in the command's own window.
 	for id, w := range marked {
-		c, ok := worked[id]
-		if !ok || hookAt(id, c.at) == c.window {
+		if _, ok := worked[id]; !ok {
 			worked[id] = w
 		}
 	}

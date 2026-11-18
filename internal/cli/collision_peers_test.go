@@ -29,8 +29,6 @@ func TestSessionsByWindow(t *testing.T) {
 		"self":            {SessionID: "self", Name: "me", PID: 4},
 		"stale":           {SessionID: "stale", Name: "old", PID: 5},
 		"started-in-main": {SessionID: "started-in-main", Name: "path-worker", PID: 6},
-		"went-back":       {SessionID: "went-back", Name: "returner", PID: 7},
-		"by-path":         {SessionID: "by-path", Name: "reacher", PID: 8},
 	}
 	recs := []coord.Record{
 		{Kind: coord.KindPresence, Window: "/r/a", Session: "moved", TS: at(3 * time.Hour)},
@@ -46,31 +44,22 @@ func TestSessionsByWindow(t *testing.T) {
 		// working in /r/b by path (its wt commands run there).
 		{Kind: coord.KindAnnounce, Window: "/r/b", Session: "started-in-main", TS: at(2 * time.Hour)},
 		{Kind: coord.KindPresence, Window: "/r/main", Session: "started-in-main", TS: at(5 * time.Minute)},
-		// #251 round 3: its presence followed it into /r/a, where it
-		// announced, then into /r/b: it works in /r/b now.
-		{Kind: coord.KindPresence, Window: "/r/a", Session: "went-back", TS: at(4 * time.Hour)},
-		{Kind: coord.KindAnnounce, Window: "/r/a", Session: "went-back", TS: at(3 * time.Hour)},
-		{Kind: coord.KindPresence, Window: "/r/b", Session: "went-back", TS: at(20 * time.Minute)},
-		// Left /r/b for /r/main, then ran a wt command in /r/b by path: the
-		// command is newer than its last mark, so it still works in /r/b.
-		{Kind: coord.KindPresence, Window: "/r/b", Session: "by-path", TS: at(5 * time.Hour)},
-		{Kind: coord.KindPresence, Window: "/r/main", Session: "by-path", TS: at(4 * time.Hour)},
-		{Kind: coord.KindAnnounce, Window: "/r/b", Session: "by-path", TS: at(time.Hour)},
 	}
 	by := sessionsByWindow(recs, live, map[string]bool{"self": true, "my-shell": true}, now)
 	var b []string
 	for _, p := range by["/r/b"] {
 		b = append(b, p.Name)
 	}
-	if strings.Join(b, ",") != "reacher,mover,one,path-worker,two,returner" || len(by["/r/a"]) != 0 || len(by["/r/main"]) != 0 || len(by) != 1 {
-		t.Errorf("sessionsByWindow = %v, want, by session id, reacher (its command is newer), mover (moved to /r/b), one, path-worker (works there, marks /r/main), two and returner (its marks followed it to /r/b) in /r/b", by)
+	if strings.Join(b, ",") != "mover,one,path-worker,two" || len(by["/r/a"]) != 0 || len(by["/r/main"]) != 0 || len(by) != 1 {
+		t.Errorf("sessionsByWindow = %v, want mover (moved to /r/b), one, path-worker (works there, marks /r/main) and two in /r/b", by)
 	}
 }
 
-// #251 rounds 3-4: a later mark in another window outranks a wt command's
-// record only when the session's latest mark at or before the command was in
-// the command's window (its hook was there when it ran it).
-func TestSessionsByWindow_laterMark(t *testing.T) {
+// #251 rounds 3-5: a wt command's record wins over any mark, later or not;
+// marks place only a session with no record. A session that moved after its
+// last command stays on the command's window (accepted: marks are hourly per
+// window and skipped where it wrote anything in the last hour).
+func TestSessionsByWindow_recordWins(t *testing.T) {
 	now := time.Now()
 	at := func(d time.Duration) string { return now.Add(-d).UTC().Format(time.RFC3339) }
 	mark := func(w string, d time.Duration) coord.Record {
@@ -85,14 +74,12 @@ func TestSessionsByWindow_laterMark(t *testing.T) {
 		recs []coord.Record
 		want string
 	}{
-		{"moved on after its command", []coord.Record{mark("/r/a", 4*h), cmd("/r/a", 3*h), mark("/r/b", 20*m)}, "/r/b"},
-		{"a mark the same second as its command counts", []coord.Record{mark("/r/a", 2*h), cmd("/r/a", 2*h), mark("/r/b", h)}, "/r/b"},
-		{"marks in three windows: the latest", []coord.Record{mark("/r/a", 5*h), cmd("/r/a", 4*h), mark("/r/c", 2*h), mark("/r/b", h)}, "/r/b"},
-		{"started in main, works by path", []coord.Record{cmd("/r/b", 2*h), mark("/r/main", 5*m)}, "/r/b"},
+		{"started in main, works in b by path", []coord.Record{cmd("/r/b", 2*h), mark("/r/main", 5*m)}, "/r/b"},
 		{"started in b, cd'd to main, works in b by path", []coord.Record{mark("/r/b", 8*h), mark("/r/main", 7*h), cmd("/r/b", 2*h), mark("/r/main", 5*m)}, "/r/b"},
-		{"its command is newer than its marks", []coord.Record{mark("/r/b", 5*h), mark("/r/main", 4*h), cmd("/r/b", h)}, "/r/b"},
-		{"a mark elsewhere the same second: its hook was there, the record wins", []coord.Record{mark("/r/a", 3*h), cmd("/r/a", 2*h), mark("/r/b", 2*h)}, "/r/a"},
-		{"a mark from yesterday doesn't count", []coord.Record{mark("/r/a", 25*h), cmd("/r/a", 3*h), mark("/r/b", h)}, "/r/a"},
+		{"cd'd to main and ran a command there (no main mark), works in b by path", []coord.Record{mark("/r/b", 8*h), cmd("/r/main", 7*h+54*m), cmd("/r/b", 7*h+40*m), mark("/r/main", 6*h+53*m)}, "/r/b"},
+		{"moved on after its last command: still that command's window", []coord.Record{mark("/r/a", 4*h), cmd("/r/a", 3*h), mark("/r/b", 20*m)}, "/r/a"},
+		{"no record: the latest mark", []coord.Record{mark("/r/a", 3*h), mark("/r/b", h)}, "/r/b"},
+		{"a record from yesterday doesn't count", []coord.Record{cmd("/r/a", 25*h), mark("/r/b", h)}, "/r/b"},
 	}
 	live := map[string]peers.Peer{"s": {SessionID: "s", Name: "n", PID: 1}}
 	for _, tc := range cases {

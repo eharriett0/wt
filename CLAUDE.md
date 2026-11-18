@@ -445,19 +445,18 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   checkout and working in a worktree by path marked main hourly, and
   "latest record" credited it there. A session started outside any
   repository writes no mark at all (the hook returns before it), so it is
-  named only through its wt commands' records. ⚠ Rounds 3-4: a later mark
-  in another window outranks the command's record only when the session's
-  latest mark at or before the command was in the command's window
-  (`hookAt`: its hook was there when it ran the command, so it moved back
-  or was resumed elsewhere). Round 3's rule (any mark there that day) sent
-  a session started in /r/b that cd'd to main and works in /r/b by path to
-  main on every hourly mark. Accepted costs, a wrong name at worst (the
-  collision still shows): a session started in one checkout whose last
-  command ran in another stays credited to the command's window for up to
-  a day (a shorter horizon would credit path workers to main again); one
-  that worked in /r/b, cd'd to main and works in /r/b by path with no
-  command since reads as a move. **Never by the listing's `cwd`** either:
-  that is where the session was STARTED. Measured on the
+  named only through its wt commands' records. ⚠ Accepted (rounds 3-5):
+  a session that moved after its last wt command stays credited to that
+  command's window until its next one, for up to a day; at worst a wrong
+  name, the collision still shows. Two rules that let a later mark win
+  were tried and dropped: marks are hourly per window, and `PresenceDue`
+  skips one where the session wrote anything in the last hour. "Any mark
+  in the command's window that day" sent a session started in /r/b that
+  cd'd to main and works in /r/b by path to main hourly; "its last mark
+  before the command was there" sent one that cd'd to main and ran
+  `wt ack` there (its main mark skipped) to main. A shorter horizon for
+  records would credit path workers to main again. **Never by the listing's
+  `cwd`** either: that is where the session was STARTED. Measured on the
   owner's machine: 5 of 6 live sessions started in a parent folder outside
   every repository and work in worktrees by path, so the first version
   (deepest worktree holding the cwd) named nobody, or the wrong window. A
@@ -477,9 +476,10 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   `status --json`, doctor, MCP; the `wt status` banner too, round 4)
   carries `name`/`status`, and `SharedCheckoutWarning` names a live latest
   session as live `name` in place of its id, cut to what line 1's 160 runes
-  leave (8 to 24; round 4: a token-less self, ten others and a day-old
-  latest ran it to 178); its /clear hint needs a tagged session not listed
-  live (round 3: an older one keeps it when the latest is live). The push
+  leave (8 to 24; round 4: a token-less self and a 24-rune name ran it to
+  181); its /clear hint needs a tagged session not listed live (round 3:
+  an older one keeps it when the latest is live). An unnamed latest with a
+  token-less self can still run a few past 160 (round 5; not new). The push
   phase first planned (wt posting into sessions' inbox sockets) was
   dropped: it duplicated `SendMessage`, woke idle sessions, and relied on
   an undocumented line format. `internal/peers` reads `claude agents

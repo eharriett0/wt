@@ -1465,8 +1465,8 @@ func SharedCheckoutWarning(others []SessionActivity, self Self, now time.Time) s
 	// tagged sessions, as the hold gate's hint is.
 	// #250: a session live on this machine is named as SendMessage addresses
 	// it, in place of its id; the name gets what line 1's 160 runes leave, 8
-	// to 24 (#251 round 4: a token-less self, ten others and a day-old latest
-	// ran a 24-rune name to 178). A live session is not this one before a /clear (the listing keys
+	// to 24 (#251 round 4: a token-less self and a 24-rune name ran it to
+	// 181). A live session is not this one before a /clear (the listing keys
 	// a session by its current id), so the hint needs a tagged session that
 	// isn't listed live (#251 round 3: an older one, when the latest is).
 	line1 := func(latestName string) string {
