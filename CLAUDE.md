@@ -403,8 +403,10 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   Code session would otherwise reach the real binary through
   `CLAUDE_CODE_EXECPATH`; a test that wants live sessions sets `livePeers`.
   Pinned by `TestHoldAdvice_liveHolderIsAskedNotCleared`, `TestPostedByLive`,
-  `TestLiveHolderNamed_hookAndGate` (a fake `claude`: named in the hook and
-  the gate, read once, never for a turn with only its own records) and
+  `TestWarnStaleHolds_liveHolderIsAsked`,
+  `TestLiveHolderNamed_hookAndGate` (a fake `claude`: named in the hook, the
+  gate's listing and advice, inbox and the banner; read once, never for a
+  turn with only its own records) and
   `internal/peers`' tests (every failure is unknown; the timeout; the
   execpath fallback).
 - **Every write to a coordination log or block ledger holds its flock (#229).**
