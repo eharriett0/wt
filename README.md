@@ -253,6 +253,20 @@ wt without session support still running next to an upgraded one), it is
 treated like another party's: its hold gates for `hold_max_age`, it stays in
 `inbox`, and its acks waive nothing for anyone.
 
+**Live Claude Code sessions are named.** Claude Code sessions on one machine
+can message each other (cross-session messaging, Claude Code 2.1.224+), by
+name. When another session's announcement or hold is shown (`inbox`, the
+per-turn hook, `merge-pr`'s hold gate, the status banner) and that session is
+running on this machine, wt adds its name and status: `(live as
+\`api-worker\`, idle: ask it with SendMessage)`. An agent blocked by the hold
+can then ask its owner directly. A hold whose session is live is never called
+orphaned: wt says to ask that session, not to `wt all-clear` it. wt reads `claude
+agents --json` (the documented listing; the `claude` on PATH, else the one
+running the session), at most once per command and only when it has another
+session's record to show, which costs about 140 ms. A session the listing
+doesn't show is never treated as gone, and a listing wt can't read changes
+nothing. `WT_PEERS=0` turns it off.
+
 **Rollout.** Windows still running wt v0.1.33 or v0.1.34 behave as before until
 they are upgraded: v0.1.33 records no session and exempts itself from every hold
 placed in its own checkout; v0.1.34 treats a record with no session as every

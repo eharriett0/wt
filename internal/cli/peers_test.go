@@ -61,7 +61,8 @@ func TestHoldAdvice_liveHolderIsAskedNotCleared(t *testing.T) {
 func TestPostedByLive(t *testing.T) {
 	orig := livePeers
 	t.Cleanup(func() { livePeers = orig })
-	listing, listed := map[string]peers.Peer{"B": apiWorker, "A": {SessionID: "A", Name: "me", PID: 1}, "C": {SessionID: "C", Name: "other-window", Status: "busy", PID: 2}}, true
+	listing, listed := map[string]peers.Peer{"B": apiWorker, "A": {SessionID: "A", Name: "me", PID: 1}, "C": {SessionID: "C", Name: "other-window", Status: "busy", PID: 2},
+		coord.SessionNone: {SessionID: coord.SessionNone, Name: "never", PID: 3}}, true
 	livePeers = func() (map[string]peers.Peer, bool) { return listing, listed }
 	self := coord.Self{Window: "/w", Session: "A"}
 	recs := []coord.Record{
@@ -174,8 +175,59 @@ func TestLiveHolderNamed_hookAndGate(t *testing.T) {
 	var code int
 	out, errOut := captureOutputForTest(t, func() { code = mergeCoordGate(c) })
 	errOut = out + errOut
-	if code == 0 || !strings.Contains(errOut, "bhold") || !strings.Contains(errOut, "live as `api-worker`") ||
+	if code == 0 || !strings.Contains(listingLine(errOut, "bhold"), "live as `api-worker`, idle") ||
 		!strings.Contains(errOut, "bhold: its session is live as `api-worker`, idle: ask it with SendMessage to release it") {
-		t.Errorf("merge gate (code %d) doesn't name the live holder:\n%s", code, errOut)
+		t.Errorf("merge gate (code %d) doesn't name the live holder in its listing and advice:\n%s", code, errOut)
+	}
+	// `wt inbox` and the status banner list it the same way.
+	for name, show := range map[string]func(){
+		"inbox":  func() { cmdInbox(nil) },
+		"banner": func() { peerHoldBanner(c) },
+	} {
+		peers.Reset()
+		out, errOut := captureOutputForTest(t, show)
+		if !strings.Contains(listingLine(out+errOut, "bhold"), "live as `api-worker`, idle") {
+			t.Errorf("%s doesn't name the live holder:\n%s%s", name, out, errOut)
+		}
+	}
+}
+
+// listingLine is the line of out that lists record id (`<id>  <who> …`),
+// not an advice line about it.
+func listingLine(out, id string) string {
+	for _, l := range strings.Split(out, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(l), id+"  ") {
+			return l
+		}
+	}
+	return ""
+}
+
+// #250: the stale-hold warning offers `wt all-clear` per hold; for a holder
+// that is live it says to ask instead.
+func TestWarnStaleHolds_liveHolderIsAsked(t *testing.T) {
+	orig := livePeers
+	t.Cleanup(func() { livePeers = orig })
+	now := time.Now()
+	self := coord.Self{Window: "/w", Session: "A"}
+	h := coord.Record{ID: "h1", Kind: coord.KindAnnounce, Window: "/w", Session: "B", Hold: []string{"merge-main"},
+		TS: now.Add(-30 * time.Hour).UTC().Format(time.RFC3339)}
+	v := coord.ViewOf([]coord.Record{h}, self)
+	for _, tc := range []struct {
+		live      bool
+		want, not string
+	}{
+		{true, "(its session is live: ask it before any all-clear)", "wt all-clear h1"},
+		{false, "(all-clear: wt all-clear h1)", "its session is live"},
+	} {
+		listed := map[string]peers.Peer{}
+		if tc.live {
+			listed["B"] = apiWorker
+		}
+		livePeers = func() (map[string]peers.Peer, bool) { return listed, true }
+		out, errOut := captureOutputForTest(t, func() { warnStaleHolds([]coord.Record{h}, v, now, 24*time.Hour) })
+		if all := out + errOut; !strings.Contains(all, tc.want) || strings.Contains(all, tc.not) {
+			t.Errorf("live=%v: stale-hold warning:\n%s\nwant %q, not %q", tc.live, all, tc.want, tc.not)
+		}
 	}
 }

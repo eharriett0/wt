@@ -375,6 +375,38 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   session's until the client restarts it, and whether a client passes its
   session id to a stdio MCP server at all is not verified. The payload's
   `session` says which one it answered as.
+- **A live Claude Code session is named, never presumed gone (#250).** Claude
+  Code's cross-session messaging (2.1.224+) addresses a session by name with
+  `SendMessage`, and wt knows each record's raw session id, so where it shows
+  another party's record (`postedByLive`: inbox, the per-turn hook through
+  `labelForContext`, merge-pr's hold gate and its stale-hold warning, the
+  status banner) it adds a live session's name and status ("live as
+  `api-worker`, idle: ask it with SendMessage"). `internal/peers` reads `claude
+  agents --json`, which Claude Code documents as the supported way to read
+  session state from outside (`peers.Live`: `claude` on PATH, else
+  `CLAUDE_CODE_EXECPATH`, the binary running the session, since the VS Code
+  extension puts none on PATH; `Timeout` 2s; memoized 10s, so a command reads
+  it once; an entry counts only with a `pid`, which the listing gives "while
+  the process is alive"). ⚠ **Annotation only.** A session missing from the
+  listing is never treated as gone (the agent-view docs say interactive
+  sessions in other terminals appear only once backgrounded; 2.1.322 lists
+  them), and a listing wt can't read (no binary, an error, the timeout, not
+  the documented array) is unknown and changes nothing. The one decision it
+  changes is in the safe direction: `holdAdvice` never offers a global `wt
+  all-clear` for a hold whose session is listed live (`otherPeer`), and says
+  to ask it; the stale-hold warning likewise. Only another session or window
+  is looked up (`otherPeer`: never a record this session provably wrote, never
+  `SessionNone`). `livePeerOf` runs the listing only when a record is shown,
+  so a turn with nothing of another party's runs no `claude` (measured: a
+  turn showing one costs ~195 ms against ~58 ms). `WT_PEERS=0` disables it,
+  and the cli package's `TestMain` sets it, since a test run inside a Claude
+  Code session would otherwise reach the real binary through
+  `CLAUDE_CODE_EXECPATH`; a test that wants live sessions sets `livePeers`.
+  Pinned by `TestHoldAdvice_liveHolderIsAskedNotCleared`, `TestPostedByLive`,
+  `TestLiveHolderNamed_hookAndGate` (a fake `claude`: named in the hook and
+  the gate, read once, never for a turn with only its own records) and
+  `internal/peers`' tests (every failure is unknown; the timeout; the
+  execpath fallback).
 - **Every write to a coordination log or block ledger holds its flock (#229).**
   `wt prune-coord` (`withLockedLog`) reads, truncates and rewrites the file
   under an exclusive flock, and `coord.Append` used to write with a bare
