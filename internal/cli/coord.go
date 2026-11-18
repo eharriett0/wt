@@ -808,12 +808,16 @@ func holdAdvice(holds, recs []coord.Record, v coord.View, now time.Time, lookup 
 			lines = append(lines, fmt.Sprintf("%s carries this session's own token, placed from checkout %s (you before a cd, or a subagent of this session): `wt all-clear %s` releases it for EVERY window; ack it instead if it still guards work there (WT_WINDOW keeps one identity across checkouts)", h.ID, h.Window, h.ID))
 			continue
 		}
-		if p, ok := otherPeer(h, v, lookup); ok {
-			lines = append(lines, fmt.Sprintf("%s: its session is %s to release it", h.ID, peers.Describe(p)))
-			continue
-		}
 		if note := undatedNote(h, now); note != "" {
 			lines = append(lines, fmt.Sprintf("%s %s", h.ID, note))
+			continue
+		}
+		if p, ok := otherPeer(h, v, lookup); ok {
+			if p.Name != "" {
+				lines = append(lines, fmt.Sprintf("%s: its session is %s to release it", h.ID, peers.Describe(p)))
+			} else { // #250 review: live, but nothing to address it by
+				lines = append(lines, fmt.Sprintf("%s: its session is still running on this machine, so it is not orphaned", h.ID))
+			}
 			continue
 		}
 		if orphaned, why := coord.HoldLooksOrphaned(recs, h, now); orphaned {

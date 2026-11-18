@@ -271,10 +271,13 @@ hold. So where wt reports one, it names the session to talk to, when that
 session is running on this machine:
 
 - **A collision** (`wt check`, both edit hooks, the per-turn hook) names the
-  live sessions working in the other window's worktree: `notes.txt ← wb
-  [active] (live: \`api-worker\`, idle; coordinate with SendMessage)`. A
-  session belongs to the deepest worktree holding its working directory, and
-  this session is never named.
+  live sessions working in the other window: `notes.txt ← wb [active] (live:
+  \`api-worker\`, idle; coordinate with SendMessage)`. A session counts as
+  working in the window its latest wt record from the last day came from
+  (with the hooks installed, a session marks presence there at most hourly),
+  not the directory Claude Code reports, which is where the session was
+  started. This session is never named, and a session with no recent record
+  in the repository is named on no collision.
 - **An announcement or hold** (`inbox`, the per-turn hook, `merge-pr`'s hold
   gate, the status banner) names the live session that placed it, by its
   session id: `(live as \`api-worker\`, idle: ask it with SendMessage)`. A

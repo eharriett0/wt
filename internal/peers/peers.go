@@ -11,14 +11,19 @@
 package peers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
+
+	"github.com/eharriett0/wt/internal/gitx"
 )
 
 // Peer is one live Claude Code session as `claude agents --json` lists it.
@@ -96,12 +101,33 @@ func read() (map[string]Peer, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), Timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, "agents", "--json")
+	// #250 review: the whole group goes at the deadline (a helper it started
+	// was orphaned), and the output is capped (100 MB took 283 MB of memory).
+	gitx.StopGroupOnCancel(cmd)
 	cmd.WaitDelay = 250 * time.Millisecond
-	out, err := cmd.Output()
-	if err != nil {
+	var out capped
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil || out.over {
 		return nil, false
 	}
-	return Parse(out)
+	return Parse(out.buf.Bytes())
+}
+
+// maxListing caps what wt reads of the listing: a session is ~250 bytes.
+const maxListing = 1 << 20
+
+// capped keeps the first maxListing bytes written to it and notes any more.
+type capped struct {
+	buf  bytes.Buffer
+	over bool
+}
+
+func (c *capped) Write(p []byte) (int, error) {
+	if c.over || c.buf.Len()+len(p) > maxListing {
+		c.over = true
+		return len(p), nil
+	}
+	return c.buf.Write(p)
 }
 
 // binary is the claude to ask: the one on PATH, else the one running this
@@ -131,10 +157,31 @@ func Parse(out []byte) (map[string]Peer, bool) {
 	live := make(map[string]Peer, len(all))
 	for _, p := range all {
 		if p.SessionID != "" && p.PID > 0 {
+			p.Name, p.Status = clean(p.Name, 64), clean(p.Status, 16)
 			live[p.SessionID] = p
 		}
 	}
 	return live, true
+}
+
+// clean makes a listed name or status safe to put in an agent's context
+// (#250 review): no control characters (a newline started a fake "SYSTEM:"
+// line) and no backticks (wt quotes names in them), at most max runes. Pure.
+func clean(s string, max int) string {
+	var b strings.Builder
+	n := 0
+	for _, r := range s {
+		if unicode.IsControl(r) || r == '`' {
+			continue
+		}
+		if n == max {
+			b.WriteString("…")
+			break
+		}
+		b.WriteRune(r)
+		n++
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // String is a Peer as a debug line.

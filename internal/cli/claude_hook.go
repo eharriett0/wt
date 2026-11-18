@@ -656,7 +656,7 @@ func hookClaudeEdit(r io.Reader) int {
 	})...)
 
 	if len(graded) > 0 { // #250: name the live sessions in the other windows
-		note := worktreeSessionNotes()
+		note := worktreeSessionNotes(c)
 		for i := range graded {
 			graded[i].entry.liveNote = note(graded[i].entry.otherWorktree)
 		}

@@ -435,10 +435,21 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   the per-turn banner): the live sessions working in the other window's
   worktree (`CheckEntry.liveNote` via `annotateLive`, or the banner's
   label map `labelSessionNotes`; `worktreeSessionNotes` reads the listing
-  and `gitx.WorktreePaths` once, on first use; `assignPeers` credits a
-  session to the DEEPEST worktree holding its cwd, since worktrees nest,
-  never to self, and `realPath` resolves the deepest existing ancestor,
-  since git reports /private/var where a cwd may say /var); (2) **an
+  and this repository's log (`coord.LoadForHook`) once, on first use).
+  ⚠ **A session is credited to the window of its latest record** in the log
+  from the last `SharedCheckoutWindow` (`sessionsByWindow`; a hooked
+  session marks presence in the window it prompts from, at most hourly,
+  #197), **never by the listing's `cwd`**: that is where the session was
+  STARTED. Measured on the owner's machine: 5 of 6 live sessions started in
+  a parent folder outside every repository and work in worktrees by path,
+  and one started in a main checkout works elsewhere, so the first version
+  (deepest worktree holding the cwd) named nobody, or the wrong window. A
+  session with no recent record here is named on no collision, self never;
+  `realPath` resolves a window's deepest existing ancestor (git reports
+  /private/var where a record may say /var). Checked against the real
+  listing and log in another repository: a real collision named the
+  session whose latest record is in that worktree, and a window with no
+  recent live session stayed unnamed. (2) **an
   announcement or hold** (`postedByLive`: inbox, the per-turn hook through
   `labelForContext`, merge-pr's hold gate and its stale-hold warning, the
   status banner), by the record's raw session id ("live as `api-worker`,
@@ -465,15 +476,23 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   is looked up (`otherPeer`: never a record this session provably wrote, never
   `SessionNone`). `livePeerOf` runs the listing only when a record is shown,
   so a turn with nothing of another party's runs no `claude` (measured: a
-  turn showing one costs ~195 ms against ~58 ms). `WT_PEERS=0` disables it,
-  and the cli package's `TestMain` sets it, since a test run inside a Claude
-  Code session would otherwise reach the real binary through
-  `CLAUDE_CODE_EXECPATH`; a test that wants live sessions sets `livePeers`.
+  turn showing one costs ~195 ms against ~58 ms; a listing is 135-297 ms).
+  ⚠ #251 review: names go into another agent's context, so `peers.Parse`
+  drops control characters and backticks and caps a name at 64 runes; the
+  read is capped at 1 MiB (`maxListing`) and its whole process group goes at
+  the deadline (`gitx.StopGroupOnCancel`); this session is excluded by its wt
+  token AND by `CLAUDE_CODE_SESSION_ID`, the id the listing keys it by (with
+  `WT_SESSION` set it was named on its own old window). `WT_PEERS=0`
+  disables it, and the cli and doctor packages' `TestMain`s set it, since a
+  test run inside a Claude Code session would otherwise reach the real binary
+  through `CLAUDE_CODE_EXECPATH`; a test that wants live sessions sets
+  `livePeers`.
   Pinned by `TestCollisions_nameTheLiveSessionInTheOtherWindow` (real git,
   a fake `claude`: check, both edit hooks in both modes and the per-turn
   hook name the other window's session and never self or an outside one;
   read once a command; never for a file no window contests; nothing under
-  `WT_PEERS=0`), `TestAssignPeers`, `TestLabelSessionNotes`,
+  `WT_PEERS=0`; the listing's cwds point elsewhere, and a session started
+  inside wb is not named), `TestSessionsByWindow`, `TestLabelSessionNotes`,
   `TestCollisionNote`, `TestHoldAdvice_liveHolderIsAskedNotCleared`, `TestPostedByLive`,
   `TestWarnStaleHolds_liveHolderIsAsked`,
   `TestLiveHolderNamed_hookAndGate` (a fake `claude`: named in the hook, the

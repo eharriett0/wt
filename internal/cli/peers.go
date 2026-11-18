@@ -6,10 +6,11 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/eharriett0/wt/internal/collide"
+	"github.com/eharriett0/wt/internal/config"
 	"github.com/eharriett0/wt/internal/coord"
-	"github.com/eharriett0/wt/internal/gitx"
 	"github.com/eharriett0/wt/internal/peers"
 )
 
@@ -23,10 +24,10 @@ var livePeers = peers.Live
 // the other window). Annotation only.
 type sessionNote func(worktree string) string
 
-// worktreeSessionNotes is the sessionNote wt uses. It reads the listing, and
-// the repository's worktrees, once and only when first asked for a note: the
-// callers ask only when they have another window's collision to show.
-func worktreeSessionNotes() sessionNote {
+// worktreeSessionNotes is the sessionNote wt uses. On first use it reads the
+// listing and this repository's coordination log once: the callers ask only
+// when they have another window's collision to show.
+func worktreeSessionNotes(c *config.Config) sessionNote {
 	var once sync.Once
 	var by map[string][]peers.Peer
 	return func(wt string) string {
@@ -38,55 +39,61 @@ func worktreeSessionNotes() sessionNote {
 			if !ok || len(live) == 0 {
 				return
 			}
-			paths, err := gitx.WorktreePaths()
+			logPath, self := coordCtx(c)
+			recs, err := coord.LoadForHook(logPath)
 			if err != nil {
 				return
 			}
-			self, _ := coord.SessionToken(os.Getenv)
-			by = assignPeers(paths, live, self)
+			// This session by its wt token (WT_SESSION first) AND the Claude
+			// id the listing keys it by (#250 review: with WT_SESSION set it
+			// was named on its own old window).
+			by = sessionsByWindow(recs, live, map[string]bool{self.Session: true, os.Getenv("CLAUDE_CODE_SESSION_ID"): true}, time.Now())
 		})
 		return collisionNote(by[realPath(wt)])
 	}
 }
 
-// assignPeers credits each live session, but self's, to the deepest worktree
-// holding its working directory: worktrees nest (one under the main
-// checkout's root), and a nested worktree's session is not its parent's.
-// Keyed by realPath. A session outside every worktree is credited to none.
-// Pure but for resolving symlinks.
-func assignPeers(worktrees []string, live map[string]peers.Peer, self string) map[string][]peers.Peer {
-	wts := make([]string, len(worktrees))
-	for i, w := range worktrees {
-		wts[i] = realPath(w)
+// sessionsByWindow credits each live session, but self's, to the window of its
+// latest record in this repository's log from the last SharedCheckoutWindow:
+// where it works now (a hooked session marks presence in the window it
+// prompts from, at most hourly, #197). Not the listing's cwd: that is where a
+// session was STARTED, and sessions started in a parent folder and working in
+// worktrees by path read as outside every worktree (measured: 5 of 6 on the
+// owner's machine), or one started in a main checkout read as working there.
+// A session with no recent record here is named on no collision. Keyed by
+// realPath of the window. Pure but for resolving symlinks.
+func sessionsByWindow(recs []coord.Record, live map[string]peers.Peer, self map[string]bool, now time.Time) map[string][]peers.Peer {
+	type seen struct {
+		window string
+		at     time.Time
 	}
-	ids := make([]string, 0, len(live))
-	for id := range live {
+	latest := map[string]seen{}
+	for _, r := range recs {
+		if r.Session == "" || r.Session == coord.SessionNone || self[r.Session] || r.Window == "" {
+			continue
+		}
+		if _, ok := live[r.Session]; !ok {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, r.TS)
+		if err != nil || now.Sub(t) > coord.SharedCheckoutWindow {
+			continue
+		}
+		if l, ok := latest[r.Session]; !ok || !t.Before(l.at) {
+			latest[r.Session] = seen{r.Window, t}
+		}
+	}
+	ids := make([]string, 0, len(latest))
+	for id := range latest {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
 	by := map[string][]peers.Peer{}
 	for _, id := range ids {
-		p := live[id]
-		if id == self || p.Cwd == "" {
-			continue
-		}
-		cwd, best := realPath(p.Cwd), ""
-		for _, w := range wts {
-			if within(cwd, w) && len(w) > len(best) {
-				best = w
-			}
-		}
-		if best != "" {
-			by[best] = append(by[best], p)
-		}
+		w := realPath(latest[id].window)
+		by[w] = append(by[w], live[id])
 	}
 	return by
-}
-
-// within reports whether path p is dir or under it. Pure.
-func within(p, dir string) bool {
-	rel, err := filepath.Rel(dir, p)
-	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // realPath is p with the symlinks of its deepest existing ancestor resolved
@@ -173,6 +180,9 @@ type peerLookup func(session string) (peers.Peer, bool)
 func livePeerOf(session string) (peers.Peer, bool) {
 	if session == "" || session == coord.SessionNone {
 		return peers.Peer{}, false
+	}
+	if session == os.Getenv("CLAUDE_CODE_SESSION_ID") {
+		return peers.Peer{}, false // this session, under the id the listing keys it by
 	}
 	live, ok := livePeers()
 	if !ok {

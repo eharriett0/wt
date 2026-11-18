@@ -48,6 +48,19 @@ func TestHoldAdvice_liveHolderIsAskedNotCleared(t *testing.T) {
 			t.Errorf("control: a silent hold of a session not listed live:\n%s", all)
 		}
 	}
+	// #250 review: a live session with no name can't be addressed: it is
+	// called not orphaned, nothing more; and an undated hold says why it
+	// gates first.
+	unnamed := func(s string) (peers.Peer, bool) { return peers.Peer{Status: "busy"}, s == "B" }
+	all = strings.Join(holdAdvice(recs, recs, v, now, unnamed), "\n")
+	if !strings.Contains(all, "h1: its session is still running on this machine, so it is not orphaned") || strings.Contains(all, "wt all-clear h1") {
+		t.Errorf("an unnamed live holder:\n%s", all)
+	}
+	undated := coord.Record{ID: "h3", Kind: coord.KindAnnounce, Window: "/w", Session: "B", Hold: []string{"merge-main"}, TS: "?"}
+	all = strings.Join(holdAdvice([]coord.Record{undated}, []coord.Record{undated}, coord.ViewOf([]coord.Record{undated}, self), now, live), "\n")
+	if !strings.Contains(all, "h3 ") || strings.Contains(all, "h3: its session is live") {
+		t.Errorf("an undated hold of a live holder skipped its note:\n%s", all)
+	}
 	// This session's own token from another checkout is never "another session".
 	own := coord.Record{ID: "h2", Kind: coord.KindAnnounce, Window: "/elsewhere", Session: "A", Hold: []string{"merge-main"}, TS: at(time.Minute)}
 	mine := func(string) (peers.Peer, bool) { return peers.Peer{Name: "me", Status: "busy"}, true }
@@ -97,6 +110,15 @@ func TestPostedByLive(t *testing.T) {
 	own := coord.Record{ID: "e", Window: "/elsewhere", Session: "A"}
 	if got := postedByLive(own, coord.ViewOf(append(recs, own), self)); got != "yours (this session's token), placed from checkout /elsewhere" {
 		t.Errorf("this session's own record from another checkout: %q", got)
+	}
+	// #250 review: under WT_SESSION, a record this session wrote with its
+	// Claude id reads as another session's; the listing keys this session by
+	// that id, and it is never named.
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "A-claude")
+	listing["A-claude"] = peers.Peer{SessionID: "A-claude", Name: "me-too", Status: "busy", PID: 9}
+	mineByClaudeID := coord.Record{ID: "m", Window: "/w", Session: "A-claude"}
+	if got := postedByLive(mineByClaudeID, coord.ViewOf(append(recs, mineByClaudeID), self)); strings.Contains(got, "me-too") {
+		t.Errorf("this session, by its Claude id, was named: %q", got)
 	}
 	// A listing wt couldn't read names nobody.
 	listed = false

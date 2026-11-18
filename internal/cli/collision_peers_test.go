@@ -8,40 +8,45 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/eharriett0/wt/internal/collide"
+	"github.com/eharriett0/wt/internal/coord"
 	"github.com/eharriett0/wt/internal/peers"
 )
 
-// #250 (reshaped): a session belongs to the deepest worktree holding its
-// working directory, never to a parent of that worktree, never to a sibling
-// that shares a name prefix; this session is never named.
-func TestAssignPeers(t *testing.T) {
-	wts := []string{"/r", "/r/.wt/feat", "/other"}
+// #250 (reshaped): a live session is credited to the window of its latest
+// record in this repository's log from the last day, not to the listing's
+// cwd (where it was started). Self, a session the listing doesn't show, a
+// token-less record and a stale one are never credited.
+func TestSessionsByWindow(t *testing.T) {
+	now := time.Now()
+	at := func(d time.Duration) string { return now.Add(-d).UTC().Format(time.RFC3339) }
 	live := map[string]peers.Peer{
-		"nested":  {SessionID: "nested", Name: "feat-worker", Cwd: "/r/.wt/feat/sub", PID: 1},
-		"main":    {SessionID: "main", Name: "main-worker", Cwd: "/r/src", PID: 2},
-		"sibling": {SessionID: "sibling", Name: "rx-worker", Cwd: "/rx", PID: 3},
-		"self":    {SessionID: "self", Name: "me", Cwd: "/other", PID: 4},
-		"nocwd":   {SessionID: "nocwd", Name: "nowhere", PID: 5},
-		"o1":      {SessionID: "o1", Name: "one", Cwd: "/other", PID: 6},
-		"o2":      {SessionID: "o2", Name: "two", Cwd: "/other/x", PID: 7},
+		"moved": {SessionID: "moved", Name: "mover", Cwd: "/parent", PID: 1},
+		"one":   {SessionID: "one", Name: "one", Cwd: "/parent", PID: 2},
+		"two":   {SessionID: "two", Name: "two", Cwd: "/r/b", PID: 3},
+		"self":  {SessionID: "self", Name: "me", PID: 4},
+		"stale": {SessionID: "stale", Name: "old", PID: 5},
 	}
-	by := assignPeers(wts, live, "self")
-	names := func(wt string) string {
-		var n []string
-		for _, p := range by[wt] {
-			n = append(n, p.Name)
-		}
-		return strings.Join(n, ",")
+	recs := []coord.Record{
+		{Kind: coord.KindPresence, Window: "/r/a", Session: "moved", TS: at(3 * time.Hour)},
+		{Kind: coord.KindPresence, Window: "/r/b", Session: "moved", TS: at(10 * time.Minute)},
+		{Kind: coord.KindAnnounce, Window: "/r/b", Session: "one", TS: at(time.Hour)},
+		{Kind: coord.KindPresence, Window: "/r/b", Session: "two", TS: at(2 * time.Hour)},
+		{Kind: coord.KindPresence, Window: "/r/b", Session: "self", TS: at(time.Minute)},
+		{Kind: coord.KindPresence, Window: "/r/a", Session: "stale", TS: at(25 * time.Hour)},
+		{Kind: coord.KindPresence, Window: "/r/a", Session: "gone", TS: at(time.Minute)},
+		{Kind: coord.KindPresence, Window: "/r/a", Session: coord.SessionNone, TS: at(time.Minute)},
+		{Kind: coord.KindPresence, Window: "/r/a", Session: "one", TS: "undated"},
 	}
-	for wt, want := range map[string]string{"/r": "main-worker", "/r/.wt/feat": "feat-worker", "/other": "one,two"} {
-		if got := names(wt); got != want {
-			t.Errorf("sessions in %s = %q, want %q", wt, got, want)
-		}
+	by := sessionsByWindow(recs, live, map[string]bool{"self": true, "my-shell": true}, now)
+	var b []string
+	for _, p := range by["/r/b"] {
+		b = append(b, p.Name)
 	}
-	if len(by) != 3 {
-		t.Errorf("assigned %v, want only the three worktrees (no /rx, no self, no session without a cwd)", by)
+	if strings.Join(b, ",") != "mover,one,two" || len(by["/r/a"]) != 0 || len(by) != 1 {
+		t.Errorf("sessionsByWindow = %v, want mover (moved to /r/b), one and two in /r/b, nothing in /r/a", by)
 	}
 }
 
@@ -132,11 +137,23 @@ func TestCollisions_nameTheLiveSessionInTheOtherWindow(t *testing.T) {
 
 	bin := t.TempDir()
 	runs := filepath.Join(bin, "runs")
+	// Every session was started in a parent folder (the listing's cwd is
+	// where a session started); wt's records say where each works now: s-b
+	// in wb, s-self here, s-out (live) in no window of this repository.
 	listing, _ := json.Marshal([]map[string]any{
-		{"sessionId": "s-b", "name": "api-worker", "status": "idle", "pid": 11, "cwd": filepath.Join(wb, "sub")},
-		{"sessionId": "s-out", "name": "elsewhere", "status": "busy", "pid": 12, "cwd": t.TempDir()},
-		{"sessionId": "s-self", "name": "me", "status": "busy", "pid": 13, "cwd": wd},
+		{"sessionId": "s-b", "name": "api-worker", "status": "idle", "pid": 11, "cwd": base},
+		{"sessionId": "s-out", "name": "elsewhere", "status": "busy", "pid": 12, "cwd": wb},
+		{"sessionId": "s-self", "name": "me", "status": "busy", "pid": 13, "cwd": base},
 	})
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, r := range []coord.Record{
+		{ID: "p1", Kind: coord.KindPresence, Window: realPath(wb), Session: "s-b", Repo: "repo", TS: now},
+		{ID: "p2", Kind: coord.KindPresence, Window: realPath(wd), Session: "s-self", Repo: "repo", TS: now},
+	} {
+		if err := coord.Append(filepath.Join(os.Getenv("HOME"), ".wt", "coordination", filepath.Base(root)+".jsonl"), r); err != nil {
+			t.Fatal(err)
+		}
+	}
 	script := "#!/bin/sh\necho \"$*\" >> '" + runs + "'\ncat <<'EOF'\n" + string(listing) + "\nEOF\n"
 	if err := os.WriteFile(filepath.Join(bin, "claude"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -147,6 +164,14 @@ func TestCollisions_nameTheLiveSessionInTheOtherWindow(t *testing.T) {
 		return strings.Count(string(b), "\n")
 	}
 	const named = "(live: `api-worker`, idle; coordinate with SendMessage)"
+	// #250 review: this session's own latest record sits in wb too, and its wt
+	// token is WT_SESSION, not the Claude id the listing keys it by: still
+	// never named.
+	if err := coord.Append(filepath.Join(os.Getenv("HOME"), ".wt", "coordination", filepath.Base(root)+".jsonl"),
+		coord.Record{ID: "p3", Kind: coord.KindPresence, Window: realPath(wb), Session: "s-self", Repo: "repo", TS: time.Now().UTC().Format(time.RFC3339)}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WT_SESSION", "my-shell")
 	t.Chdir(wd)
 
 	// wt check (text).

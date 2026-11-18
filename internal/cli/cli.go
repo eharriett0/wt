@@ -1531,7 +1531,7 @@ func cmdCheck(args []string) int {
 			return renderCheckJSON(entries, includeStale)
 		}
 		if len(entries) > 0 {
-			annotateLive(entries, worktreeSessionNotes()) // #250
+			annotateLive(entries, worktreeSessionNotes(c)) // #250
 		}
 		if blocking {
 			return renderCheckBlocking(entries, paths)
