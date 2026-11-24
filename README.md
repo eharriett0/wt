@@ -149,8 +149,8 @@ like any grade wt can't compute; its tag then reads `working tree unread`, not
 `wt_status`) and `unread_windows` (`window`, `worktree`, `error`) in `wt check
 --json` and MCP `wt_check`. Run `git status` in that worktree to see what is
 wrong. Two entries are not unread, since neither has a work tree to hold
-edits: a worktree git lists as prunable (its directory deleted; `git worktree
-prune` removes its record) and the bare repository of a bare-plus-worktrees
+edits: a worktree whose directory was deleted (git lists it as prunable; `git
+worktree prune` removes its record) and the bare repository of a bare-plus-worktrees
 layout. A locked worktree whose directory is gone (an unmounted volume) is
 unread: its edits still exist. In a `--separate-git-dir` repository git lists
 the main work tree by its git directory; wt reads it from inside that work

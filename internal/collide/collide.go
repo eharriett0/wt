@@ -82,9 +82,9 @@ func Scan(c *config.Config) ([]Window, error) {
 	// a bounded worker pool cuts wall time to roughly the slowest single
 	// worktree. Indexed writes preserve `git worktree list` order (stable
 	// output). A window whose uncommitted changes can't be read is marked
-	// Unread (#253), except one git lists as prunable (its directory is gone
-	// and it is not locked: nothing to read); other per-worktree git errors
-	// stay swallowed, as before.
+	// Unread (#253), except one git lists as prunable whose directory is gone
+	// (not locked, nothing to read); other per-worktree git errors stay
+	// swallowed, as before.
 	ws := make([]Window, len(paths))
 	errs := make([]error, len(paths))
 	sem := make(chan struct{}, scanWorkers())
@@ -98,7 +98,7 @@ func Scan(c *config.Config) ([]Window, error) {
 			br, _ := gitx.CurrentBranchIn(p)
 			touched, terr := gitx.TouchedFiles(p, c.Base)
 			w := Window{Worktree: p, Branch: br, Touched: touched}
-			if terr != nil && !refs[i].Prunable {
+			if terr != nil && !(refs[i].Prunable && gone(p)) {
 				w.Unread, errs[i] = terr.Error(), terr
 			}
 			if e, ok := byWorktree[p]; ok {
@@ -112,6 +112,15 @@ func Scan(c *config.Config) ([]Window, error) {
 	wg.Wait()
 	readOwnGitDirEntry(c, ws, errs, byWorktree)
 	return ws, nil
+}
+
+// gone reports whether path no longer exists (a symlink is followed). git
+// lists a worktree as prunable when it can't reach the worktree's .git file,
+// which a directory it may not enter causes too (measured, git 2.39): only
+// one whose directory is gone has nothing to read (#254 review).
+func gone(path string) bool {
+	_, err := os.Stat(path)
+	return errors.Is(err, os.ErrNotExist)
 }
 
 // readOwnGitDirEntry reads, by its work tree, the entry of a

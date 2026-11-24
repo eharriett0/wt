@@ -59,8 +59,9 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   (#254 review). The #93 unknown-path refusal names unread windows too: one
   may be creating that path. The committed diff
   failing stays silent: it fails for an unborn or unrelated branch too. An
-  entry with no work tree is NOT unread: one git lists as prunable
-  (`WorktreeRef.Prunable`, applied in `Scan`) and a bare repository
+  entry with no work tree is NOT unread: one git lists as prunable whose
+  directory is really gone (`WorktreeRef.Prunable` plus a stat in `Scan`:
+  git also says prunable for a directory it can't enter) and a bare repository
   (`gitx.statusError`); naming either repeated a false warning on every agent
   turn (measured in review). A LOCKED worktree whose directory is gone is
   unread: its edits sit on an unmounted volume. A `--separate-git-dir`

@@ -348,7 +348,8 @@ func TestUnreadWindow_committedPathStillGraded(t *testing.T) {
 
 // Scan reads each worktree as git lists it (#253 review): a removed worktree
 // git would prune is not unread, a locked one whose directory is gone (an
-// unmounted volume) is, a path ending in a space is read whole, and the main
+// unmounted volume) is, one git can't enter is (git calls it prunable too, but
+// its directory is there), a path ending in a space is read whole, and the main
 // work tree of a --separate-git-dir repository reads itself from inside it
 // and is named unread from another window.
 func TestScan_worktreeStates(t *testing.T) {
@@ -411,7 +412,24 @@ func TestScan_worktreeStates(t *testing.T) {
 		}
 	}
 	writeT(t, spaced, "notes.txt", "spaced edit\n")
+	shut := ""
+	if os.Geteuid() != 0 { // root enters a mode-000 directory
+		shut = filepath.Join(dirs, "shut")
+		gitT(t, root, "worktree", "add", "-q", "-b", "shut", shut, "main")
+		if err := os.Chmod(shut, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(shut, 0o755) })
+	}
 	ws := scan(t, root)
+	if shut != "" {
+		if w, ok := at(ws, shut); !ok || !strings.Contains(w.Unread, "permission denied") {
+			t.Errorf("worktree git can't enter: %+v (listed %v), want unread: permission denied", w, ok)
+		}
+		if err := os.Chmod(shut, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if w, ok := at(ws, gone); !ok || w.Unread != "" {
 		t.Errorf("removed (prunable) worktree: %+v (listed %v), want listed, not unread", w, ok)
 	}
