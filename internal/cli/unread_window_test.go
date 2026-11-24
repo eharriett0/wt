@@ -446,10 +446,17 @@ func TestScan_worktreeStates(t *testing.T) {
 	if w, ok := at(ws, locked); !ok || !strings.Contains(w.Unread, "no such file or directory") {
 		t.Errorf("locked worktree, directory gone: %+v (listed %v), want unread with its reason", w, ok)
 	}
-	// git never ran there, so its commits weren't read either: wt status says so.
+	// git never ran there, so its commits weren't read either: wt status's
+	// UNREAD line says so.
 	sout, serr := captureOutputForTest(t, func() { cmdStatus(nil) })
-	if !strings.Contains(sout+serr, "none of its edits are compared") {
-		t.Errorf("wt status with a locked worktree whose directory is gone: want \"none of its edits are compared\":\n%s", sout+serr)
+	line := ""
+	for _, ln := range strings.Split(sout+serr, "\n") {
+		if strings.Contains(ln, "UNREAD: "+gitx.ErrNoDir.Error()) {
+			line = ln
+		}
+	}
+	if !strings.Contains(line, "none of its edits are compared") {
+		t.Errorf("wt status, the locked worktree's UNREAD line: %q, want \"none of its edits are compared\":\n%s", line, sout+serr)
 	}
 	if w, ok := at(ws, spaced); !ok || w.Unread != "" || !has(w.Touched, "notes.txt") {
 		t.Errorf("worktree at %q: %+v (listed %v), want read, with its edit", spaced, w, ok)
@@ -460,6 +467,19 @@ func TestScan_worktreeStates(t *testing.T) {
 	out, errOut := captureOutputForTest(t, func() { code = cmdCheck([]string{"notes.txt"}) })
 	if code != 0 || strings.Contains(out+errOut, "← spaced") {
 		t.Errorf("wt check notes.txt inside %q: exit %d, want 0 and no entry for itself:\n%s", spaced, code, out+errOut)
+	}
+
+	// A worktree moved without `git worktree repair`: git lists it at its old
+	// path, so from inside it no entry is this work tree, and none may be
+	// taken for it (the main checkout stays the main checkout).
+	moved := filepath.Join(dirs, "moved")
+	gitT(t, root, "worktree", "add", "-q", "-b", "moved", filepath.Join(dirs, "before"), "main")
+	if err := os.Rename(filepath.Join(dirs, "before"), moved); err != nil {
+		t.Fatal(err)
+	}
+	ws = scan(t, moved)
+	if _, ok := at(ws, root); !ok {
+		t.Errorf("from a moved worktree, the main checkout is no longer listed at %s: %+v", root, ws)
 	}
 
 	// A bare layout: the bare entry is not unread; a worktree nested in it
