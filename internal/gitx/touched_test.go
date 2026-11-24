@@ -380,7 +380,7 @@ func TestTouchedFiles_UnreadIsAnError(t *testing.T) {
 		if err := os.RemoveAll(gone); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := TouchedFiles(gone, "main"); err == nil || !strings.Contains(err.Error(), "no such file or directory") {
+		if _, err := TouchedFiles(gone, "main"); !errors.Is(err, ErrNoDir) || !strings.Contains(err.Error(), "no such file or directory") {
 			t.Errorf("TouchedFiles(gone) err = %v, want its directory's own error", err)
 		}
 	})
@@ -393,7 +393,7 @@ func TestTouchedFiles_UnreadIsAnError(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
-		if _, err := TouchedFiles(dir, "main"); err == nil || !strings.Contains(err.Error(), "permission denied") || strings.Contains(err.Error(), "exec") {
+		if _, err := TouchedFiles(dir, "main"); !errors.Is(err, ErrNoDir) || !strings.Contains(err.Error(), "permission denied") || strings.Contains(err.Error(), "exec") {
 			t.Errorf("err = %v, want the directory's own error (permission denied), not git's exec", err)
 		}
 	})
@@ -412,7 +412,7 @@ func TestTouchedFiles_UnreadIsAnError(t *testing.T) {
 			t.Errorf("TouchedFiles(its work tree) = %v, %v; want dirty.txt and no error", files, err)
 		}
 	})
-	t.Run("bare repository with worktrees: no error", func(t *testing.T) {
+	t.Run("bare repository: ErrGitDirOnly (Scan leaves it out); a directory inside it is not", func(t *testing.T) {
 		bare := filepath.Join(t.TempDir(), "r.git")
 		runGit(t, t.TempDir(), "clone", "-q", "--bare", branch(t), bare)
 		wa := filepath.Join(t.TempDir(), "wa")
@@ -420,12 +420,23 @@ func TestTouchedFiles_UnreadIsAnError(t *testing.T) {
 		if out := gitOut(t, bare, "worktree", "list", "--porcelain"); !strings.Contains(out, "\nbare\n") {
 			t.Fatalf("precondition: git lists the bare repository as a worktree:\n%s", out)
 		}
-		// Its HEAD (feat) still lists what it committed, as before #253.
-		if files, err := TouchedFiles(bare, "main"); err != nil {
-			t.Errorf("TouchedFiles(bare) = %v, %v; want no error", files, err)
+		if _, err := TouchedFiles(bare, "main"); !errors.Is(err, ErrGitDirOnly) {
+			t.Errorf("TouchedFiles(bare) err = %v, want ErrGitDirOnly", err)
 		}
 		if files, err := TouchedFiles(wa, "main"); err != nil || !touchedContains(files, "committed.txt") {
 			t.Errorf("TouchedFiles(its worktree) = %v, %v; want its committed file and no error", files, err)
+		}
+		// A worktree nested in the bare repository that lost its .git file:
+		// git status walks up into the bare repository and fails there, but
+		// this directory is no git directory, and it holds an edit.
+		nested := filepath.Join(bare, "nested")
+		runGit(t, bare, "worktree", "add", "-q", "-b", "nested", nested, "feat")
+		if err := os.Remove(filepath.Join(nested, ".git")); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, nested, "dirty.txt", "d\n")
+		if _, err := TouchedFiles(nested, "main"); err == nil || errors.Is(err, ErrGitDirOnly) {
+			t.Errorf("TouchedFiles(a directory inside a bare repository) err = %v, want git's own failure", err)
 		}
 	})
 	t.Run("index unreadable: committed files still listed", func(t *testing.T) {

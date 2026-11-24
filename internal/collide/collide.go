@@ -82,11 +82,10 @@ func Scan(c *config.Config) ([]Window, error) {
 	// a bounded worker pool cuts wall time to roughly the slowest single
 	// worktree. Indexed writes preserve `git worktree list` order (stable
 	// output). A window whose uncommitted changes can't be read is marked
-	// Unread (#253), except one git lists as prunable whose directory is gone
-	// (not locked, nothing to read); other per-worktree git errors stay
-	// swallowed, as before.
+	// Unread (#253), except a bare repository (no work tree) and one git lists
+	// as prunable whose directory is gone (not locked, nothing to read); other
+	// per-worktree git errors stay swallowed, as before.
 	ws := make([]Window, len(paths))
-	errs := make([]error, len(paths))
 	sem := make(chan struct{}, scanWorkers())
 	var wg sync.WaitGroup
 	for i, p := range paths {
@@ -98,8 +97,8 @@ func Scan(c *config.Config) ([]Window, error) {
 			br, _ := gitx.CurrentBranchIn(p)
 			touched, terr := gitx.TouchedFiles(p, c.Base)
 			w := Window{Worktree: p, Branch: br, Touched: touched}
-			if terr != nil && !(refs[i].Prunable && gone(p)) {
-				w.Unread, errs[i] = terr.Error(), terr
+			if terr != nil && !refs[i].Bare && !(refs[i].Prunable && gone(p)) {
+				w.Unread = terr.Error()
 			}
 			if e, ok := byWorktree[p]; ok {
 				w.Issue, w.Title = e.Issue, e.Title
@@ -110,7 +109,7 @@ func Scan(c *config.Config) ([]Window, error) {
 		}(i, p)
 	}
 	wg.Wait()
-	readOwnGitDirEntry(c, ws, errs, byWorktree)
+	readOwnEntry(c, ws, byWorktree)
 	return ws, nil
 }
 
@@ -123,21 +122,31 @@ func gone(path string) bool {
 	return errors.Is(err, os.ErrNotExist)
 }
 
-// readOwnGitDirEntry reads, by its work tree, the entry of a
-// `--separate-git-dir` repository's main work tree when Scan runs inside it
-// (#253 review): git lists that window by its git directory, which
-// TouchedFiles can't read (gitx.ErrGitDirOnly), and the window would be
-// named unread to itself. From any other window it stays unread: git does
-// not say where that work tree is.
-func readOwnGitDirEntry(c *config.Config, ws []Window, errs []error, byWorktree map[string]activework.Entry) {
-	for i, err := range errs {
-		if !errors.Is(err, gitx.ErrGitDirOnly) {
-			continue
-		}
-		gitDir, gerr := gitx.Run("rev-parse", "--path-format=absolute", "--git-dir")
-		root, rerr := gitx.RepoRoot()
-		if gerr != nil || rerr != nil || !sameWorktree(gitDir, ws[i].Worktree) {
+// readOwnEntry reads, by its work tree, the window Scan runs in when git
+// lists it by its git directory instead (#254 review): the main work tree of
+// a `--separate-git-dir` repository (an entry TouchedFiles can't read,
+// gitx.ErrGitDirOnly) and the checkout of a submodule with linked worktrees
+// (an entry git reads through core.worktree). Left as listed, the window is
+// named unread to itself, or its own edits grade as another window's. Asked
+// only when no window is listed at this work tree's root. From another
+// window the entry stays as listed: git does not say where that work tree is.
+func readOwnEntry(c *config.Config, ws []Window, byWorktree map[string]activework.Entry) {
+	root, err := gitx.RepoRoot()
+	if err != nil {
+		return
+	}
+	for _, w := range ws {
+		if sameWorktree(w.Worktree, root) {
 			return
+		}
+	}
+	gitDir, err := gitx.GitDir()
+	if err != nil {
+		return
+	}
+	for i := range ws {
+		if !sameWorktree(ws[i].Worktree, gitDir) {
+			continue
 		}
 		touched, terr := gitx.TouchedFiles(root, c.Base)
 		ws[i].Worktree, ws[i].Touched, ws[i].Unread = root, touched, ""
@@ -607,7 +616,7 @@ func UnreadNote(unread []Window) string {
 		return ""
 	case 1:
 		w := unread[0]
-		note := fmt.Sprintf("window %s could not be read (%s): its uncommitted edits are not compared.", w.Label(), w.Unread)
+		note := fmt.Sprintf("window %s could not be read (%s): %s.", w.Label(), w.Unread, UnreadScope(w))
 		if strings.HasPrefix(w.Unread, "git status: ") { // git's own failure, not gitx.ErrGitDirOnly
 			note += fmt.Sprintf(" Run `git status` in %s.", w.Worktree)
 		}
@@ -617,7 +626,17 @@ func UnreadNote(unread []Window) string {
 	for i, w := range unread {
 		parts[i] = fmt.Sprintf("%s at %s (%s)", w.Label(), w.Worktree, w.Unread)
 	}
-	return fmt.Sprintf("%d windows could not be read: %s. Their uncommitted edits are not compared; run `git status` in each.", len(unread), strings.Join(parts, "; "))
+	return fmt.Sprintf("%d windows could not be read: %s. Edits wt could not read there are not compared.", len(unread), strings.Join(parts, "; "))
+}
+
+// UnreadScope is what wt did not compare of an unread window (#253): its
+// uncommitted edits, or, when git could not run in its directory at all
+// (gitx.ErrNoDir), its commits too (#254 review).
+func UnreadScope(w Window) string {
+	if strings.HasPrefix(w.Unread, gitx.ErrNoDir.Error()) {
+		return "none of its edits are compared, committed or not"
+	}
+	return "its uncommitted edits are not compared"
 }
 
 // RangeFn resolves the line ranges a worktree changed in a path, relative to

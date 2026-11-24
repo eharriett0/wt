@@ -932,7 +932,7 @@ func renderBlockingGate(graded []StatusOverlap, ws []collide.Window, live map[st
 	}
 	ui.Collision("%d file(s) with a HIGH-risk collision:", len(high))
 	for _, o := range high {
-		detail := ui.Yellow("indeterminate (no line-level diff, e.g. binary — can't prove disjoint)")
+		detail := ui.Yellow(indeterminateDetail(o, ws))
 		if s := spansString(o.OverlapSpans); s != "" {
 			detail = ui.Yellow("overlap " + s)
 		} else if s := sectionsString(o.SharedSections); s != "" {
@@ -976,7 +976,7 @@ func statusReport(c *config.Config, asJSON, blocking bool) int {
 		fmt.Println(line)
 		fmt.Println("   " + ui.Dim(w.Worktree))
 		if w.Unread != "" { // #253: never "(no changes)"
-			fmt.Println("   " + ui.Yellow("⚠ UNREAD: "+w.Unread+": its uncommitted edits are not compared"))
+			fmt.Println("   " + ui.Yellow("⚠ UNREAD: "+w.Unread+": "+collide.UnreadScope(w)))
 		}
 		if len(w.Touched) == 0 {
 			if w.Unread == "" {
@@ -1025,7 +1025,7 @@ func statusReport(c *config.Config, asJSON, blocking bool) int {
 	if len(high) > 0 {
 		ui.Collision("%d file(s) with a HIGH-risk collision (overlapping hunks):", len(high))
 		for _, o := range high {
-			detail := ui.Yellow("indeterminate (no line-level diff, e.g. binary — can't prove disjoint)")
+			detail := ui.Yellow(indeterminateDetail(o, ws))
 			if s := spansString(o.OverlapSpans); s != "" {
 				detail = ui.Yellow("overlap " + s)
 			} else if s := sectionsString(o.SharedSections); s != "" {

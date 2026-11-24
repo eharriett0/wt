@@ -53,22 +53,29 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   per-turn context, pre-push (once a push) and pre-commit. Being unread NEVER
   blocks (decided in #253): no path can be tied to it, so blocking would stop
   every edit in every window until the worktree is repaired. A path the
-  window COMMITTED is still graded, and its unreadable working copy makes that
-  grade indeterminate, so HIGH (the fail-safe; never hidden); its tag reads
-  `working tree unread` (`WindowLiveness.Unread`), not `uncommitted edits`
-  (#254 review). The #93 unknown-path refusal names unread windows too: one
+  window COMMITTED is still graded when git runs there (a broken branch or
+  index), and its unreadable working copy makes that grade indeterminate, so
+  HIGH (the fail-safe; never hidden); its tag reads `working tree unread`
+  (`WindowLiveness.Unread`), not `uncommitted edits`, and status explains the
+  indeterminate overlap by it (`indeterminateDetail`) (#254 review). When git
+  can't run in the directory at all (`gitx.ErrNoDir`), none of its edits are
+  compared, committed or not, and `collide.UnreadScope` says so. The #93 unknown-path refusal names unread windows too: one
   may be creating that path. The committed diff
   failing stays silent: it fails for an unborn or unrelated branch too. An
   entry with no work tree is NOT unread: one git lists as prunable whose
   directory is really gone (`WorktreeRef.Prunable` plus a stat in `Scan`:
   git also says prunable for a directory it can't enter) and a bare repository
-  (`gitx.statusError`); naming either repeated a false warning on every agent
-  turn (measured in review). A LOCKED worktree whose directory is gone is
+  (`WorktreeRef.Bare`; `gitx.statusError` asks `--git-dir`, since a directory
+  merely INSIDE a bare repo walks up into it); naming either repeated a false
+  warning on every agent turn (measured in review). A LOCKED worktree whose directory is gone is
   unread: its edits sit on an unmounted volume. A `--separate-git-dir`
-  repo's main entry is its git dir (`gitx.ErrGitDirOnly`): `Scan` reads it by
-  its work tree from inside it (`readOwnGitDirEntry`), and other windows name
-  it unread. Worktree paths are taken verbatim from git: trimming a path that
-  ends in a space read a directory that doesn't exist. When git never ran,
+  repo's main entry is its git dir (`gitx.ErrGitDirOnly`), and a submodule
+  with linked worktrees lists its checkout as `.git/modules/<name>`: `Scan`
+  reads such an entry by its work tree from inside it (`readOwnEntry`, keyed
+  on `gitx.GitDir`), and other windows see it as listed. Worktree paths are
+  taken verbatim from git, and so are `RepoRoot` and `WorktreeToplevel`
+  (`runPath`): trimming a path that ends in a space read a directory that
+  doesn't exist, and a window there then graded its own edit. When git never ran,
   the reason is the directory's own error, not Go's failed exec of git.
   Pinned by `TestUnreadWindow_namedEverywhere` (every surface, with a healthy
   control), `TestScan_worktreeStates`, `TestWorktreeList_PrunableLockedVerbatim`

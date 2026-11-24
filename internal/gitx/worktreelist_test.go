@@ -54,4 +54,12 @@ func TestWorktreeList_PrunableLockedVerbatim(t *testing.T) {
 	if !found {
 		t.Errorf("WorktreePaths() = %q, want %q whole", paths, spaced)
 	}
+	// Read from inside it, its root is whole too, so a window there is itself.
+	t.Chdir(spaced)
+	if got, err := RepoRoot(); err != nil || got != spaced {
+		t.Errorf("RepoRoot() inside %q = %q, %v; want it whole", spaced, got, err)
+	}
+	if got := WorktreeToplevel(spaced); got != spaced {
+		t.Errorf("WorktreeToplevel(%q) = %q, want it whole", spaced, got)
+	}
 }

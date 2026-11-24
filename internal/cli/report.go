@@ -537,12 +537,29 @@ func unreadWindowsPayload(ws []collide.Window) []UnreadWindow {
 
 // windowScope is the "across N window(s)" of a status verdict, or, when
 // windows went unread (#253), "among the M window(s) wt could read (U could
-// not be read)", so the count never includes a window that was not read.
+// not be read)": the unread ones are counted apart.
 func windowScope(n, unread int) string {
 	if unread == 0 {
 		return fmt.Sprintf("across %d window(s)", n)
 	}
 	return fmt.Sprintf("among the %d window(s) wt could read (%d could not be read)", n-unread, unread)
+}
+
+// indeterminateDetail explains a HIGH status overlap no span or section
+// proves: a window whose working tree could not be read (#254 review), else
+// no line-level diff.
+func indeterminateDetail(o StatusOverlap, ws []collide.Window) string {
+	for _, w := range ws {
+		if w.Unread == "" {
+			continue
+		}
+		for _, l := range o.Windows {
+			if l == w.Label() {
+				return "indeterminate (" + l + "'s working tree could not be read, so it can't be proven disjoint)"
+			}
+		}
+	}
+	return "indeterminate (no line-level diff, e.g. binary — can't prove disjoint)"
 }
 
 // noWindowTouching is the #93 refusal's "no window", narrowed to the windows

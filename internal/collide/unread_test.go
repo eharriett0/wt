@@ -3,6 +3,8 @@ package collide
 import (
 	"strings"
 	"testing"
+
+	"github.com/eharriett0/wt/internal/gitx"
 )
 
 // #253: windows git could not read are named; the caller's own is left out,
@@ -53,11 +55,20 @@ func TestUnreadNote(t *testing.T) {
 	if !strings.Contains(sep, "git directory") || strings.Contains(sep, "git status`") {
 		t.Errorf("git-directory window: %q, want its reason and no `git status` advice", sep)
 	}
+	// git never ran there: its commits weren't read either, and `git status`
+	// there can't help (#254 review).
+	nodir := UnreadNote([]Window{{Worktree: "/r/wd", Branch: "wd", Unread: gitx.ErrNoDir.Error() + ": open /r/wd: permission denied"}})
+	if !strings.Contains(nodir, "none of its edits are compared") || strings.Contains(nodir, "git status`") {
+		t.Errorf("unreadable directory: %q, want none of its edits compared and no `git status` advice", nodir)
+	}
 	two := UnreadNote([]Window{wb, wc})
 	for _, want := range []string{"2 windows could not be read", "wb at /r/wb (git status: fatal: bad object HEAD)", "#7 at /r/wc (git status: fatal: index file open failed)", "not compared"} {
 		if !strings.Contains(two, want) {
 			t.Errorf("two windows: %q lacks %q", two, want)
 		}
+	}
+	if strings.Contains(two, "git status` in each") {
+		t.Errorf("two windows: %q gives `git status` advice that can't help every kind", two)
 	}
 }
 

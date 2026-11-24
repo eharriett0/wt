@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -344,6 +345,15 @@ func TestUnreadWindow_committedPathStillGraded(t *testing.T) {
 	if code != 3 || !strings.Contains(out, "window wh could not be read") || !strings.Contains(out, "working tree unread") || strings.Contains(out, "uncommitted edits]") {
 		t.Errorf("wh's index unreadable: exit %d, want 3 (indeterminate), wh named and tagged \"working tree unread\":\n%s", code, out)
 	}
+	// wt status says why the overlap is indeterminate, not "e.g. binary".
+	sout, serr := captureOutputForTest(t, func() { cmdStatus(nil) })
+	if !strings.Contains(sout+serr, "wh's working tree could not be read") || strings.Contains(sout+serr, "e.g. binary") {
+		t.Errorf("wt status: want the indeterminate overlap explained by wh's unread working tree:\n%s", sout+serr)
+	}
+	bout, berr := captureOutputForTest(t, func() { cmdStatus([]string{"--blocking"}) })
+	if !strings.Contains(bout+berr, "wh's working tree could not be read") {
+		t.Errorf("wt status --blocking: want the indeterminate overlap explained by wh's unread working tree:\n%s", bout+berr)
+	}
 }
 
 // Scan reads each worktree as git lists it (#253 review): a removed worktree
@@ -436,8 +446,75 @@ func TestScan_worktreeStates(t *testing.T) {
 	if w, ok := at(ws, locked); !ok || !strings.Contains(w.Unread, "no such file or directory") {
 		t.Errorf("locked worktree, directory gone: %+v (listed %v), want unread with its reason", w, ok)
 	}
+	// git never ran there, so its commits weren't read either: wt status says so.
+	sout, serr := captureOutputForTest(t, func() { cmdStatus(nil) })
+	if !strings.Contains(sout+serr, "none of its edits are compared") {
+		t.Errorf("wt status with a locked worktree whose directory is gone: want \"none of its edits are compared\":\n%s", sout+serr)
+	}
 	if w, ok := at(ws, spaced); !ok || w.Unread != "" || !has(w.Touched, "notes.txt") {
 		t.Errorf("worktree at %q: %+v (listed %v), want read, with its edit", spaced, w, ok)
+	}
+	// From inside it, it is itself: its own edit is no collision (#254 review).
+	t.Chdir(spaced)
+	var code int
+	out, errOut := captureOutputForTest(t, func() { code = cmdCheck([]string{"notes.txt"}) })
+	if code != 0 || strings.Contains(out+errOut, "← spaced") {
+		t.Errorf("wt check notes.txt inside %q: exit %d, want 0 and no entry for itself:\n%s", spaced, code, out+errOut)
+	}
+
+	// A bare layout: the bare entry is not unread; a worktree nested in it
+	// that lost its .git file is (git status walks up into the bare repo).
+	bareRepo := filepath.Join(real(t, t.TempDir()), "r.git")
+	gitT(t, root, "clone", "-q", "--bare", root, bareRepo)
+	bw, nested := filepath.Join(dirs, "bw"), filepath.Join(bareRepo, "nested")
+	gitT(t, bareRepo, "worktree", "add", "-q", "-b", "bw", bw, "main")
+	gitT(t, bareRepo, "worktree", "add", "-q", "-b", "nested", nested, "main")
+	if err := os.Remove(filepath.Join(nested, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	writeT(t, nested, "notes.txt", "nested edit\n")
+	ws = scan(t, bw)
+	if w, ok := at(ws, bareRepo); !ok || w.Unread != "" {
+		t.Errorf("bare repository entry: %+v (listed %v), want listed, not unread", w, ok)
+	}
+	if w, ok := at(ws, nested); !ok || w.Unread == "" {
+		t.Errorf("worktree nested in the bare repository without its .git: %+v (listed %v), want unread", w, ok)
+	}
+
+	// A submodule with a linked worktree: git lists the submodule's checkout by
+	// its git directory (.git/modules/sub), and git status succeeds there
+	// through core.worktree. From the checkout, that entry is itself.
+	subSrc, super := real(t, t.TempDir()), real(t, t.TempDir())
+	for _, d := range []string{subSrc, super} {
+		gitT(t, d, "init", "-q", "-b", "main")
+		gitT(t, d, "config", "user.email", "t@t.test")
+		gitT(t, d, "config", "user.name", "t")
+	}
+	writeT(t, subSrc, "s.txt", "a\n")
+	gitT(t, subSrc, "add", "-A")
+	gitT(t, subSrc, "commit", "-qm", "sub")
+	gitT(t, super, "commit", "-q", "--allow-empty", "-m", "super")
+	gitT(t, super, "-c", "protocol.file.allow=always", "submodule", "add", "-q", subSrc, "sub")
+	gitT(t, super, "commit", "-qm", "add sub")
+	sub, swb := filepath.Join(super, "sub"), filepath.Join(real(t, t.TempDir()), "swb")
+	gitT(t, sub, "worktree", "add", "-q", "-b", "swb", swb)
+	modules := filepath.Join(super, ".git", "modules", "sub")
+	listed := exec.Command("git", "worktree", "list", "--porcelain")
+	listed.Dir = sub
+	if lo, err := listed.Output(); err != nil || !strings.Contains(string(lo), "worktree "+modules+"\n") {
+		t.Fatalf("precondition: git lists the submodule's checkout by %s: %v\n%s", modules, err, lo)
+	}
+	writeT(t, sub, "s.txt", "sub edit\n")
+	ws = scan(t, sub)
+	if _, ok := at(ws, modules); ok {
+		t.Errorf("from the submodule's checkout, a window is still listed by its git directory: %+v", ws)
+	}
+	if w, ok := at(ws, sub); !ok || w.Unread != "" || !has(w.Touched, "s.txt") {
+		t.Errorf("from the submodule's checkout, its own window: %+v (listed %v), want read, with its edit", w, ok)
+	}
+	out, errOut = captureOutputForTest(t, func() { code = cmdCheck([]string{"s.txt"}) })
+	if code != 0 {
+		t.Errorf("wt check s.txt in the submodule's checkout: exit %d, want 0 (its own edit):\n%s", code, out+errOut)
 	}
 
 	sepBase := real(t, t.TempDir())

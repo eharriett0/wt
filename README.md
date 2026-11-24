@@ -142,10 +142,12 @@ window's uncommitted edits. `wt status` marks it `UNREAD` with git's reason
 instead of `(no changes)`, and `wt check`, both edit hooks, the per-turn
 context, pre-push and pre-commit name it, with any clear qualified as being
 about the windows wt could read. Being unread never blocks, since no path can
-be tied to it. A file the window committed is still graded, and as its
-working copy can't be read, an overlap there is indeterminate and so HIGH,
-like any grade wt can't compute; its tag then reads `working tree unread`, not
-`uncommitted edits`. In JSON it is `unread` on the window (`wt status --json`, MCP
+be tied to it. A file the window committed is still graded when git can run
+there (a broken branch or index), and as its working copy can't be read, an
+overlap there is indeterminate and so HIGH, like any grade wt can't compute;
+its tag then reads `working tree unread`, not `uncommitted edits`. When git
+can't run in its directory at all (gone but locked, or not enterable), none
+of its edits are compared, committed or not, and the note says so. In JSON it is `unread` on the window (`wt status --json`, MCP
 `wt_status`) and `unread_windows` (`window`, `worktree`, `error`) in `wt check
 --json` and MCP `wt_check`. Run `git status` in that worktree to see what is
 wrong. Two entries are not unread, since neither has a work tree to hold

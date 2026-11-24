@@ -276,8 +276,22 @@ func Present() bool {
 	return err == nil
 }
 
-// RepoRoot returns the top-level dir of the repo containing cwd.
-func RepoRoot() (string, error) { return Run("rev-parse", "--show-toplevel") }
+// RepoRoot returns the top-level dir of the repo containing cwd, whole: a
+// worktree path may end in a space, and Scan's paths are read verbatim (#254
+// review).
+func RepoRoot() (string, error) { return runPath("", "rev-parse", "--show-toplevel") }
+
+// GitDir returns the absolute git directory of the work tree containing cwd.
+func GitDir() (string, error) {
+	return runPath("", "rev-parse", "--path-format=absolute", "--git-dir")
+}
+
+// runPath is run for a command that prints one path: only the trailing
+// newline is cut, since a path may end in a space (#254 review).
+func runPath(dir string, args ...string) (string, error) {
+	out, err := runRaw(dir, args...)
+	return strings.TrimSuffix(out, "\n"), err
+}
 
 // ShowPrefix returns cwd's path relative to the top of its worktree, as git
 // sees it: "pkg/svc/" in a subdirectory, "" at the root. Used to read a path the
@@ -518,7 +532,7 @@ func pickExactRef(out, ref string) string {
 // wt tells its own worktree from a stray directory under the main checkout
 // (#198 review).
 func WorktreeToplevel(dir string) string {
-	out, err := RunDir(dir, "rev-parse", "--show-toplevel")
+	out, err := runPath(dir, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return ""
 	}
@@ -1234,10 +1248,10 @@ func parseMergeTreeConflictPaths(out string) []string {
 // err is non-nil when (a) can't be read: `git status` fails, as it does for a
 // branch holding an object the repo lacks or an unreadable index (an
 // index.lock does not fail it; measured, git 2.39). The window is then
-// unread, never "no changes" (#253); files still holds what (b) read. A bare
-// repository is no error (statusError): it has no work tree. A directory
-// that is gone is an error here; Scan leaves out the ones git lists as
-// prunable. (b)
+// unread, never "no changes" (#253); files still holds what (b) read (none
+// when git can't run in dir: ErrNoDir). A git directory is ErrGitDirOnly; Scan
+// leaves out a bare repository, and a worktree git lists as prunable whose
+// directory is gone. (b)
 // failing is no error: it fails for a branch with no commits, with no base,
 // or with no merge base with it, and those have nothing committed to list.
 func TouchedFiles(dir, base string) (files []string, err error) {
@@ -1282,32 +1296,34 @@ func TouchedFiles(dir, base string) (files []string, err error) {
 	return files, err
 }
 
-// ErrGitDirOnly is TouchedFiles' error for a worktree entry that is a git
-// directory but not bare: the main entry of a `--separate-git-dir`
-// repository. Its work tree exists, but git does not say where (#253 review).
+// ErrGitDirOnly is TouchedFiles' error for a worktree entry that is itself a
+// git directory: a bare repository (Scan leaves those out: no work tree), or
+// the main entry of a `--separate-git-dir` repository, whose work tree exists
+// but git does not say where (#253 review).
 var ErrGitDirOnly = errors.New("it is the repository's git directory, and git does not list where its work tree is (a --separate-git-dir layout)")
 
-// statusError is why `git status` failed in dir (serr), or nil when dir is a
-// bare repository (git lists one first when worktrees hang off it), which has
-// no work tree to read. A git directory that is not bare is ErrGitDirOnly.
-// When git never ran (no *exec.ExitError), the reason is dir's own: Go
-// reports a directory it can't enter as a failed exec of git. Asked only
-// after status fails; a linked worktree with a broken branch or index reads
-// false/false here (measured, git 2.39).
+// ErrNoDir is TouchedFiles' error when git could not run in the directory at
+// all (gone but locked, or one it can't enter): neither its uncommitted nor
+// its committed changes were read (#254 review).
+var ErrNoDir = errors.New("directory unreadable")
+
+// statusError is why `git status` failed in dir (serr). When git never ran
+// (no *exec.ExitError), it is ErrNoDir with dir's own error: Go reports a
+// directory it can't enter as a failed exec of git. A dir that is itself a
+// git directory is ErrGitDirOnly; one merely inside a git directory (a
+// worktree nested in a bare repository that lost its .git file) is a real
+// failure. Asked only after status fails.
 func statusError(dir string, serr error) error {
 	var ee *exec.ExitError
 	if !errors.As(serr, &ee) {
 		f, oerr := os.Open(dir)
 		if oerr != nil {
-			return fmt.Errorf("git status: %s", oerr)
+			return fmt.Errorf("%w: %v", ErrNoDir, oerr)
 		}
 		_ = f.Close()
 		return fmt.Errorf("git status: %s", serr)
 	}
-	switch out, _ := RunDir(dir, "rev-parse", "--is-bare-repository", "--is-inside-git-dir"); out {
-	case "true\ntrue":
-		return nil
-	case "false\ntrue":
+	if gd, err := runPath(dir, "rev-parse", "--path-format=absolute", "--git-dir"); err == nil && resolvedPath(gd) == resolvedPath(dir) {
 		return ErrGitDirOnly
 	}
 	return fmt.Errorf("git status: %s", exitText(serr))
