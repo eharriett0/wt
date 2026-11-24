@@ -196,9 +196,25 @@ func TestChangedDocEdits_BaseClaimsOnlyWhenBehind(t *testing.T) {
 	writeFile(t, dir, "PLAN.md", "# Plan\n## Alpha\na1\na2\n## Beta two\nb1\nb2\nb3\n")
 	runGit(t, dir, "add", "PLAN.md")
 	runGit(t, dir, "commit", "-qm", "main restores it, renamed")
-	failGit(t, func(args []string) bool { return len(args) > 3 && args[0] == "diff" && args[3] == "main" })
-	if e := ChangedDocEdits(wt, "main", "PLAN.md"); !e.All {
-		t.Errorf("base's diff failing: %+v, want All", e)
+	ok := ChangedDocEdits(wt, "main", "PLAN.md")
+	if ok.All || len(ok.Base) == 0 {
+		t.Fatalf("precondition: base renamed Beta, wa edits a1: %+v, want base claims", ok)
+	}
+	// Base's copy, its listing or its diff unreadable: All, never "no such
+	// doc" (#252 review: an unreadable copy read as the pre-#247 miss).
+	for name, fail := range map[string]func([]string) bool{
+		"copy": func(a []string) bool {
+			return len(a) > 2 && a[0] == "cat-file" && a[1] == "blob" && a[2] == "main:PLAN.md"
+		},
+		"listing": func(a []string) bool { return len(a) > 0 && a[0] == "ls-tree" },
+		"diff":    func(a []string) bool { return len(a) > 3 && a[0] == "diff" && a[3] == "main" },
+	} {
+		t.Run(name, func(t *testing.T) { // the subtest's Cleanup lifts the failure
+			failGit(t, fail)
+			if e := ChangedDocEdits(wt, "main", "PLAN.md"); !e.All {
+				t.Errorf("base's %s unreadable: %+v, want All", name, e)
+			}
+		})
 	}
 }
 
@@ -224,6 +240,16 @@ func TestChangedDocEdits_NoBaseCountsDeletions(t *testing.T) {
 	if e := ChangedDocEdits(dir, "no-such-base", "NEW.md"); !e.All {
 		t.Errorf("a doc new since HEAD: %+v, want All", e)
 	}
+	// HEAD that can't be read is no unborn branch: All (#252 review).
+	t.Run("HEAD unreadable", func(t *testing.T) { // the subtest's Cleanup lifts the failure
+		failGit(t, func(a []string) bool { return len(a) > 1 && a[0] == "rev-parse" && a[len(a)-1] == "HEAD^{commit}" })
+		if e := ChangedDocEdits(dir, "no-such-base", "PLAN.md"); !e.All {
+			t.Errorf("HEAD unreadable: %+v, want All", e)
+		}
+		if e, ok := ChangedDocEditsWith(dir, "no-such-base", "PLAN.md", []byte(content)); !ok || !e.All {
+			t.Errorf("pending, HEAD unreadable: %+v, %v; want All", e, ok)
+		}
+	})
 	// No HEAD either (an unborn branch): the uncommitted ranges, as before.
 	unborn := t.TempDir()
 	runGit(t, unborn, "init", "-q", "-b", "main")

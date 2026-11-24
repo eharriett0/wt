@@ -81,7 +81,11 @@ func ChangedDocEditsWith(dir, base, file string, content []byte) (DocEdits, bool
 
 	ref, sha, hasBase := resolveBaseRef(dir, base)
 	if !hasBase {
-		if headResolves(dir) {
+		head, herr := headCommit(dir)
+		if herr != nil {
+			return failed, true
+		}
+		if head {
 			e, _, err := diff(revSide("HEAD"), copySide)
 			if err != nil {
 				return failed, true

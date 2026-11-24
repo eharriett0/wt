@@ -513,12 +513,6 @@ type CheckPayload struct {
 	BaseUnresolved bool `json:"base_unresolved,omitempty"`
 }
 
-// noBaseNote is the one line `wt check` prints when no base branch
-// resolves (#247).
-func noBaseNote(base string) string {
-	return fmt.Sprintf("no base branch resolves here (neither origin/%s nor %s): windows' committed changes are not compared, only their uncommitted edits, so a file another window only committed reads clear. Set `base` in .wt.conf to the branch windows start from.", base, base)
-}
-
 // buildCheckPayload filters stale entries (unless includeStale) and computes the
 // blocking flag. Pure.
 func buildCheckPayload(entries []CheckEntry, includeStale bool) CheckPayload {

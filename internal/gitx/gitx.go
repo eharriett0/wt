@@ -1272,7 +1272,7 @@ func TouchedFiles(dir, base string) []string {
 // only a change to a line on either side of its gap, or another insertion at the
 // same gap. Spans alone can't say that: an insertion spans both neighbours of its
 // gap, so a touch rule over spans claims one line too many next to every
-// insertion. A NEW-frame range (ChangedRangesNew, the base-less fallback) never
+// insertion. A NEW-frame range (ChangedRangesNew, uncommittedRangesNew) never
 // sets Gap; a pure deletion there spans the gap's neighbours, so a change rule
 // over it errs toward flagging.
 type LineRange struct {
@@ -1573,7 +1573,11 @@ type DocEdits struct {
 func ChangedDocEdits(dir, base, file string) DocEdits {
 	ref, sha, hasBase := resolveBaseRef(dir, base)
 	if !hasBase {
-		if headResolves(dir) {
+		head, err := headCommit(dir)
+		if err != nil {
+			return DocEdits{New: wholeFile, All: true}
+		}
+		if head {
 			out, err := runRaw(dir, gradeDiff([]string{"HEAD"}, file)...)
 			if err != nil {
 				return DocEdits{New: wholeFile, All: true}
@@ -1630,14 +1634,26 @@ func docEditsFrom(dir, old, diff string, oldMissing bool) DocEdits {
 // its own hunks (own, the -U0 diff from its merge base mb) moved into base's
 // line numbers through base's hunks since mb, as ChangedRanges moves them,
 // and base's copy of file. Base without the file adds nothing (there is no
-// section of base's to claim); a diff that fails is All.
+// section of base's to claim), read from its tree (ls-tree, as RefFileText
+// reads it: cat-file can't tell a missing path from a failure); a listing,
+// a copy or a diff that can't be read is All (#252 review: an unreadable
+// copy read as "no such doc", the pre-#247 miss).
 func withBaseClaims(dir, ref, mb, file, own string, e DocEdits) DocEdits {
 	hunks := parseHunks(own)
 	if len(hunks) == 0 || e.All {
 		return e
 	}
+	listed, err := runRaw(dir, "ls-tree", "-z", "--full-tree", ref, "--", file)
+	if err != nil {
+		e.All = true
+		return e
+	}
+	if _, _, _, ok := lsTreeEntry(listed, file); !ok {
+		return e
+	}
 	baseCopy, err := runRaw(dir, "cat-file", "blob", ref+":"+file)
 	if err != nil {
+		e.All = true
 		return e
 	}
 	moved, err := runRaw(dir, gradeDiff([]string{mb, ref}, file)...)
@@ -1657,11 +1673,19 @@ func BaseResolves(dir, base string) bool {
 	return ok
 }
 
-// headResolves reports whether HEAD names a commit in dir (not an unborn
-// branch).
-func headResolves(dir string) bool {
+// headCommit reports whether HEAD names a commit in dir. An unborn branch
+// is (false, nil), only when git says so (rev-parse --verify --quiet exits
+// 1); any other failure is an error (#252 review: read as unborn, it
+// dropped the deletions the HEAD diff counts).
+func headCommit(dir string) (bool, error) {
 	s, err := RunDir(dir, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
-	return err == nil && s != ""
+	if err == nil {
+		return s != "", nil
+	}
+	if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, err
 }
 
 // parseInsertGaps extracts the OLD-side gap of each pure insertion (#237
@@ -1986,10 +2010,11 @@ func FileChangeSubsumed(worktree, base, path string) (subsumed, known bool) {
 	return merged == ours, true
 }
 
-// uncommittedRangesNew is the base-less fallback of ChangedRanges and
-// ChangedRangesNew: the NEW-side hunks of the unstaged and the staged diff
-// (index frame). With no base to be old-relative to, a single window still
-// self-reports. ok=false when either diff fails.
+// uncommittedRangesNew is the base-less fallback of ChangedRanges and of
+// ChangedDocEdits on an unborn HEAD (ChangedRangesNew's too, #247): the
+// NEW-side hunks of the unstaged and the staged diff (index frame). With no
+// base to be old-relative to, a single window still self-reports. ok=false
+// when either diff fails.
 func uncommittedRangesNew(dir, file string) (ranges []LineRange, ok bool) {
 	ok = true
 	for _, args := range [][]string{gradeDiff(nil, file), gradeDiff([]string{"--cached"}, file)} {

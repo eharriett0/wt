@@ -1532,7 +1532,7 @@ func cmdCheck(args []string) int {
 			return renderCheckJSON(entries, includeStale, noBase)
 		}
 		if noBase {
-			ui.Warn("%s", noBaseNote(c.Base))
+			ui.Warn("%s", collide.NoBaseNote(c.Base))
 		}
 		if len(entries) > 0 {
 			annotateLive(entries, worktreeSessionNotes(c)) // #250

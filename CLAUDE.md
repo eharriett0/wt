@@ -125,7 +125,8 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   window's section was silent while `wt check` then said HIGH, and one moving
   OUT kept a heads-up (a deny under block). `ChangedRangesNewWith` IS
   `ChangedRangesNew` once the copy is written, fallbacks included (no base:
-  the uncommitted ranges; a side without the file is empty and an untracked
+  one diff from HEAD, #247, or the uncommitted ranges on an unborn HEAD; a
+  side without the file is empty and an untracked
   copy is not the working tree's, as `git diff <rev> -- file` reads them; a
   failed diff: the whole file); each fallback it lacked read as
   "unmeasurable" (#226 review). ⚠ A copy the hook can't predict or put in as
@@ -195,21 +196,27 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   base), and `BaseCopy`; `collide.baseClaims` reads their sections in base's
   copy by `oldClaims`' rules (a change its lines, plus the line above when
   it starts at a heading; an insertion the line it lands after), and they
-  are added to the rest. Base without the doc adds nothing; base's diff
-  failing is All. ⚠ **No base (#247):** the section grade reads ONE diff
+  are added to the rest. Base without the doc adds nothing (read from its
+  tree, `ls-tree`: `cat-file` can't tell a missing path from a failure); a
+  listing, copy or diff of base's that can't be read is All (#252 review:
+  an unreadable copy read as "no such doc", the old miss). ⚠ **No base
+  (#247):** the section grade reads ONE diff
   from HEAD, both sides, so a base-less repo's uncommitted deletions and
   gaps count too (its old fallback, the uncommitted ranges' new side, still
-  reads an unborn HEAD). Committed changes there have no frame to compare,
-  and `TouchedFiles` doesn't list them, so `wt check` warns that no base
-  resolves (`noBaseNote`; `base_unresolved` in `--json` and MCP
-  `wt_check`) rather than a bare clear.
+  reads an unborn HEAD, `headCommit`: only when rev-parse exits 1; any
+  other failure is All). Committed changes there have no frame to compare,
+  and `TouchedFiles` doesn't list them, so `wt check` and pre-push warn
+  that no base resolves (`collide.NoBaseNote`; `base_unresolved` in
+  `--json` and MCP `wt_check`) rather than a bare clear (#252 review:
+  pre-push, which ships the commits, passed a real conflict silently).
   Pinned by `TestSectionDeletions_MatchMergeTree` (deleting a section,
   emptying or deleting the doc, a heading deleted or renamed, duplicate
   headings, the two-step history, a behind branch, a new section against
   each deletion, two sections appended at the end, the lanes case that
   stays advisory, and #247's R1, R2, SPLIT and MERGE with a control: each
   held against `git merge-tree` in `wt check` and pre-push from both
-  windows), `TestSectionGrade_NoBase` (B2 HIGH; B1 says so), `TestOldClaims`,
+  windows), `TestSectionGrade_NoBase` (B2 HIGH; B1 said by check, JSON,
+  MCP and pre-push), `TestOldClaims`,
   `TestBaseClaims`, `TestPreEditHooks_StructuredDocDeletionsGradeHIGH`,
   `TestSharedSectionsAcross_CountsDeletions`,
   `TestSharedSectionsAcross_BehindCountsBasesSections` and

@@ -256,6 +256,16 @@ func TestSectionGrade_NoBase(t *testing.T) {
 	if text, isErr := mcpCheck(c, []string{"PLAN.md"}, false, false); isErr || !strings.Contains(text, `"base_unresolved": true`) {
 		t.Errorf("B1: MCP wt_check lacks base_unresolved (isError %v):\n%s", isErr, text)
 	}
+	// Pre-push, which ships the committed change, says so too (#252 review).
+	_, errOut = captureOutputForTest(t, func() { prePushBlocks(t, wa, "wa") })
+	if !strings.Contains(errOut, "no base branch resolves here") {
+		t.Errorf("B1: pre-push doesn't say committed changes aren't compared:\n%s", errOut)
+	}
+	// Once per push, however many refs it ships.
+	_, errOut = captureOutputForTest(t, func() { prePushRefs(t, wa, "wa", "wa-again") })
+	if n := strings.Count(errOut, "no base branch resolves here"); n != 1 {
+		t.Errorf("B1: a two-ref push says no base %d times, want once:\n%s", n, errOut)
+	}
 
 	// With a base, no note, and the committed shape grades HIGH.
 	writeT(t, wa, ".wt.conf", conf+"base = trunk\n")
@@ -266,6 +276,9 @@ func TestSectionGrade_NoBase(t *testing.T) {
 	}
 	if out, _ := captureOutputForTest(t, func() { cmdCheck([]string{"--json", "PLAN.md"}) }); strings.Contains(out, "base_unresolved") {
 		t.Errorf("with base = trunk, --json carries base_unresolved:\n%s", out)
+	}
+	if _, errOut := captureOutputForTest(t, func() { prePushBlocks(t, wa, "wa") }); strings.Contains(errOut, "no base branch") {
+		t.Errorf("with base = trunk, pre-push still says no base:\n%s", errOut)
 	}
 	if e := planEntry(t, wa, "wb"); e.Category != CatBlocking {
 		t.Errorf("with base = trunk, committed: %s %v, want HIGH", e.Category, e.SharedSections)

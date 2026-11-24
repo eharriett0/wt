@@ -521,6 +521,14 @@ func IsSharedDoc(path string, shared []string) bool {
 	return false
 }
 
+// NoBaseNote is what `wt check` and pre-push say when no base branch
+// resolves (#247): committed changes have no frame to compare in, and
+// TouchedFiles doesn't list them, so a file another window only committed
+// reads clear.
+func NoBaseNote(base string) string {
+	return fmt.Sprintf("no base branch resolves here (neither origin/%s nor %s): windows' committed changes are not compared, only their uncommitted edits, so a file another window only committed reads clear. Set `base` in .wt.conf to the branch windows start from.", base, base)
+}
+
 // RangeFn resolves the line ranges a worktree changed in a path, relative to
 // base. Injected so section/hunk grading is unit-testable without a live repo;
 // production callers pass gitx.ChangedRanges.

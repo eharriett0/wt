@@ -192,10 +192,11 @@ func HookPrePush(c *config.Config, stdin io.Reader) int {
 	// The window scan (for the collision check) is expensive; load it lazily and
 	// once, only when a non-base line actually needs it.
 	var (
-		ws        []collide.Window
-		root      string
-		scanTried bool
-		scanOK    bool
+		ws          []collide.Window
+		root        string
+		scanTried   bool
+		scanOK      bool
+		noBaseNoted bool
 	)
 	sc := bufio.NewScanner(stdin)
 	for sc.Scan() {
@@ -234,6 +235,14 @@ func HookPrePush(c *config.Config, stdin io.Reader) int {
 		}
 		if !scanOK {
 			continue
+		}
+		// #247 review: with no base, the pushed commits have no frame to be
+		// compared in; say so, as `wt check` does, rather than pass silently.
+		if !noBaseNoted {
+			noBaseNoted = true
+			if !gitx.BaseResolves(root, base) {
+				ui.Warn("%s", collide.NoBaseNote(base))
+			}
 		}
 		if pushCollisionBlocks(c, ws, root, outgoingPaths(root, base, localSHA)) {
 			code = 1
