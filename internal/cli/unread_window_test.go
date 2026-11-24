@@ -71,6 +71,7 @@ func TestUnreadWindow_namedEverywhere(t *testing.T) {
 		fmt.Fprintf(&notes, "line %d\n", i)
 	}
 	writeT(t, root, "notes.txt", notes.String())
+	writeT(t, root, "other.txt", "alone\n") // no other window touches it
 	gitT(t, root, "add", "-A")
 	gitT(t, root, "commit", "-qm", "base")
 	dirs := t.TempDir()
@@ -87,11 +88,14 @@ func TestUnreadWindow_namedEverywhere(t *testing.T) {
 		"file_path": filepath.Join(wa, "notes.txt"), "old_string": "A line 5\n", "new_string": "AA line 5\n"}})
 	codex, _ := json.Marshal(map[string]any{"cwd": wa, "tool_name": "apply_patch", "tool_input": map[string]string{
 		"command": "*** Begin Patch\n*** Update File: notes.txt\n@@\n-A line 5\n+AA line 5\n*** End Patch\n"}})
+	alone, _ := json.Marshal(map[string]any{"cwd": wa, "tool_name": "Edit", "tool_input": map[string]string{
+		"file_path": filepath.Join(wa, "other.txt"), "old_string": "alone\n", "new_string": "still alone\n"}})
 	turn := fmt.Sprintf(`{"cwd":%q,"hook_event_name":"UserPromptSubmit"}`, wa)
 
 	type seen struct {
 		status, statusJSON, statusBlocking, check, checkBlocking, checkJSON, mcp string
 		claude, codex, turn, prePush, preCommit                                  string
+		claudeAlone, checkAlone                                                  string
 		checkCode, checkBlockingCode, statusBlockingCode                         int
 		prePushBlocked                                                           bool
 	}
@@ -109,6 +113,8 @@ func TestUnreadWindow_namedEverywhere(t *testing.T) {
 		out, errOut = captureOutputForTest(t, func() { s.checkBlockingCode = cmdCheck([]string{"--blocking", "notes.txt"}) })
 		s.checkBlocking = out + errOut
 		s.checkJSON, _ = captureOutputForTest(t, func() { cmdCheck([]string{"--json", "notes.txt"}) })
+		out, errOut = captureOutputForTest(t, func() { cmdCheck([]string{"other.txt"}) })
+		s.checkAlone = out + errOut
 		c, err := config.Load()
 		if err != nil {
 			t.Fatal(err)
@@ -116,6 +122,7 @@ func TestUnreadWindow_namedEverywhere(t *testing.T) {
 		s.mcp, _ = mcpCheck(c, []string{"notes.txt"}, false, false)
 		s.claude = runHookCapture(t, hookClaudeEdit, string(claude))
 		s.codex = runHookCapture(t, hookCodexEdit, string(codex))
+		s.claudeAlone = runHookCapture(t, hookClaudeEdit, string(alone))
 		s.turn = captureStdoutForTest(t, func() { withStdinForTest(t, turn, func() { runHook([]string{"claude-context"}) }) })
 		_, s.prePush = captureOutputForTest(t, func() { s.prePushBlocked = prePushRefs(t, wa, "wa", "wa-again") })
 		t.Chdir(wa)
@@ -127,6 +134,7 @@ func TestUnreadWindow_namedEverywhere(t *testing.T) {
 	healthy := observe(t)
 	for name, out := range map[string]string{"status": healthy.status, "status --json": healthy.statusJSON, "status --blocking": healthy.statusBlocking,
 		"check": healthy.check, "check --blocking": healthy.checkBlocking, "check --json": healthy.checkJSON, "MCP wt_check": healthy.mcp, "claude-edit": healthy.claude, "codex-edit": healthy.codex,
+		"check other.txt": healthy.checkAlone, "claude-edit other.txt": healthy.claudeAlone,
 		"per-turn": healthy.turn, "pre-push": healthy.prePush, "pre-commit": healthy.preCommit} {
 		if strings.Contains(out, "could not be read") || strings.Contains(out, `"unread`) {
 			t.Errorf("control, %s names an unread window:\n%s", name, out)
@@ -206,8 +214,16 @@ func TestUnreadWindow_namedEverywhere(t *testing.T) {
 		}
 	}
 
-	// Both edit hooks (block mode on): the note, never a deny.
-	for name, out := range map[string]string{"claude-edit": broken.claude, "codex-edit": broken.codex} {
+	if !strings.Contains(broken.checkAlone, named) || !strings.Contains(broken.checkAlone, "no other window is touching other.txt (of the windows wt could read; 1 could not be read)") {
+		t.Errorf("wt check of a file no window touches: want wb named and the clear qualified:\n%s", broken.checkAlone)
+	}
+
+	// Both edit hooks (block mode on): the note, never a deny, also for a file
+	// no other window touches (the Claude hook's no-entries return).
+	if strings.TrimSpace(healthy.claudeAlone) != "" {
+		t.Errorf("control, claude-edit of a file no window touches printed: %s", healthy.claudeAlone)
+	}
+	for name, out := range map[string]string{"claude-edit": broken.claude, "codex-edit": broken.codex, "claude-edit other.txt": broken.claudeAlone} {
 		if !strings.Contains(out, named) || strings.Contains(out, `"permissionDecision"`) {
 			t.Errorf("%s: want the note as context, no decision:\n%s", name, out)
 		}
