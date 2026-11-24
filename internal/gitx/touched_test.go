@@ -384,6 +384,22 @@ func TestTouchedFiles_UnreadIsAnError(t *testing.T) {
 			t.Errorf("TouchedFiles(gone) = %v, %v; want nothing and no error", files, err)
 		}
 	})
+	t.Run("bare repository with worktrees: no error", func(t *testing.T) {
+		bare := filepath.Join(t.TempDir(), "r.git")
+		runGit(t, t.TempDir(), "clone", "-q", "--bare", branch(t), bare)
+		wa := filepath.Join(t.TempDir(), "wa")
+		runGit(t, bare, "worktree", "add", "-q", wa, "feat")
+		if out := gitOut(t, bare, "worktree", "list", "--porcelain"); !strings.Contains(out, "\nbare\n") {
+			t.Fatalf("precondition: git lists the bare repository as a worktree:\n%s", out)
+		}
+		// Its HEAD (feat) still lists what it committed, as before #253.
+		if files, err := TouchedFiles(bare, "main"); err != nil {
+			t.Errorf("TouchedFiles(bare) = %v, %v; want no error", files, err)
+		}
+		if files, err := TouchedFiles(wa, "main"); err != nil || !touchedContains(files, "committed.txt") {
+			t.Errorf("TouchedFiles(its worktree) = %v, %v; want its committed file and no error", files, err)
+		}
+	})
 	t.Run("index unreadable: committed files still listed", func(t *testing.T) {
 		if os.Geteuid() == 0 {
 			t.Skip("root reads a mode-000 file")

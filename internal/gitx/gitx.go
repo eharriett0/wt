@@ -1226,8 +1226,8 @@ func parseMergeTreeConflictPaths(out string) []string {
 // branch holding an object the repo lacks or an unreadable index (an
 // index.lock does not fail it; measured, git 2.39). The window is then
 // unread, never "no changes" (#253); files still holds what (b) read. A dir
-// that no longer exists is no error: git lists that worktree as prunable,
-// and it holds no uncommitted changes to miss. (b)
+// with no working tree (noWorkTree: deleted, or a bare repository) is no
+// error: it holds no uncommitted changes to miss. (b)
 // failing is no error: it fails for a branch with no commits, with no base,
 // or with no merge base with it, and those have nothing committed to list.
 func TouchedFiles(dir, base string) (files []string, err error) {
@@ -1249,7 +1249,7 @@ func TouchedFiles(dir, base string) (files []string, err error) {
 		for _, p := range parsePorcelainZ(out) {
 			set[p] = struct{}{}
 		}
-	} else if !dirGone(dir) {
+	} else if !noWorkTree(dir) {
 		err = fmt.Errorf("git status: %s", exitText(serr))
 	}
 
@@ -1272,11 +1272,17 @@ func TouchedFiles(dir, base string) (files []string, err error) {
 	return files, err
 }
 
-// dirGone reports whether dir no longer exists (a worktree git lists as
-// prunable).
-func dirGone(dir string) bool {
-	_, err := os.Stat(dir)
-	return errors.Is(err, os.ErrNotExist)
+// noWorkTree reports whether dir has no working tree for `git status` to
+// read: it no longer exists (a worktree git lists as prunable), or it is a
+// bare repository (git lists one first when worktrees hang off it). Asked
+// only after status fails; a linked worktree with a broken branch or index
+// is not bare (measured, git 2.39).
+func noWorkTree(dir string) bool {
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		return true
+	}
+	out, err := RunDir(dir, "rev-parse", "--is-bare-repository")
+	return err == nil && out == "true"
 }
 
 // exitText is a failed git call's error as git put it: the stderr an
