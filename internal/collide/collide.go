@@ -8,6 +8,7 @@
 package collide
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -53,9 +54,13 @@ func (w Window) Label() string {
 // Scan enumerates every worktree of the repo, its branch, claim info (matched
 // from the active-work file by worktree path then branch), and touched files.
 func Scan(c *config.Config) ([]Window, error) {
-	paths, err := gitx.WorktreePaths()
+	refs, err := gitx.WorktreeList()
 	if err != nil {
 		return nil, err
+	}
+	paths := make([]string, len(refs))
+	for i, r := range refs {
+		paths[i] = r.Path
 	}
 	claims := activework.Parse(activework.Read(c.ActiveWork))
 	byWorktree := map[string]activework.Entry{}
@@ -75,10 +80,13 @@ func Scan(c *config.Config) ([]Window, error) {
 	// inherited the cost since it also calls Scan. The reads are independent per
 	// worktree (separate working trees, read-only — no git-lock contention), so
 	// a bounded worker pool cuts wall time to roughly the slowest single
-	// worktree. Indexed writes preserve WorktreePaths order (stable output). A
-	// window whose uncommitted changes can't be read is marked Unread (#253);
-	// other per-worktree git errors stay swallowed, as before.
+	// worktree. Indexed writes preserve `git worktree list` order (stable
+	// output). A window whose uncommitted changes can't be read is marked
+	// Unread (#253), except one git lists as prunable (its directory is gone
+	// and it is not locked: nothing to read); other per-worktree git errors
+	// stay swallowed, as before.
 	ws := make([]Window, len(paths))
+	errs := make([]error, len(paths))
 	sem := make(chan struct{}, scanWorkers())
 	var wg sync.WaitGroup
 	for i, p := range paths {
@@ -90,8 +98,8 @@ func Scan(c *config.Config) ([]Window, error) {
 			br, _ := gitx.CurrentBranchIn(p)
 			touched, terr := gitx.TouchedFiles(p, c.Base)
 			w := Window{Worktree: p, Branch: br, Touched: touched}
-			if terr != nil {
-				w.Unread = terr.Error()
+			if terr != nil && !refs[i].Prunable {
+				w.Unread, errs[i] = terr.Error(), terr
 			}
 			if e, ok := byWorktree[p]; ok {
 				w.Issue, w.Title = e.Issue, e.Title
@@ -102,7 +110,36 @@ func Scan(c *config.Config) ([]Window, error) {
 		}(i, p)
 	}
 	wg.Wait()
+	readOwnGitDirEntry(c, ws, errs, byWorktree)
 	return ws, nil
+}
+
+// readOwnGitDirEntry reads, by its work tree, the entry of a
+// `--separate-git-dir` repository's main work tree when Scan runs inside it
+// (#253 review): git lists that window by its git directory, which
+// TouchedFiles can't read (gitx.ErrGitDirOnly), and the window would be
+// named unread to itself. From any other window it stays unread: git does
+// not say where that work tree is.
+func readOwnGitDirEntry(c *config.Config, ws []Window, errs []error, byWorktree map[string]activework.Entry) {
+	for i, err := range errs {
+		if !errors.Is(err, gitx.ErrGitDirOnly) {
+			continue
+		}
+		gitDir, gerr := gitx.Run("rev-parse", "--path-format=absolute", "--git-dir")
+		root, rerr := gitx.RepoRoot()
+		if gerr != nil || rerr != nil || !sameWorktree(gitDir, ws[i].Worktree) {
+			return
+		}
+		touched, terr := gitx.TouchedFiles(root, c.Base)
+		ws[i].Worktree, ws[i].Touched, ws[i].Unread = root, touched, ""
+		if terr != nil {
+			ws[i].Unread = terr.Error()
+		}
+		if e, ok := byWorktree[root]; ok {
+			ws[i].Issue, ws[i].Title = e.Issue, e.Title
+		}
+		return
+	}
 }
 
 // scanWorkers bounds the concurrent per-worktree git reads in Scan: enough to
@@ -561,11 +598,15 @@ func UnreadNote(unread []Window) string {
 		return ""
 	case 1:
 		w := unread[0]
-		return fmt.Sprintf("window %s could not be read (%s): its uncommitted edits are not compared. Run `git status` in %s.", w.Label(), w.Unread, w.Worktree)
+		note := fmt.Sprintf("window %s could not be read (%s): its uncommitted edits are not compared.", w.Label(), w.Unread)
+		if strings.HasPrefix(w.Unread, "git status: ") { // git's own failure, not gitx.ErrGitDirOnly
+			note += fmt.Sprintf(" Run `git status` in %s.", w.Worktree)
+		}
+		return note
 	}
 	parts := make([]string, len(unread))
 	for i, w := range unread {
-		parts[i] = fmt.Sprintf("%s (%s)", w.Label(), w.Unread)
+		parts[i] = fmt.Sprintf("%s at %s (%s)", w.Label(), w.Worktree, w.Unread)
 	}
 	return fmt.Sprintf("%d windows could not be read: %s. Their uncommitted edits are not compared; run `git status` in each.", len(unread), strings.Join(parts, "; "))
 }
@@ -1059,6 +1100,10 @@ type WindowLiveness struct {
 	Dirty      bool          // the worktree also has uncommitted edits — noted on a suppressed level so a reopened-merged/closed branch is legible (#79 comment 2)
 	BehindBase int           // commits behind origin/base; >0 only computed for a dirty base checkout, enriches the LiveDirty "likely stale" label (#87)
 	Age        time.Duration // time since the branch's last commit (0 if unknown)
+	// Unread: git could not read the window's working tree (#253). IsClean
+	// failing counts it Dirty, so it is never hidden; the label says what is
+	// actually known (#254 review).
+	Unread bool
 }
 
 // Label is the plain (uncolored) liveness word, e.g. "open PR #747" or
@@ -1066,6 +1111,9 @@ type WindowLiveness struct {
 // edits note when a shipped/closed branch still has a dirty index.
 func (wl WindowLiveness) Label() string {
 	base := wl.Level.Tag()
+	if wl.Unread && wl.Level == LiveDirty { // #253: dirty only because it can't be read
+		base = "working tree unread"
+	}
 	if wl.Level == LiveOpenPR && wl.PR != "" {
 		base = "open PR #" + wl.PR
 	}
@@ -1085,8 +1133,11 @@ func (wl WindowLiveness) Label() string {
 	// #79 comment 2: when a shipped/closed branch ALSO has a leftover dirty index
 	// (the unresolvable false-HIGH case — `wt clean` won't remove the unshared
 	// index, so `check` would flag it forever), say WHY it's still only an FYI.
-	if wl.Dirty && (wl.Level == LiveStale || wl.Level == LiveClosedPR) {
+	if wl.Dirty && !wl.Unread && (wl.Level == LiveStale || wl.Level == LiveClosedPR) {
 		base += " · leftover uncommitted edits"
+	}
+	if wl.Unread && wl.Level != LiveDirty {
+		base += " · working tree unread"
 	}
 	// #168: a dirty worktree whose commits merged under another branch name stays
 	// HIGH (ClassifyFacts' tip exception). Name the PR so the reader can see the
@@ -1265,7 +1316,7 @@ func Classify(w Window, base string, maxAge time.Duration, now time.Time) Window
 			}
 		}
 	}
-	wl := WindowLiveness{Level: ClassifyFacts(f, maxAge), Age: f.Age, Dirty: f.Dirty, BehindBase: behindBase}
+	wl := WindowLiveness{Level: ClassifyFacts(f, maxAge), Age: f.Age, Dirty: f.Dirty, BehindBase: behindBase, Unread: w.Unread != ""}
 	if wl.Level == LiveOpenPR {
 		wl.PR = pr
 	}

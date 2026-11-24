@@ -927,11 +927,7 @@ func renderBlockingGate(graded []StatusOverlap, ws []collide.Window, live map[st
 		ui.Warn("%s", collide.UnreadNote(unread))
 	}
 	if len(high) == 0 {
-		if len(unread) > 0 {
-			ui.OK("no HIGH-risk collisions among the %d window(s) wt could read", len(ws)-len(unread))
-		} else {
-			ui.OK("no HIGH-risk collisions across %d window(s)", len(ws))
-		}
+		ui.OK("no HIGH-risk collisions %s", windowScope(len(ws), len(unread)))
 		return 0
 	}
 	ui.Collision("%d file(s) with a HIGH-risk collision:", len(high))
@@ -1005,7 +1001,7 @@ func statusReport(c *config.Config, asJSON, blocking bool) int {
 	}
 	if len(ov) == 0 {
 		if len(unread) > 0 {
-			ui.OK("no file collisions among the %d window(s) wt could read", len(ws)-len(unread))
+			ui.OK("no file collisions %s", windowScope(len(ws), len(unread)))
 		} else {
 			ui.OK("no file collisions across %d window(s) — all clear", len(ws))
 		}
@@ -1039,7 +1035,7 @@ func statusReport(c *config.Config, asJSON, blocking bool) int {
 				strings.Join(taggedWindows(o.Windows, live), ", "), detail)
 		}
 	} else {
-		ui.OK("no HIGH-risk (overlapping-hunk) collisions across %d window(s)%s", len(ws), clearScope(len(unread)))
+		ui.OK("no HIGH-risk (overlapping-hunk) collisions %s", windowScope(len(ws), len(unread)))
 	}
 	for _, o := range low {
 		reason := fmt.Sprintf("%d windows, 0 overlapping hunks → low", len(o.Windows))
@@ -1529,6 +1525,7 @@ func cmdCheck(args []string) int {
 		// that exact path by a window) matches EXACTLY; only one that names
 		// nothing in the repo is a fuzzy basename/suffix search.
 		args := resolveCheckArgs(paths, root, cwdArgBase(root), ws)
+		unread := collide.UnreadWindows(ws, root) // #253: named, never blocking
 		// #201: a path no worktree of this repository holds has nothing to check;
 		// "clear" would be a claim about nothing. Not even --allow-missing makes it
 		// checkable.
@@ -1543,13 +1540,16 @@ func cmdCheck(args []string) int {
 		// opts into checking a genuinely-gone path.
 		if !allowMissing {
 			if unknown := unknownCheckPaths(args, ws); len(unknown) > 0 {
-				ui.Err("wt check: no such path(s) — refusing to report 'clear' for path(s) that don't exist, aren't tracked, and no window is touching: %s. (typo, or zsh didn't word-split a $var? checking a path you're about to CREATE, or one that's deleted/on another branch? re-run with --allow-missing.)", strings.Join(unknown, ", "))
+				// #253 review: an unread window may be the one creating it.
+				if len(unread) > 0 {
+					ui.Warn("%s", collide.UnreadNote(unread))
+				}
+				ui.Err("wt check: no such path(s) — refusing to report 'clear' for path(s) that don't exist, aren't tracked, and %s is touching: %s. (typo, or zsh didn't word-split a $var? checking a path you're about to CREATE, or one that's deleted/on another branch? re-run with --allow-missing.)", noWindowTouching(len(unread)), strings.Join(unknown, ", "))
 				return 64
 			}
 		}
 		entries := buildCheckReport(c, ws, root, checkQueries(args))
 		noBase := !gitx.BaseResolves(root, c.Base) // #247
-		unread := collide.UnreadWindows(ws, root)  // #253: named, never blocking
 		if asJSON {
 			return renderCheckJSON(entries, includeStale, noBase, unread)
 		}

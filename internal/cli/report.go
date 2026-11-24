@@ -535,6 +535,25 @@ func unreadWindowsPayload(ws []collide.Window) []UnreadWindow {
 	return out
 }
 
+// windowScope is the "across N window(s)" of a status verdict, or, when
+// windows went unread (#253), "among the M window(s) wt could read (U could
+// not be read)", so the count never includes a window that was not read.
+func windowScope(n, unread int) string {
+	if unread == 0 {
+		return fmt.Sprintf("across %d window(s)", n)
+	}
+	return fmt.Sprintf("among the %d window(s) wt could read (%d could not be read)", n-unread, unread)
+}
+
+// noWindowTouching is the #93 refusal's "no window", narrowed to the windows
+// wt could read when some went unread (#253 review).
+func noWindowTouching(unread int) string {
+	if unread == 0 {
+		return "no window"
+	}
+	return "no window wt could read"
+}
+
 // clearScope qualifies a clear verdict when windows went unread (#253): it
 // is then about the windows wt could read. "" when every window was read.
 func clearScope(unread int) string {

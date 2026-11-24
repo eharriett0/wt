@@ -141,13 +141,20 @@ index can't be read; a `git add` running there does not), wt can't see that
 window's uncommitted edits. `wt status` marks it `UNREAD` with git's reason
 instead of `(no changes)`, and `wt check`, both edit hooks, the per-turn
 context, pre-push and pre-commit name it, with any clear qualified as being
-about the windows wt could read. It never blocks, since no path can be tied
-to it. In JSON it is `unread` on the window (`wt status --json`, MCP
+about the windows wt could read. Being unread never blocks, since no path can
+be tied to it. A file the window committed is still graded, and as its
+working copy can't be read, an overlap there is indeterminate and so HIGH,
+like any grade wt can't compute; its tag then reads `working tree unread`, not
+`uncommitted edits`. In JSON it is `unread` on the window (`wt status --json`, MCP
 `wt_status`) and `unread_windows` (`window`, `worktree`, `error`) in `wt check
 --json` and MCP `wt_check`. Run `git status` in that worktree to see what is
-wrong. A worktree whose directory was deleted (`git worktree prune` removes
-its record) and the bare repository of a bare-plus-worktrees layout are not
-unread: neither has a working tree to hold uncommitted edits.
+wrong. Two entries are not unread, since neither has a work tree to hold
+edits: a worktree git lists as prunable (its directory deleted; `git worktree
+prune` removes its record) and the bare repository of a bare-plus-worktrees
+layout. A locked worktree whose directory is gone (an unmounted volume) is
+unread: its edits still exist. In a `--separate-git-dir` repository git lists
+the main work tree by its git directory; wt reads it from inside that work
+tree, and other windows name it unread, since git does not say where it is.
 
 ### Stale branches don't count
 

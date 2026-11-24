@@ -666,6 +666,9 @@ func FastForwardBranch(branch, from, to string) error {
 }
 
 // WorktreePaths lists every worktree path (primary first), via porcelain.
+//
+// Each path is taken verbatim: a worktree path may end in a space, and
+// trimming it named a directory that doesn't exist (#253 review).
 func WorktreePaths() ([]string, error) {
 	out, err := Run("worktree", "list", "--porcelain")
 	if err != nil {
@@ -674,7 +677,7 @@ func WorktreePaths() ([]string, error) {
 	var paths []string
 	for _, ln := range strings.Split(out, "\n") {
 		if strings.HasPrefix(ln, "worktree ") {
-			paths = append(paths, strings.TrimSpace(strings.TrimPrefix(ln, "worktree ")))
+			paths = append(paths, strings.TrimPrefix(ln, "worktree "))
 		}
 	}
 	return paths, nil
@@ -695,7 +698,7 @@ func WorktreeBranchesUnder(root string) ([]string, error) {
 	for _, ln := range strings.Split(out, "\n") {
 		switch {
 		case strings.HasPrefix(ln, "worktree "):
-			curPath = strings.TrimSpace(strings.TrimPrefix(ln, "worktree "))
+			curPath = strings.TrimPrefix(ln, "worktree ")
 		case strings.HasPrefix(ln, "branch "):
 			br := strings.TrimPrefix(strings.TrimSpace(strings.TrimPrefix(ln, "branch ")), "refs/heads/")
 			if br != "" && pathUnder(curPath, root) {
@@ -716,6 +719,10 @@ type WorktreeRef struct {
 	// worktrees beside or inside it): listed first, with no work tree (#201
 	// review).
 	Bare bool
+	// Prunable: git lists it as prunable, its directory gone and the worktree
+	// not locked (#253 review). A locked one whose directory is gone (an
+	// unmounted volume) is not: its edits still exist.
+	Prunable bool
 }
 
 // BareWorktreesIn lists the bare entries of `git worktree list` run in dir: a
@@ -759,7 +766,7 @@ func WorktreeListIn(dir string) ([]WorktreeRef, error) {
 		switch {
 		case strings.HasPrefix(ln, "worktree "):
 			flush()
-			cur.Path = strings.TrimSpace(strings.TrimPrefix(ln, "worktree "))
+			cur.Path = strings.TrimPrefix(ln, "worktree ")
 		case strings.HasPrefix(ln, "branch "):
 			cur.Branch = strings.TrimPrefix(strings.TrimSpace(strings.TrimPrefix(ln, "branch ")), "refs/heads/")
 		case strings.HasPrefix(ln, "HEAD "):
@@ -770,6 +777,8 @@ func WorktreeListIn(dir string) ([]WorktreeRef, error) {
 			cur.Locked = true
 		case ln == "bare":
 			cur.Bare = true
+		case ln == "prunable" || strings.HasPrefix(ln, "prunable "):
+			cur.Prunable = true
 		}
 	}
 	flush()
@@ -1225,9 +1234,10 @@ func parseMergeTreeConflictPaths(out string) []string {
 // err is non-nil when (a) can't be read: `git status` fails, as it does for a
 // branch holding an object the repo lacks or an unreadable index (an
 // index.lock does not fail it; measured, git 2.39). The window is then
-// unread, never "no changes" (#253); files still holds what (b) read. A dir
-// with no working tree (noWorkTree: deleted, or a bare repository) is no
-// error: it holds no uncommitted changes to miss. (b)
+// unread, never "no changes" (#253); files still holds what (b) read. A bare
+// repository is no error (statusError): it has no work tree. A directory
+// that is gone is an error here; Scan leaves out the ones git lists as
+// prunable. (b)
 // failing is no error: it fails for a branch with no commits, with no base,
 // or with no merge base with it, and those have nothing committed to list.
 func TouchedFiles(dir, base string) (files []string, err error) {
@@ -1249,8 +1259,8 @@ func TouchedFiles(dir, base string) (files []string, err error) {
 		for _, p := range parsePorcelainZ(out) {
 			set[p] = struct{}{}
 		}
-	} else if !noWorkTree(dir) {
-		err = fmt.Errorf("git status: %s", exitText(serr))
+	} else {
+		err = statusError(dir, serr)
 	}
 
 	// (b) committed-on-branch vs base (three-dot = since merge-base). A COMMITTED
@@ -1272,17 +1282,35 @@ func TouchedFiles(dir, base string) (files []string, err error) {
 	return files, err
 }
 
-// noWorkTree reports whether dir has no working tree for `git status` to
-// read: it no longer exists (a worktree git lists as prunable), or it is a
-// bare repository (git lists one first when worktrees hang off it). Asked
-// only after status fails; a linked worktree with a broken branch or index
-// is not bare (measured, git 2.39).
-func noWorkTree(dir string) bool {
-	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
-		return true
+// ErrGitDirOnly is TouchedFiles' error for a worktree entry that is a git
+// directory but not bare: the main entry of a `--separate-git-dir`
+// repository. Its work tree exists, but git does not say where (#253 review).
+var ErrGitDirOnly = errors.New("it is the repository's git directory, and git does not list where its work tree is (a --separate-git-dir layout)")
+
+// statusError is why `git status` failed in dir (serr), or nil when dir is a
+// bare repository (git lists one first when worktrees hang off it), which has
+// no work tree to read. A git directory that is not bare is ErrGitDirOnly.
+// When git never ran (no *exec.ExitError), the reason is dir's own: Go
+// reports a directory it can't enter as a failed exec of git. Asked only
+// after status fails; a linked worktree with a broken branch or index reads
+// false/false here (measured, git 2.39).
+func statusError(dir string, serr error) error {
+	var ee *exec.ExitError
+	if !errors.As(serr, &ee) {
+		f, oerr := os.Open(dir)
+		if oerr != nil {
+			return fmt.Errorf("git status: %s", oerr)
+		}
+		_ = f.Close()
+		return fmt.Errorf("git status: %s", serr)
 	}
-	out, err := RunDir(dir, "rev-parse", "--is-bare-repository")
-	return err == nil && out == "true"
+	switch out, _ := RunDir(dir, "rev-parse", "--is-bare-repository", "--is-inside-git-dir"); out {
+	case "true\ntrue":
+		return nil
+	case "false\ntrue":
+		return ErrGitDirOnly
+	}
+	return fmt.Errorf("git status: %s", exitText(serr))
 }
 
 // exitText is a failed git call's error as git put it: the stderr an

@@ -1,6 +1,7 @@
 package gitx
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -338,8 +339,10 @@ func TestFileChangeSubsumed(t *testing.T) {
 
 // A worktree whose uncommitted changes git can't read is an error, never "no
 // changes" (#253), measured on real git: a branch holding an object the repo
-// lacks, an unreadable index. An index.lock (a `git add` running in that
-// window) does not fail git status, so it is no error.
+// lacks, an unreadable index, a directory that is gone or can't be entered.
+// An index.lock (a `git add` running in that window) does not fail git
+// status, so it is no error; nor is a bare repository, which has no work
+// tree. A --separate-git-dir repository's git directory is ErrGitDirOnly.
 func TestTouchedFiles_UnreadIsAnError(t *testing.T) {
 	t.Setenv("GIT_DEFAULT_REF_FORMAT", "files") // the branch case writes a ref file
 	branch := func(t *testing.T) string {
@@ -370,18 +373,43 @@ func TestTouchedFiles_UnreadIsAnError(t *testing.T) {
 			t.Errorf("err = %v, want git status's own reason (bad object HEAD)", err)
 		}
 	})
-	t.Run("directory gone (prunable): no error", func(t *testing.T) {
+	t.Run("directory gone: its own error (Scan leaves out the prunable)", func(t *testing.T) {
 		dir := branch(t)
 		gone := filepath.Join(t.TempDir(), "gone")
 		runGit(t, dir, "worktree", "add", "-q", "-b", "gone", gone, "main")
 		if err := os.RemoveAll(gone); err != nil {
 			t.Fatal(err)
 		}
-		if out := gitOut(t, dir, "worktree", "list", "--porcelain"); !strings.Contains(out, "prunable") {
-			t.Fatalf("precondition: git lists the removed worktree as prunable:\n%s", out)
+		if _, err := TouchedFiles(gone, "main"); err == nil || !strings.Contains(err.Error(), "no such file or directory") {
+			t.Errorf("TouchedFiles(gone) err = %v, want its directory's own error", err)
 		}
-		if files, err := TouchedFiles(gone, "main"); err != nil || len(files) != 0 {
-			t.Errorf("TouchedFiles(gone) = %v, %v; want nothing and no error", files, err)
+	})
+	t.Run("directory can't be entered: its own error, not a failed exec", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root enters a mode-000 directory")
+		}
+		dir := branch(t)
+		if err := os.Chmod(dir, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+		if _, err := TouchedFiles(dir, "main"); err == nil || !strings.Contains(err.Error(), "permission denied") || strings.Contains(err.Error(), "exec") {
+			t.Errorf("err = %v, want the directory's own error (permission denied), not git's exec", err)
+		}
+	})
+	t.Run("separate git dir: ErrGitDirOnly, its work tree read", func(t *testing.T) {
+		base := t.TempDir()
+		sep, work := filepath.Join(base, "sep.git"), filepath.Join(base, "main")
+		runGit(t, base, "init", "-q", "-b", "main", "--separate-git-dir", sep, work)
+		runGit(t, work, "config", "user.email", "t@t.test")
+		runGit(t, work, "config", "user.name", "t")
+		runGit(t, work, "commit", "--allow-empty", "-qm", "init")
+		writeFile(t, work, "dirty.txt", "d\n")
+		if _, err := TouchedFiles(sep, "main"); !errors.Is(err, ErrGitDirOnly) {
+			t.Errorf("TouchedFiles(its git dir) err = %v, want ErrGitDirOnly", err)
+		}
+		if files, err := TouchedFiles(work, "main"); err != nil || !touchedContains(files, "dirty.txt") {
+			t.Errorf("TouchedFiles(its work tree) = %v, %v; want dirty.txt and no error", files, err)
 		}
 	})
 	t.Run("bare repository with worktrees: no error", func(t *testing.T) {

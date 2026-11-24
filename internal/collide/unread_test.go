@@ -47,10 +47,36 @@ func TestUnreadNote(t *testing.T) {
 			t.Errorf("one window: %q lacks %q", one, want)
 		}
 	}
+	// A reason that is not git's own failure gets no `git status` advice: in
+	// a --separate-git-dir repository's git directory it can't help.
+	sep := UnreadNote([]Window{{Worktree: "/r/sep.git", Branch: "main", Unread: "it is the repository's git directory"}})
+	if !strings.Contains(sep, "git directory") || strings.Contains(sep, "git status`") {
+		t.Errorf("git-directory window: %q, want its reason and no `git status` advice", sep)
+	}
 	two := UnreadNote([]Window{wb, wc})
-	for _, want := range []string{"2 windows could not be read", "wb (git status: fatal: bad object HEAD)", "#7 (git status: fatal: index file open failed)", "not compared"} {
+	for _, want := range []string{"2 windows could not be read", "wb at /r/wb (git status: fatal: bad object HEAD)", "#7 at /r/wc (git status: fatal: index file open failed)", "not compared"} {
 		if !strings.Contains(two, want) {
 			t.Errorf("two windows: %q lacks %q", two, want)
+		}
+	}
+}
+
+// An unread window counts as dirty (IsClean fails), so it is never hidden, but
+// its tag says its working tree was not read, not that it has edits (#254
+// review).
+func TestWindowLiveness_UnreadLabel(t *testing.T) {
+	for _, c := range []struct {
+		wl   WindowLiveness
+		want string
+	}{
+		{WindowLiveness{Level: LiveDirty, Dirty: true, Unread: true}, "working tree unread"},
+		{WindowLiveness{Level: LiveDirty, Dirty: true}, "uncommitted edits"},
+		{WindowLiveness{Level: LiveOpenPR, PR: "7", Dirty: true, Unread: true}, "open PR #7 · working tree unread"},
+		{WindowLiveness{Level: LiveStale, MergedPR: "9", Dirty: true, Unread: true}, "merged #9 · working tree unread"},
+		{WindowLiveness{Level: LiveStale, MergedPR: "9", Dirty: true}, "merged #9 · leftover uncommitted edits"},
+	} {
+		if got := c.wl.Label(); got != c.want {
+			t.Errorf("%+v: Label() = %q, want %q", c.wl, got, c.want)
 		}
 	}
 }

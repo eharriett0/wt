@@ -142,7 +142,8 @@ func mcpToolDescriptors() []map[string]any {
 				"plus graded cross-window overlaps. An overlap lists only live windows (merged, closed-PR and dormant ones are left out) " +
 				"and is HIGH when some pair of them would each block in wt_check (hunks git would merge as one conflict: overlapping, or touching with no unchanged line between; or the same section of a structured doc); " +
 				"a window whose copy is already on base, already landed, or untracked contests nothing. " +
-				"Also `session` (the session this server reads as, fixed when the client started it) and `other_sessions`: other sessions that posted coordination records from this checkout in the last 24h (sessions_unread says the log could not be read). Read-only.",
+				"Also `session` (the session this server reads as, fixed when the client started it) and `other_sessions`: other sessions that posted coordination records from this checkout in the last 24h (sessions_unread says the log could not be read). " +
+				"A window git could not read carries `unread` (git's reason): its uncommitted edits were not compared. Read-only.",
 			"inputSchema": obj(map[string]any{
 				"blocking": map[string]any{"type": "boolean", "description": "return only HIGH-risk overlaps"},
 			}),
@@ -150,7 +151,8 @@ func mcpToolDescriptors() []map[string]any {
 		{
 			"name": "wt_check",
 			"description": "Before editing: is any other live window touching these paths? Returns per-path " +
-				"grading (HIGH: hunks that overlap or touch, which git merges as one conflict; low: disjoint/advisory). Read-only.",
+				"grading (HIGH: hunks that overlap or touch, which git merges as one conflict; low: disjoint/advisory). " +
+				"`unread_windows` names other windows git could not read: their uncommitted edits were not compared, so a clear covers only the windows that were read. Read-only.",
 			"inputSchema": obj(map[string]any{
 				"paths":           map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "repo-relative or absolute paths to check, matched exactly; a bare name that is no path in the repo (e.g. foo.go) matches any touched file with that basename. \".\" is the whole repository; an absolute path inside another worktree of this repository is checked as the same repo path; one outside every worktree is refused"},
 				"include_stale":   map[string]any{"type": "boolean", "description": "include merged/dormant windows"},
@@ -306,9 +308,14 @@ func mcpCheck(c *config.Config, paths []string, includeStale, allowMissing bool)
 	// answer can't diverge from `wt check --json`.
 	if !allowMissing {
 		if unk := unknownCheckPaths(args, ws); len(unk) > 0 {
-			return "no such path(s) — refusing to report 'clear' for path(s) that don't exist, " +
-				"aren't tracked, and no window is touching: " + strings.Join(unk, ", ") +
-				" (typo? or a path you're about to CREATE — re-call with include_missing:true).", true
+			unread := collide.UnreadWindows(ws, root)
+			msg := "no such path(s) — refusing to report 'clear' for path(s) that don't exist, " +
+				"aren't tracked, and " + noWindowTouching(len(unread)) + " is touching: " + strings.Join(unk, ", ") +
+				" (typo? or a path you're about to CREATE — re-call with include_missing:true)."
+			if len(unread) > 0 { // #253 review: an unread window may be the one creating it
+				msg += " " + collide.UnreadNote(unread)
+			}
+			return msg, true
 		}
 	}
 	entries := buildCheckReport(c, ws, root, checkQueries(args))

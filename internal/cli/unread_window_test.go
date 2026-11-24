@@ -8,7 +8,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/eharriett0/wt/internal/collide"
 	"github.com/eharriett0/wt/internal/config"
+	"github.com/eharriett0/wt/internal/gitx"
 	"github.com/eharriett0/wt/internal/hooks"
 )
 
@@ -104,6 +106,8 @@ func TestUnreadWindow_namedEverywhere(t *testing.T) {
 		status, statusJSON, statusBlocking, check, checkBlocking, checkJSON, mcp string
 		claude, codex, turn, prePush, preCommit                                  string
 		claudeAlone, checkAlone                                                  string
+		checkUnknown, mcpUnknown, codexTurn, mcpStatus                           string
+		checkUnknownCode                                                         int
 		checkCode, checkBlockingCode, statusBlockingCode                         int
 		prePushBlocked                                                           bool
 	}
@@ -123,15 +127,20 @@ func TestUnreadWindow_namedEverywhere(t *testing.T) {
 		s.checkJSON, _ = captureOutputForTest(t, func() { cmdCheck([]string{"--json", "notes.txt"}) })
 		out, errOut = captureOutputForTest(t, func() { cmdCheck([]string{"other.txt"}) })
 		s.checkAlone = out + errOut
+		out, errOut = captureOutputForTest(t, func() { s.checkUnknownCode = cmdCheck([]string{"pkg/new.go"}) })
+		s.checkUnknown = out + errOut
 		c, err := config.Load()
 		if err != nil {
 			t.Fatal(err)
 		}
 		s.mcp, _ = mcpCheck(c, []string{"notes.txt"}, false, false)
+		s.mcpUnknown, _ = mcpCheck(c, []string{"pkg/new.go"}, false, false)
+		s.mcpStatus, _ = mcpStatus(c, false)
 		s.claude = runHookCapture(t, hookClaudeEdit, string(claude))
 		s.codex = runHookCapture(t, hookCodexEdit, string(codex))
 		s.claudeAlone = runHookCapture(t, hookClaudeEdit, string(alone))
 		s.turn = captureStdoutForTest(t, func() { withStdinForTest(t, turn, func() { runHook([]string{"claude-context"}) }) })
+		s.codexTurn = captureStdoutForTest(t, func() { withStdinForTest(t, turn, func() { runHook([]string{"codex-context"}) }) })
 		_, s.prePush = captureOutputForTest(t, func() { s.prePushBlocked = prePushRefs(t, wa, "wa", "wa-again") })
 		t.Chdir(wa)
 		_, s.preCommit = captureOutputForTest(t, func() { hooks.HookPreCommit(c) })
@@ -143,6 +152,7 @@ func TestUnreadWindow_namedEverywhere(t *testing.T) {
 	for name, out := range map[string]string{"status": healthy.status, "status --json": healthy.statusJSON, "status --blocking": healthy.statusBlocking,
 		"check": healthy.check, "check --blocking": healthy.checkBlocking, "check --json": healthy.checkJSON, "MCP wt_check": healthy.mcp, "claude-edit": healthy.claude, "codex-edit": healthy.codex,
 		"check other.txt": healthy.checkAlone, "claude-edit other.txt": healthy.claudeAlone,
+		"check pkg/new.go": healthy.checkUnknown, "MCP wt_check pkg/new.go": healthy.mcpUnknown, "codex per-turn": healthy.codexTurn, "MCP wt_status": healthy.mcpStatus,
 		"per-turn": healthy.turn, "pre-push": healthy.prePush, "pre-commit": healthy.preCommit} {
 		if strings.Contains(out, "could not be read") || strings.Contains(out, `"unread`) {
 			t.Errorf("control, %s names an unread window:\n%s", name, out)
@@ -242,11 +252,195 @@ func TestUnreadWindow_namedEverywhere(t *testing.T) {
 		t.Errorf("per-turn context doesn't name wb:\n%s", broken.turn)
 	}
 
+	// A path no window wt could read touches is still refused (#93), and the
+	// refusal names wb: it may be the window creating that path.
+	if healthy.checkUnknownCode != 64 || broken.checkUnknownCode != 64 || !strings.Contains(broken.checkUnknown, named) || !strings.Contains(broken.checkUnknown, "no window wt could read is touching") {
+		t.Errorf("wt check pkg/new.go: exit %d then %d, want 64 both, the second naming wb:\n%s", healthy.checkUnknownCode, broken.checkUnknownCode, broken.checkUnknown)
+	}
+	if !strings.Contains(broken.mcpUnknown, named) {
+		t.Errorf("MCP wt_check pkg/new.go doesn't name wb:\n%s", broken.mcpUnknown)
+	}
+	if !strings.Contains(broken.codexTurn, named) {
+		t.Errorf("codex per-turn context doesn't name wb:\n%s", broken.codexTurn)
+	}
+	var mst StatusPayload
+	if err := json.Unmarshal([]byte(broken.mcpStatus), &mst); err != nil {
+		t.Fatalf("MCP wt_status: %v\n%s", err, broken.mcpStatus)
+	}
+	mcpUnread := ""
+	for _, w := range mst.Windows {
+		if w.Label == "wb" {
+			mcpUnread = w.Unread
+		}
+	}
+	if !strings.Contains(mcpUnread, "bad object HEAD") {
+		t.Errorf("MCP wt_status: wb's unread = %q, want git's reason", mcpUnread)
+	}
+
 	// Pre-push: once per push, never blocking; pre-commit: named.
 	if n := strings.Count(broken.prePush, named); n != 1 || broken.prePushBlocked {
 		t.Errorf("pre-push of two refs: named %d time(s), blocked %v; want once, not blocked:\n%s", n, broken.prePushBlocked, broken.prePush)
 	}
 	if !strings.Contains(broken.preCommit, named) {
 		t.Errorf("pre-commit doesn't name wb:\n%s", broken.preCommit)
+	}
+
+	// With no overlap left, wt status reaches its no-collisions verdict: still
+	// about the windows wt could read, never "all clear" (#254 review: the
+	// states above always had an overlap).
+	writeT(t, wa, "notes.txt", notes.String())
+	writeT(t, wc, "notes.txt", notes.String())
+	t.Chdir(wa)
+	out, errOut := captureOutputForTest(t, func() { cmdStatus(nil) })
+	if quiet := out + errOut; !strings.Contains(quiet, "no file collisions among the") || strings.Contains(quiet, "all clear") || !strings.Contains(quiet, named) {
+		t.Errorf("wt status with no overlap: want wb named and the verdict about the windows wt could read:\n%s", quiet)
+	}
+}
+
+// An unread window that COMMITTED a change to the path is still graded (#254
+// review): its working copy can't be read, so the grade is indeterminate and
+// HIGH (the fail-safe), and it is tagged "working tree unread", not
+// "uncommitted edits". Control: the same commits with wh's index intact are
+// disjoint (low, exit 0).
+func TestUnreadWindow_committedPathStillGraded(t *testing.T) {
+	offlineGH(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("WT_SKIP_COLLISION", "")
+	t.Chdir(t.TempDir())
+	root := t.TempDir()
+	gitT(t, root, "init", "-q", "-b", "main")
+	gitT(t, root, "config", "user.email", "t@t.test")
+	gitT(t, root, "config", "user.name", "t")
+	var notes strings.Builder
+	for i := 1; i <= 9; i++ {
+		fmt.Fprintf(&notes, "line %d\n", i)
+	}
+	writeT(t, root, "notes.txt", notes.String())
+	gitT(t, root, "add", "-A")
+	gitT(t, root, "commit", "-qm", "base")
+	dirs := t.TempDir()
+	wa, wh := filepath.Join(dirs, "wa"), filepath.Join(dirs, "wh")
+	gitT(t, root, "worktree", "add", "-q", "-b", "wa", wa, "main")
+	gitT(t, root, "worktree", "add", "-q", "-b", "wh", wh, "main")
+	writeT(t, wa, "notes.txt", strings.Replace(notes.String(), "line 5\n", "A line 5\n", 1))
+	gitT(t, wa, "commit", "-qam", "wa")
+	writeT(t, wh, "notes.txt", strings.Replace(notes.String(), "line 1\n", "H line 1\n", 1))
+	gitT(t, wh, "commit", "-qam", "wh")
+	check := func() (int, string) {
+		t.Chdir(wa)
+		var code int
+		out, errOut := captureOutputForTest(t, func() { code = cmdCheck([]string{"notes.txt"}) })
+		return code, out + errOut
+	}
+	if code, out := check(); code != 0 || strings.Contains(out, "could not be read") {
+		t.Fatalf("precondition: with wh's index intact, exit %d (want 0) and no unread window:\n%s", code, out)
+	}
+	index := filepath.Join(root, ".git", "worktrees", "wh", "index")
+	if _, err := os.Stat(index); err != nil {
+		t.Fatalf("precondition: wh's index is at %s: %v", index, err)
+	}
+	writeT(t, filepath.Dir(index), "index", "not an index\n")
+	code, out := check()
+	if code != 3 || !strings.Contains(out, "window wh could not be read") || !strings.Contains(out, "working tree unread") || strings.Contains(out, "uncommitted edits]") {
+		t.Errorf("wh's index unreadable: exit %d, want 3 (indeterminate), wh named and tagged \"working tree unread\":\n%s", code, out)
+	}
+}
+
+// Scan reads each worktree as git lists it (#253 review): a removed worktree
+// git would prune is not unread, a locked one whose directory is gone (an
+// unmounted volume) is, a path ending in a space is read whole, and the main
+// work tree of a --separate-git-dir repository reads itself from inside it
+// and is named unread from another window.
+func TestScan_worktreeStates(t *testing.T) {
+	offlineGH(t)
+	t.Setenv("HOME", t.TempDir())
+	real := func(t *testing.T, p string) string {
+		t.Helper()
+		r, err := filepath.EvalSymlinks(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	scan := func(t *testing.T, dir string) []collide.Window {
+		t.Helper()
+		t.Chdir(dir)
+		c, err := config.Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ws, err := collide.Scan(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ws
+	}
+	at := func(ws []collide.Window, worktree string) (collide.Window, bool) {
+		for _, w := range ws {
+			if w.Worktree == worktree {
+				return w, true
+			}
+		}
+		return collide.Window{}, false
+	}
+	has := func(files []string, f string) bool {
+		for _, x := range files {
+			if x == f {
+				return true
+			}
+		}
+		return false
+	}
+
+	root := real(t, t.TempDir())
+	gitT(t, root, "init", "-q", "-b", "main")
+	gitT(t, root, "config", "user.email", "t@t.test")
+	gitT(t, root, "config", "user.name", "t")
+	writeT(t, root, "notes.txt", "a\n")
+	gitT(t, root, "add", "-A")
+	gitT(t, root, "commit", "-qm", "base")
+	dirs := real(t, t.TempDir())
+	gone, locked, spaced := filepath.Join(dirs, "gone"), filepath.Join(dirs, "locked"), filepath.Join(dirs, "spaced ")
+	for br, p := range map[string]string{"gone": gone, "locked": locked, "spaced": spaced} {
+		gitT(t, root, "worktree", "add", "-q", "-b", br, p, "main")
+	}
+	gitT(t, root, "worktree", "lock", locked)
+	for _, p := range []string{gone, locked} {
+		if err := os.RemoveAll(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeT(t, spaced, "notes.txt", "spaced edit\n")
+	ws := scan(t, root)
+	if w, ok := at(ws, gone); !ok || w.Unread != "" {
+		t.Errorf("removed (prunable) worktree: %+v (listed %v), want listed, not unread", w, ok)
+	}
+	if w, ok := at(ws, locked); !ok || !strings.Contains(w.Unread, "no such file or directory") {
+		t.Errorf("locked worktree, directory gone: %+v (listed %v), want unread with its reason", w, ok)
+	}
+	if w, ok := at(ws, spaced); !ok || w.Unread != "" || !has(w.Touched, "notes.txt") {
+		t.Errorf("worktree at %q: %+v (listed %v), want read, with its edit", spaced, w, ok)
+	}
+
+	sepBase := real(t, t.TempDir())
+	sep, work, wb := filepath.Join(sepBase, "sep.git"), filepath.Join(sepBase, "main"), filepath.Join(sepBase, "wb")
+	gitT(t, sepBase, "init", "-q", "-b", "main", "--separate-git-dir", sep, work)
+	gitT(t, work, "config", "user.email", "t@t.test")
+	gitT(t, work, "config", "user.name", "t")
+	writeT(t, work, "notes.txt", "a\n")
+	gitT(t, work, "add", "-A")
+	gitT(t, work, "commit", "-qm", "base")
+	gitT(t, work, "worktree", "add", "-q", "-b", "wb", wb, "main")
+	writeT(t, work, "notes.txt", "main edit\n")
+	fromWB := scan(t, wb)
+	if w, ok := at(fromWB, sep); !ok || w.Unread != gitx.ErrGitDirOnly.Error() {
+		t.Errorf("from wb, the git directory's window: %+v (listed %v), want unread: %v", w, ok, gitx.ErrGitDirOnly)
+	}
+	fromMain := scan(t, work)
+	if _, ok := at(fromMain, sep); ok {
+		t.Errorf("from the main work tree, a window is still listed by its git directory: %+v", fromMain)
+	}
+	if w, ok := at(fromMain, work); !ok || w.Unread != "" || !has(w.Touched, "notes.txt") {
+		t.Errorf("from the main work tree, its own window: %+v (listed %v), want read by its work tree, with its edit", w, ok)
 	}
 }
