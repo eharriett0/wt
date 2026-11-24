@@ -922,8 +922,16 @@ func renderBlockingGate(graded []StatusOverlap, ws []collide.Window, live map[st
 			high = append(high, o)
 		}
 	}
+	unread := collide.UnreadWindows(ws, "") // #253: named, never blocking
+	if len(unread) > 0 {
+		ui.Warn("%s", collide.UnreadNote(unread))
+	}
 	if len(high) == 0 {
-		ui.OK("no HIGH-risk collisions across %d window(s)", len(ws))
+		if len(unread) > 0 {
+			ui.OK("no HIGH-risk collisions among the %d window(s) wt could read", len(ws)-len(unread))
+		} else {
+			ui.OK("no HIGH-risk collisions across %d window(s)", len(ws))
+		}
 		return 0
 	}
 	ui.Collision("%d file(s) with a HIGH-risk collision:", len(high))
@@ -971,8 +979,13 @@ func statusReport(c *config.Config, asJSON, blocking bool) int {
 		}
 		fmt.Println(line)
 		fmt.Println("   " + ui.Dim(w.Worktree))
+		if w.Unread != "" { // #253: never "(no changes)"
+			fmt.Println("   " + ui.Yellow("⚠ UNREAD: "+w.Unread+": its uncommitted edits are not compared"))
+		}
 		if len(w.Touched) == 0 {
-			fmt.Println("   " + ui.Dim("(no changes)"))
+			if w.Unread == "" {
+				fmt.Println("   " + ui.Dim("(no changes)"))
+			}
 		} else {
 			fmt.Printf("   %s %s\n", ui.Yellow(fmt.Sprintf("%d file(s):", len(w.Touched))), strings.Join(capList(w.Touched, 10), ", "))
 		}
@@ -986,12 +999,20 @@ func statusReport(c *config.Config, asJSON, blocking bool) int {
 		fmt.Println()
 	}
 
+	unread := collide.UnreadWindows(ws, "") // #253
+	if len(unread) > 0 {
+		ui.Warn("%s", collide.UnreadNote(unread))
+	}
 	if len(ov) == 0 {
-		ui.OK("no file collisions across %d window(s) — all clear", len(ws))
+		if len(unread) > 0 {
+			ui.OK("no file collisions among the %d window(s) wt could read", len(ws)-len(unread))
+		} else {
+			ui.OK("no file collisions across %d window(s) — all clear", len(ws))
+		}
 		return 0
 	}
 	if len(graded) == 0 {
-		ui.OK("no active collisions — %d file-overlap(s) are all on stale/dormant branches", len(benign))
+		ui.OK("no active collisions — %d file-overlap(s) are all on stale/dormant branches%s", len(benign), clearScope(len(unread)))
 		return 0
 	}
 
@@ -1018,7 +1039,7 @@ func statusReport(c *config.Config, asJSON, blocking bool) int {
 				strings.Join(taggedWindows(o.Windows, live), ", "), detail)
 		}
 	} else {
-		ui.OK("no HIGH-risk (overlapping-hunk) collisions across %d window(s)", len(ws))
+		ui.OK("no HIGH-risk (overlapping-hunk) collisions across %d window(s)%s", len(ws), clearScope(len(unread)))
 	}
 	for _, o := range low {
 		reason := fmt.Sprintf("%d windows, 0 overlapping hunks → low", len(o.Windows))
@@ -1528,19 +1549,23 @@ func cmdCheck(args []string) int {
 		}
 		entries := buildCheckReport(c, ws, root, checkQueries(args))
 		noBase := !gitx.BaseResolves(root, c.Base) // #247
+		unread := collide.UnreadWindows(ws, root)  // #253: named, never blocking
 		if asJSON {
-			return renderCheckJSON(entries, includeStale, noBase)
+			return renderCheckJSON(entries, includeStale, noBase, unread)
 		}
 		if noBase {
 			ui.Warn("%s", collide.NoBaseNote(c.Base))
+		}
+		if len(unread) > 0 {
+			ui.Warn("%s", collide.UnreadNote(unread))
 		}
 		if len(entries) > 0 {
 			annotateLive(entries, worktreeSessionNotes(c)) // #250
 		}
 		if blocking {
-			return renderCheckBlocking(entries, paths)
+			return renderCheckBlocking(entries, paths, len(unread))
 		}
-		return renderCheckText(entries, paths, includeStale, showDiff)
+		return renderCheckText(entries, paths, includeStale, showDiff, len(unread))
 	})
 }
 

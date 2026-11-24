@@ -375,7 +375,7 @@ func checkEntries(c *config.Config, f gradeFacts, ws []collide.Window, currentWo
 // renderCheckText prints the check report and returns the process exit code
 // (3 iff any blocking entry). includeStale reveals suppressed windows;
 // showDiff previews the other window's hunk ranges inline.
-func renderCheckText(entries []CheckEntry, paths []string, includeStale, showDiff bool) int {
+func renderCheckText(entries []CheckEntry, paths []string, includeStale, showDiff bool, unread int) int {
 	var blocking, advisory, fyi, stale []CheckEntry
 	for _, e := range entries {
 		switch e.Category {
@@ -396,9 +396,9 @@ func renderCheckText(entries []CheckEntry, paths []string, includeStale, showDif
 
 	if len(blocking) == 0 {
 		if len(advisory)+len(fyi) == 0 {
-			ui.OK("clear — no other window is touching %s", strings.Join(paths, ", "))
+			ui.OK("clear — no other window is touching %s%s", strings.Join(paths, ", "), clearScope(unread))
 		} else {
-			ui.OK("clear of blocking collisions on %s", strings.Join(paths, ", "))
+			ui.OK("clear of blocking collisions on %s%s", strings.Join(paths, ", "), clearScope(unread))
 		}
 		printCheckAdvisories(advisory, fyi, showDiff)
 		if len(stale) > 0 {
@@ -432,7 +432,7 @@ func renderCheckText(entries []CheckEntry, paths []string, includeStale, showDif
 // otherwise. Advisory / FYI / stale noise is suppressed so a pre-push hook (or
 // any CI gate) can key purely on the exit code without parsing prose. Mirrors
 // `wt status --blocking` (renderBlockingGate) but scoped to requested paths.
-func renderCheckBlocking(entries []CheckEntry, paths []string) int {
+func renderCheckBlocking(entries []CheckEntry, paths []string, unread int) int {
 	var blocking []CheckEntry
 	for _, e := range entries {
 		if e.Category == CatBlocking {
@@ -440,7 +440,7 @@ func renderCheckBlocking(entries []CheckEntry, paths []string) int {
 		}
 	}
 	if len(blocking) == 0 {
-		ui.OK("clear of blocking collisions on %s", strings.Join(paths, ", "))
+		ui.OK("clear of blocking collisions on %s%s", strings.Join(paths, ", "), clearScope(unread))
 		return 0
 	}
 	ui.Collision("%d path(s) with a HIGH-risk collision (overlapping edits by an active window):", len(blocking))
@@ -511,6 +511,37 @@ type CheckPayload struct {
 	// were not compared, only their uncommitted edits (#247). A file another
 	// window only committed is then absent, not clear.
 	BaseUnresolved bool `json:"base_unresolved,omitempty"`
+	// UnreadWindows are the other windows git could not read (#253): their
+	// uncommitted edits were not compared, so no entry from one is unknown,
+	// not clear. It never sets Blocking.
+	UnreadWindows []UnreadWindow `json:"unread_windows,omitempty"`
+}
+
+// UnreadWindow is a window git could not read, as check's JSON names it
+// (#253): its label, worktree, and git's reason.
+type UnreadWindow struct {
+	Window   string `json:"window"`
+	Worktree string `json:"worktree"`
+	Error    string `json:"error"`
+}
+
+// unreadWindowsPayload is ws (collide.UnreadWindows) as check's JSON lists
+// them; nil for none, so the field is omitted. Pure.
+func unreadWindowsPayload(ws []collide.Window) []UnreadWindow {
+	var out []UnreadWindow
+	for _, w := range ws {
+		out = append(out, UnreadWindow{Window: w.Label(), Worktree: w.Worktree, Error: w.Unread})
+	}
+	return out
+}
+
+// clearScope qualifies a clear verdict when windows went unread (#253): it
+// is then about the windows wt could read. "" when every window was read.
+func clearScope(unread int) string {
+	if unread == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (of the windows wt could read; %d could not be read)", unread)
 }
 
 // buildCheckPayload filters stale entries (unless includeStale) and computes the
@@ -529,9 +560,10 @@ func buildCheckPayload(entries []CheckEntry, includeStale bool) CheckPayload {
 	return p
 }
 
-func renderCheckJSON(entries []CheckEntry, includeStale, baseUnresolved bool) int {
+func renderCheckJSON(entries []CheckEntry, includeStale, baseUnresolved bool, unread []collide.Window) int {
 	p := buildCheckPayload(entries, includeStale)
 	p.BaseUnresolved = baseUnresolved
+	p.UnreadWindows = unreadWindowsPayload(unread)
 	b, _ := json.MarshalIndent(p, "", "  ")
 	fmt.Println(string(b))
 	if p.Blocking {
@@ -746,6 +778,9 @@ type StatusWindow struct {
 	Title    string   `json:"title,omitempty"`
 	Worktree string   `json:"worktree"`
 	Touched  []string `json:"touched"`
+	// Unread is why git could not read the window's uncommitted changes
+	// (#253): touched then lists only its committed files.
+	Unread string `json:"unread,omitempty"`
 }
 
 // StatusPayload is the JSON shape of `wt status --json` — single-sourced so the
@@ -772,7 +807,7 @@ type StatusPayload struct {
 func buildStatusPayload(ws []collide.Window, graded []StatusOverlap, benignCount int) StatusPayload {
 	p := StatusPayload{Overlaps: graded, BenignCount: benignCount}
 	for _, w := range ws {
-		p.Windows = append(p.Windows, StatusWindow{w.Label(), w.Branch, w.Issue, w.Title, w.Worktree, w.Touched})
+		p.Windows = append(p.Windows, StatusWindow{Label: w.Label(), Branch: w.Branch, Issue: w.Issue, Title: w.Title, Worktree: w.Worktree, Touched: w.Touched, Unread: w.Unread})
 	}
 	for _, o := range graded {
 		if o.Category == CatBlocking {

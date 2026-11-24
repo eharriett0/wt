@@ -33,6 +33,10 @@ type Window struct {
 	Issue    string   // claimed issue number, or "" if unclaimed
 	Title    string   // claimed issue title, or ""
 	Touched  []string // files changed (uncommitted ∪ committed-on-branch vs base)
+	// Unread is why git could not read the window's uncommitted changes, ""
+	// when it could (#253). Touched then holds only its committed files, so
+	// the window is named, never shown as one with no changes.
+	Unread string
 }
 
 // Label is a short human identifier for a window.
@@ -71,8 +75,9 @@ func Scan(c *config.Config) ([]Window, error) {
 	// inherited the cost since it also calls Scan. The reads are independent per
 	// worktree (separate working trees, read-only — no git-lock contention), so
 	// a bounded worker pool cuts wall time to roughly the slowest single
-	// worktree. Indexed writes preserve WorktreePaths order (stable output);
-	// per-worktree git errors stay swallowed, exactly as before.
+	// worktree. Indexed writes preserve WorktreePaths order (stable output). A
+	// window whose uncommitted changes can't be read is marked Unread (#253);
+	// other per-worktree git errors stay swallowed, as before.
 	ws := make([]Window, len(paths))
 	sem := make(chan struct{}, scanWorkers())
 	var wg sync.WaitGroup
@@ -83,7 +88,11 @@ func Scan(c *config.Config) ([]Window, error) {
 			defer wg.Done()
 			defer func() { <-sem }()
 			br, _ := gitx.CurrentBranchIn(p)
-			w := Window{Worktree: p, Branch: br, Touched: gitx.TouchedFiles(p, c.Base)}
+			touched, terr := gitx.TouchedFiles(p, c.Base)
+			w := Window{Worktree: p, Branch: br, Touched: touched}
+			if terr != nil {
+				w.Unread = terr.Error()
+			}
 			if e, ok := byWorktree[p]; ok {
 				w.Issue, w.Title = e.Issue, e.Title
 			} else if e, ok := byBranch[br]; ok {
@@ -527,6 +536,38 @@ func IsSharedDoc(path string, shared []string) bool {
 // reads clear.
 func NoBaseNote(base string) string {
 	return fmt.Sprintf("no base branch resolves here (neither origin/%s nor %s): committed changes are not compared, so pushed commits, and a file another window only committed, read clear (`wt check` still compares uncommitted edits). Set `base` in .wt.conf to the branch windows start from.", base, base)
+}
+
+// UnreadWindows returns the windows of ws git could not read (Unread, #253),
+// in ws's order, leaving out the one whose worktree is self ("" leaves out
+// none): a window's own check says nothing about itself.
+func UnreadWindows(ws []Window, self string) []Window {
+	var out []Window
+	for _, w := range ws {
+		if w.Unread != "" && (self == "" || !sameWorktree(w.Worktree, self)) {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// UnreadNote is what every collision report says about windows git could not
+// read (#253): who, git's reason, and that their uncommitted edits are not
+// compared, so a clear is only about the windows that were read. "" for none.
+// It never blocks: an unread window can't be tied to any path.
+func UnreadNote(unread []Window) string {
+	switch len(unread) {
+	case 0:
+		return ""
+	case 1:
+		w := unread[0]
+		return fmt.Sprintf("window %s could not be read (%s): its uncommitted edits are not compared. Run `git status` in %s.", w.Label(), w.Unread, w.Worktree)
+	}
+	parts := make([]string, len(unread))
+	for i, w := range unread {
+		parts[i] = fmt.Sprintf("%s (%s)", w.Label(), w.Unread)
+	}
+	return fmt.Sprintf("%d windows could not be read: %s. Their uncommitted edits are not compared; run `git status` in each.", len(unread), strings.Join(parts, "; "))
 }
 
 // RangeFn resolves the line ranges a worktree changed in a path, relative to

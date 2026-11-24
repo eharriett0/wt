@@ -313,7 +313,8 @@ func mcpCheck(c *config.Config, paths []string, includeStale, allowMissing bool)
 	}
 	entries := buildCheckReport(c, ws, root, checkQueries(args))
 	p := buildCheckPayload(entries, includeStale)
-	p.BaseUnresolved = !gitx.BaseResolves(root, c.Base) // #247
+	p.BaseUnresolved = !gitx.BaseResolves(root, c.Base)                     // #247
+	p.UnreadWindows = unreadWindowsPayload(collide.UnreadWindows(ws, root)) // #253
 	return jsonText(p), false
 }
 

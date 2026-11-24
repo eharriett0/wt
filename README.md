@@ -135,6 +135,18 @@ prune-coord` drops marks older than a day, which `wt doctor` lists without a
 warning. One without the hooks shows only once it runs a coordination
 command.
 
+**A window wt can't read is named, never skipped.** When `git status` fails in
+another worktree (its branch holds an object the repository lacks, or its
+index can't be read; a `git add` running there does not), wt can't see that
+window's uncommitted edits. `wt status` marks it `UNREAD` with git's reason
+instead of `(no changes)`, and `wt check`, both edit hooks, the per-turn
+context, pre-push and pre-commit name it, with any clear qualified as being
+about the windows wt could read. It never blocks, since no path can be tied
+to it. In JSON it is `unread` on the window (`wt status --json`, MCP
+`wt_status`) and `unread_windows` (`window`, `worktree`, `error`) in `wt check
+--json` and MCP `wt_check`. Run `git status` in that worktree to see what is
+wrong.
+
 ### Stale branches don't count
 
 A file "collision" only matters if the other window can still *change* that

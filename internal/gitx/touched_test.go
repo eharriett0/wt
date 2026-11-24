@@ -18,6 +18,16 @@ func hermeticGit(t *testing.T) {
 	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 }
 
+// mustTouched is TouchedFiles for a worktree git reads: an error fails the test.
+func mustTouched(t *testing.T, dir, base string) []string {
+	t.Helper()
+	files, err := TouchedFiles(dir, base)
+	if err != nil {
+		t.Fatalf("TouchedFiles(%s): %v", dir, err)
+	}
+	return files
+}
+
 func runGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	hermeticGit(t)
@@ -57,7 +67,7 @@ func TestTouchedFiles_UntrackedNewDirListsFiles(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "newpkg", "foo.go"), []byte("package newpkg\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got := TouchedFiles(dir, "main")
+	got := mustTouched(t, dir, "main")
 	if !touchedContains(got, "newpkg/foo.go") {
 		t.Errorf("expected full path newpkg/foo.go in touched set, got %v", got)
 	}
@@ -77,7 +87,7 @@ func TestTouchedFiles_RenameRecordsBothPaths(t *testing.T) {
 	runGit(t, dir, "commit", "-qm", "add old")
 	runGit(t, dir, "mv", "old.go", "new.go") // staged rename
 
-	got := TouchedFiles(dir, "main")
+	got := mustTouched(t, dir, "main")
 	if !touchedContains(got, "old.go") {
 		t.Errorf("expected OLD path old.go in touched set, got %v", got)
 	}
@@ -128,7 +138,7 @@ func movedRepo(t *testing.T, staged bool) string {
 
 func TestTouchedFiles_CommittedMoveRecordsBothPaths(t *testing.T) {
 	dir := movedRepo(t, false)
-	got := TouchedFiles(dir, "main")
+	got := mustTouched(t, dir, "main")
 	for _, want := range []string{"README.md", "pkg/README.md"} {
 		if !touchedContains(got, want) {
 			t.Errorf("committed move: %s missing from the touched set %v", want, got)
@@ -324,4 +334,58 @@ func TestFileChangeSubsumed(t *testing.T) {
 	if subsumed, known := FileChangeSubsumed(dir, "main", "new-only.txt"); known || subsumed {
 		t.Errorf("base lacking the file must be known=false: subsumed=%v known=%v", subsumed, known)
 	}
+}
+
+// A worktree whose uncommitted changes git can't read is an error, never "no
+// changes" (#253), measured on real git: a branch holding an object the repo
+// lacks, an unreadable index. An index.lock (a `git add` running in that
+// window) does not fail git status, so it is no error.
+func TestTouchedFiles_UnreadIsAnError(t *testing.T) {
+	t.Setenv("GIT_DEFAULT_REF_FORMAT", "files") // the branch case writes a ref file
+	branch := func(t *testing.T) string {
+		dir := gitRepo(t)
+		runGit(t, dir, "checkout", "-q", "-b", "feat")
+		writeFile(t, dir, "committed.txt", "c\n")
+		runGit(t, dir, "add", "committed.txt")
+		runGit(t, dir, "commit", "-qm", "feat commits")
+		writeFile(t, dir, "dirty.txt", "d\n") // uncommitted, untracked
+		return dir
+	}
+	t.Run("healthy and with index.lock: read", func(t *testing.T) {
+		dir := branch(t)
+		for _, lock := range []bool{false, true} {
+			if lock {
+				writeFile(t, dir, ".git/index.lock", "")
+			}
+			files, err := TouchedFiles(dir, "main")
+			if err != nil || !touchedContains(files, "dirty.txt") || !touchedContains(files, "committed.txt") {
+				t.Errorf("index.lock=%v: %v, %v; want both files and no error", lock, files, err)
+			}
+		}
+	})
+	t.Run("branch holds a missing object", func(t *testing.T) {
+		dir := branch(t)
+		writeFile(t, dir, ".git/refs/heads/feat", strings.Repeat("1", 40)+"\n")
+		if _, err := TouchedFiles(dir, "main"); err == nil || !strings.Contains(err.Error(), "git status: ") || !strings.Contains(err.Error(), "bad object HEAD") {
+			t.Errorf("err = %v, want git status's own reason (bad object HEAD)", err)
+		}
+	})
+	t.Run("index unreadable: committed files still listed", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root reads a mode-000 file")
+		}
+		dir := branch(t)
+		index := filepath.Join(dir, ".git", "index")
+		if err := os.Chmod(index, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(index, 0o644) })
+		files, err := TouchedFiles(dir, "main")
+		if err == nil || !strings.Contains(err.Error(), "index") {
+			t.Errorf("err = %v, want git status's reason (the index)", err)
+		}
+		if !touchedContains(files, "committed.txt") {
+			t.Errorf("files = %v, want the committed file still listed", files)
+		}
+	})
 }

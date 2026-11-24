@@ -75,7 +75,7 @@ func TestPathListers_CommittedNamesVerbatim(t *testing.T) {
 	runGit(t, dir, "commit", "-qam", "feat edits every odd name")
 	want := sortedNames(oddNames)
 
-	if got := sortedNames(TouchedFiles(dir, "main")); !reflect.DeepEqual(got, want) {
+	if got := sortedNames(mustTouched(t, dir, "main")); !reflect.DeepEqual(got, want) {
 		t.Errorf("TouchedFiles (committed) = %q,\nwant %q", got, want)
 	}
 	got, err := RangeChangedPaths(dir, "main", "HEAD")
@@ -116,7 +116,7 @@ func TestPathListers_UncommittedNamesVerbatim(t *testing.T) {
 	}
 
 	want := sortedNames(oddNames, []string{"dír é/moved ü.md", "it ä.md"}, untracked)
-	if got := sortedNames(TouchedFiles(dir, "main")); !reflect.DeepEqual(got, want) {
+	if got := sortedNames(mustTouched(t, dir, "main")); !reflect.DeepEqual(got, want) {
 		t.Errorf("TouchedFiles (uncommitted) = %q,\nwant %q", got, want)
 	}
 }

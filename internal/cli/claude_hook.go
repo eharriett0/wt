@@ -140,6 +140,50 @@ func claudeDecision(file string, graded []pendingGrade, block bool) (string, boo
 	return string(j), true
 }
 
+// preToolUseOutput is the PreToolUse hook output both edit hooks print
+// (claudeDecision, codexEditDecision).
+type preToolUseOutput struct {
+	HookSpecificOutput struct {
+		HookEventName            string `json:"hookEventName"`
+		AdditionalContext        string `json:"additionalContext,omitempty"`
+		PermissionDecision       string `json:"permissionDecision,omitempty"`
+		PermissionDecisionReason string `json:"permissionDecisionReason,omitempty"`
+	} `json:"hookSpecificOutput"`
+}
+
+// withUnreadNote adds note (collide.UnreadNote, #253) to an edit hook's
+// decision out: to the deny reason when it denies, else to its context, or
+// as the only context when there is no decision (has=false). It never denies
+// on its own: an unread window can't be tied to the edited path. A note of
+// "" leaves out as it was. Pure.
+func withUnreadNote(out string, has bool, note string) (string, bool) {
+	if note == "" {
+		return out, has
+	}
+	note = "wt: " + note
+	var d preToolUseOutput
+	if has {
+		if err := json.Unmarshal([]byte(out), &d); err != nil {
+			return out, has
+		}
+	}
+	h := &d.HookSpecificOutput
+	h.HookEventName = "PreToolUse"
+	switch {
+	case h.PermissionDecision == "deny":
+		h.PermissionDecisionReason += "\n" + note
+	case h.AdditionalContext != "":
+		h.AdditionalContext += "\n" + note
+	default:
+		h.AdditionalContext = note
+	}
+	j, err := json.Marshal(d)
+	if err != nil {
+		return out, has
+	}
+	return string(j), true
+}
+
 // repoRelativePath converts file to a clean, slash-separated repo-relative path.
 // Returns "" when it is outside root, or is root itself: nothing to
 // collision-check.
@@ -624,7 +668,11 @@ func hookClaudeEdit(r io.Reader) int {
 	// as the pre-push guard does. A fuzzy match flagged an edit to the root
 	// README.md because another window edited pkg/svc/README.md.
 	entries := buildCheckReport(c, ws, root, collide.ExactQueries([]string{rel}))
+	unreadNote := collide.UnreadNote(collide.UnreadWindows(ws, root)) // #253
 	if len(entries) == 0 {
+		if out, has := withUnreadNote("", false, unreadNote); has {
+			fmt.Println(out)
+		}
 		return 0
 	}
 
@@ -661,7 +709,8 @@ func hookClaudeEdit(r io.Reader) int {
 			graded[i].entry.liveNote = note(graded[i].entry.otherWorktree)
 		}
 	}
-	if out, has := claudeDecision(rel, graded, os.Getenv("WT_CLAUDE_HOOK_BLOCK") == "1"); has {
+	out, has := claudeDecision(rel, graded, os.Getenv("WT_CLAUDE_HOOK_BLOCK") == "1")
+	if out, has = withUnreadNote(out, has, unreadNote); has {
 		fmt.Println(out)
 	}
 	return 0

@@ -43,7 +43,19 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   only *definitively*-inert states (merged / dormant / closed-PR). A **dirty**
   worktree is NEVER suppressed — even a far-behind base checkout stays HIGH and
   is only *labelled* "likely stale" (#87). Uncomputable/offline → surfaced, not
-  hidden.
+  hidden. ⚠ **A window git can't read is named, never "no changes" (#253).**
+  `TouchedFiles` returns git status's failure (a branch holding a missing
+  object, an unreadable index; an `index.lock` does NOT fail it, measured on
+  git 2.39), `Scan` sets `Window.Unread`, and every surface names it through
+  `collide.UnreadWindows`/`UnreadNote`: `wt status` (`UNREAD`, `unread` in
+  JSON and MCP), `wt check` text/`--blocking`/JSON/MCP (`unread_windows`, the
+  clear qualified by `clearScope`), both edit hooks (`withUnreadNote`), the
+  per-turn context, pre-push (once a push) and pre-commit. It NEVER blocks
+  (decided in #253): no path can be tied to it, so blocking would stop every
+  edit in every window until the worktree is repaired. The committed diff
+  failing stays silent: it fails for an unborn or unrelated branch too.
+  Pinned by `TestUnreadWindow_namedEverywhere` (every surface, with a healthy
+  control) and `TestTouchedFiles_UnreadIsAnError`.
 - **A window's ranges are its OWN edits, in BASE line numbers (#29/#142/#184).**
   Diffed straight from base, a branch BEHIND base reads every line base inserted
   or modified after it forked as its own edit (it still holds the old text), so

@@ -5,6 +5,7 @@ package gitx
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -1220,7 +1221,14 @@ func parseMergeTreeConflictPaths(out string) []string {
 // TouchedFiles returns the union of (a) uncommitted changes in the worktree at
 // dir and (b) files this branch changed vs base (merge-base diff). This is the
 // "what is this window working on right now" set used for collision detection.
-func TouchedFiles(dir, base string) []string {
+//
+// err is non-nil when (a) can't be read: `git status` fails, as it does for a
+// branch holding an object the repo lacks or an unreadable index (an
+// index.lock does not fail it; measured, git 2.39). The window is then
+// unread, never "no changes" (#253); files still holds what (b) read. (b)
+// failing is no error: it fails for a branch with no commits, with no base,
+// or with no merge base with it, and those have nothing committed to list.
+func TouchedFiles(dir, base string) (files []string, err error) {
 	set := map[string]struct{}{}
 
 	// (a) uncommitted (staged + unstaged + untracked) via porcelain, -z and
@@ -1235,10 +1243,12 @@ func TouchedFiles(dir, base string) []string {
 	// collision under a freshly-created dir goes silently undetected. -uall
 	// lists each new file at its full path. Gitignored files stay excluded, so
 	// the cost is bounded to genuinely-new files.
-	if out, err := runRaw(dir, "status", "--porcelain", nulPaths, "--untracked-files=all"); err == nil {
+	if out, serr := runRaw(dir, "status", "--porcelain", nulPaths, "--untracked-files=all"); serr == nil {
 		for _, p := range parsePorcelainZ(out) {
 			set[p] = struct{}{}
 		}
+	} else {
+		err = fmt.Errorf("git status: %s", exitText(serr))
 	}
 
 	// (b) committed-on-branch vs base (three-dot = since merge-base). A COMMITTED
@@ -1253,11 +1263,24 @@ func TouchedFiles(dir, base string) []string {
 		}
 	}
 
-	files := make([]string, 0, len(set))
+	files = make([]string, 0, len(set))
 	for f := range set {
 		files = append(files, f)
 	}
-	return files
+	return files, err
+}
+
+// exitText is a failed git call's error as git put it: the stderr an
+// *exec.ExitError from Output carries, condensed by gitStderr, else err's
+// own text.
+func exitText(err error) string {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		if msg := gitStderr(string(ee.Stderr)); msg != "" {
+			return msg
+		}
+	}
+	return err.Error()
 }
 
 // LineRange is a 1-based inclusive span of lines. ChangedRanges emits these in
