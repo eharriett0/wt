@@ -52,7 +52,8 @@ func TestWithUnreadNote(t *testing.T) {
 // #253: a window whose `git status` fails (here its branch holds an object
 // the repo lacks) is named by every collision surface, never read as "no
 // changes" or a bare clear, and never blocks. Control: the same windows with
-// wb's branch intact, where wb's edit of line 5 is HIGH and the hooks deny.
+// wb's branch intact, where wb's edit of line 5 is HIGH and the hooks deny. A
+// worktree whose directory is gone is not unread in either.
 func TestUnreadWindow_namedEverywhere(t *testing.T) {
 	offlineGH(t)
 	t.Setenv("HOME", t.TempDir())
@@ -79,6 +80,13 @@ func TestUnreadWindow_namedEverywhere(t *testing.T) {
 	gitT(t, root, "worktree", "add", "-q", "-b", "wa", wa, "main")
 	gitT(t, root, "worktree", "add", "-q", "-b", "wb", wb, "main")
 	gitT(t, root, "worktree", "add", "-q", "-b", "wc", wc, "main")
+	// wd's directory is deleted (git lists it as prunable): it holds no
+	// uncommitted edits, so it is never unread, in either state.
+	wd := filepath.Join(dirs, "wd")
+	gitT(t, root, "worktree", "add", "-q", "-b", "wd", wd, "main")
+	if err := os.RemoveAll(wd); err != nil {
+		t.Fatal(err)
+	}
 	writeT(t, wa, "notes.txt", strings.Replace(notes.String(), "line 5\n", "A line 5\n", 1))
 	writeT(t, wb, "notes.txt", strings.Replace(notes.String(), "line 5\n", "B line 5\n", 1))
 	// wc edits the same file far from line 5: an entry the hooks re-grade and

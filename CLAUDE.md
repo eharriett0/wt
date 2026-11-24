@@ -53,7 +53,10 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   per-turn context, pre-push (once a push) and pre-commit. It NEVER blocks
   (decided in #253): no path can be tied to it, so blocking would stop every
   edit in every window until the worktree is repaired. The committed diff
-  failing stays silent: it fails for an unborn or unrelated branch too.
+  failing stays silent: it fails for an unborn or unrelated branch too. A
+  worktree whose directory is gone (git lists it as prunable) is NOT unread:
+  it holds no uncommitted edits, and naming it would repeat a false warning
+  on every agent turn until someone prunes it.
   Pinned by `TestUnreadWindow_namedEverywhere` (every surface, with a healthy
   control) and `TestTouchedFiles_UnreadIsAnError`.
 - **A window's ranges are its OWN edits, in BASE line numbers (#29/#142/#184).**

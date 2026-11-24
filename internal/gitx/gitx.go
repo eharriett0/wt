@@ -1225,7 +1225,9 @@ func parseMergeTreeConflictPaths(out string) []string {
 // err is non-nil when (a) can't be read: `git status` fails, as it does for a
 // branch holding an object the repo lacks or an unreadable index (an
 // index.lock does not fail it; measured, git 2.39). The window is then
-// unread, never "no changes" (#253); files still holds what (b) read. (b)
+// unread, never "no changes" (#253); files still holds what (b) read. A dir
+// that no longer exists is no error: git lists that worktree as prunable,
+// and it holds no uncommitted changes to miss. (b)
 // failing is no error: it fails for a branch with no commits, with no base,
 // or with no merge base with it, and those have nothing committed to list.
 func TouchedFiles(dir, base string) (files []string, err error) {
@@ -1247,7 +1249,7 @@ func TouchedFiles(dir, base string) (files []string, err error) {
 		for _, p := range parsePorcelainZ(out) {
 			set[p] = struct{}{}
 		}
-	} else {
+	} else if !dirGone(dir) {
 		err = fmt.Errorf("git status: %s", exitText(serr))
 	}
 
@@ -1268,6 +1270,13 @@ func TouchedFiles(dir, base string) (files []string, err error) {
 		files = append(files, f)
 	}
 	return files, err
+}
+
+// dirGone reports whether dir no longer exists (a worktree git lists as
+// prunable).
+func dirGone(dir string) bool {
+	_, err := os.Stat(dir)
+	return errors.Is(err, os.ErrNotExist)
 }
 
 // exitText is a failed git call's error as git put it: the stderr an

@@ -145,7 +145,8 @@ about the windows wt could read. It never blocks, since no path can be tied
 to it. In JSON it is `unread` on the window (`wt status --json`, MCP
 `wt_status`) and `unread_windows` (`window`, `worktree`, `error`) in `wt check
 --json` and MCP `wt_check`. Run `git status` in that worktree to see what is
-wrong.
+wrong. A worktree whose directory was deleted is not unread: it has no
+uncommitted edits (`git worktree prune` removes its record).
 
 ### Stale branches don't count
 

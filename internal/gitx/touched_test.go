@@ -370,6 +370,20 @@ func TestTouchedFiles_UnreadIsAnError(t *testing.T) {
 			t.Errorf("err = %v, want git status's own reason (bad object HEAD)", err)
 		}
 	})
+	t.Run("directory gone (prunable): no error", func(t *testing.T) {
+		dir := branch(t)
+		gone := filepath.Join(t.TempDir(), "gone")
+		runGit(t, dir, "worktree", "add", "-q", "-b", "gone", gone, "main")
+		if err := os.RemoveAll(gone); err != nil {
+			t.Fatal(err)
+		}
+		if out := gitOut(t, dir, "worktree", "list", "--porcelain"); !strings.Contains(out, "prunable") {
+			t.Fatalf("precondition: git lists the removed worktree as prunable:\n%s", out)
+		}
+		if files, err := TouchedFiles(gone, "main"); err != nil || len(files) != 0 {
+			t.Errorf("TouchedFiles(gone) = %v, %v; want nothing and no error", files, err)
+		}
+	})
 	t.Run("index unreadable: committed files still listed", func(t *testing.T) {
 		if os.Geteuid() == 0 {
 			t.Skip("root reads a mode-000 file")
