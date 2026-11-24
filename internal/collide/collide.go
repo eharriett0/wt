@@ -521,6 +521,14 @@ func IsSharedDoc(path string, shared []string) bool {
 	return false
 }
 
+// NoBaseNote is what `wt check` and pre-push say when no base branch
+// resolves (#247): committed changes have no frame to compare in, and
+// TouchedFiles doesn't list them, so a file another window only committed
+// reads clear.
+func NoBaseNote(base string) string {
+	return fmt.Sprintf("no base branch resolves here (neither origin/%s nor %s): committed changes are not compared, so pushed commits, and a file another window only committed, read clear (`wt check` still compares uncommitted edits). Set `base` in .wt.conf to the branch windows start from.", base, base)
+}
+
 // RangeFn resolves the line ranges a worktree changed in a path, relative to
 // base. Injected so section/hunk grading is unit-testable without a live repo;
 // production callers pass gitx.ChangedRanges.
@@ -557,7 +565,9 @@ func NewOnly(ranges RangeFn) DocEditsFn {
 // window's copy, so deleting another window's section, or emptying or
 // deleting the file, read disjoint while git conflicts. A window whose doc
 // is gone counts its deletions too. A window whose measurement failed
-// (DocEdits.All) edits every section, never none.
+// (DocEdits.All) edits every section, never none. A window BEHIND base also
+// counts the sections of base's copy its edits land in (#247: DocEdits.Base),
+// since its own copies carry the headings it forked with.
 func SharedSectionsAcross(base string, worktrees []string, rel, delimiter string, edits DocEditsFn) (shared []string, graded bool) {
 	return SharedSectionsAcrossWith(base, worktrees, rel, delimiter, edits, nil)
 }
@@ -608,6 +618,33 @@ func oldClaims(secs []section.Section, e gitx.DocEdits) []gitx.LineRange {
 	return out
 }
 
+// baseClaims are the lines of base's copy (secs, parsed from e.BaseCopy)
+// whose sections a behind window's edits claim there (#247), by oldClaims'
+// rules: a change claims its lines, and the line above when its first line
+// is a heading; an insertion (a Gap) the line it lands after (the first
+// line, at the top). Pure.
+func baseClaims(secs []section.Section, e gitx.DocEdits) []gitx.LineRange {
+	heading := map[int]bool{}
+	for _, s := range secs {
+		if s.Heading != "" {
+			heading[s.Start] = true
+		}
+	}
+	var out []gitx.LineRange
+	for _, r := range e.Base {
+		if r.Gap {
+			k := max(r.Start, 1)
+			out = append(out, gitx.LineRange{Start: k, End: k})
+			continue
+		}
+		out = append(out, gitx.LineRange{Start: r.Start, End: r.End})
+		if heading[r.Start] && r.Start > 1 {
+			out = append(out, gitx.LineRange{Start: r.Start - 1, End: r.Start - 1})
+		}
+	}
+	return out
+}
+
 // SharedSectionsAcrossWith is SharedSectionsAcross with some worktrees' copies
 // given instead of read from disk (pending, keyed by worktree): the edit hooks
 // grade a structured doc's sections as they will read once the edit is made,
@@ -649,6 +686,10 @@ func SharedSectionsAcrossWith(base string, worktrees []string, rel, delimiter st
 		if len(e.Deleted) > 0 || len(e.Gaps) > 0 {
 			old := section.Parse(e.Old, re)
 			heads = append(heads, section.EditedHeadings(old, oldClaims(old, e))...)
+		}
+		if len(e.Base) > 0 {
+			bs := section.Parse(e.BaseCopy, re)
+			heads = append(heads, section.EditedHeadings(bs, baseClaims(bs, e))...)
 		}
 		if e.All {
 			all++

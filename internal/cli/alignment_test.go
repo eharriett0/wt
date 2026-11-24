@@ -134,6 +134,13 @@ func mergeTreeConflicts(t *testing.T, root string, aBehind bool) bool {
 // prePushBlocks runs the pre-push hook in dir for a push of branch's tip.
 func prePushBlocks(t *testing.T, dir, branch string) bool {
 	t.Helper()
+	return prePushRefs(t, dir, branch)
+}
+
+// prePushRefs runs the pre-push hook in dir for one push of HEAD to each
+// branch named, one stdin line per ref.
+func prePushRefs(t *testing.T, dir string, branches ...string) bool {
+	t.Helper()
 	cmd := exec.Command("git", "rev-parse", "HEAD")
 	cmd.Dir = dir
 	sha, err := cmd.Output()
@@ -145,8 +152,11 @@ func prePushBlocks(t *testing.T, dir, branch string) bool {
 	if err != nil {
 		t.Fatal(err)
 	}
-	line := fmt.Sprintf("refs/heads/%s %s refs/heads/%s %s\n", branch, strings.TrimSpace(string(sha)), branch, strings.Repeat("0", 40))
-	return hooks.HookPrePush(c, strings.NewReader(line)) != 0
+	var lines strings.Builder
+	for _, branch := range branches {
+		fmt.Fprintf(&lines, "refs/heads/%s %s refs/heads/%s %s\n", branch, strings.TrimSpace(string(sha)), branch, strings.Repeat("0", 40))
+	}
+	return hooks.HookPrePush(c, strings.NewReader(lines.String())) != 0
 }
 
 // #199 review: the pre-edit hooks grade the file the edit will produce, so they

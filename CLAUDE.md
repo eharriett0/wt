@@ -125,7 +125,8 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   window's section was silent while `wt check` then said HIGH, and one moving
   OUT kept a heads-up (a deny under block). `ChangedRangesNewWith` IS
   `ChangedRangesNew` once the copy is written, fallbacks included (no base:
-  the uncommitted ranges; a side without the file is empty and an untracked
+  one diff from HEAD, #247, or the uncommitted ranges on an unborn HEAD; a
+  side without the file is empty and an untracked
   copy is not the working tree's, as `git diff <rev> -- file` reads them; a
   failed diff: the whole file); each fallback it lacked read as
   "unmeasurable" (#226 review). ⚠ A copy the hook can't predict or put in as
@@ -181,21 +182,50 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   the next section too (git conflicts with an edit of that next heading line;
   the heading rule now catches that from its side as well, and dropping the
   line-after claim measured 0 misses and 3-14% fewer over-reports in #244's
-  review: left as is, a possible refinement). The hooks' stopgap (`headingGone`) is gone. Not counted
-  (#247): a base-less repo's deletions and gaps (its fallback reads the
-  uncommitted ranges' new side only, and committed changes not at all), and
-  a heading base ADDED, REMOVED or RENAMED after a behind window forked (its
-  claims count under the merge base's sections, the current window's under
-  base's: #244's review measured 76 and 197 misses in the behind-window
-  enumeration for an added and a removed heading).
+  review: left as is, a possible refinement). The hooks' stopgap
+  (`headingGone`) is gone. ⚠ **A window BEHIND base is read in base's copy
+  too (#247).** Its own copy and its merge base's still carry the headings
+  it forked with, so where base RENAMED, ADDED or REMOVED a heading since,
+  its edits counted under the merge base's sections and a current window's
+  edits of the same lines under base's: "disjoint" while git conflicts
+  (#244's review measured 76 and 197 misses in a behind-window enumeration
+  for an added and a removed heading). `ChangedDocEdits` (and the pending
+  `ChangedDocEditsWith`) add `DocEdits.Base`, the window's own hunks moved
+  into base's numbering exactly as `ChangedRanges` moves them
+  (`withBaseClaims`: `mapHunksToBase` over base's diff since the merge
+  base), and `BaseCopy`; `collide.baseClaims` reads their sections in base's
+  copy by `oldClaims`' rules (a change its lines, plus the line above when
+  it starts at a heading; an insertion the line it lands after), and they
+  are added to the rest. Base without the doc adds nothing (read from its
+  tree, `ls-tree` with a literal pathspec: `cat-file` can't tell a missing
+  path from a failure, and a plain `:PLAN.md` is pathspec magic); a
+  listing, copy or diff of base's that can't be read is All (#252 review:
+  an unreadable copy read as "no such doc", the old miss), and so is a
+  base entry that is no regular file (symlink, directory, submodule).
+  ⚠ **No base (#247):** the section grade reads ONE diff
+  from HEAD, both sides, so a base-less repo's uncommitted deletions and
+  gaps count too (its old fallback, the uncommitted ranges' new side, still
+  reads an unborn HEAD, `unbornHEAD`: HEAD names a branch, `symbolic-ref`
+  succeeds, that doesn't exist, `rev-parse --verify HEAD` exits 1. A
+  branch holding a missing object, a tree or garbage, or a bad symref,
+  also fails `HEAD^{commit}` with exit 1; those and any other failure are
+  All). Committed changes there have no frame to compare,
+  and `TouchedFiles` doesn't list them, so `wt check` and pre-push warn
+  that no base resolves (`collide.NoBaseNote`; `base_unresolved` in
+  `--json` and MCP `wt_check`) rather than a bare clear (#252 review:
+  pre-push, which ships the commits, passed a real conflict silently).
   Pinned by `TestSectionDeletions_MatchMergeTree` (deleting a section,
   emptying or deleting the doc, a heading deleted or renamed, duplicate
   headings, the two-step history, a behind branch, a new section against
-  each deletion, two sections appended at the end, and the lanes case that
-  stays advisory: each held against `git merge-tree` in `wt check` and
-  pre-push from both windows), `TestOldClaims`,
-  `TestPreEditHooks_StructuredDocDeletionsGradeHIGH`,
-  `TestSharedSectionsAcross_CountsDeletions` and `TestChangedDocEdits*`.
+  each deletion, two sections appended at the end, the lanes case that
+  stays advisory, and #247's R1, R2, SPLIT and MERGE with a control: each
+  held against `git merge-tree` in `wt check` and pre-push from both
+  windows), `TestSectionGrade_NoBase` (B2 HIGH; B1 said by check, JSON,
+  MCP and pre-push), `TestOldClaims`,
+  `TestBaseClaims`, `TestPreEditHooks_StructuredDocDeletionsGradeHIGH`,
+  `TestSharedSectionsAcross_CountsDeletions`,
+  `TestSharedSectionsAcross_BehindCountsBasesSections` and
+  `TestChangedDocEdits*`.
   A delimiter that doesn't compile leaves the entries as they were (`wt
   check` can't section-grade that doc either). The empty side of a
   measurement is hashed `--no-filters` (git's /dev/null never sees a clean

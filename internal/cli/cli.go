@@ -1527,8 +1527,12 @@ func cmdCheck(args []string) int {
 			}
 		}
 		entries := buildCheckReport(c, ws, root, checkQueries(args))
+		noBase := !gitx.BaseResolves(root, c.Base) // #247
 		if asJSON {
-			return renderCheckJSON(entries, includeStale)
+			return renderCheckJSON(entries, includeStale, noBase)
+		}
+		if noBase {
+			ui.Warn("%s", collide.NoBaseNote(c.Base))
 		}
 		if len(entries) > 0 {
 			annotateLive(entries, worktreeSessionNotes(c)) // #250

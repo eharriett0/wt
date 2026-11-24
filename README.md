@@ -328,8 +328,10 @@ are not protected from each other.
 
 Structured shared docs (`structured_doc.<name>` in config) upgrade the blanket
 "shared doc — advisory" to **section-aware** grading: two windows editing the
-**same** section is HIGH, disjoint sections stay advisory. The installed binary
-also nudges (once/day, best-effort) when a newer `wt` is available on the remote
+**same** section is HIGH, disjoint sections stay advisory. A window behind the
+base branch is read in the base's copy too, so a heading the base renamed,
+added or removed after the window forked can't hide a conflict. The
+installed binary also nudges (once/day, best-effort) when a newer `wt` is available on the remote
 — silence with `WT_NO_UPDATE_CHECK=1`.
 
 ## Typical multi-window flow
@@ -707,7 +709,7 @@ base branch's `.wt.conf` counts too, and the stricter applies, see the merge sec
 
 | `.wt.conf` key | env | default |
 |---|---|---|
-| `base` | `WT_BASE` | derived from `origin/HEAD` (main → master fallback) |
+| `base` | `WT_BASE` | derived from `origin/HEAD` (main → master fallback). When neither `origin/<base>` nor `<base>` resolves, windows' committed changes can't be compared, only their uncommitted edits: `wt check` and pre-push say so (`base_unresolved` in `--json`) instead of a bare clear |
 | `worktree_root` | `WT_WORKTREE_ROOT` | `<repo-parent>/<repo>-worktrees`. A relative value is read from the main checkout, so it names one directory from every window |
 | `active_work` | `WT_ACTIVE_WORK` | `$GIT_COMMON_DIR/wt-active-work.md`. A relative value is read from the main checkout |
 | `prefix` | `WT_PREFIX` | `feat-` (claim branch prefix) |
