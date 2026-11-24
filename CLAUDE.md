@@ -197,14 +197,19 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   copy by `oldClaims`' rules (a change its lines, plus the line above when
   it starts at a heading; an insertion the line it lands after), and they
   are added to the rest. Base without the doc adds nothing (read from its
-  tree, `ls-tree`: `cat-file` can't tell a missing path from a failure); a
+  tree, `ls-tree` with a literal pathspec: `cat-file` can't tell a missing
+  path from a failure, and a plain `:PLAN.md` is pathspec magic); a
   listing, copy or diff of base's that can't be read is All (#252 review:
-  an unreadable copy read as "no such doc", the old miss). ⚠ **No base
-  (#247):** the section grade reads ONE diff
+  an unreadable copy read as "no such doc", the old miss), and so is a
+  base entry that is no regular file (symlink, directory, submodule).
+  ⚠ **No base (#247):** the section grade reads ONE diff
   from HEAD, both sides, so a base-less repo's uncommitted deletions and
   gaps count too (its old fallback, the uncommitted ranges' new side, still
-  reads an unborn HEAD, `headCommit`: only when rev-parse exits 1; any
-  other failure is All). Committed changes there have no frame to compare,
+  reads an unborn HEAD, `unbornHEAD`: HEAD names a branch, `symbolic-ref`
+  succeeds, that doesn't exist, `rev-parse --verify HEAD` exits 1. A
+  branch holding a missing object, a tree or garbage, or a bad symref,
+  also fails `HEAD^{commit}` with exit 1; those and any other failure are
+  All). Committed changes there have no frame to compare,
   and `TouchedFiles` doesn't list them, so `wt check` and pre-push warn
   that no base resolves (`collide.NoBaseNote`; `base_unresolved` in
   `--json` and MCP `wt_check`) rather than a bare clear (#252 review:

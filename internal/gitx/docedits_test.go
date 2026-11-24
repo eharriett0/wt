@@ -328,6 +328,9 @@ func TestChangedDocEdits_NoBaseCountsDeletions(t *testing.T) {
 // and read as unborn they dropped the deletions. Each is All, written and
 // pending (the unborn reading is TestChangedDocEdits_NoBaseCountsDeletions').
 func TestChangedDocEdits_BrokenHEADIsAll(t *testing.T) {
+	// The shapes are written as ref files: pin the files backend where git
+	// has another (reftable, git 2.45+; older git ignores the variable).
+	t.Setenv("GIT_DEFAULT_REF_FORMAT", "files")
 	const content = "# Plan\n## Alpha\na1\na2\n" // Beta deleted
 	gitFile := func(t *testing.T, dir, name, text string) {
 		writeFile(t, dir, gitOut(t, dir, "rev-parse", "--git-path", name), text)
@@ -353,6 +356,9 @@ func TestChangedDocEdits_BrokenHEADIsAll(t *testing.T) {
 			dir := docRepo(t)
 			writeFile(t, dir, "PLAN.md", content)
 			corrupt(t, dir)
+			if _, err := RunDir(dir, "rev-parse", "--verify", "--quiet", "HEAD^{commit}"); err == nil {
+				t.Fatalf("precondition: HEAD still reads as a commit after %s", name)
+			}
 			if e := ChangedDocEdits(dir, "no-such-base", "PLAN.md"); !e.All {
 				t.Errorf("%s: %+v, want All", name, e)
 			}
