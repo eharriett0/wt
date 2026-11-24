@@ -75,8 +75,13 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   on `gitx.GitDir`), and other windows see it as listed. Worktree paths are
   taken verbatim from git, and so are `RepoRoot` and `WorktreeToplevel`
   (`runPath`): trimming a path that ends in a space read a directory that
-  doesn't exist, and a window there then graded its own edit. When git never ran,
-  the reason is the directory's own error, not Go's failed exec of git.
+  doesn't exist, and a window there then graded its own edit. When git never ran
+  (any error but an `*exec.ExitError`, git itself found), it is `ErrNoDir` with
+  the directory's own error: Go reports a directory it may read but not enter
+  (mode 644) as a failed exec of git, so `os.Open` succeeding proves nothing.
+  `ErrGitDirOnly` also needs `--show-toplevel` to fail there: a submodule's
+  `.git/modules/<name>` is its own git dir but has a work tree
+  (core.worktree), so its failures keep git's reason.
   Pinned by `TestUnreadWindow_namedEverywhere` (every surface, with a healthy
   control), `TestScan_worktreeStates`, `TestWorktreeList_PrunableLockedVerbatim`
   and `TestTouchedFiles_UnreadIsAnError`.

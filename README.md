@@ -149,8 +149,8 @@ its tag then reads `working tree unread`, not `uncommitted edits`. When git
 can't run in its directory at all (gone but locked, or not enterable), none
 of its edits are compared, committed or not, and the note says so. In JSON it is `unread` on the window (`wt status --json`, MCP
 `wt_status`) and `unread_windows` (`window`, `worktree`, `error`) in `wt check
---json` and MCP `wt_check`. Run `git status` in that worktree to see what is
-wrong. Two entries are not unread, since neither has a work tree to hold
+--json` and MCP `wt_check`. When git itself failed there, run `git status` in
+that worktree to see what is wrong. Two entries are not unread, since neither has a work tree to hold
 edits: a worktree whose directory was deleted (git lists it as prunable; `git
 worktree prune` removes its record) and the bare repository of a bare-plus-worktrees
 layout. A locked worktree whose directory is gone (an unmounted volume) is

@@ -128,12 +128,17 @@ func gone(path string) bool {
 // gitx.ErrGitDirOnly) and the checkout of a submodule with linked worktrees
 // (an entry git reads through core.worktree). Left as listed, the window is
 // named unread to itself, or its own edits grade as another window's. Asked
-// only when no window is listed at this work tree's root. From another
-// window the entry stays as listed: git does not say where that work tree is.
+// only when no window is listed at this work tree's root (c.Root, which
+// config.Load read). From another window the entry stays as listed: git
+// does not say where that work tree is.
 func readOwnEntry(c *config.Config, ws []Window, byWorktree map[string]activework.Entry) {
-	root, err := gitx.RepoRoot()
-	if err != nil {
-		return
+	root := c.Root
+	if root == "" {
+		r, err := gitx.RepoRoot()
+		if err != nil {
+			return
+		}
+		root = r
 	}
 	for _, w := range ws {
 		if sameWorktree(w.Worktree, root) {

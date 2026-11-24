@@ -143,7 +143,7 @@ func mcpToolDescriptors() []map[string]any {
 				"and is HIGH when some pair of them would each block in wt_check (hunks git would merge as one conflict: overlapping, or touching with no unchanged line between; or the same section of a structured doc); " +
 				"a window whose copy is already on base, already landed, or untracked contests nothing. " +
 				"Also `session` (the session this server reads as, fixed when the client started it) and `other_sessions`: other sessions that posted coordination records from this checkout in the last 24h (sessions_unread says the log could not be read). " +
-				"A window git could not read carries `unread` (git's reason): its uncommitted edits were not compared. Read-only.",
+				"A window git could not read carries `unread` (the reason): its uncommitted edits were not compared, and its commits neither when the reason begins \"directory unreadable\". Read-only.",
 			"inputSchema": obj(map[string]any{
 				"blocking": map[string]any{"type": "boolean", "description": "return only HIGH-risk overlaps"},
 			}),
@@ -152,7 +152,7 @@ func mcpToolDescriptors() []map[string]any {
 			"name": "wt_check",
 			"description": "Before editing: is any other live window touching these paths? Returns per-path " +
 				"grading (HIGH: hunks that overlap or touch, which git merges as one conflict; low: disjoint/advisory). " +
-				"`unread_windows` names other windows git could not read: their uncommitted edits were not compared, so a clear covers only the windows that were read. Read-only.",
+				"`unread_windows` names other windows git could not read: their uncommitted edits were not compared (their commits neither when `error` begins \"directory unreadable\"), so a clear covers only the windows that were read. Read-only.",
 			"inputSchema": obj(map[string]any{
 				"paths":           map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "repo-relative or absolute paths to check, matched exactly; a bare name that is no path in the repo (e.g. foo.go) matches any touched file with that basename. \".\" is the whole repository; an absolute path inside another worktree of this repository is checked as the same repo path; one outside every worktree is refused"},
 				"include_stale":   map[string]any{"type": "boolean", "description": "include merged/dormant windows"},

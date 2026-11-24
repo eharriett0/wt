@@ -388,13 +388,16 @@ func TestTouchedFiles_UnreadIsAnError(t *testing.T) {
 		if os.Geteuid() == 0 {
 			t.Skip("root enters a mode-000 directory")
 		}
-		dir := branch(t)
-		if err := os.Chmod(dir, 0); err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
-		if _, err := TouchedFiles(dir, "main"); !errors.Is(err, ErrNoDir) || !strings.Contains(err.Error(), "permission denied") || strings.Contains(err.Error(), "exec") {
-			t.Errorf("err = %v, want the directory's own error (permission denied), not git's exec", err)
+		// 000: it can't be opened. 600: it can be opened (read), not entered.
+		for _, mode := range []os.FileMode{0, 0o600} {
+			dir := branch(t)
+			if err := os.Chmod(dir, mode); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+			if _, err := TouchedFiles(dir, "main"); !errors.Is(err, ErrNoDir) || !strings.Contains(err.Error(), "permission denied") || strings.Contains(err.Error(), "exec") {
+				t.Errorf("mode %o: err = %v, want ErrNoDir with the directory's own error (permission denied), not git's exec", mode, err)
+			}
 		}
 	})
 	t.Run("separate git dir: ErrGitDirOnly, its work tree read", func(t *testing.T) {

@@ -536,6 +536,13 @@ func TestScan_worktreeStates(t *testing.T) {
 	if code != 0 {
 		t.Errorf("wt check s.txt in the submodule's checkout: exit %d, want 0 (its own edit):\n%s", code, out+errOut)
 	}
+	// The submodule's git dir has a work tree (core.worktree): a real failure
+	// there keeps git's reason, from its linked worktree too (#254 review).
+	writeT(t, modules, "index", "not an index\n")
+	ws = scan(t, swb)
+	if w, ok := at(ws, modules); !ok || !strings.Contains(w.Unread, "index") || w.Unread == gitx.ErrGitDirOnly.Error() {
+		t.Errorf("from swb, the submodule checkout with a corrupt index: %+v (listed %v), want unread with git's reason", w, ok)
+	}
 
 	sepBase := real(t, t.TempDir())
 	sep, work, wb := filepath.Join(sepBase, "sep.git"), filepath.Join(sepBase, "main"), filepath.Join(sepBase, "wb")

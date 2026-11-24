@@ -1303,28 +1303,40 @@ func TouchedFiles(dir, base string) (files []string, err error) {
 var ErrGitDirOnly = errors.New("it is the repository's git directory, and git does not list where its work tree is (a --separate-git-dir layout)")
 
 // ErrNoDir is TouchedFiles' error when git could not run in the directory at
-// all (gone but locked, or one it can't enter): neither its uncommitted nor
-// its committed changes were read (#254 review).
+// all (gone but locked, or one it can't enter, even one it may read): neither
+// its uncommitted nor its committed changes were read (#254 review).
 var ErrNoDir = errors.New("directory unreadable")
 
 // statusError is why `git status` failed in dir (serr). When git never ran
-// (no *exec.ExitError), it is ErrNoDir with dir's own error: Go reports a
-// directory it can't enter as a failed exec of git. A dir that is itself a
-// git directory is ErrGitDirOnly; one merely inside a git directory (a
-// worktree nested in a bare repository that lost its .git file) is a real
-// failure. Asked only after status fails.
+// in dir (no *exec.ExitError, git itself found), it is ErrNoDir with dir's
+// own error: Go reports a directory it can't enter, even one it may read, as
+// a failed exec of git. A dir that is itself a git directory with no work
+// tree git knows is ErrGitDirOnly. A submodule's git dir has one
+// (core.worktree), and a directory merely inside a git directory (a worktree
+// nested in a bare repository that lost its .git file) is no git directory:
+// both are real failures, with git's reason. Asked only after status fails.
 func statusError(dir string, serr error) error {
 	var ee *exec.ExitError
 	if !errors.As(serr, &ee) {
+		if errors.Is(serr, exec.ErrNotFound) {
+			return fmt.Errorf("git status: %v", serr)
+		}
 		f, oerr := os.Open(dir)
 		if oerr != nil {
 			return fmt.Errorf("%w: %v", ErrNoDir, oerr)
 		}
 		_ = f.Close()
-		return fmt.Errorf("git status: %s", serr)
+		cause := serr
+		var pe *os.PathError
+		if errors.As(serr, &pe) {
+			cause = pe.Err
+		}
+		return fmt.Errorf("%w: can't enter %s: %v", ErrNoDir, dir, cause)
 	}
 	if gd, err := runPath(dir, "rev-parse", "--path-format=absolute", "--git-dir"); err == nil && resolvedPath(gd) == resolvedPath(dir) {
-		return ErrGitDirOnly
+		if _, terr := runPath(dir, "rev-parse", "--show-toplevel"); terr != nil {
+			return ErrGitDirOnly
+		}
 	}
 	return fmt.Errorf("git status: %s", exitText(serr))
 }
