@@ -208,6 +208,7 @@ func TestSectionGrade_NoBase(t *testing.T) {
 	offlineGH(t)
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("WT_SKIP_COLLISION", "")
+	t.Setenv("HOOK_DISABLE_MULTIWINDOW_CHECK", "") // or pre-push skips the check, note and all
 	t.Chdir(t.TempDir())
 	root := t.TempDir()
 	gitT(t, root, "init", "-q", "-b", "trunk")

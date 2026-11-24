@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -202,9 +203,10 @@ func TestChangedDocEdits_BaseClaimsOnlyWhenBehind(t *testing.T) {
 	}
 	// Base's copy, its listing or its diff unreadable: All, never "no such
 	// doc" (#252 review: an unreadable copy read as the pre-#247 miss).
+	baseBlob := gitOut(t, dir, "rev-parse", "main:PLAN.md")
 	for name, fail := range map[string]func([]string) bool{
 		"copy": func(a []string) bool {
-			return len(a) > 2 && a[0] == "cat-file" && a[1] == "blob" && a[2] == "main:PLAN.md"
+			return len(a) > 2 && a[0] == "cat-file" && a[1] == "blob" && a[2] == baseBlob
 		},
 		"listing": func(a []string) bool { return len(a) > 0 && a[0] == "ls-tree" },
 		"diff":    func(a []string) bool { return len(a) > 3 && a[0] == "diff" && a[3] == "main" },
@@ -213,6 +215,67 @@ func TestChangedDocEdits_BaseClaimsOnlyWhenBehind(t *testing.T) {
 			failGit(t, fail)
 			if e := ChangedDocEdits(wt, "main", "PLAN.md"); !e.All {
 				t.Errorf("base's %s unreadable: %+v, want All", name, e)
+			}
+		})
+	}
+}
+
+// A doc named like pathspec magic (":PLAN.md") is listed in base's tree as a
+// literal path; listed as magic it read as missing and dropped the base
+// claims (#252 review).
+func TestChangedDocEdits_BehindLiteralPath(t *testing.T) {
+	const doc, main = ":PLAN.md", "# Plan\n## Alpha\na1\na2\n## Beta two\nb1\nb2\nb3\n"
+	dir := gitRepo(t)
+	writeFile(t, dir, doc, docBase)
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "commit", "-qm", "base")
+	wt := filepath.Join(t.TempDir(), "wa")
+	runGit(t, dir, "worktree", "add", "-q", "-b", "wa", wt)
+	writeFile(t, dir, doc, main)
+	runGit(t, dir, "commit", "-qam", "main renames Beta")
+	mine := "# Plan\n## Alpha\na1\na2\n## Beta\nb1\nXb2\nb3\n"
+	writeFile(t, wt, doc, mine)
+	e := ChangedDocEdits(wt, "main", doc)
+	if want := []LineRange{{Start: 7, End: 7}}; !reflect.DeepEqual(e.Base, want) || e.BaseCopy != main || e.All {
+		t.Errorf("%s: Base = %v, BaseCopy = %q, All = %v; want %v, main's copy, false", doc, e.Base, e.BaseCopy, e.All, want)
+	}
+	if p, ok := ChangedDocEditsWith(wt, "main", doc, []byte(mine)); !ok || !reflect.DeepEqual(p, e) {
+		t.Errorf("pending: %+v, want %+v", p, e)
+	}
+}
+
+// Base's entry for the doc that is no regular file has no sections to read:
+// All, never the link target's name read as base's doc (#252 review).
+func TestChangedDocEdits_BaseEntryNotAFileIsAll(t *testing.T) {
+	const mine = "# Plan\n## Alpha\na1\na2\n## Beta\nb1\nXb2\nb3\n"
+	for name, replace := range map[string]func(t *testing.T, dir string){
+		"symlink": func(t *testing.T, dir string) {
+			writeFile(t, dir, "REAL.md", docBase)
+			if err := os.Symlink("REAL.md", filepath.Join(dir, "PLAN.md")); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"directory": func(t *testing.T, dir string) {
+			if err := os.Mkdir(filepath.Join(dir, "PLAN.md"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			writeFile(t, dir, "PLAN.md/x", "x\n")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := docRepo(t)
+			wt := filepath.Join(t.TempDir(), "wa")
+			runGit(t, dir, "worktree", "add", "-q", "-b", "wa", wt)
+			runGit(t, dir, "rm", "-q", "PLAN.md")
+			replace(t, dir)
+			runGit(t, dir, "add", "-A")
+			runGit(t, dir, "commit", "-qm", "main replaces the doc")
+			writeFile(t, wt, "PLAN.md", mine)
+			if e := ChangedDocEdits(wt, "main", "PLAN.md"); !e.All {
+				t.Errorf("base's PLAN.md a %s: %+v, want All", name, e)
+			}
+			if p, ok := ChangedDocEditsWith(wt, "main", "PLAN.md", []byte(mine)); !ok || !p.All {
+				t.Errorf("pending, base's PLAN.md a %s: %+v, %v; want All", name, p, ok)
 			}
 		})
 	}
@@ -257,6 +320,46 @@ func TestChangedDocEdits_NoBaseCountsDeletions(t *testing.T) {
 	runGit(t, unborn, "add", "PLAN.md")
 	if e := ChangedDocEdits(unborn, "no-such-base", "PLAN.md"); e.All || !reflect.DeepEqual(e.New, []LineRange{{Start: 1, End: 8}}) {
 		t.Errorf("no HEAD: %+v, want the staged ranges [1-8]", e)
+	}
+}
+
+// A HEAD git can't read is no unborn branch (#252 review): rev-parse
+// --verify HEAD^{commit} exits 1 for each of these, as for an unborn one,
+// and read as unborn they dropped the deletions. Each is All, written and
+// pending (the unborn reading is TestChangedDocEdits_NoBaseCountsDeletions').
+func TestChangedDocEdits_BrokenHEADIsAll(t *testing.T) {
+	const content = "# Plan\n## Alpha\na1\na2\n" // Beta deleted
+	gitFile := func(t *testing.T, dir, name, text string) {
+		writeFile(t, dir, gitOut(t, dir, "rev-parse", "--git-path", name), text)
+	}
+	for name, corrupt := range map[string]func(t *testing.T, dir string){
+		"branch holds a missing object": func(t *testing.T, dir string) {
+			gitFile(t, dir, "refs/heads/main", strings.Repeat("1", 40)+"\n")
+		},
+		"branch holds a tree": func(t *testing.T, dir string) {
+			gitFile(t, dir, "refs/heads/main", gitOut(t, dir, "rev-parse", "HEAD^{tree}")+"\n")
+		},
+		"branch holds garbage": func(t *testing.T, dir string) {
+			gitFile(t, dir, "refs/heads/main", "not-a-sha\n")
+		},
+		"HEAD is a bad symref": func(t *testing.T, dir string) {
+			gitFile(t, dir, "HEAD", "ref: refs/heads/..bad\n")
+		},
+		"detached at a missing object": func(t *testing.T, dir string) {
+			gitFile(t, dir, "HEAD", strings.Repeat("2", 40)+"\n")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := docRepo(t)
+			writeFile(t, dir, "PLAN.md", content)
+			corrupt(t, dir)
+			if e := ChangedDocEdits(dir, "no-such-base", "PLAN.md"); !e.All {
+				t.Errorf("%s: %+v, want All", name, e)
+			}
+			if e, ok := ChangedDocEditsWith(dir, "no-such-base", "PLAN.md", []byte(content)); !ok || !e.All {
+				t.Errorf("pending, %s: %+v, %v; want All", name, e, ok)
+			}
+		})
 	}
 }
 

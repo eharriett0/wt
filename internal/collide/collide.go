@@ -526,7 +526,7 @@ func IsSharedDoc(path string, shared []string) bool {
 // TouchedFiles doesn't list them, so a file another window only committed
 // reads clear.
 func NoBaseNote(base string) string {
-	return fmt.Sprintf("no base branch resolves here (neither origin/%s nor %s): windows' committed changes are not compared, only their uncommitted edits, so a file another window only committed reads clear. Set `base` in .wt.conf to the branch windows start from.", base, base)
+	return fmt.Sprintf("no base branch resolves here (neither origin/%s nor %s): committed changes are not compared (uncommitted edits still are), so pushed commits, and a file another window only committed, read clear. Set `base` in .wt.conf to the branch windows start from.", base, base)
 }
 
 // RangeFn resolves the line ranges a worktree changed in a path, relative to

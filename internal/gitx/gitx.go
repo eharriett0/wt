@@ -1634,24 +1634,30 @@ func docEditsFrom(dir, old, diff string, oldMissing bool) DocEdits {
 // its own hunks (own, the -U0 diff from its merge base mb) moved into base's
 // line numbers through base's hunks since mb, as ChangedRanges moves them,
 // and base's copy of file. Base without the file adds nothing (there is no
-// section of base's to claim), read from its tree (ls-tree, as RefFileText
-// reads it: cat-file can't tell a missing path from a failure); a listing,
-// a copy or a diff that can't be read is All (#252 review: an unreadable
-// copy read as "no such doc", the pre-#247 miss).
+// section of base's to claim), read from its tree (ls-tree, a literal path:
+// cat-file can't tell a missing path from a failure). A listing, a copy or a
+// diff that can't be read is All (#252 review: an unreadable copy read as "no
+// such doc", the pre-#247 miss), and so is an entry that is no regular file
+// (a symlink's blob is its target's name, not base's doc).
 func withBaseClaims(dir, ref, mb, file, own string, e DocEdits) DocEdits {
 	hunks := parseHunks(own)
 	if len(hunks) == 0 || e.All {
 		return e
 	}
-	listed, err := runRaw(dir, "ls-tree", "-z", "--full-tree", ref, "--", file)
+	listed, err := runRaw(dir, "ls-tree", "-z", "--full-tree", ref, "--", literalPath(file))
 	if err != nil {
 		e.All = true
 		return e
 	}
-	if _, _, _, ok := lsTreeEntry(listed, file); !ok {
+	mode, kind, oid, ok := lsTreeEntry(listed, file)
+	if !ok {
 		return e
 	}
-	baseCopy, err := runRaw(dir, "cat-file", "blob", ref+":"+file)
+	if mode == "120000" || kind != "blob" {
+		e.All = true
+		return e
+	}
+	baseCopy, err := runRaw(dir, "cat-file", "blob", oid)
 	if err != nil {
 		e.All = true
 		return e
@@ -1674,18 +1680,31 @@ func BaseResolves(dir, base string) bool {
 }
 
 // headCommit reports whether HEAD names a commit in dir. An unborn branch
-// is (false, nil), only when git says so (rev-parse --verify --quiet exits
-// 1); any other failure is an error (#252 review: read as unborn, it
-// dropped the deletions the HEAD diff counts).
+// is (false, nil); any other failure is an error (#252 review: read as
+// unborn, it dropped the deletions the HEAD diff counts).
 func headCommit(dir string) (bool, error) {
 	s, err := RunDir(dir, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
 	if err == nil {
 		return s != "", nil
 	}
-	if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
+	if unbornHEAD(dir) {
 		return false, nil
 	}
 	return false, err
+}
+
+// unbornHEAD reports whether HEAD names a branch (symbolic-ref succeeds)
+// that doesn't exist yet (rev-parse --verify --quiet HEAD exits 1). The
+// HEAD^{commit} probe alone can't say: it exits 1 too for a branch holding a
+// missing object, a tree or garbage, and for a bad symref (#252 review,
+// measured on git 2.39). Those resolve (exit 0) or fail symbolic-ref (128).
+func unbornHEAD(dir string) bool {
+	_, err := RunDir(dir, "rev-parse", "--verify", "--quiet", "HEAD")
+	if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 1 {
+		return false
+	}
+	_, err = RunDir(dir, "symbolic-ref", "--quiet", "HEAD")
+	return err == nil
 }
 
 // parseInsertGaps extracts the OLD-side gap of each pure insertion (#237
