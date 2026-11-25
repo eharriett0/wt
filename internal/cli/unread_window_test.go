@@ -475,8 +475,10 @@ func TestScan_worktreeStates(t *testing.T) {
 	}
 	for _, n := range []string{"nogit", "empty"} {
 		w, ok := at(ws, nest[n])
-		if !ok || w.Unread != collide.ErrNoGitLink || len(w.Touched) != 0 || w.Branch != "n-"+n || collide.NotCompared(w) != "all" {
-			t.Errorf("nested worktree %s: %+v (listed %v), want unread (%s), nothing attributed, its own branch", n, w, ok, collide.ErrNoGitLink)
+		// #256: its commits (none beyond main) are read at its head, from
+		// this repository: only its uncommitted edits go uncompared.
+		if !ok || w.Unread != collide.ErrNoGitLink || len(w.Touched) != 0 || w.Branch != "n-"+n || w.ReadAt == "" || collide.NotCompared(w) != "uncommitted" {
+			t.Errorf("nested worktree %s: %+v (listed %v), want unread (%s), nothing attributed, its own branch, read at its head", n, w, ok, collide.ErrNoGitLink)
 		}
 	}
 	if partial != "" {
@@ -498,11 +500,11 @@ func TestScan_worktreeStates(t *testing.T) {
 	if w, ok := at(ws, gone); !ok || w.Unread != "" {
 		t.Errorf("removed (prunable) worktree: %+v (listed %v), want listed, not unread", w, ok)
 	}
-	if w, ok := at(ws, locked); !ok || !strings.Contains(w.Unread, "no such file or directory") || w.Branch != "locked" {
-		t.Errorf("locked worktree, directory gone: %+v (listed %v), want unread with its reason", w, ok)
+	if w, ok := at(ws, locked); !ok || !strings.Contains(w.Unread, "no such file or directory") || w.Branch != "locked" || w.ReadAt == "" {
+		t.Errorf("locked worktree, directory gone: %+v (listed %v), want unread with its reason, read at its head", w, ok)
 	}
-	// git never ran there, so its commits weren't read either: wt status's
-	// UNREAD line says so.
+	// git never ran there, but its commits were read at its head (#256):
+	// wt status's UNREAD line says only its uncommitted edits weren't.
 	sout, serr := captureOutputForTest(t, func() { cmdStatus(nil) })
 	line := ""
 	for _, ln := range strings.Split(sout+serr, "\n") {
@@ -510,8 +512,8 @@ func TestScan_worktreeStates(t *testing.T) {
 			line = ln
 		}
 	}
-	if !strings.Contains(line, "none of its edits are compared") {
-		t.Errorf("wt status, the locked worktree's UNREAD line: %q, want \"none of its edits are compared\":\n%s", line, sout+serr)
+	if !strings.Contains(line, "its uncommitted edits are not compared") {
+		t.Errorf("wt status, the locked worktree's UNREAD line: %q, want \"its uncommitted edits are not compared\":\n%s", line, sout+serr)
 	}
 	if w, ok := at(ws, spaced); !ok || w.Unread != "" || !has(w.Touched, "notes.txt") {
 		t.Errorf("worktree at %q: %+v (listed %v), want read, with its edit", spaced, w, ok)
