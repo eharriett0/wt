@@ -104,18 +104,24 @@ func Scan(c *config.Config) ([]Window, error) {
 			switch {
 			case refs[i].Bare || refs[i].Prunable && gone(p):
 				// no work tree to read
-			case refs[i].Prunable && terr == nil:
+			case refs[i].Prunable && !errors.Is(terr, gitx.ErrNoDir):
 				// #255: its .git link is gone but its directory is there, so
-				// git status ran in the work tree around it: what it read is
-				// not this window's. Named by its own branch, nothing of it read.
+				// whatever git status read (the work tree around it, which may
+				// itself be partly unread) or failed on is not this window's.
+				// Named by its own branch, nothing of it read.
 				w.Branch, w.Touched = refs[i].Branch, nil
-				w.Unread, w.CommitsUnread = ErrNoGitLink, true
+				w.Unread, w.UnreadSome, w.CommitsUnread = ErrNoGitLink, false, true
 			case terr != nil:
+				if refs[i].Prunable { // a directory git can't enter: it can't reach the .git either
+					w.Branch = refs[i].Branch
+				}
 				markUnread(&w, terr)
 			}
+			// Claims by the window's own branch: for a #255 entry, br is the
+			// enclosing work tree's (#254 review, round 6).
 			if e, ok := byWorktree[p]; ok {
 				w.Issue, w.Title = e.Issue, e.Title
-			} else if e, ok := byBranch[br]; ok {
+			} else if e, ok := byBranch[w.Branch]; ok {
 				w.Issue, w.Title = e.Issue, e.Title
 			}
 			ws[i] = w
@@ -127,9 +133,9 @@ func Scan(c *config.Config) ([]Window, error) {
 }
 
 // ErrNoGitLink is the unread reason of a worktree git lists as prunable
-// whose directory is still there (#255): its .git file is gone, so git
-// reads the work tree around it (or nothing) instead.
-const ErrNoGitLink = "its .git link is missing (git lists it as prunable), so git reads the work tree around it, not this one"
+// whose directory is still there and can be entered (#255): its .git file is
+// gone, so git reads the work tree around it, or none.
+const ErrNoGitLink = "its .git link is missing (git lists it as prunable), so git can't read it as its own work tree"
 
 // markUnread records TouchedFiles' error on w (#253): the reason, and what
 // of the window was not read (#254 review).

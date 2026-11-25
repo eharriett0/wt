@@ -155,7 +155,10 @@ func runReporting(dir string, args ...string) (string, error) {
 
 // gitStderr condenses git's stderr for an error message: blank lines and git's
 // "hint:" lines dropped, the rest joined with "; ". Pure.
-func gitStderr(s string) string {
+func gitStderr(s string) string { return strings.Join(gitStderrLines(s), "; ") }
+
+// gitStderrLines is gitStderr's lines before joining.
+func gitStderrLines(s string) []string {
 	var lines []string
 	for _, ln := range strings.Split(s, "\n") {
 		ln = strings.TrimSpace(ln)
@@ -164,7 +167,7 @@ func gitStderr(s string) string {
 		}
 		lines = append(lines, ln)
 	}
-	return strings.Join(lines, "; ")
+	return lines
 }
 
 // noRenames is the flag every `git diff --name-only` feeding the collision
@@ -755,9 +758,10 @@ type WorktreeRef struct {
 	// worktrees beside or inside it): listed first, with no work tree (#201
 	// review).
 	Bare bool
-	// Prunable: git lists it as prunable, its directory gone and the worktree
-	// not locked (#253 review). A locked one whose directory is gone (an
-	// unmounted volume) is not: its edits still exist.
+	// Prunable: git lists it as prunable: it can't reach the worktree's .git
+	// file (the directory is gone, the .git file deleted, or a directory it
+	// can't enter) and the worktree is not locked (#253 review). A locked one
+	// whose directory is gone (an unmounted volume) is not.
 	Prunable bool
 }
 
@@ -1442,8 +1446,8 @@ func statusError(dir string, serr error) error {
 func exitText(err error) string {
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
-		if msg := gitStderr(string(ee.Stderr)); msg != "" {
-			return capLines(strings.Split(msg, "; "), 3)
+		if lines := gitStderrLines(string(ee.Stderr)); len(lines) > 0 {
+			return capLines(lines, 3) // capped by line, never mid-path (round 6)
 		}
 	}
 	return err.Error()

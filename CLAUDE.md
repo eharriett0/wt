@@ -69,9 +69,12 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   merely INSIDE a bare repo walks up into it); naming either repeated a false
   warning on every agent turn (measured in review). A prunable worktree whose
   directory EXISTS (its .git file gone: an empty mount point, a deleted link)
-  is unread (`collide.ErrNoGitLink`, #255): `git status` there walks up and
-  SUCCEEDS on the enclosing work tree, so its result is dropped, never
-  attributed to it. `statusMissed` counts a `<path>: <text>` line only when
+  is unread (`collide.ErrNoGitLink`, #255) under ITS OWN branch
+  (`WorktreeRef.Branch`, which also keys its claim): nested, `git status`
+  there walks up into the enclosing work tree, and whatever that read or
+  failed on (it may be partly unread itself) is dropped, never attributed to
+  it; not nested, git fails there. Only a directory git can't enter keeps its
+  `ErrNoDir` reason (git calls that prunable too). `statusMissed` counts a `<path>: <text>` line only when
   the text after the last ": " is exactly a system error (`errnoText`, git run
   with LC_ALL=C): an fsmonitor hook, GIT_TRACE or a hook's output on a
   successful status made healthy windows unread (round 5). Reasons are capped

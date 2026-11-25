@@ -621,3 +621,73 @@ func TestScan_worktreeStates(t *testing.T) {
 		t.Errorf("from the main work tree, its own window: %+v (listed %v), want read by its work tree, with its edit", w, ok)
 	}
 }
+
+// #255, round 6: a nested worktree without its .git is never read as the work
+// tree around it, even when that one is itself partly unread, and never takes
+// that window's branch or claim.
+func TestScan_nestedUnderUnreadClaimedMain(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a mode-000 directory")
+	}
+	offlineGH(t)
+	t.Setenv("HOME", t.TempDir())
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, root, "init", "-q", "-b", "main")
+	gitT(t, root, "config", "user.email", "t@t.test")
+	gitT(t, root, "config", "user.name", "t")
+	writeT(t, root, ".gitignore", ".wt/\n")
+	writeT(t, root, "shared.txt", "a\n")
+	gitT(t, root, "add", "-A")
+	gitT(t, root, "commit", "-qm", "base")
+	gitT(t, root, "checkout", "-q", "-b", "feat-7")
+	writeT(t, root, filepath.Join(".git", "wt-active-work.md"), "## #7 seven\n- Branch: `feat-7`\n")
+	writeT(t, root, "shared.txt", "main edit\n")
+	locked := filepath.Join(root, "locked") // the main checkout is partly unread
+	if err := os.Mkdir(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeT(t, locked, "f.txt", "f\n")
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+	x := filepath.Join(root, ".wt", "x")
+	gitT(t, root, "worktree", "add", "-q", "-b", "n-x", x, "feat-7")
+	if err := os.Remove(filepath.Join(x, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(root)
+	c, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws, err := collide.Scan(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mainW, nested collide.Window
+	feat7 := 0
+	for _, w := range ws {
+		switch w.Worktree {
+		case root:
+			mainW = w
+		case x:
+			nested = w
+		}
+		if w.Branch == "feat-7" {
+			feat7++
+		}
+	}
+	if !mainW.UnreadSome || mainW.Issue != "7" {
+		t.Errorf("main checkout: %+v, want partly unread (locked/) and claimed #7", mainW)
+	}
+	if nested.Unread != collide.ErrNoGitLink || len(nested.Touched) != 0 || nested.Branch != "n-x" || nested.Issue != "" {
+		t.Errorf("nested worktree without its .git: %+v, want unread (%s), nothing attributed, its own branch, no claim", nested, collide.ErrNoGitLink)
+	}
+	if feat7 != 1 {
+		t.Errorf("%d windows on feat-7, want 1 (the nested one took the main checkout's branch): %+v", feat7, ws)
+	}
+}

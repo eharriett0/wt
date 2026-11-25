@@ -602,4 +602,9 @@ func TestExitText_capped(t *testing.T) {
 	if !strings.HasSuffix(got, "; and 48 more") || strings.Count(got, "Permission denied") != 3 {
 		t.Errorf("exitText of 51 lines = %q, want 3 and a count", got)
 	}
+	// One line holding "; " (a path) is one line, never cut (round 6).
+	one := "fatal: /r; a; b; c/.git/worktrees/w/index: index file open failed: Permission denied"
+	if got := exitText(&exec.ExitError{Stderr: []byte(one + "\n")}); got != one {
+		t.Errorf("exitText of one line with \"; \" = %q, want it whole", got)
+	}
 }
