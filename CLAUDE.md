@@ -69,8 +69,10 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   banner, pre-push (`RangesAtCommit`/`DocEditsAtCommit`) and both edit hooks
   (`CheckEntry.otherAt`). The checks that need its directory (already merged,
   untracked, subsumed) are OFF for it, fail-safe: git run in a #255 entry's
-  directory reads the checkout around it, and its untracked read turned a real
-  add/add advisory. Liveness reads such a window (any fully unread one) as
+  directory reads the checkout around it, and, the entry not under an
+  ignored directory, its untracked read listed the window's committed file
+  as the enclosing checkout's untracked one and turned a real add/add
+  advisory (measured; under an ignored directory git reads nothing there). Liveness reads such a window (any fully unread one) as
   dirty and ages it by its head. Only when the head can't be read either
   (a missing object, no base) are none of its edits compared, and
   `collide.UnreadScope` says so. An unreadable structured doc in a READABLE

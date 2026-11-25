@@ -95,7 +95,8 @@ func TestUnreachableWindow_gradedAtItsCommit(t *testing.T) {
 	push := func(file, content string) bool {
 		writeT(t, me, file, content)
 		gitT(t, me, "commit", "-qam", "me")
-		blocked := prePushRefs(t, me, "me")
+		var blocked bool
+		captureOutputForTest(t, func() { blocked = prePushRefs(t, me, "me") }) // its report goes to stderr
 		gitT(t, me, "reset", "-q", "--hard", "main")
 		return blocked
 	}
@@ -171,7 +172,9 @@ func TestNestedWindowWithoutGit_gradedAtItsCommit(t *testing.T) {
 	writeT(t, me, "y.go", "package me\n")
 	gitT(t, me, "add", "y.go")
 	gitT(t, me, "commit", "-qm", "me adds y.go")
-	if !prePushRefs(t, me, "me") {
+	var blocked bool
+	captureOutputForTest(t, func() { blocked = prePushRefs(t, me, "me") })
+	if !blocked {
 		t.Error("pre-push of y.go from me: not blocked, want the add/add with n's commit")
 	}
 }
