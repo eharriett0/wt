@@ -700,7 +700,7 @@ func hookClaudeEdit(r io.Reader) int {
 	// window's copy as the edit leaves it.
 	sections, rest := regradeSections(c, root, rel, []byte(content), predicted, entries)
 	graded := append(sections, regradePending(rest, after, afterOK, func(e CheckEntry) bool {
-		return subsumedByBase(e.otherWorktree, c.Base, rel) // that window's, not a namesake's (#193)
+		return e.otherAt == "" && subsumedByBase(e.otherWorktree, c.Base, rel) // that window's, not a namesake's (#193); #256
 	})...)
 
 	if len(graded) > 0 { // #250: name the live sessions in the other windows
@@ -754,6 +754,11 @@ func regradeSections(c *config.Config, root, rel string, content []byte, predict
 	f := newGitGradeFacts(c.Base)
 	f.pendingPath = rel
 	f.pending = map[string]collide.PendingDoc{root: {Content: string(content), Edits: edits}}
+	for _, e := range entries { // #256: windows read at their commit
+		if e.otherAt != "" {
+			f.at[e.otherWorktree] = e.otherAt
+		}
+	}
 	for _, e := range entries {
 		switch {
 		case !sectionGraded(e):

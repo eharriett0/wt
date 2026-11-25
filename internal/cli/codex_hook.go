@@ -122,7 +122,7 @@ func agentContextOverlaps(c *config.Config, ws []collide.Window, root string) []
 		delete(labels, self.Label)
 	}
 	live := collide.ClassifyWindows(ws, c.Base, labels, c.MaxAge)
-	return agentOverlaps(c, gitFactsFor(c), ws, ov, live, self)
+	return agentOverlaps(c, gitFactsFor(c, ws), ws, ov, live, self)
 }
 
 // agentOverlaps is the banner's decision (#182): which overlaps it lists, with
@@ -729,7 +729,7 @@ func hookCodexEdit(r io.Reader) int {
 		// leaves, as the Claude hook does.
 		sections, rest := regradeSections(c, root, path, []byte(content), predictable && touched, byEntryPath[path])
 		graded := append(sections, regradePending(rest, after, afterOK, func(e CheckEntry) bool {
-			return subsumedByBase(e.otherWorktree, c.Base, path) // that window's, not a namesake's (#193)
+			return e.otherAt == "" && subsumedByBase(e.otherWorktree, c.Base, path) // that window's, not a namesake's (#193); #256
 		})...)
 		for _, g := range graded {
 			high = append(high, codexGradedEntry{entry: g.entry, confirmed: g.confirmed})

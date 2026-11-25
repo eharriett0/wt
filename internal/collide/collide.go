@@ -42,6 +42,13 @@ type Window struct {
 	// (#254 review). CommitsUnread: its committed changes were not read
 	// either. See NotCompared.
 	UnreadSome, CommitsUnread bool
+	// ReadAt is the commit an unread window's committed changes were read at,
+	// from this repository, when git could not read them in its directory
+	// (#256): the head `git worktree list` records for it. Touched then holds
+	// them, and the grade measures this window there (RangesAtCommit,
+	// DocEditsAtCommit, PendingAtCommit), never in its directory, which git
+	// can't enter or reads as the work tree around it.
+	ReadAt string
 }
 
 // Label is a short human identifier for a window.
@@ -118,6 +125,13 @@ func Scan(c *config.Config) ([]Window, error) {
 					w.Branch = refs[i].Branch
 				}
 				markUnread(&w, terr)
+			}
+			// #256: its commits could not be read in its directory: read them
+			// at the head git lists for it, from this repository.
+			if w.CommitsUnread && refs[i].Head != "" {
+				if files, err := gitx.CommittedFilesAt(c.Base, refs[i].Head); err == nil {
+					w.Touched, w.CommitsUnread, w.ReadAt = files, false, refs[i].Head
+				}
 			}
 			// Claims by the window's own branch: for a #255 entry, br is the
 			// enclosing work tree's (#254 review, round 6).
@@ -741,6 +755,71 @@ func SharedSectionsAcross(base string, worktrees []string, rel, delimiter string
 	return SharedSectionsAcrossWith(base, worktrees, rel, delimiter, edits, nil)
 }
 
+// ReadAt is the commit the window at worktree is read at (#256), "" for a
+// window read in its directory, or one ws doesn't list.
+func ReadAt(ws []Window, worktree string) string {
+	for _, w := range ws {
+		if w.Worktree == worktree {
+			return w.ReadAt
+		}
+	}
+	return ""
+}
+
+// RangesAtCommit is ranges, except that a window read at its commit (ReadAt)
+// is measured there, from this repository (#256).
+func RangesAtCommit(ws []Window, ranges RangeFn) RangeFn {
+	return func(worktree, base, path string) []gitx.LineRange {
+		if at := ReadAt(ws, worktree); at != "" {
+			r, _ := gitx.ChangedRangesAt(base, at, path)
+			return r
+		}
+		return ranges(worktree, base, path)
+	}
+}
+
+// DocEditsAtCommit is edits, except that a window read at its commit is
+// measured there (#256).
+func DocEditsAtCommit(ws []Window, edits DocEditsFn) DocEditsFn {
+	return func(worktree, base, path string) gitx.DocEdits {
+		if at := ReadAt(ws, worktree); at != "" {
+			return gitx.ChangedDocEditsAt(base, at, path)
+		}
+		return edits(worktree, base, path)
+	}
+}
+
+// PendingAtCommit returns pending plus, for each of worktrees read at its
+// commit (#256), the doc rel as that commit has it, with its edits from
+// edits: SharedSectionsAcrossWith then never reads such a window's directory.
+// A copy git can't read is left out, so the disk read, and its fail-safe
+// (every section), applies. pending itself is never modified.
+func PendingAtCommit(ws []Window, worktrees []string, base, rel string, edits DocEditsFn, pending map[string]PendingDoc) map[string]PendingDoc {
+	out := pending
+	for _, wt := range worktrees {
+		at := ReadAt(ws, wt)
+		if at == "" {
+			continue
+		}
+		if _, ok := out[wt]; ok {
+			continue
+		}
+		text, _, err := gitx.RefFileText(at, rel)
+		if err != nil {
+			continue
+		}
+		if len(out) == len(pending) { // first addition: copy, never write the caller's map
+			cp := make(map[string]PendingDoc, len(pending)+1)
+			for k, v := range pending {
+				cp[k] = v
+			}
+			out = cp
+		}
+		out[wt] = PendingDoc{Content: text, Edits: edits(wt, base, rel)}
+	}
+	return out
+}
+
 // PendingDoc is one worktree's copy of a structured doc as a pending edit will
 // leave it, with what that worktree changed: Edits.New in the copy's own
 // (NEW-frame) line numbers (#226), Edits.Deleted in the copy it is measured
@@ -841,11 +920,13 @@ func SharedSectionsAcrossWith(base string, worktrees []string, rel, delimiter st
 			content, e = doc.Content, doc.Edits
 		} else {
 			b, rerr := os.ReadFile(filepath.Join(wt, rel))
-			if rerr != nil && !os.IsNotExist(rerr) {
-				continue // unreadable here; others may still grade
-			}
 			e = edits(wt, base, rel)
-			if rerr != nil && len(e.Deleted) == 0 && !e.All {
+			switch {
+			case rerr != nil && !os.IsNotExist(rerr):
+				// Unreadable here: it may edit any section. Skipping it read
+				// as no claim, so a shared section graded advisory (#256 review).
+				e.All = true
+			case rerr != nil && len(e.Deleted) == 0 && !e.All:
 				continue // this worktree lacks the doc and deleted nothing of it
 			}
 			content = string(b)
@@ -1378,13 +1459,23 @@ func Classify(w Window, base string, maxAge time.Duration, now time.Time) Window
 			}
 		}
 	}
-	f.Dirty = !gitx.IsClean(w.Worktree)
+	if w.Unread != "" && !w.UnreadSome {
+		// #256: its working tree is unknown (#253), never read as clean; git
+		// in its directory may read the work tree around it (#255).
+		f.Dirty = true
+	} else {
+		f.Dirty = !gitx.IsClean(w.Worktree)
+	}
 	if n, err := gitx.CountUnshipped(base, w.Branch); err == nil {
 		f.Unshipped = n
 	} else {
 		f.Unshipped = -1
 	}
-	if age, err := gitx.LastCommitAge(w.Worktree, now); err == nil {
+	age, aerr := gitx.LastCommitAge(w.Worktree, now)
+	if w.ReadAt != "" {
+		age, aerr = gitx.CommitAge(w.ReadAt, now) // #256: by its head, not its directory
+	}
+	if aerr == nil {
 		f.Age = age
 	}
 	// #87: for the dirty base-branch checkout (only the primary can be on base —
@@ -1396,7 +1487,11 @@ func Classify(w Window, base string, maxAge time.Duration, now time.Time) Window
 	behindBase := 0
 	if w.Branch == base && f.Dirty {
 		if ref := gitx.ResolveRemoteBase(base); ref != "" {
-			if headSHA, err := gitx.RunDir(w.Worktree, "rev-parse", "HEAD"); err == nil {
+			headSHA, err := w.ReadAt, error(nil)
+			if headSHA == "" {
+				headSHA, err = gitx.RunDir(w.Worktree, "rev-parse", "HEAD")
+			}
+			if err == nil {
 				if n := gitx.BehindCount(strings.TrimSpace(headSHA), ref); n > 0 {
 					behindBase = n
 				}

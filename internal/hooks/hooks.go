@@ -447,17 +447,20 @@ func gradeConflicts(c *config.Config, active []collide.Conflict, root string, ws
 		if rangesPath == "" {
 			rangesPath = cf.Path
 		}
+		// #256: a window read at its commit is measured there; the checks that
+		// need its directory (merged, untracked, subsumed) stay off: fail-safe.
+		readAt := collide.ReadAt(ws, otherWt) != ""
 		// #109: an already-merged path — the other window's content is byte-identical
 		// to the upstream base (stale index / worktree) — is not a live collision.
 		// Advisory, never blocks; matches `wt check`'s already-merged downgrade.
-		if merged, known := collide.PathMatchesUpstream(otherWt, c.Base, rangesPath); known && merged {
+		if merged, known := collide.PathMatchesUpstream(otherWt, c.Base, rangesPath); !readAt && known && merged {
 			soft = append(soft, cf)
 			continue
 		}
 		// #113: the other window's claim on this path is an UNTRACKED file — nothing
 		// committed/staged there, so it can't be pushed and can't collide until
 		// committed. Advisory, never blocks; matches `wt check`'s untracked downgrade.
-		if gitx.IsUntracked(otherWt, rangesPath) {
+		if !readAt && gitx.IsUntracked(otherWt, rangesPath) {
 			soft = append(soft, cf)
 			continue
 		}
@@ -470,8 +473,9 @@ func gradeConflicts(c *config.Config, active []collide.Conflict, root string, ws
 			// same lane of a hand-merged doc — blocked in `wt check` and sailed
 			// straight through the pre-push guard.
 			if delim, isStructured := c.StructuredDocs[filepath.Base(cf.Path)]; isStructured {
-				if shared, graded := collide.SharedSectionsAcross(
-					c.Base, []string{root, otherWt}, rangesPath, delim, sectionEdits,
+				pair, edits := []string{root, otherWt}, collide.DocEditsAtCommit(ws, sectionEdits)
+				if shared, graded := collide.SharedSectionsAcrossWith(
+					c.Base, pair, rangesPath, delim, edits, collide.PendingAtCommit(ws, pair, c.Base, rangesPath, edits, nil),
 				); graded && len(shared) > 0 {
 					hard = append(hard, cf)
 					continue
@@ -485,7 +489,7 @@ func gradeConflicts(c *config.Config, active []collide.Conflict, root string, ws
 			continue
 		}
 		cur := ranges(root, c.Base, rangesPath)
-		other := ranges(otherWt, c.Base, rangesPath)
+		other := collide.RangesAtCommit(ws, collide.RangeFn(ranges))(otherWt, c.Base, rangesPath)
 		if collide.ConflictSeverity(cur, other, false) != collide.SevHigh {
 			soft = append(soft, cf)
 			continue
@@ -495,7 +499,7 @@ func gradeConflicts(c *config.Config, active []collide.Conflict, root string, ws
 		// the other window's change to this file is already on base (a clean 3-way
 		// merge into base is a no-op), it isn't contesting it. Fail-safe: an
 		// undeterminable check keeps the hard block.
-		if s, known := gitx.FileChangeSubsumed(otherWt, c.Base, rangesPath); known && s {
+		if s, known := gitx.FileChangeSubsumed(otherWt, c.Base, rangesPath); !readAt && known && s {
 			soft = append(soft, cf)
 			continue
 		}

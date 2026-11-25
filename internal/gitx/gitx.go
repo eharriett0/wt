@@ -1428,6 +1428,68 @@ func capLines(lines []string, max int) string {
 	return fmt.Sprintf("%s; and %d more", strings.Join(lines[:max], "; "), len(lines)-max)
 }
 
+// CommittedFilesAt is TouchedFiles' committed part for a branch at head,
+// read from the current repository (#256): what a window git can't run in
+// committed, by the head `git worktree list` records for it. An error when no
+// base resolves or git can't read head (a missing object).
+func CommittedFilesAt(base, head string) ([]string, error) {
+	var err error
+	for _, ref := range []string{"origin/" + base, base} {
+		var out string
+		if out, err = runRaw("", "diff", "--name-only", noRenames, nulPaths, ref+"..."+head); err == nil {
+			return splitNUL(out), nil
+		}
+	}
+	return nil, err
+}
+
+// ChangedRangesAt is ChangedRanges for a window read at its commit head
+// (#256): its committed changes only, in the base frame, measured from the
+// current repository because git can't run in its directory. ok=false when
+// no base resolves or git fails; callers grade that fail-safe, as nil from
+// ChangedRanges.
+func ChangedRangesAt(base, head, file string) ([]LineRange, bool) {
+	ref, sha, hasBase := resolveBaseRef("", base)
+	if !hasBase {
+		return nil, false
+	}
+	return changedRanges("", ref, sha, file, &pendingSide{commit: head})
+}
+
+// ChangedDocEditsAt is ChangedDocEdits for a window read at its commit head
+// (#256), from the current repository. Without a base, or when a diff fails,
+// every section (All), as ChangedDocEdits does.
+func ChangedDocEditsAt(base, head, file string) DocEdits {
+	ref, sha, hasBase := resolveBaseRef("", base)
+	if !hasBase {
+		return DocEdits{New: wholeFile, All: true}
+	}
+	if mb := behindMergeBaseFrom("", ref, sha, file, head); mb != "" {
+		if out, err := runRaw("", gradeDiff([]string{mb, head}, file)...); err == nil {
+			return withBaseClaims("", ref, mb, file, out, docEditsFrom("", mb+":"+file, out, false))
+		}
+	}
+	out, err := runRaw("", gradeDiff([]string{ref, head}, file)...)
+	if err != nil {
+		return DocEdits{New: wholeFile, All: true}
+	}
+	return docEditsFrom("", ref+":"+file, out, false)
+}
+
+// CommitAge is how long ago commit rev was made, read from the current
+// repository (#256: a window git can't run in, aged by its head).
+func CommitAge(rev string, now time.Time) (time.Duration, error) {
+	out, err := RunDir("", "log", "-1", "--format=%ct", rev)
+	if err != nil {
+		return 0, err
+	}
+	ts, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return now.Sub(time.Unix(ts, 0)), nil
+}
+
 // ErrGitDirOnly is TouchedFiles' error for a worktree entry that is itself a
 // git directory: a bare repository (Scan leaves those out: no work tree), or
 // the main entry of a `--separate-git-dir` repository, whose work tree exists
@@ -1668,13 +1730,20 @@ func ChangedRangesWith(dir, base, file string, content []byte) ([]LineRange, boo
 type pendingSide struct {
 	blob string
 	env  []string
+	// commit: the window's side is this commit's tree, not a blob or its
+	// working tree (#256: a window git can't run in, read at the head git
+	// worktree list records for it).
+	commit string
 }
 
 // diffFrom is the grading diff of file from commit old to the working tree, or
 // to the pending blob in its place.
 func (p *pendingSide) diffFrom(dir, old, file string) (string, error) {
-	if p == nil {
+	switch {
+	case p == nil:
 		return runRaw(dir, gradeDiff([]string{old}, file)...)
+	case p.commit != "":
+		return runRaw(dir, gradeDiff([]string{old, p.commit}, file)...)
 	}
 	out, err := gitOutput(dir, p.env, nil, gradeDiff([]string{old + ":" + file, p.blob}, "")...)
 	return string(out), err
@@ -1683,7 +1752,11 @@ func (p *pendingSide) diffFrom(dir, old, file string) (string, error) {
 // changedRanges is ChangedRangesChecked's measurement from base ref (at sha),
 // with the working tree's copy of file, or the pending one in its place.
 func changedRanges(dir, ref, sha, file string, pending *pendingSide) ([]LineRange, bool) {
-	if mb := behindMergeBase(dir, ref, sha, file); mb != "" {
+	tip := "HEAD"
+	if pending != nil && pending.commit != "" {
+		tip = pending.commit
+	}
+	if mb := behindMergeBaseFrom(dir, ref, sha, file, tip); mb != "" {
 		own, ownErr := pending.diffFrom(dir, mb, file)
 		moved, movedErr := runRaw(dir, gradeDiff([]string{mb, ref}, file)...)
 		if ownErr == nil && movedErr == nil {
@@ -1975,7 +2048,13 @@ func resolveBaseRef(dir, base string) (ref, sha string, ok bool) {
 // "lines base changed under the branch" means nothing (each side added its own
 // file, an add/add the plain base diff must keep seeing, #142 review).
 func behindMergeBase(dir, ref, sha, file string) string {
-	mb, err := RunDir(dir, "merge-base", ref, "HEAD")
+	return behindMergeBaseFrom(dir, ref, sha, file, "HEAD")
+}
+
+// behindMergeBaseFrom is behindMergeBase for the branch at tip (a commit, or
+// "HEAD" in dir), #256.
+func behindMergeBaseFrom(dir, ref, sha, file, tip string) string {
+	mb, err := RunDir(dir, "merge-base", ref, tip)
 	if err != nil || mb == "" || mb == sha {
 		return ""
 	}

@@ -58,8 +58,24 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   HIGH (the fail-safe; never hidden); its tag reads `working tree unread`
   (`WindowLiveness.Unread`), not `uncommitted edits`, and status explains the
   indeterminate overlap by it (`indeterminateDetail`) (#254 review). When git
-  can't run in the directory at all (`gitx.ErrNoDir`), none of its edits are
-  compared, committed or not, and `collide.UnreadScope` says so. The #93 unknown-path refusal names unread windows too: one
+  can't read the window's commits in its directory (`ErrNoDir`, a #255
+  entry, a checkout git no longer recognises), `Scan` reads them from THIS
+  repository at the head `git worktree list` records (`gitx.CommittedFilesAt`,
+  `Window.ReadAt`, #256), and the grade measures that window there and never
+  in its directory: `ChangedRangesAt`/`ChangedDocEditsAt` (the same merge-base
+  logic, the tip a parameter: `behindMergeBaseFrom`, `pendingSide.commit`),
+  its structured doc's content from the commit through the `pending` seam
+  (`gitGradeFacts.at`, `collide.PendingAtCommit`), in `wt check`, status, the
+  banner, pre-push (`RangesAtCommit`/`DocEditsAtCommit`) and both edit hooks
+  (`CheckEntry.otherAt`). The checks that need its directory (already merged,
+  untracked, subsumed) are OFF for it, fail-safe: git run in a #255 entry's
+  directory reads the checkout around it, and its untracked read turned a real
+  add/add advisory. Liveness reads such a window (any fully unread one) as
+  dirty and ages it by its head. Only when the head can't be read either
+  (a missing object, no base) are none of its edits compared, and
+  `collide.UnreadScope` says so. An unreadable structured doc in a READABLE
+  window is every section (`SharedSectionsAcrossWith`), never skipped (#256
+  review: skipped, a shared section read advisory). The #93 unknown-path refusal names unread windows too: one
   may be creating that path. The committed diff
   failing stays silent: it fails for an unborn or unrelated branch too. An
   entry with no work tree is NOT unread: one git lists as prunable whose

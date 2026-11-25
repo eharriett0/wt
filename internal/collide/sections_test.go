@@ -260,3 +260,34 @@ func TestOldClaims(t *testing.T) {
 		}
 	}
 }
+
+// #256 review: a worktree whose copy of the doc can't be read (permission
+// denied, not missing) edits every section, never none. Skipped, it read as
+// no claim, so a section another window shares with it graded advisory.
+func TestSharedSectionsAcross_unreadableDocIsEverySection(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a mode-000 file")
+	}
+	const doc = "# Plan\n## Alpha\na1\n## Beta\nb1\n"
+	wtA, wtB := t.TempDir(), t.TempDir()
+	for _, wt := range []string{wtA, wtB} {
+		if err := os.WriteFile(filepath.Join(wt, "PLAN.md"), []byte(doc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	disk := map[string][]gitx.LineRange{wtA: {{Start: 3, End: 3}}, wtB: {{Start: 5, End: 5}}} // A: Alpha, B: Beta
+	ranges := func(wt, base, path string) []gitx.LineRange { return disk[wt] }
+	const delim = `^##\s`
+	both := []string{wtA, wtB}
+	if shared, graded := SharedSectionsAcross("main", both, "PLAN.md", delim, NewOnly(ranges)); !graded || len(shared) != 0 {
+		t.Fatalf("precondition: Alpha vs Beta, both readable = %v, %v; want none, graded", shared, graded)
+	}
+	docB := filepath.Join(wtB, "PLAN.md")
+	if err := os.Chmod(docB, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(docB, 0o644) })
+	if shared, graded := SharedSectionsAcross("main", both, "PLAN.md", delim, NewOnly(ranges)); !graded || !reflect.DeepEqual(shared, []string{"## Alpha"}) {
+		t.Errorf("B's copy unreadable = %v, %v; want [## Alpha] (B may edit any section), graded", shared, graded)
+	}
+}
