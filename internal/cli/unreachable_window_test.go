@@ -46,7 +46,9 @@ func TestUnreachableWindow_gradedAtItsCommit(t *testing.T) {
 	gitT(t, root, "worktree", "add", "-q", "-b", "lane", lane, "main")
 	gitT(t, root, "worktree", "add", "-q", "-b", "me", me, "main")
 	writeT(t, lane, "x.go", strings.Replace(x.String(), "line 2\n", "LANE 2\n", 1))
-	writeT(t, lane, "PLAN.md", strings.Replace(plan, "b1\n", "Lb1\n", 1))
+	// A pure insertion in Beta: with lane's directory gone, only its copy at
+	// the commit (not its deletions, it has none) places it in a section.
+	writeT(t, lane, "PLAN.md", strings.Replace(plan, "b1\n", "b1\nLnew\n", 1))
 	gitT(t, lane, "commit", "-qam", "lane")
 	gitT(t, root, "worktree", "lock", lane)
 
@@ -99,11 +101,12 @@ func TestUnreachableWindow_gradedAtItsCommit(t *testing.T) {
 	}
 	pushOverlap := func() bool {
 		return push("x.go", strings.Replace(x.String(), "line 2\n", "ME 2\n", 1)) &&
+			!push("x.go", strings.Replace(x.String(), "line 8\n", "ME 8\n", 1)) &&
 			push("PLAN.md", strings.Replace(plan, "b2\n", "Mb2\n", 1)) &&
 			!push("PLAN.md", strings.Replace(plan, "a1\n", "Ma1\n", 1))
 	}
 	if !pushOverlap() {
-		t.Fatal("precondition: pre-push blocks on lane's line and section (not on another section) while lane is in place")
+		t.Fatal("precondition: pre-push blocks on lane's line and section (not on another line or section) while lane is in place")
 	}
 
 	if err := os.Rename(lane, lane+"-unmounted"); err != nil {
@@ -113,7 +116,7 @@ func TestUnreachableWindow_gradedAtItsCommit(t *testing.T) {
 		t.Errorf("lane's directory gone (locked): %+v, want %+v, as in place", got, want)
 	}
 	if !pushOverlap() {
-		t.Error("lane's directory gone: pre-push did not grade as in place (line and section block, another section doesn't)")
+		t.Error("lane's directory gone: pre-push did not grade as in place (line and section block, another line or section doesn't)")
 	}
 	writeT(t, me, "x.go", strings.Replace(x.String(), "line 2\n", "ME 2\n", 1))
 	if code, out := check(me, "x.go"); code != 3 || !strings.Contains(out, "window lane could not be read") || !strings.Contains(out, "its uncommitted edits are not compared") {
@@ -123,9 +126,9 @@ func TestUnreachableWindow_gradedAtItsCommit(t *testing.T) {
 
 // #256 with #255: a nested worktree without its .git is graded at its
 // commit, and never through git run in its directory, which reads the
-// checkout around it. There, its new file is untracked in the main
-// checkout, and the untracked downgrade (#113) read the main checkout's
-// status as the window's: a real add/add read as advisory.
+// checkout around it. Not under an ignored directory, its committed file is
+// untracked in the main checkout, and the untracked downgrade (#113) read the
+// main checkout's status as the window's: a real add/add read as advisory.
 func TestNestedWindowWithoutGit_gradedAtItsCommit(t *testing.T) {
 	offlineGH(t)
 	t.Setenv("HOME", t.TempDir())
@@ -137,7 +140,6 @@ func TestNestedWindowWithoutGit_gradedAtItsCommit(t *testing.T) {
 	gitT(t, root, "init", "-q", "-b", "main")
 	gitT(t, root, "config", "user.email", "t@t.test")
 	gitT(t, root, "config", "user.name", "t")
-	writeT(t, root, ".gitignore", ".wt/\n")
 	writeT(t, root, "a.txt", "a\n")
 	gitT(t, root, "add", "-A")
 	gitT(t, root, "commit", "-qm", "base")
