@@ -66,6 +66,10 @@ func TestChangedAt_matchesTheWorktreeReads(t *testing.T) {
 	}
 	t.Chdir(filepath.Join(main, "sub"))
 	t.Run("from a subdirectory", check)
+	// diff.relative lists only a subdirectory's paths from there (#259 review).
+	runGit(t, main, "config", "diff.relative", "true")
+	t.Run("from a subdirectory with diff.relative", check)
+	runGit(t, main, "config", "--unset", "diff.relative")
 	t.Chdir(main)
 	// Subsumed, read at the commit, answers as in its directory.
 	sa, ka := FileChangeSubsumedAt("main", head, "x.go")

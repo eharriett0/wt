@@ -70,9 +70,16 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   (`CheckEntry.otherAt`). Already merged and subsumed are read at the commit
   too (`collide.PathMatchesUpstreamAt`, `gitx.FileChangeSubsumedAt`, #259
   review: off, landed work blocked permanently), and untracked is false (its
-  change is committed); NO git runs in its directory, which for a #255 entry
-  reads the checkout around it (round 1 found git still ran there before a
-  guard discarded the answer). The at-commit diffs run at the work tree's top
+  change is committed). The grade runs NO git in its directory, which for a
+  #255 entry reads the checkout around it (round 1 found git still ran there
+  before a guard discarded the answer), and neither does `Scan` for a #255
+  entry: its `.git` stat comes first (round 2: git status there scanned the
+  whole enclosing checkout on every Scan). Its branch comes from `git worktree
+  list` whenever it is fully unread, its head readable or not. Read from the
+  commit, a copy can grade differently from its directory's in two shapes,
+  and the commit's is the right one: line-ending filters (in place, merge-file
+  compared a CRLF working copy with LF blobs) and a symlink (in place, the
+  link's target was hashed). The at-commit diffs run at the work tree's top
   (`topDir`): a `-- <path>` pathspec is cwd-relative, and from a subdirectory
   the grade read clear. Its branch comes from `git worktree list` too (a
   checkout git no longer recognises lost its claim and PR). ⚠ Known: diff
@@ -85,7 +92,8 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   dirty: its working tree is unknown, so it is NEVER dormant or
   stale-by-ancestry, and an overlap with its commits stays HIGH until its
   directory is back or the worktree is removed (owner pane 11-25, "keep the
-  fail-safe"); a merged PR still quiets it, and so does work already on base
+  fail-safe"); a merged PR found under its branch's name still quiets it (one
+  found only by its tip doesn't: a dirty window, #168), and so does work already on base
   (above). Its age, read from its head, only labels it. Only when the head can't be read either
   (a missing object, no base) are none of its edits compared, and
   `collide.UnreadScope` says so. An unreadable structured doc in a READABLE

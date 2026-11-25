@@ -1433,10 +1433,11 @@ func capLines(lines []string, max int) string {
 // committed, by the head `git worktree list` records for it. An error when no
 // base resolves or git can't read head (a missing object).
 func CommittedFilesAt(base, head string) ([]string, error) {
+	top := topDir() // diff.relative would list a subdirectory's paths only (#259 review)
 	var err error
 	for _, ref := range []string{"origin/" + base, base} {
 		var out string
-		if out, err = runRaw("", "diff", "--name-only", noRenames, nulPaths, ref+"..."+head); err == nil {
+		if out, err = runRaw(top, "diff", "--name-only", noRenames, nulPaths, ref+"..."+head); err == nil {
 			return splitNUL(out), nil
 		}
 	}
@@ -2300,8 +2301,9 @@ func FileChangeSubsumed(worktree, base, path string) (subsumed, known bool) {
 // head (#256, #259 review): its change is head's copy of path, from this
 // repository, never its directory.
 func FileChangeSubsumedAt(base, head, path string) (subsumed, known bool) {
-	return fileChangeSubsumed(topDir(), base, head, path, func() (string, error) {
-		return runRaw(topDir(), "show", head+":"+path)
+	top := topDir()
+	return fileChangeSubsumed(top, base, head, path, func() (string, error) {
+		return runRaw(top, "show", head+":"+path)
 	})
 }
 

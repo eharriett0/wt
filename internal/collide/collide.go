@@ -105,13 +105,23 @@ func Scan(c *config.Config) ([]Window, error) {
 		go func(i int, p string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			br, _ := gitx.CurrentBranchIn(p)
-			touched, terr := gitx.TouchedFiles(p, c.Base)
+			// #255: a linked worktree whose directory is there without its
+			// .git file is never read with git in it: git there walks up and
+			// reads, for a nested one scans, the work tree around it, on every
+			// Scan (#259 review). So the stat comes first.
+			noLink := i > 0 && !gone(p) && gone(filepath.Join(p, ".git"))
+			var br string
+			var touched []string
+			var terr error
+			if !noLink {
+				br, _ = gitx.CurrentBranchIn(p)
+				touched, terr = gitx.TouchedFiles(p, c.Base)
+			}
 			w := Window{Worktree: p, Branch: br, Touched: touched}
 			switch {
 			case refs[i].Bare || refs[i].Prunable && gone(p):
 				// no work tree to read
-			case i > 0 && !gone(p) && gone(filepath.Join(p, ".git")):
+			case noLink:
 				// #255: a linked worktree whose directory is there without its
 				// .git file (deleted, or an unmounted volume's empty mount
 				// point; locked or not, round 7): whatever git status read
@@ -121,19 +131,20 @@ func Scan(c *config.Config) ([]Window, error) {
 				w.Branch, w.Touched = refs[i].Branch, nil
 				w.Unread, w.UnreadSome, w.CommitsUnread = ErrNoGitLink, false, true
 			case terr != nil:
-				if errors.Is(terr, gitx.ErrNoDir) { // git never ran there: br is not its branch
-					w.Branch = refs[i].Branch
-				}
 				markUnread(&w, terr)
+			}
+			// A window git couldn't read takes its branch from git worktree
+			// list: git in its directory can't say it (a checkout git no longer
+			// recognises read "" and lost its claim and PR, #259 review), even
+			// when its head can't be read either.
+			if w.Unread != "" && !w.UnreadSome && refs[i].Branch != "" {
+				w.Branch = refs[i].Branch
 			}
 			// #256: its commits could not be read in its directory: read them
 			// at the head git lists for it, from this repository.
 			if w.CommitsUnread && refs[i].Head != "" {
 				if files, err := gitx.CommittedFilesAt(c.Base, refs[i].Head); err == nil {
-					// Its branch too: git in its directory can't say it (a checkout
-					// git no longer recognises read "" and lost its claim and PR,
-					// #259 review).
-					w.Touched, w.CommitsUnread, w.ReadAt, w.Branch = files, false, refs[i].Head, refs[i].Branch
+					w.Touched, w.CommitsUnread, w.ReadAt = files, false, refs[i].Head
 				}
 			}
 			// Claims by the window's own branch: for a #255 entry, br is the

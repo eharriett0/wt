@@ -71,8 +71,8 @@ func TestUnreachableWindow_gradedAtItsCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	type grades struct {
-		x2, x2sub, x8, beta, alpha, status int
-		hookBeta, hookAlpha                bool
+		x2, x2sub, x8, x8sub, beta, alpha, status int
+		hookBeta, hookAlpha                       bool
 	}
 	measure := func() grades {
 		var g grades
@@ -86,6 +86,8 @@ func TestUnreachableWindow_gradedAtItsCommit(t *testing.T) {
 		captureOutputForTest(t, func() { g.status = cmdStatus([]string{"--blocking"}) })
 		writeT(t, me, "x.go", strings.Replace(x.String(), "line 8\n", "ME 8\n", 1))
 		g.x8, _ = check(me, "x.go")
+		// Disjoint from a subdirectory too: no ranges there would read HIGH.
+		g.x8sub, _ = check(filepath.Join(me, "sub"), "../x.go")
 		writeT(t, me, "x.go", x.String())
 		writeT(t, me, "PLAN.md", strings.Replace(plan, "b2\n", "Mb2\n", 1))
 		g.beta, _ = check(me, "PLAN.md")
@@ -94,7 +96,7 @@ func TestUnreachableWindow_gradedAtItsCommit(t *testing.T) {
 		writeT(t, me, "PLAN.md", plan)
 		return g
 	}
-	want := grades{x2: 3, x2sub: 3, x8: 0, beta: 3, alpha: 0, status: 3, hookBeta: true, hookAlpha: false}
+	want := grades{x2: 3, x2sub: 3, x8: 0, x8sub: 0, beta: 3, alpha: 0, status: 3, hookBeta: true, hookAlpha: false}
 	if got := measure(); got != want {
 		t.Fatalf("precondition, lane in place: %+v, want %+v", got, want)
 	}

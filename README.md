@@ -153,7 +153,8 @@ as it would in place: an overlap with what it committed is HIGH even while,
 say, a locked worktree's volume is unmounted. Its uncommitted edits can't be
 seen, so it counts as possibly editing: it never goes dormant, and the
 overlap stays until its directory is back or the worktree is removed (a
-merged PR, or work already on base, still quiets it). Only when that can't be read
+merged PR under its branch's name, or work already on base, still quiets
+it). Only when that can't be read
 either (a branch at a missing object, no base, an unborn branch) are none of
 its edits compared, committed or not; when `git status` works but says it
 could not read some paths, only those are missing. The note says which. A worktree whose `.git`
