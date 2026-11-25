@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -55,9 +56,22 @@ func TestUnreachableWindow_gradedAtItsCommit(t *testing.T) {
 		out, errOut := captureOutputForTest(t, func() { code = cmdCheck([]string{path}) })
 		return code, out + errOut
 	}
-	type grades struct{ x2, x8, beta, alpha int }
+	// The Claude edit hook (block mode) on me's PLAN.md: deny iff the edit
+	// shares lane's section (Beta), as wt check grades it once made.
+	t.Setenv("WT_CLAUDE_HOOK_BLOCK", "1")
+	hookDenies := func(oldLine, newLine string) bool {
+		payload, _ := json.Marshal(map[string]any{"cwd": me, "tool_name": "Edit", "tool_input": map[string]string{
+			"file_path": filepath.Join(me, "PLAN.md"), "old_string": oldLine, "new_string": newLine}})
+		t.Chdir(me)
+		return strings.Contains(runHookCapture(t, hookClaudeEdit, string(payload)), `"permissionDecision":"deny"`)
+	}
+	type grades struct {
+		x2, x8, beta, alpha int
+		hookBeta, hookAlpha bool
+	}
 	measure := func() grades {
 		var g grades
+		g.hookBeta, g.hookAlpha = hookDenies("b2\n", "Mb2\n"), hookDenies("a1\n", "Ma1\n")
 		writeT(t, me, "x.go", strings.Replace(x.String(), "line 2\n", "ME 2\n", 1))
 		g.x2, _ = check(me, "x.go")
 		writeT(t, me, "x.go", strings.Replace(x.String(), "line 8\n", "ME 8\n", 1))
@@ -70,20 +84,26 @@ func TestUnreachableWindow_gradedAtItsCommit(t *testing.T) {
 		writeT(t, me, "PLAN.md", plan)
 		return g
 	}
-	want := grades{x2: 3, x8: 0, beta: 3, alpha: 0}
+	want := grades{x2: 3, x8: 0, beta: 3, alpha: 0, hookBeta: true, hookAlpha: false}
 	if got := measure(); got != want {
 		t.Fatalf("precondition, lane in place: %+v, want %+v", got, want)
 	}
-	// pre-push in place: me commits line 2 and pushes.
-	pushOverlap := func() bool {
-		writeT(t, me, "x.go", strings.Replace(x.String(), "line 2\n", "ME 2\n", 1))
+	// pre-push in place: me commits an overlap and pushes; a disjoint section
+	// of the structured doc does not block.
+	push := func(file, content string) bool {
+		writeT(t, me, file, content)
 		gitT(t, me, "commit", "-qam", "me")
 		blocked := prePushRefs(t, me, "me")
 		gitT(t, me, "reset", "-q", "--hard", "main")
 		return blocked
 	}
+	pushOverlap := func() bool {
+		return push("x.go", strings.Replace(x.String(), "line 2\n", "ME 2\n", 1)) &&
+			push("PLAN.md", strings.Replace(plan, "b2\n", "Mb2\n", 1)) &&
+			!push("PLAN.md", strings.Replace(plan, "a1\n", "Ma1\n", 1))
+	}
 	if !pushOverlap() {
-		t.Fatal("precondition: pre-push of an overlap with lane's commit blocks while lane is in place")
+		t.Fatal("precondition: pre-push blocks on lane's line and section (not on another section) while lane is in place")
 	}
 
 	if err := os.Rename(lane, lane+"-unmounted"); err != nil {
@@ -93,7 +113,7 @@ func TestUnreachableWindow_gradedAtItsCommit(t *testing.T) {
 		t.Errorf("lane's directory gone (locked): %+v, want %+v, as in place", got, want)
 	}
 	if !pushOverlap() {
-		t.Error("lane's directory gone: pre-push of an overlap with its commit did not block")
+		t.Error("lane's directory gone: pre-push did not grade as in place (line and section block, another section doesn't)")
 	}
 	writeT(t, me, "x.go", strings.Replace(x.String(), "line 2\n", "ME 2\n", 1))
 	if code, out := check(me, "x.go"); code != 3 || !strings.Contains(out, "window lane could not be read") || !strings.Contains(out, "its uncommitted edits are not compared") {
@@ -141,5 +161,15 @@ func TestNestedWindowWithoutGit_gradedAtItsCommit(t *testing.T) {
 	}
 	if code, out := check(); code != 3 || !strings.Contains(out, "window n could not be read") {
 		t.Errorf("n without its .git: wt check y.go exit %d, want 3 with n named:\n%s", code, out)
+	}
+	// Pre-push from another worktree adding y.go: blocked (add/add with n's
+	// commit), never downgraded by the main checkout's untracked y.go.
+	me := filepath.Join(filepath.Dir(root), filepath.Base(root)+"-me")
+	gitT(t, root, "worktree", "add", "-q", "-b", "me", me, "main")
+	writeT(t, me, "y.go", "package me\n")
+	gitT(t, me, "add", "y.go")
+	gitT(t, me, "commit", "-qm", "me adds y.go")
+	if !prePushRefs(t, me, "me") {
+		t.Error("pre-push of y.go from me: not blocked, want the add/add with n's commit")
 	}
 }
