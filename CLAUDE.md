@@ -76,9 +76,15 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   taken verbatim from git, and so are `RepoRoot` and `WorktreeToplevel`
   (`runPath`): trimming a path that ends in a space read a directory that
   doesn't exist, and a window there then graded its own edit. When git never ran
-  (any error but an `*exec.ExitError`, git itself found), it is `ErrNoDir` with
-  the directory's own error: Go reports a directory it may read but not enter
-  (mode 644) as a failed exec of git, so `os.Open` succeeding proves nothing.
+  because of the directory, it is `ErrNoDir`: Go's start-up stat failed
+  (`chdir`) or the child could not enter it (`fork/exec` + permission denied,
+  which mode 644 also gives); any other start failure (EMFILE) keeps its text.
+  What was NOT compared is measured, not inferred from the reason:
+  `gitx.UnreadError.CommitsRead` (did the committed diff run) and `.Partial`
+  (`git status` exited 0 but named paths on stderr, `statusMissed`: it drops
+  an edit under a directory it can't search, silently, measured) feed
+  `collide.NotCompared` (`uncommitted`/`some_uncommitted`/`all`), the note,
+  status and the JSON `not_compared`.
   `ErrGitDirOnly` also needs `--show-toplevel` to fail there: a submodule's
   `.git/modules/<name>` is its own git dir but has a work tree
   (core.worktree), so its failures keep git's reason.

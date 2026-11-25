@@ -102,6 +102,26 @@ var gitOutput = func(dir string, env []string, stdin []byte, args ...string) ([]
 	return cmd.Output()
 }
 
+// gitOutputStderr is gitOutput for a call whose stderr matters even when it
+// succeeds: `git status` exits 0 yet names there the paths it could not read
+// (#254 review). On failure the *exec.ExitError carries stderr, as from
+// gitOutput.
+var gitOutputStderr = func(dir string, args ...string) (stdout, stderr []byte, err error) {
+	cmd := exec.Command("git", args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	cmd.Env = scopedEnv()
+	var eb bytes.Buffer
+	cmd.Stderr = &eb
+	stdout, err = cmd.Output()
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		ee.Stderr = eb.Bytes()
+	}
+	return stdout, eb.Bytes(), err
+}
+
 // run executes git with args in dir ("" = current dir) and returns trimmed
 // stdout. stderr is discarded; callers branch on err.
 func run(dir string, args ...string) (string, error) {
@@ -1245,15 +1265,16 @@ func parseMergeTreeConflictPaths(out string) []string {
 // dir and (b) files this branch changed vs base (merge-base diff). This is the
 // "what is this window working on right now" set used for collision detection.
 //
-// err is non-nil when (a) can't be read: `git status` fails, as it does for a
-// branch holding an object the repo lacks or an unreadable index (an
-// index.lock does not fail it; measured, git 2.39). The window is then
-// unread, never "no changes" (#253); files still holds what (b) read (none
-// when git can't run in dir: ErrNoDir). A git directory is ErrGitDirOnly; Scan
-// leaves out a bare repository, and a worktree git lists as prunable whose
-// directory is gone. (b)
-// failing is no error: it fails for a branch with no commits, with no base,
-// or with no merge base with it, and those have nothing committed to list.
+// err (an *UnreadError) is non-nil when (a) can't be read: `git status` fails,
+// as it does for a branch holding an object the repo lacks or an unreadable
+// index (an index.lock does not fail it; measured, git 2.39), or it succeeds
+// but says it could not read some paths (Partial, statusMissed). The window
+// is then unread, never "no changes" (#253); files holds what was read, and
+// CommitsRead says whether (b) was. See statusError for the reasons (ErrNoDir,
+// ErrGitDirOnly); Scan leaves out a bare repository, and a worktree git lists
+// as prunable whose directory is gone. (b) failing alone is no error: it fails
+// for a branch with no commits, with no base, or with no merge base with it,
+// and those have nothing committed to list.
 func TouchedFiles(dir, base string) (files []string, err error) {
 	set := map[string]struct{}{}
 
@@ -1269,22 +1290,29 @@ func TouchedFiles(dir, base string) (files []string, err error) {
 	// collision under a freshly-created dir goes silently undetected. -uall
 	// lists each new file at its full path. Gitignored files stay excluded, so
 	// the cost is bounded to genuinely-new files.
-	if out, serr := runRaw(dir, "status", "--porcelain", nulPaths, "--untracked-files=all"); serr == nil {
-		for _, p := range parsePorcelainZ(out) {
+	var unread error
+	partial := false
+	if out, stderr, serr := gitOutputStderr(dir, "status", "--porcelain", nulPaths, "--untracked-files=all"); serr == nil {
+		for _, p := range parsePorcelainZ(string(out)) {
 			set[p] = struct{}{}
 		}
+		if missed := statusMissed(string(stderr)); missed != "" {
+			unread, partial = fmt.Errorf("git status: %s", missed), true
+		}
 	} else {
-		err = statusError(dir, serr)
+		unread = statusError(dir, serr)
 	}
 
 	// (b) committed-on-branch vs base (three-dot = since merge-base). A COMMITTED
 	// move records both paths too (noRenames), like the staged one above, and
 	// every path is verbatim (nulPaths).
+	commitsRead := false
 	for _, ref := range []string{"origin/" + base, base} {
 		if out, err := runRaw(dir, "diff", "--name-only", noRenames, nulPaths, ref+"...HEAD"); err == nil {
 			for _, p := range splitNUL(out) {
 				set[p] = struct{}{}
 			}
+			commitsRead = true
 			break // first ref that resolves wins
 		}
 	}
@@ -1293,7 +1321,50 @@ func TouchedFiles(dir, base string) (files []string, err error) {
 	for f := range set {
 		files = append(files, f)
 	}
+	if unread != nil {
+		err = &UnreadError{Reason: unread, Partial: partial, CommitsRead: commitsRead}
+	}
 	return files, err
+}
+
+// UnreadError is TouchedFiles' error (#253): why the window's uncommitted
+// changes were not (all) read, and what of it was (#254 review).
+type UnreadError struct {
+	Reason error
+	// Partial: git status succeeded but said it could not read some paths;
+	// the rest were read.
+	Partial bool
+	// CommitsRead: the branch's committed changes were listed. When git
+	// failed before reading anything there (a directory it can't enter, a
+	// checkout git no longer recognises, a branch at a missing object), they
+	// were not.
+	CommitsRead bool
+}
+
+func (e *UnreadError) Error() string { return e.Reason.Error() }
+func (e *UnreadError) Unwrap() error { return e.Reason }
+
+// statusMissed is what a successful `git status` says on stderr it could not
+// read, condensed; "" when it read everything (#254 review). Measured, git
+// 2.39: "warning: could not open directory 'd/': Permission denied" (a
+// directory it can't list, so its untracked files are missing) and
+// "d/k.txt: Permission denied" (a tracked file it can't stat, so its edit is
+// missing). Other warnings (line endings, an unreadable global config) are
+// not about missed paths.
+func statusMissed(stderr string) string {
+	var missed []string
+	for _, ln := range strings.Split(stderr, "\n") {
+		ln = strings.TrimSpace(ln)
+		switch {
+		case strings.HasPrefix(ln, "warning: could not open directory "):
+			missed = append(missed, ln)
+		case ln == "" || strings.HasPrefix(ln, "warning:") || strings.HasPrefix(ln, "hint:") ||
+			strings.HasPrefix(ln, "error:") || strings.HasPrefix(ln, "fatal:"):
+		case strings.Contains(ln, ": "):
+			missed = append(missed, ln) // "<path>: <errno text>"
+		}
+	}
+	return strings.Join(missed, "; ")
 }
 
 // ErrGitDirOnly is TouchedFiles' error for a worktree entry that is itself a
@@ -1308,30 +1379,26 @@ var ErrGitDirOnly = errors.New("it is the repository's git directory, and git do
 var ErrNoDir = errors.New("directory unreadable")
 
 // statusError is why `git status` failed in dir (serr). When git never ran
-// in dir (no *exec.ExitError, git itself found), it is ErrNoDir with dir's
-// own error: Go reports a directory it can't enter, even one it may read, as
-// a failed exec of git. A dir that is itself a git directory with no work
-// tree git knows is ErrGitDirOnly. A submodule's git dir has one
-// (core.worktree), and a directory merely inside a git directory (a worktree
-// nested in a bare repository that lost its .git file) is no git directory:
-// both are real failures, with git's reason. Asked only after status fails.
+// because of dir itself, it is ErrNoDir: Go's start-up stat of the directory
+// failed ("chdir", e.g. it is gone), or the child could not enter it ("fork/
+// exec" with permission denied, which a directory it may read but not enter
+// also gives). Any other start failure (too many open files) keeps its own
+// text. A dir that is itself a git directory with no work tree git knows is
+// ErrGitDirOnly. A submodule's git dir has one (core.worktree), and a
+// directory merely inside a git directory (a worktree nested in a bare
+// repository that lost its .git file) is no git directory: both are real
+// failures, with git's reason. Asked only after status fails.
 func statusError(dir string, serr error) error {
 	var ee *exec.ExitError
 	if !errors.As(serr, &ee) {
-		if errors.Is(serr, exec.ErrNotFound) {
-			return fmt.Errorf("git status: %v", serr)
-		}
-		f, oerr := os.Open(dir)
-		if oerr != nil {
-			return fmt.Errorf("%w: %v", ErrNoDir, oerr)
-		}
-		_ = f.Close()
-		cause := serr
 		var pe *os.PathError
-		if errors.As(serr, &pe) {
-			cause = pe.Err
+		switch {
+		case errors.As(serr, &pe) && pe.Op == "chdir":
+			return fmt.Errorf("%w: %v", ErrNoDir, pe)
+		case errors.As(serr, &pe) && pe.Op == "fork/exec" && errors.Is(pe.Err, os.ErrPermission):
+			return fmt.Errorf("%w: can't enter %s: %v", ErrNoDir, dir, pe.Err)
 		}
-		return fmt.Errorf("%w: can't enter %s: %v", ErrNoDir, dir, cause)
+		return fmt.Errorf("git status: %v", serr)
 	}
 	if gd, err := runPath(dir, "rev-parse", "--path-format=absolute", "--git-dir"); err == nil && resolvedPath(gd) == resolvedPath(dir) {
 		if _, terr := runPath(dir, "rev-parse", "--show-toplevel"); terr != nil {

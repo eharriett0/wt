@@ -35,9 +35,13 @@ type Window struct {
 	Title    string   // claimed issue title, or ""
 	Touched  []string // files changed (uncommitted ∪ committed-on-branch vs base)
 	// Unread is why git could not read the window's uncommitted changes, ""
-	// when it could (#253). Touched then holds only its committed files, so
-	// the window is named, never shown as one with no changes.
+	// when it could (#253). Touched then holds what was read, so the window
+	// is named, never shown as one with no changes.
 	Unread string
+	// UnreadSome: git read the window but said it could not read some paths
+	// (#254 review). CommitsUnread: its committed changes were not read
+	// either. See NotCompared.
+	UnreadSome, CommitsUnread bool
 }
 
 // Label is a short human identifier for a window.
@@ -98,7 +102,7 @@ func Scan(c *config.Config) ([]Window, error) {
 			touched, terr := gitx.TouchedFiles(p, c.Base)
 			w := Window{Worktree: p, Branch: br, Touched: touched}
 			if terr != nil && !refs[i].Bare && !(refs[i].Prunable && gone(p)) {
-				w.Unread = terr.Error()
+				markUnread(&w, terr)
 			}
 			if e, ok := byWorktree[p]; ok {
 				w.Issue, w.Title = e.Issue, e.Title
@@ -111,6 +115,16 @@ func Scan(c *config.Config) ([]Window, error) {
 	wg.Wait()
 	readOwnEntry(c, ws, byWorktree)
 	return ws, nil
+}
+
+// markUnread records TouchedFiles' error on w (#253): the reason, and what
+// of the window was not read (#254 review).
+func markUnread(w *Window, err error) {
+	w.Unread = err.Error()
+	var ue *gitx.UnreadError
+	if errors.As(err, &ue) {
+		w.UnreadSome, w.CommitsUnread = ue.Partial, !ue.CommitsRead
+	}
 }
 
 // gone reports whether path no longer exists (a symlink is followed). git
@@ -154,9 +168,10 @@ func readOwnEntry(c *config.Config, ws []Window, byWorktree map[string]activewor
 			continue
 		}
 		touched, terr := gitx.TouchedFiles(root, c.Base)
-		ws[i].Worktree, ws[i].Touched, ws[i].Unread = root, touched, ""
+		ws[i].Worktree, ws[i].Touched = root, touched
+		ws[i].Unread, ws[i].UnreadSome, ws[i].CommitsUnread = "", false, false
 		if terr != nil {
-			ws[i].Unread = terr.Error()
+			markUnread(&ws[i], terr)
 		}
 		if e, ok := byWorktree[root]; ok {
 			ws[i].Issue, ws[i].Title = e.Issue, e.Title
@@ -634,11 +649,28 @@ func UnreadNote(unread []Window) string {
 	return fmt.Sprintf("%d windows could not be read: %s. Edits wt could not read there are not compared.", len(unread), strings.Join(parts, "; "))
 }
 
-// UnreadScope is what wt did not compare of an unread window (#253): its
-// uncommitted edits, or, when git could not run in its directory at all
-// (gitx.ErrNoDir), its commits too (#254 review).
+// NotCompared is what wt did not compare of an unread window (#253), as the
+// JSON says it: "some_uncommitted" (git read it but named paths it could
+// not), "all" (its commits were not read either), else "uncommitted"; "" for
+// a window that was read (#254 review).
+func NotCompared(w Window) string {
+	switch {
+	case w.Unread == "":
+		return ""
+	case w.UnreadSome:
+		return "some_uncommitted"
+	case w.CommitsUnread:
+		return "all"
+	}
+	return "uncommitted"
+}
+
+// UnreadScope is NotCompared in words, for the note and wt status.
 func UnreadScope(w Window) string {
-	if strings.HasPrefix(w.Unread, gitx.ErrNoDir.Error()) {
+	switch NotCompared(w) {
+	case "some_uncommitted":
+		return "some of its uncommitted edits are not compared"
+	case "all":
 		return "none of its edits are compared, committed or not"
 	}
 	return "its uncommitted edits are not compared"

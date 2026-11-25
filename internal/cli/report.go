@@ -523,6 +523,9 @@ type UnreadWindow struct {
 	Window   string `json:"window"`
 	Worktree string `json:"worktree"`
 	Error    string `json:"error"`
+	// NotCompared: "uncommitted", "some_uncommitted" or "all" (its commits
+	// too), collide.NotCompared (#254 review).
+	NotCompared string `json:"not_compared"`
 }
 
 // unreadWindowsPayload is ws (collide.UnreadWindows) as check's JSON lists
@@ -530,7 +533,7 @@ type UnreadWindow struct {
 func unreadWindowsPayload(ws []collide.Window) []UnreadWindow {
 	var out []UnreadWindow
 	for _, w := range ws {
-		out = append(out, UnreadWindow{Window: w.Label(), Worktree: w.Worktree, Error: w.Unread})
+		out = append(out, UnreadWindow{Window: w.Label(), Worktree: w.Worktree, Error: w.Unread, NotCompared: collide.NotCompared(w)})
 	}
 	return out
 }
@@ -815,8 +818,10 @@ type StatusWindow struct {
 	Worktree string   `json:"worktree"`
 	Touched  []string `json:"touched"`
 	// Unread is why git could not read the window's uncommitted changes
-	// (#253): touched then lists only its committed files.
-	Unread string `json:"unread,omitempty"`
+	// (#253): touched then lists what was read. NotCompared says what was not
+	// (collide.NotCompared, #254 review).
+	Unread      string `json:"unread,omitempty"`
+	NotCompared string `json:"not_compared,omitempty"`
 }
 
 // StatusPayload is the JSON shape of `wt status --json` — single-sourced so the
@@ -843,7 +848,7 @@ type StatusPayload struct {
 func buildStatusPayload(ws []collide.Window, graded []StatusOverlap, benignCount int) StatusPayload {
 	p := StatusPayload{Overlaps: graded, BenignCount: benignCount}
 	for _, w := range ws {
-		p.Windows = append(p.Windows, StatusWindow{Label: w.Label(), Branch: w.Branch, Issue: w.Issue, Title: w.Title, Worktree: w.Worktree, Touched: w.Touched, Unread: w.Unread})
+		p.Windows = append(p.Windows, StatusWindow{Label: w.Label(), Branch: w.Branch, Issue: w.Issue, Title: w.Title, Worktree: w.Worktree, Touched: w.Touched, Unread: w.Unread, NotCompared: collide.NotCompared(w)})
 	}
 	for _, o := range graded {
 		if o.Category == CatBlocking {

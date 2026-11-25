@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -366,11 +367,95 @@ func TestTouchedFiles_UnreadIsAnError(t *testing.T) {
 			}
 		}
 	})
+	// unreadOf is err as TouchedFiles' *UnreadError, failing the test if it
+	// is not one.
+	unreadOf := func(t *testing.T, err error) *UnreadError {
+		t.Helper()
+		var ue *UnreadError
+		if !errors.As(err, &ue) {
+			t.Fatalf("err = %v (%T), want an *UnreadError", err, err)
+		}
+		return ue
+	}
 	t.Run("branch holds a missing object", func(t *testing.T) {
 		dir := branch(t)
 		writeFile(t, dir, ".git/refs/heads/feat", strings.Repeat("1", 40)+"\n")
-		if _, err := TouchedFiles(dir, "main"); err == nil || !strings.Contains(err.Error(), "git status: ") || !strings.Contains(err.Error(), "bad object HEAD") {
+		_, err := TouchedFiles(dir, "main")
+		if err == nil || !strings.Contains(err.Error(), "git status: ") || !strings.Contains(err.Error(), "bad object HEAD") {
 			t.Errorf("err = %v, want git status's own reason (bad object HEAD)", err)
+		}
+		if ue := unreadOf(t, err); ue.CommitsRead || ue.Partial {
+			t.Errorf("%+v: want its commits unread too (HEAD is the missing object), not partial", ue)
+		}
+	})
+	t.Run("main checkout moved without repair: git can't find the repository", func(t *testing.T) {
+		base := t.TempDir()
+		main, linked := filepath.Join(base, "main"), filepath.Join(base, "linked")
+		runGit(t, base, "init", "-q", "-b", "main", main)
+		runGit(t, main, "config", "user.email", "t@t.test")
+		runGit(t, main, "config", "user.name", "t")
+		runGit(t, main, "commit", "--allow-empty", "-qm", "init")
+		runGit(t, main, "worktree", "add", "-q", "-b", "linked", linked, "main")
+		writeFile(t, linked, "c.txt", "c\n")
+		runGit(t, linked, "add", "c.txt")
+		runGit(t, linked, "commit", "-qm", "linked commits")
+		if err := os.Rename(main, filepath.Join(base, "moved")); err != nil {
+			t.Fatal(err)
+		}
+		_, err := TouchedFiles(linked, "main")
+		if ue := unreadOf(t, err); ue.CommitsRead || errors.Is(err, ErrNoDir) || !strings.Contains(err.Error(), "git status: ") {
+			t.Errorf("err = %v %+v: want git's own reason, its commits unread too", err, ue)
+		}
+	})
+	t.Run("git status exits 0 but names paths it could not read: partial", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root reads mode-restricted directories")
+		}
+		dir := branch(t)
+		if err := os.MkdirAll(filepath.Join(dir, "d"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, dir, "d/k.txt", "k\n")
+		runGit(t, dir, "add", "d/k.txt")
+		runGit(t, dir, "commit", "-qm", "d")
+		writeFile(t, dir, "d/k.txt", "k2\n") // a tracked edit under d/
+		d := filepath.Join(dir, "d")
+		t.Cleanup(func() { _ = os.Chmod(d, 0o755) })
+		// 000: d/k.txt's edit is left out of git status's output (measured; it
+		// is still listed here, as the branch committed it). 300: d/k.txt is
+		// read, but d/ can't be listed for untracked files.
+		for _, c := range []struct {
+			mode   os.FileMode
+			stderr string
+		}{{0, "d/k.txt: Permission denied"}, {0o300, "could not open directory 'd/'"}} {
+			if err := os.Chmod(d, c.mode); err != nil {
+				t.Fatal(err)
+			}
+			files, err := TouchedFiles(dir, "main")
+			ue := unreadOf(t, err)
+			if !ue.Partial || !ue.CommitsRead || !strings.Contains(err.Error(), c.stderr) {
+				t.Errorf("mode %o: %v %+v, want partial with %q, its commits read", c.mode, err, ue, c.stderr)
+			}
+			if !touchedContains(files, "dirty.txt") || !touchedContains(files, "committed.txt") {
+				t.Errorf("mode %o: files = %v, want what git read kept", c.mode, files)
+			}
+		}
+		if err := os.Chmod(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if files, err := TouchedFiles(dir, "main"); err != nil || !touchedContains(files, "d/k.txt") {
+			t.Errorf("control, d/ readable: %v, %v; want d/k.txt and no error", files, err)
+		}
+	})
+	t.Run("a start failure that is not the directory keeps its own reason", func(t *testing.T) {
+		dir := branch(t)
+		orig := gitOutputStderr
+		t.Cleanup(func() { gitOutputStderr = orig })
+		gitOutputStderr = func(dir string, args ...string) ([]byte, []byte, error) {
+			return nil, nil, &os.SyscallError{Syscall: "pipe", Err: syscall.EMFILE}
+		}
+		if _, err := TouchedFiles(dir, "main"); errors.Is(err, ErrNoDir) || !strings.Contains(err.Error(), "git status: pipe: too many open files") {
+			t.Errorf("err = %v, want its own reason, not ErrNoDir", err)
 		}
 	})
 	t.Run("directory gone: its own error (Scan leaves out the prunable)", func(t *testing.T) {
@@ -380,7 +465,7 @@ func TestTouchedFiles_UnreadIsAnError(t *testing.T) {
 		if err := os.RemoveAll(gone); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := TouchedFiles(gone, "main"); !errors.Is(err, ErrNoDir) || !strings.Contains(err.Error(), "no such file or directory") {
+		if _, err := TouchedFiles(gone, "main"); !errors.Is(err, ErrNoDir) || !strings.Contains(err.Error(), "no such file or directory") || unreadOf(t, err).CommitsRead {
 			t.Errorf("TouchedFiles(gone) err = %v, want its directory's own error", err)
 		}
 	})
@@ -395,7 +480,7 @@ func TestTouchedFiles_UnreadIsAnError(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
-			if _, err := TouchedFiles(dir, "main"); !errors.Is(err, ErrNoDir) || !strings.Contains(err.Error(), "permission denied") || strings.Contains(err.Error(), "exec") {
+			if _, err := TouchedFiles(dir, "main"); !errors.Is(err, ErrNoDir) || !strings.Contains(err.Error(), "permission denied") || strings.Contains(err.Error(), "exec") || unreadOf(t, err).CommitsRead {
 				t.Errorf("mode %o: err = %v, want ErrNoDir with the directory's own error (permission denied), not git's exec", mode, err)
 			}
 		}
@@ -459,5 +544,24 @@ func TestTouchedFiles_UnreadIsAnError(t *testing.T) {
 		if !touchedContains(files, "committed.txt") {
 			t.Errorf("files = %v, want the committed file still listed", files)
 		}
+		if ue := unreadOf(t, err); !ue.CommitsRead || ue.Partial {
+			t.Errorf("%+v: want its commits read, not partial", ue)
+		}
 	})
+}
+
+// statusMissed keeps only what a successful git status says it could not
+// read (#254 review): measured lines kept, unrelated warnings dropped.
+func TestStatusMissed(t *testing.T) {
+	got := statusMissed("warning: in the working copy of 'a.txt', CRLF will be replaced by LF the next time Git touches it\n" +
+		"warning: unable to access '/home/u/.config/git/ignore': Permission denied\n" +
+		"d/k.txt: Permission denied\n" +
+		"warning: could not open directory 'd/': Permission denied\n" +
+		"hint: something\n\n")
+	if want := "d/k.txt: Permission denied; warning: could not open directory 'd/': Permission denied"; got != want {
+		t.Errorf("statusMissed = %q, want %q", got, want)
+	}
+	if got := statusMissed("warning: in the working copy of 'a.txt', CRLF will be replaced by LF\n"); got != "" {
+		t.Errorf("a line-ending warning only: %q, want none", got)
+	}
 }

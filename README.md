@@ -146,10 +146,14 @@ be tied to it. A file the window committed is still graded when git can run
 there (a broken branch or index), and as its working copy can't be read, an
 overlap there is indeterminate and so HIGH, like any grade wt can't compute;
 its tag then reads `working tree unread`, not `uncommitted edits`. When git
-can't run in its directory at all (gone but locked, or not enterable), none
-of its edits are compared, committed or not, and the note says so. In JSON it is `unread` on the window (`wt status --json`, MCP
-`wt_status`) and `unread_windows` (`window`, `worktree`, `error`) in `wt check
---json` and MCP `wt_check`. When git itself failed there, run `git status` in
+fails before reading anything there (a directory it can't enter, a checkout
+it no longer recognises, a branch at a missing object), none of its edits are
+compared, committed or not; when `git status` works but says it could not read
+some paths, only those are missing. The note says which. In JSON it is
+`unread` and `not_compared` (`uncommitted`, `some_uncommitted` or `all`) on
+the window (`wt status --json`, MCP `wt_status`), and `unread_windows`
+(`window`, `worktree`, `error`, `not_compared`) in `wt check --json` and MCP
+`wt_check`. When git itself failed there, run `git status` in
 that worktree to see what is wrong. Two entries are not unread, since neither has a work tree to hold
 edits: a worktree whose directory was deleted (git lists it as prunable; `git
 worktree prune` removes its record) and the bare repository of a bare-plus-worktrees

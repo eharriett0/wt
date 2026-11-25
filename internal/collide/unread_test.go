@@ -57,7 +57,7 @@ func TestUnreadNote(t *testing.T) {
 	}
 	// git never ran there: its commits weren't read either, and `git status`
 	// there can't help (#254 review).
-	nodir := UnreadNote([]Window{{Worktree: "/r/wd", Branch: "wd", Unread: gitx.ErrNoDir.Error() + ": open /r/wd: permission denied"}})
+	nodir := UnreadNote([]Window{{Worktree: "/r/wd", Branch: "wd", Unread: gitx.ErrNoDir.Error() + ": open /r/wd: permission denied", CommitsUnread: true}})
 	if !strings.Contains(nodir, "none of its edits are compared") || strings.Contains(nodir, "git status`") {
 		t.Errorf("unreadable directory: %q, want none of its edits compared and no `git status` advice", nodir)
 	}
@@ -88,6 +88,30 @@ func TestWindowLiveness_UnreadLabel(t *testing.T) {
 	} {
 		if got := c.wl.Label(); got != c.want {
 			t.Errorf("%+v: Label() = %q, want %q", c.wl, got, c.want)
+		}
+	}
+}
+
+// What an unread window did not compare comes from what was read, not from
+// its reason's wording (#254 review).
+func TestNotCompared(t *testing.T) {
+	for _, c := range []struct {
+		w           Window
+		want, scope string
+	}{
+		{Window{}, "", "its uncommitted edits are not compared"},
+		{Window{Unread: "git status: fatal: index file corrupt"}, "uncommitted", "its uncommitted edits are not compared"},
+		{Window{Unread: "git status: fatal: not a git repository", CommitsUnread: true}, "all", "none of its edits are compared, committed or not"},
+		{Window{Unread: "git status: d/k.txt: Permission denied", UnreadSome: true}, "some_uncommitted", "some of its uncommitted edits are not compared"},
+		{Window{Unread: "git status: x", UnreadSome: true, CommitsUnread: true}, "some_uncommitted", "some of its uncommitted edits are not compared"},
+	} {
+		if got := NotCompared(c.w); got != c.want {
+			t.Errorf("NotCompared(%+v) = %q, want %q", c.w, got, c.want)
+		}
+		if c.w.Unread != "" {
+			if got := UnreadScope(c.w); got != c.scope {
+				t.Errorf("UnreadScope(%+v) = %q, want %q", c.w, got, c.scope)
+			}
 		}
 	}
 }

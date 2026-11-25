@@ -181,8 +181,9 @@ func TestUnreadWindow_namedEverywhere(t *testing.T) {
 			continue
 		}
 		found = true
-		if next := lines[i+1]; !strings.Contains(next, "UNREAD") || !strings.Contains(next, "bad object HEAD") {
-			t.Errorf("wt status, the line under wb's worktree: %q, want UNREAD with git's reason", next)
+		// HEAD is the missing object, so its commits weren't read either.
+		if next := lines[i+1]; !strings.Contains(next, "UNREAD") || !strings.Contains(next, "bad object HEAD") || !strings.Contains(next, "none of its edits are compared") {
+			t.Errorf("wt status, the line under wb's worktree: %q, want UNREAD with git's reason and none of its edits compared", next)
 		}
 		for _, l := range lines[i+1:] { // wb's block runs to the blank line
 			if strings.TrimSpace(l) == "" {
@@ -206,14 +207,14 @@ func TestUnreadWindow_namedEverywhere(t *testing.T) {
 	if err := json.Unmarshal([]byte(broken.statusJSON), &st); err != nil {
 		t.Fatalf("status --json: %v\n%s", err, broken.statusJSON)
 	}
-	var wbUnread string
+	var wbUnread, wbNotCompared string
 	for _, w := range st.Windows {
 		if w.Label == "wb" {
-			wbUnread = w.Unread
+			wbUnread, wbNotCompared = w.Unread, w.NotCompared
 		}
 	}
-	if !strings.Contains(wbUnread, "bad object HEAD") {
-		t.Errorf("status --json: wb's unread = %q, want git's reason\n%s", wbUnread, broken.statusJSON)
+	if !strings.Contains(wbUnread, "bad object HEAD") || wbNotCompared != "all" {
+		t.Errorf("status --json: wb's unread = %q, not_compared %q; want git's reason, all\n%s", wbUnread, wbNotCompared, broken.statusJSON)
 	}
 
 	// wt check: named, the clear qualified, and no block (exit 0).
@@ -228,7 +229,7 @@ func TestUnreadWindow_namedEverywhere(t *testing.T) {
 		if err := json.Unmarshal([]byte(out), &p); err != nil {
 			t.Fatalf("%s: %v\n%s", name, err, out)
 		}
-		if len(p.UnreadWindows) != 1 || p.UnreadWindows[0].Window != "wb" || !strings.Contains(p.UnreadWindows[0].Error, "bad object HEAD") || p.Blocking {
+		if len(p.UnreadWindows) != 1 || p.UnreadWindows[0].Window != "wb" || !strings.Contains(p.UnreadWindows[0].Error, "bad object HEAD") || p.UnreadWindows[0].NotCompared != "all" || p.Blocking {
 			t.Errorf("%s: unread_windows = %+v, blocking %v; want wb with git's reason, not blocking", name, p.UnreadWindows, p.Blocking)
 		}
 	}
@@ -422,6 +423,22 @@ func TestScan_worktreeStates(t *testing.T) {
 		}
 	}
 	writeT(t, spaced, "notes.txt", "spaced edit\n")
+	// A worktree git reads, except for a directory it can't list: partly
+	// unread, the rest kept (#254 review).
+	partial := ""
+	if os.Geteuid() != 0 {
+		partial = filepath.Join(dirs, "partial")
+		gitT(t, root, "worktree", "add", "-q", "-b", "partial", partial, "main")
+		if err := os.MkdirAll(filepath.Join(partial, "u"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeT(t, partial, "u/new.txt", "n\n")
+		writeT(t, partial, "p.txt", "partial's own file\n")
+		if err := os.Chmod(filepath.Join(partial, "u"), 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(filepath.Join(partial, "u"), 0o755) })
+	}
 	shut := ""
 	if os.Geteuid() != 0 { // root enters a mode-000 directory
 		shut = filepath.Join(dirs, "shut")
@@ -432,6 +449,14 @@ func TestScan_worktreeStates(t *testing.T) {
 		t.Cleanup(func() { _ = os.Chmod(shut, 0o755) })
 	}
 	ws := scan(t, root)
+	if partial != "" {
+		if w, ok := at(ws, partial); !ok || !w.UnreadSome || !strings.Contains(w.Unread, "could not open directory 'u/'") || !has(w.Touched, "p.txt") || collide.NotCompared(w) != "some_uncommitted" {
+			t.Errorf("worktree with a directory git can't list: %+v (listed %v), want partly unread, its readable edit kept", w, ok)
+		}
+		if err := os.Chmod(filepath.Join(partial, "u"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if shut != "" {
 		if w, ok := at(ws, shut); !ok || !strings.Contains(w.Unread, "permission denied") {
 			t.Errorf("worktree git can't enter: %+v (listed %v), want unread: permission denied", w, ok)
