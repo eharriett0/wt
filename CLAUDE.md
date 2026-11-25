@@ -58,8 +58,47 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   HIGH (the fail-safe; never hidden); its tag reads `working tree unread`
   (`WindowLiveness.Unread`), not `uncommitted edits`, and status explains the
   indeterminate overlap by it (`indeterminateDetail`) (#254 review). When git
-  can't run in the directory at all (`gitx.ErrNoDir`), none of its edits are
-  compared, committed or not, and `collide.UnreadScope` says so. The #93 unknown-path refusal names unread windows too: one
+  can't read the window's commits in its directory (`ErrNoDir`, a #255
+  entry, a checkout git no longer recognises), `Scan` reads them from THIS
+  repository at the head `git worktree list` records (`gitx.CommittedFilesAt`,
+  `Window.ReadAt`, #256), and the grade measures that window there and never
+  in its directory: `ChangedRangesAt`/`ChangedDocEditsAt` (the same merge-base
+  logic, the tip a parameter: `behindMergeBaseFrom`, `pendingSide.commit`),
+  its structured doc's content from the commit through the `pending` seam
+  (`gitGradeFacts.at`, `collide.PendingAtCommit`), in `wt check`, status, the
+  banner, pre-push (`RangesAtCommit`/`DocEditsAtCommit`) and both edit hooks
+  (`CheckEntry.otherAt`). Already merged and subsumed are read at the commit
+  too (`collide.PathMatchesUpstreamAt`, `gitx.FileChangeSubsumedAt`, #259
+  review: off, landed work blocked permanently), and untracked is false (its
+  change is committed). The grade runs NO git in its directory, which for a
+  #255 entry reads the checkout around it (round 1 found git still ran there
+  before a guard discarded the answer), and neither does `Scan` for a #255
+  entry: its `.git` stat comes first (round 2: git status there scanned the
+  whole enclosing checkout on every Scan). Its branch comes from `git worktree
+  list` whenever it is fully unread, its head readable or not. Read from the
+  commit, a copy can grade differently from its directory's in two shapes,
+  and the commit's is the right one: line-ending filters (in place, merge-file
+  compared a CRLF working copy with LF blobs) and a symlink (in place, the
+  link's target was hashed). The at-commit diffs run at the work tree's top
+  (`topDir`): a `-- <path>` pathspec is cwd-relative, and from a subdirectory
+  the grade read clear. Its branch comes from `git worktree list` too (a
+  checkout git no longer recognises lost its claim and PR). ⚠ Known: diff
+  attributes come from the current checkout, not the window's commit
+  (`--attr-source` needs git 2.40). Why untracked stays off: git run in a #255 entry's
+  directory reads the checkout around it, and, the entry not under an
+  ignored directory, its untracked read listed the window's committed file
+  as the enclosing checkout's untracked one and turned a real add/add
+  advisory (measured; under an ignored directory git reads nothing there). Liveness reads such a window (any fully unread one) as
+  dirty: its working tree is unknown, so it is NEVER dormant or
+  stale-by-ancestry, and an overlap with its commits stays HIGH until its
+  directory is back or the worktree is removed (owner pane 11-25, "keep the
+  fail-safe"); a merged PR found under its branch's name still quiets it (one
+  found only by its tip doesn't: a dirty window, #168), and so does work already on base
+  (above). Its age, read from its head, only labels it. Only when the head can't be read either
+  (a missing object, no base) are none of its edits compared, and
+  `collide.UnreadScope` says so. An unreadable structured doc in a READABLE
+  window is every section (`SharedSectionsAcrossWith`), never skipped (#256
+  review: skipped, a shared section read advisory). The #93 unknown-path refusal names unread windows too: one
   may be creating that path. The committed diff
   failing stays silent: it fails for an unborn or unrelated branch too. An
   entry with no work tree is NOT unread: one git lists as prunable whose

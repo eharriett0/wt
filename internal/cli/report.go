@@ -88,6 +88,9 @@ type CheckEntry struct {
 	// the pre-edit hooks' #122 re-check: Window is a label, and a label can name
 	// two windows. Not in the JSON.
 	otherWorktree string
+	// otherAt is that window's collide.Window.ReadAt (#256): read at this
+	// commit, never in its directory. Not in the JSON.
+	otherAt string
 	// liveNote names the live sessions working in that worktree (#250,
 	// annotateLive), shown after the window. Not in the JSON.
 	liveNote string
@@ -168,6 +171,10 @@ type gitGradeFacts struct {
 	// with it, through the same SharedSections `wt check` uses.
 	pendingPath string
 	pending     map[string]collide.PendingDoc
+	// at maps a worktree read at its commit (collide.Window.ReadAt, #256) to
+	// that commit: every fact comes from there, never its directory; it has no
+	// untracked file (its change is committed).
+	at map[string]string
 }
 
 // factSource is the uncached lookups behind gitGradeFacts: the gitx shell-outs
@@ -178,6 +185,13 @@ type factSource struct {
 	subsumed      func(worktree, base, path string) bool
 	ranges        func(worktree, base, path string) []gitx.LineRange // base frame (#29/#108)
 	docEdits      func(worktree, base, path string) gitx.DocEdits    // new frame (#123) + deletions (#237)
+	// The same, for a window read at its commit (#256): measured from this
+	// repository, never in its directory.
+	rangesAt        func(base, head, path string) []gitx.LineRange
+	docEditsAt      func(base, head, path string) gitx.DocEdits
+	contentAt       func(head, path string) (string, bool) // false: unreadable
+	alreadyMergedAt func(base, head, path string) bool
+	subsumedAt      func(base, head, path string) bool
 }
 
 var gitFactSource = factSource{
@@ -186,10 +200,50 @@ var gitFactSource = factSource{
 	subsumed:      subsumedByBase,
 	ranges:        gitx.ChangedRanges,
 	docEdits:      gitx.ChangedDocEdits,
+	rangesAt: func(base, head, path string) []gitx.LineRange {
+		r, _ := gitx.ChangedRangesAt(base, head, path)
+		return r
+	},
+	docEditsAt: gitx.ChangedDocEditsAt,
+	contentAt: func(head, path string) (string, bool) {
+		text, _, err := gitx.RefFileText(head, path)
+		return text, err == nil
+	},
+	alreadyMergedAt: func(base, head, path string) bool {
+		merged, known := collide.PathMatchesUpstreamAt(base, head, path)
+		return known && merged
+	},
+	subsumedAt: func(base, head, path string) bool {
+		s, known := gitx.FileChangeSubsumedAt(base, head, path)
+		return known && s
+	},
+}
+
+// subsumedFor is subsumedByBase for the window an entry was graded against:
+// at its commit when it is read there (#256, #259 review), never in its
+// directory.
+func subsumedFor(e CheckEntry, base, path string) bool {
+	if e.otherAt != "" {
+		s, known := gitx.FileChangeSubsumedAt(base, e.otherAt, path)
+		return known && s
+	}
+	return subsumedByBase(e.otherWorktree, base, path)
 }
 
 func newGitGradeFacts(base string) *gitGradeFacts {
 	return newMemoFacts(base, gitFactSource)
+}
+
+// newGitGradeFactsFor is newGitGradeFacts knowing ws's windows read at their
+// commit (#256).
+func newGitGradeFactsFor(base string, ws []collide.Window) *gitGradeFacts {
+	g := newGitGradeFacts(base)
+	for _, w := range ws {
+		if w.ReadAt != "" {
+			g.at[w.Worktree] = w.ReadAt
+		}
+	}
+	return g
 }
 
 func newMemoFacts(base string, src factSource) *gitGradeFacts {
@@ -201,6 +255,7 @@ func newMemoFacts(base string, src factSource) *gitGradeFacts {
 		subsumed:  map[factKey]bool{},
 		ranges:    map[factKey][]gitx.LineRange{},
 		docEdits:  map[factKey]gitx.DocEdits{},
+		at:        map[string]string{},
 	}
 }
 
@@ -223,19 +278,33 @@ func memoRanges(m map[factKey][]gitx.LineRange, k factKey, f func() []gitx.LineR
 }
 
 func (g *gitGradeFacts) AlreadyMerged(wt, path string) bool {
+	if at := g.at[wt]; at != "" {
+		return memoBool(g.merged, factKey{wt, path}, func() bool { return g.src.alreadyMergedAt(g.base, at, path) })
+	}
 	return memoBool(g.merged, factKey{wt, path}, func() bool { return g.src.alreadyMerged(wt, g.base, path) })
 }
 
 func (g *gitGradeFacts) Untracked(wt, path string) bool {
+	if g.at[wt] != "" {
+		return false // #256: its committed change is no untracked file
+	}
 	return memoBool(g.untracked, factKey{wt, path}, func() bool { return g.src.untracked(wt, path) })
 }
 
 func (g *gitGradeFacts) Subsumed(wt, path string) bool {
+	if at := g.at[wt]; at != "" {
+		return memoBool(g.subsumed, factKey{wt, path}, func() bool { return g.src.subsumedAt(g.base, at, path) })
+	}
 	return memoBool(g.subsumed, factKey{wt, path}, func() bool { return g.src.subsumed(wt, g.base, path) })
 }
 
 func (g *gitGradeFacts) Ranges(wt, path string) []gitx.LineRange {
-	return memoRanges(g.ranges, factKey{wt, path}, func() []gitx.LineRange { return g.src.ranges(wt, g.base, path) })
+	return memoRanges(g.ranges, factKey{wt, path}, func() []gitx.LineRange {
+		if at := g.at[wt]; at != "" {
+			return g.src.rangesAt(g.base, at, path)
+		}
+		return g.src.ranges(wt, g.base, path)
+	})
 }
 
 // SharedSections attributes each window's diff to its OWN current-content
@@ -247,13 +316,32 @@ func (g *gitGradeFacts) SharedSections(worktrees []string, path, delimiter strin
 		if v, ok := g.docEdits[k]; ok {
 			return v
 		}
-		v := g.src.docEdits(wt, base, p)
+		var v gitx.DocEdits
+		if at := g.at[wt]; at != "" {
+			v = g.src.docEditsAt(base, at, p) // never its directory (#259 review)
+		} else {
+			v = g.src.docEdits(wt, base, p)
+		}
 		g.docEdits[k] = v
 		return v
 	}
 	var pending map[string]collide.PendingDoc
 	if path == g.pendingPath {
 		pending = g.pending
+	}
+	// #256: a window read at its commit has the doc as that commit has it.
+	for _, wt := range worktrees {
+		at := g.at[wt]
+		if _, ok := pending[wt]; at == "" || ok {
+			continue
+		}
+		if text, ok := g.src.contentAt(at, path); ok {
+			cp := map[string]collide.PendingDoc{wt: {Content: text, Edits: newFrame(wt, g.base, path)}}
+			for k, v := range pending {
+				cp[k] = v
+			}
+			pending = cp
+		}
 	}
 	return collide.SharedSectionsAcrossWith(g.base, worktrees, path, delimiter, newFrame, pending)
 }
@@ -343,7 +431,7 @@ func gradeEntry(c *config.Config, f gradeFacts, currentWorktree, otherWt string,
 func buildCheckReport(c *config.Config, ws []collide.Window, currentWorktree string, qs []collide.Query) []CheckEntry {
 	conflicts := collide.CheckPaths(ws, currentWorktree, qs)
 	live := collide.ClassifyWindows(ws, c.Base, collide.ConflictWindowSet(conflicts), c.MaxAge)
-	return checkEntries(c, newGitGradeFacts(c.Base), ws, currentWorktree, conflicts, live)
+	return checkEntries(c, newGitGradeFactsFor(c.Base, ws), ws, currentWorktree, conflicts, live)
 }
 
 // checkEntries is buildCheckReport's decision: every conflict graded by
@@ -358,7 +446,10 @@ func buildCheckReport(c *config.Config, ws []collide.Window, currentWorktree str
 func checkEntries(c *config.Config, f gradeFacts, ws []collide.Window, currentWorktree string, conflicts []collide.Conflict, live map[string]collide.WindowLiveness) []CheckEntry {
 	var out []CheckEntry
 	for _, cf := range conflicts {
-		out = append(out, gradeEntry(c, f, currentWorktree, collide.WorktreeOf(cf, ws), cf, live[cf.Window]))
+		otherWt := collide.WorktreeOf(cf, ws)
+		e := gradeEntry(c, f, currentWorktree, otherWt, cf, live[cf.Window])
+		e.otherAt = collide.ReadAt(ws, otherWt) // #256
+		out = append(out, e)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Path != out[j].Path {
@@ -628,14 +719,14 @@ type StatusOverlap struct {
 // lists only live windows) for `wt status` and the MCP wt_status: the
 // window-neutral view, through the same per-entry grade as `wt check` (#182).
 func gradeStatusOverlaps(c *config.Config, ws []collide.Window, active []collide.Overlap) []StatusOverlap {
-	return gradeOverlaps(c, gitFactsFor(c), ws, active, nil, collide.Self{})
+	return gradeOverlaps(c, gitFactsFor(c, ws), ws, active, nil, collide.Self{})
 }
 
 // gitFactsFor returns the production facts factory: a FRESH memoized instance on
 // every call (one call per overlap graded). gitGradeFacts' memo is unsynchronized
 // maps, so returning one shared instance would race the concurrent grading.
-func gitFactsFor(c *config.Config) func() gradeFacts {
-	return func() gradeFacts { return newGitGradeFacts(c.Base) }
+func gitFactsFor(c *config.Config, ws []collide.Window) func() gradeFacts {
+	return func() gradeFacts { return newGitGradeFactsFor(c.Base, ws) }
 }
 
 // gradeWorkers bounds the overlaps graded at once. Each grade is a handful of

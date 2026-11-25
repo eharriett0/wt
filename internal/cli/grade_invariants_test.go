@@ -203,7 +203,7 @@ func TestDistinctTail(t *testing.T) {
 // a fresh instance for every overlap. A shared one is a data race on every
 // `wt status` and per-turn banner (a fatal "concurrent map writes" outside -race).
 func TestGitFactsFor_FreshInstancePerCall(t *testing.T) {
-	newFacts := gitFactsFor(&config.Config{Base: "main"})
+	newFacts := gitFactsFor(&config.Config{Base: "main"}, nil)
 	if a, b := newFacts(), newFacts(); a == b {
 		t.Fatal("gitFactsFor handed out the same gitGradeFacts twice; its memo must not be shared across goroutines")
 	}

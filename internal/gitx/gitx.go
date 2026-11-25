@@ -1428,6 +1428,83 @@ func capLines(lines []string, max int) string {
 	return fmt.Sprintf("%s; and %d more", strings.Join(lines[:max], "; "), len(lines)-max)
 }
 
+// CommittedFilesAt is TouchedFiles' committed part for a branch at head,
+// read from the current repository (#256): what a window git can't run in
+// committed, by the head `git worktree list` records for it. An error when no
+// base resolves or git can't read head (a missing object).
+func CommittedFilesAt(base, head string) ([]string, error) {
+	top := topDir() // diff.relative would list a subdirectory's paths only (#259 review)
+	var err error
+	for _, ref := range []string{"origin/" + base, base} {
+		var out string
+		if out, err = runRaw(top, "diff", "--name-only", noRenames, nulPaths, ref+"..."+head); err == nil {
+			return splitNUL(out), nil
+		}
+	}
+	return nil, err
+}
+
+// ChangedRangesAt is ChangedRanges for a window read at its commit head
+// (#256): its committed changes only, in the base frame, measured from the
+// current repository because git can't run in its directory. ok=false when
+// no base resolves or git fails; callers grade that fail-safe, as nil from
+// ChangedRanges.
+func ChangedRangesAt(base, head, file string) ([]LineRange, bool) {
+	top := topDir()
+	ref, sha, hasBase := resolveBaseRef(top, base)
+	if !hasBase {
+		return nil, false
+	}
+	return changedRanges(top, ref, sha, file, &pendingSide{commit: head})
+}
+
+// topDir is the top of the work tree holding the current directory, "" when
+// there is none: a `-- <path>` pathspec is read from git's working directory,
+// so a repo-relative path diffed from a subdirectory named another file
+// (#259 review: from a subdirectory the at-commit grade read clear).
+func topDir() string {
+	top, err := RepoRoot()
+	if err != nil {
+		return ""
+	}
+	return top
+}
+
+// ChangedDocEditsAt is ChangedDocEdits for a window read at its commit head
+// (#256), from the current repository. Without a base, or when a diff fails,
+// every section (All), as ChangedDocEdits does.
+func ChangedDocEditsAt(base, head, file string) DocEdits {
+	top := topDir()
+	ref, sha, hasBase := resolveBaseRef(top, base)
+	if !hasBase {
+		return DocEdits{New: wholeFile, All: true}
+	}
+	if mb := behindMergeBaseFrom(top, ref, sha, file, head); mb != "" {
+		if out, err := runRaw(top, gradeDiff([]string{mb, head}, file)...); err == nil {
+			return withBaseClaims(top, ref, mb, file, out, docEditsFrom(top, mb+":"+file, out, false))
+		}
+	}
+	out, err := runRaw(top, gradeDiff([]string{ref, head}, file)...)
+	if err != nil {
+		return DocEdits{New: wholeFile, All: true}
+	}
+	return docEditsFrom(top, ref+":"+file, out, false)
+}
+
+// CommitAge is how long ago commit rev was made, read from the current
+// repository (#256: a window git can't run in, aged by its head).
+func CommitAge(rev string, now time.Time) (time.Duration, error) {
+	out, err := RunDir("", "log", "-1", "--format=%ct", rev)
+	if err != nil {
+		return 0, err
+	}
+	ts, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return now.Sub(time.Unix(ts, 0)), nil
+}
+
 // ErrGitDirOnly is TouchedFiles' error for a worktree entry that is itself a
 // git directory: a bare repository (Scan leaves those out: no work tree), or
 // the main entry of a `--separate-git-dir` repository, whose work tree exists
@@ -1668,13 +1745,20 @@ func ChangedRangesWith(dir, base, file string, content []byte) ([]LineRange, boo
 type pendingSide struct {
 	blob string
 	env  []string
+	// commit: the window's side is this commit's tree, not a blob or its
+	// working tree (#256: a window git can't run in, read at the head git
+	// worktree list records for it).
+	commit string
 }
 
 // diffFrom is the grading diff of file from commit old to the working tree, or
 // to the pending blob in its place.
 func (p *pendingSide) diffFrom(dir, old, file string) (string, error) {
-	if p == nil {
+	switch {
+	case p == nil:
 		return runRaw(dir, gradeDiff([]string{old}, file)...)
+	case p.commit != "":
+		return runRaw(dir, gradeDiff([]string{old, p.commit}, file)...)
 	}
 	out, err := gitOutput(dir, p.env, nil, gradeDiff([]string{old + ":" + file, p.blob}, "")...)
 	return string(out), err
@@ -1683,7 +1767,11 @@ func (p *pendingSide) diffFrom(dir, old, file string) (string, error) {
 // changedRanges is ChangedRangesChecked's measurement from base ref (at sha),
 // with the working tree's copy of file, or the pending one in its place.
 func changedRanges(dir, ref, sha, file string, pending *pendingSide) ([]LineRange, bool) {
-	if mb := behindMergeBase(dir, ref, sha, file); mb != "" {
+	tip := "HEAD"
+	if pending != nil && pending.commit != "" {
+		tip = pending.commit
+	}
+	if mb := behindMergeBaseFrom(dir, ref, sha, file, tip); mb != "" {
 		own, ownErr := pending.diffFrom(dir, mb, file)
 		moved, movedErr := runRaw(dir, gradeDiff([]string{mb, ref}, file)...)
 		if ownErr == nil && movedErr == nil {
@@ -1975,7 +2063,13 @@ func resolveBaseRef(dir, base string) (ref, sha string, ok bool) {
 // "lines base changed under the branch" means nothing (each side added its own
 // file, an add/add the plain base diff must keep seeing, #142 review).
 func behindMergeBase(dir, ref, sha, file string) string {
-	mb, err := RunDir(dir, "merge-base", ref, "HEAD")
+	return behindMergeBaseFrom(dir, ref, sha, file, "HEAD")
+}
+
+// behindMergeBaseFrom is behindMergeBase for the branch at tip (a commit, or
+// "HEAD" in dir), #256.
+func behindMergeBaseFrom(dir, ref, sha, file, tip string) string {
+	mb, err := RunDir(dir, "merge-base", ref, tip)
 	if err != nil || mb == "" || mb == sha {
 		return ""
 	}
@@ -2197,6 +2291,26 @@ func FileChangeSubsumed(worktree, base, path string) (subsumed, known bool) {
 	if worktree == "" {
 		return false, false // no worktree to evaluate — fail-safe (keep the collision)
 	}
+	return fileChangeSubsumed(worktree, base, "HEAD", path, func() (string, error) {
+		b, err := os.ReadFile(filepath.Join(worktree, path))
+		return string(b), err
+	})
+}
+
+// FileChangeSubsumedAt is FileChangeSubsumed for a window read at its commit
+// head (#256, #259 review): its change is head's copy of path, from this
+// repository, never its directory.
+func FileChangeSubsumedAt(base, head, path string) (subsumed, known bool) {
+	top := topDir()
+	return fileChangeSubsumed(top, base, head, path, func() (string, error) {
+		return runRaw(top, "show", head+":"+path)
+	})
+}
+
+// fileChangeSubsumed is FileChangeSubsumed's decision, for the branch at tip
+// in dir, its copy of path from theirsFn.
+func fileChangeSubsumed(dir, base, tip, path string, theirsFn func() (string, error)) (subsumed, known bool) {
+	worktree := dir
 	baseRef := "origin/" + base
 	if _, err := RunDir(worktree, "rev-parse", "--verify", "--quiet", baseRef+"^{commit}"); err != nil {
 		baseRef = base
@@ -2204,7 +2318,7 @@ func FileChangeSubsumed(worktree, base, path string) (subsumed, known bool) {
 			return false, false
 		}
 	}
-	mb, err := RunDir(worktree, "merge-base", baseRef, "HEAD")
+	mb, err := RunDir(worktree, "merge-base", baseRef, tip)
 	if err != nil || mb == "" {
 		return false, false
 	}
@@ -2214,22 +2328,22 @@ func FileChangeSubsumed(worktree, base, path string) (subsumed, known bool) {
 	if err != nil {
 		return false, false // base lacks the file — the branch adds a new one → contested
 	}
-	theirs, err := os.ReadFile(filepath.Join(worktree, path))
+	theirs, err := theirsFn()
 	if err != nil {
-		return false, false // no worktree file (staged deletion etc.) → contested
+		return false, false // no copy of its own (a deletion etc.) → contested
 	}
 	ancestor, aerr := runRaw(worktree, "show", mb+":"+path)
 	if aerr != nil {
 		ancestor = "" // file added since the merge-base → empty ancestor (add/add)
 	}
 
-	dir, err := os.MkdirTemp("", "wt-subsumed-")
+	tmp, err := os.MkdirTemp("", "wt-subsumed-")
 	if err != nil {
 		return false, false
 	}
-	defer os.RemoveAll(dir)
+	defer os.RemoveAll(tmp)
 	write := func(name, content string) (string, bool) {
-		p := filepath.Join(dir, name)
+		p := filepath.Join(tmp, name)
 		if werr := os.WriteFile(p, []byte(content), 0o600); werr != nil {
 			return "", false
 		}

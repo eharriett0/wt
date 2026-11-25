@@ -147,10 +147,17 @@ there (a broken branch or index), and as its working copy can't be read, an
 overlap there is indeterminate and so HIGH, like any grade wt can't compute;
 its tag then reads `working tree unread`, not `uncommitted edits`. When git
 fails before reading anything there (a directory it can't enter, a checkout
-it no longer recognises, a branch at a missing object), or its commits can't
-be listed (no base, an unborn branch), none of its edits are compared,
-committed or not; when `git status` works but says it could not read some
-paths, only those are missing. The note says which. A worktree whose `.git`
+it no longer recognises), wt reads that window's commits instead from this
+repository, at the commit `git worktree list` records for it, and grades them
+as it would in place: an overlap with what it committed is HIGH even while,
+say, a locked worktree's volume is unmounted. Its uncommitted edits can't be
+seen, so it counts as possibly editing: it never goes dormant, and the
+overlap stays until its directory is back or the worktree is removed (a
+merged PR under its branch's name, or work already on base, still quiets
+it). Only when that can't be read
+either (a branch at a missing object, no base, an unborn branch) are none of
+its edits compared, committed or not; when `git status` works but says it
+could not read some paths, only those are missing. The note says which. A worktree whose `.git`
 file is gone while its directory is still there (an unmounted volume left as
 an empty mount point, a deleted link; locked or not) is unread too, under its
 own branch: git can't read it as its own work tree (nested, it would read the
