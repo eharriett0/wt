@@ -554,9 +554,11 @@ func TestTouchedFiles_UnreadIsAnError(t *testing.T) {
 // statusMissed keeps only what a successful git status says it could not
 // read (#254 review): measured lines kept, unrelated warnings dropped.
 func TestStatusMissed(t *testing.T) {
-	dir := t.TempDir() // the window: d/, a file "a: b.txt", and nothing else
-	if err := os.MkdirAll(filepath.Join(dir, "d"), 0o755); err != nil {
-		t.Fatal(err)
+	dir := t.TempDir() // the window: .git/hooks/, d/, a file "a: b.txt", and nothing else
+	for _, d := range []string{"d", filepath.Join(".git", "hooks")} {
+		if err := os.MkdirAll(filepath.Join(dir, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 	writeFile(t, dir, "a: b.txt", "x\n")
 	statusMissed := func(stderr string) string { return statusMissed(dir, stderr) }
