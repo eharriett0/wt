@@ -526,6 +526,17 @@ func TestScan_worktreeStates(t *testing.T) {
 		t.Errorf("wt check notes.txt inside %q: exit %d, want 0 and no entry for itself:\n%s", spaced, code, out+errOut)
 	}
 
+	// A checkout whose .git file points at a gitdir that doesn't exist: git
+	// fails there, and git worktree list still names its branch (#259
+	// review: it lost its branch, so its claim and PR).
+	broken := filepath.Join(dirs, "broken")
+	gitT(t, root, "worktree", "add", "-q", "-b", "brokenlink", broken, "main")
+	writeT(t, broken, ".git", "gitdir: "+filepath.Join(dirs, "no-such-gitdir")+"\n")
+	ws = scan(t, root)
+	if w, ok := at(ws, broken); !ok || w.Unread == "" || w.Branch != "brokenlink" || w.ReadAt == "" {
+		t.Errorf("checkout with a broken .git link: %+v (listed %v), want unread, its own branch, read at its head", w, ok)
+	}
+
 	// A worktree moved without `git worktree repair`: git lists it at its old
 	// path, so from inside it no entry is this work tree, and none may be
 	// taken for it (the main checkout stays the main checkout).

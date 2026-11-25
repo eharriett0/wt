@@ -447,20 +447,25 @@ func gradeConflicts(c *config.Config, active []collide.Conflict, root string, ws
 		if rangesPath == "" {
 			rangesPath = cf.Path
 		}
-		// #256: a window read at its commit is measured there; the checks that
-		// need its directory (merged, untracked, subsumed) stay off: fail-safe.
-		readAt := collide.ReadAt(ws, otherWt) != ""
+		// #256: a window read at its commit is measured there, every fact,
+		// never in its directory (#259 review: git ran there before the guard).
+		at := collide.ReadAt(ws, otherWt)
+		mergedFn, subsumedFn := collide.PathMatchesUpstream, gitx.FileChangeSubsumed
+		if at != "" {
+			mergedFn = func(_, base, path string) (bool, bool) { return collide.PathMatchesUpstreamAt(base, at, path) }
+			subsumedFn = func(_, base, path string) (bool, bool) { return gitx.FileChangeSubsumedAt(base, at, path) }
+		}
 		// #109: an already-merged path — the other window's content is byte-identical
 		// to the upstream base (stale index / worktree) — is not a live collision.
 		// Advisory, never blocks; matches `wt check`'s already-merged downgrade.
-		if merged, known := collide.PathMatchesUpstream(otherWt, c.Base, rangesPath); !readAt && known && merged {
+		if merged, known := mergedFn(otherWt, c.Base, rangesPath); known && merged {
 			soft = append(soft, cf)
 			continue
 		}
 		// #113: the other window's claim on this path is an UNTRACKED file — nothing
 		// committed/staged there, so it can't be pushed and can't collide until
 		// committed. Advisory, never blocks; matches `wt check`'s untracked downgrade.
-		if !readAt && gitx.IsUntracked(otherWt, rangesPath) {
+		if at == "" && gitx.IsUntracked(otherWt, rangesPath) {
 			soft = append(soft, cf)
 			continue
 		}
@@ -499,7 +504,7 @@ func gradeConflicts(c *config.Config, active []collide.Conflict, root string, ws
 		// the other window's change to this file is already on base (a clean 3-way
 		// merge into base is a no-op), it isn't contesting it. Fail-safe: an
 		// undeterminable check keeps the hard block.
-		if s, known := gitx.FileChangeSubsumed(otherWt, c.Base, rangesPath); !readAt && known && s {
+		if s, known := subsumedFn(otherWt, c.Base, rangesPath); known && s {
 			soft = append(soft, cf)
 			continue
 		}

@@ -729,7 +729,7 @@ func hookCodexEdit(r io.Reader) int {
 		// leaves, as the Claude hook does.
 		sections, rest := regradeSections(c, root, path, []byte(content), predictable && touched, byEntryPath[path])
 		graded := append(sections, regradePending(rest, after, afterOK, func(e CheckEntry) bool {
-			return e.otherAt == "" && subsumedByBase(e.otherWorktree, c.Base, path) // that window's, not a namesake's (#193); #256
+			return subsumedFor(e, c.Base, path) // that window's, not a namesake's (#193); at its commit (#256)
 		})...)
 		for _, g := range graded {
 			high = append(high, codexGradedEntry{entry: g.entry, confirmed: g.confirmed})

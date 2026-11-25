@@ -172,8 +172,8 @@ type gitGradeFacts struct {
 	pendingPath string
 	pending     map[string]collide.PendingDoc
 	// at maps a worktree read at its commit (collide.Window.ReadAt, #256) to
-	// that commit: its facts come from there, and the suppressions that need
-	// its directory (already merged, untracked, subsumed) stay off: fail-safe.
+	// that commit: every fact comes from there, never its directory; it has no
+	// untracked file (its change is committed).
 	at map[string]string
 }
 
@@ -187,9 +187,11 @@ type factSource struct {
 	docEdits      func(worktree, base, path string) gitx.DocEdits    // new frame (#123) + deletions (#237)
 	// The same, for a window read at its commit (#256): measured from this
 	// repository, never in its directory.
-	rangesAt   func(base, head, path string) []gitx.LineRange
-	docEditsAt func(base, head, path string) gitx.DocEdits
-	contentAt  func(head, path string) (string, bool) // false: unreadable
+	rangesAt        func(base, head, path string) []gitx.LineRange
+	docEditsAt      func(base, head, path string) gitx.DocEdits
+	contentAt       func(head, path string) (string, bool) // false: unreadable
+	alreadyMergedAt func(base, head, path string) bool
+	subsumedAt      func(base, head, path string) bool
 }
 
 var gitFactSource = factSource{
@@ -207,6 +209,25 @@ var gitFactSource = factSource{
 		text, _, err := gitx.RefFileText(head, path)
 		return text, err == nil
 	},
+	alreadyMergedAt: func(base, head, path string) bool {
+		merged, known := collide.PathMatchesUpstreamAt(base, head, path)
+		return known && merged
+	},
+	subsumedAt: func(base, head, path string) bool {
+		s, known := gitx.FileChangeSubsumedAt(base, head, path)
+		return known && s
+	},
+}
+
+// subsumedFor is subsumedByBase for the window an entry was graded against:
+// at its commit when it is read there (#256, #259 review), never in its
+// directory.
+func subsumedFor(e CheckEntry, base, path string) bool {
+	if e.otherAt != "" {
+		s, known := gitx.FileChangeSubsumedAt(base, e.otherAt, path)
+		return known && s
+	}
+	return subsumedByBase(e.otherWorktree, base, path)
 }
 
 func newGitGradeFacts(base string) *gitGradeFacts {
@@ -257,8 +278,8 @@ func memoRanges(m map[factKey][]gitx.LineRange, k factKey, f func() []gitx.LineR
 }
 
 func (g *gitGradeFacts) AlreadyMerged(wt, path string) bool {
-	if g.at[wt] != "" {
-		return false // #256: needs its directory; keep the collision
+	if at := g.at[wt]; at != "" {
+		return memoBool(g.merged, factKey{wt, path}, func() bool { return g.src.alreadyMergedAt(g.base, at, path) })
 	}
 	return memoBool(g.merged, factKey{wt, path}, func() bool { return g.src.alreadyMerged(wt, g.base, path) })
 }
@@ -271,8 +292,8 @@ func (g *gitGradeFacts) Untracked(wt, path string) bool {
 }
 
 func (g *gitGradeFacts) Subsumed(wt, path string) bool {
-	if g.at[wt] != "" {
-		return false // #256: needs its directory; keep the collision
+	if at := g.at[wt]; at != "" {
+		return memoBool(g.subsumed, factKey{wt, path}, func() bool { return g.src.subsumedAt(g.base, at, path) })
 	}
 	return memoBool(g.subsumed, factKey{wt, path}, func() bool { return g.src.subsumed(wt, g.base, path) })
 }
@@ -295,9 +316,11 @@ func (g *gitGradeFacts) SharedSections(worktrees []string, path, delimiter strin
 		if v, ok := g.docEdits[k]; ok {
 			return v
 		}
-		v := g.src.docEdits(wt, base, p)
+		var v gitx.DocEdits
 		if at := g.at[wt]; at != "" {
-			v = g.src.docEditsAt(base, at, p)
+			v = g.src.docEditsAt(base, at, p) // never its directory (#259 review)
+		} else {
+			v = g.src.docEdits(wt, base, p)
 		}
 		g.docEdits[k] = v
 		return v

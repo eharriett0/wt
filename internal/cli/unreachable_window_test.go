@@ -67,15 +67,23 @@ func TestUnreachableWindow_gradedAtItsCommit(t *testing.T) {
 		t.Chdir(me)
 		return strings.Contains(runHookCapture(t, hookClaudeEdit, string(payload)), `"permissionDecision":"deny"`)
 	}
+	if err := os.MkdirAll(filepath.Join(me, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	type grades struct {
-		x2, x8, beta, alpha int
-		hookBeta, hookAlpha bool
+		x2, x2sub, x8, beta, alpha, status int
+		hookBeta, hookAlpha                bool
 	}
 	measure := func() grades {
 		var g grades
 		g.hookBeta, g.hookAlpha = hookDenies("b2\n", "Mb2\n"), hookDenies("a1\n", "Ma1\n")
 		writeT(t, me, "x.go", strings.Replace(x.String(), "line 2\n", "ME 2\n", 1))
 		g.x2, _ = check(me, "x.go")
+		// From a subdirectory (#259 review: the at-commit diff read clear there).
+		g.x2sub, _ = check(filepath.Join(me, "sub"), "../x.go")
+		// wt status --blocking grades the pair window-neutrally (gitFactsFor).
+		t.Chdir(me)
+		captureOutputForTest(t, func() { g.status = cmdStatus([]string{"--blocking"}) })
 		writeT(t, me, "x.go", strings.Replace(x.String(), "line 8\n", "ME 8\n", 1))
 		g.x8, _ = check(me, "x.go")
 		writeT(t, me, "x.go", x.String())
@@ -86,7 +94,7 @@ func TestUnreachableWindow_gradedAtItsCommit(t *testing.T) {
 		writeT(t, me, "PLAN.md", plan)
 		return g
 	}
-	want := grades{x2: 3, x8: 0, beta: 3, alpha: 0, hookBeta: true, hookAlpha: false}
+	want := grades{x2: 3, x2sub: 3, x8: 0, beta: 3, alpha: 0, status: 3, hookBeta: true, hookAlpha: false}
 	if got := measure(); got != want {
 		t.Fatalf("precondition, lane in place: %+v, want %+v", got, want)
 	}
@@ -176,5 +184,77 @@ func TestNestedWindowWithoutGit_gradedAtItsCommit(t *testing.T) {
 	captureOutputForTest(t, func() { blocked = prePushRefs(t, me, "me") })
 	if !blocked {
 		t.Error("pre-push of y.go from me: not blocked, want the add/add with n's commit")
+	}
+}
+
+// #259 review: work a window read at its commit already landed on base stays
+// quiet, as it does in place: a file whose copy at the commit IS base's
+// (already merged, #109) and one whose change base already holds beside base's
+// own (subsumed, #122). Both were HIGH while those checks were off for it.
+func TestUnreachableWindow_landedWorkStaysQuiet(t *testing.T) {
+	offlineGH(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("WT_SKIP_COLLISION", "")
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, root, "init", "-q", "-b", "main")
+	gitT(t, root, "config", "user.email", "t@t.test")
+	gitT(t, root, "config", "user.name", "t")
+	var x strings.Builder
+	for i := 1; i <= 10; i++ {
+		fmt.Fprintf(&x, "line %d\n", i)
+	}
+	writeT(t, root, "merged.txt", x.String())
+	writeT(t, root, "subsumed.txt", x.String())
+	gitT(t, root, "add", "-A")
+	gitT(t, root, "commit", "-qm", "base")
+	dirs, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lane := filepath.Join(dirs, "lane")
+	gitT(t, root, "worktree", "add", "-q", "-b", "lane", lane, "main")
+	landed := strings.Replace(x.String(), "line 2\n", "LANE 2\n", 1)
+	writeT(t, lane, "merged.txt", landed)
+	writeT(t, lane, "subsumed.txt", landed)
+	gitT(t, lane, "commit", "-qam", "lane")
+	// Base takes lane's change (a squash elsewhere): merged.txt as is,
+	// subsumed.txt with base's own edit of line 9 beside it.
+	writeT(t, root, "merged.txt", landed)
+	writeT(t, root, "subsumed.txt", strings.Replace(landed, "line 9\n", "BASE 9\n", 1))
+	gitT(t, root, "commit", "-qam", "base lands lane's change")
+	gitT(t, root, "worktree", "lock", lane)
+	me := filepath.Join(dirs, "me")
+	gitT(t, root, "worktree", "add", "-q", "-b", "me", me, "main")
+	writeT(t, me, "merged.txt", strings.Replace(landed, "LANE 2\n", "ME 2\n", 1))
+	writeT(t, me, "subsumed.txt", strings.Replace(strings.Replace(landed, "LANE 2\n", "ME 2\n", 1), "line 9\n", "BASE 9\n", 1))
+	t.Setenv("WT_CLAUDE_HOOK_BLOCK", "1")
+	type quiet struct {
+		merged, subsumed        int
+		hookDenies, pushBlocked bool
+	}
+	measure := func() quiet {
+		var q quiet
+		t.Chdir(me)
+		captureOutputForTest(t, func() { q.merged = cmdCheck([]string{"merged.txt"}) })
+		captureOutputForTest(t, func() { q.subsumed = cmdCheck([]string{"subsumed.txt"}) })
+		payload, _ := json.Marshal(map[string]any{"cwd": me, "tool_name": "Edit", "tool_input": map[string]string{
+			"file_path": filepath.Join(me, "subsumed.txt"), "old_string": "ME 2\n", "new_string": "ME 2b\n"}})
+		q.hookDenies = strings.Contains(runHookCapture(t, hookClaudeEdit, string(payload)), `"permissionDecision":"deny"`)
+		gitT(t, me, "commit", "-qam", "me")
+		captureOutputForTest(t, func() { q.pushBlocked = prePushRefs(t, me, "me") })
+		gitT(t, me, "reset", "-q", "--soft", "HEAD~1")
+		return q
+	}
+	if q := measure(); q != (quiet{}) {
+		t.Fatalf("precondition, lane in place: %+v; want check 0, 0, no deny, push not blocked", q)
+	}
+	if err := os.Rename(lane, lane+"-unmounted"); err != nil {
+		t.Fatal(err)
+	}
+	if q := measure(); q != (quiet{}) {
+		t.Errorf("lane's directory gone: %+v; want check 0, 0, no deny, push not blocked, as in place", q)
 	}
 }

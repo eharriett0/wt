@@ -67,8 +67,17 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   its structured doc's content from the commit through the `pending` seam
   (`gitGradeFacts.at`, `collide.PendingAtCommit`), in `wt check`, status, the
   banner, pre-push (`RangesAtCommit`/`DocEditsAtCommit`) and both edit hooks
-  (`CheckEntry.otherAt`). The checks that need its directory (already merged,
-  untracked, subsumed) are OFF for it, fail-safe: git run in a #255 entry's
+  (`CheckEntry.otherAt`). Already merged and subsumed are read at the commit
+  too (`collide.PathMatchesUpstreamAt`, `gitx.FileChangeSubsumedAt`, #259
+  review: off, landed work blocked permanently), and untracked is false (its
+  change is committed); NO git runs in its directory, which for a #255 entry
+  reads the checkout around it (round 1 found git still ran there before a
+  guard discarded the answer). The at-commit diffs run at the work tree's top
+  (`topDir`): a `-- <path>` pathspec is cwd-relative, and from a subdirectory
+  the grade read clear. Its branch comes from `git worktree list` too (a
+  checkout git no longer recognises lost its claim and PR). ⚠ Known: diff
+  attributes come from the current checkout, not the window's commit
+  (`--attr-source` needs git 2.40). Why untracked stays off: git run in a #255 entry's
   directory reads the checkout around it, and, the entry not under an
   ignored directory, its untracked read listed the window's committed file
   as the enclosing checkout's untracked one and turned a real add/add

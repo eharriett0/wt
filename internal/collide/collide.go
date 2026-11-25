@@ -130,7 +130,10 @@ func Scan(c *config.Config) ([]Window, error) {
 			// at the head git lists for it, from this repository.
 			if w.CommitsUnread && refs[i].Head != "" {
 				if files, err := gitx.CommittedFilesAt(c.Base, refs[i].Head); err == nil {
-					w.Touched, w.CommitsUnread, w.ReadAt = files, false, refs[i].Head
+					// Its branch too: git in its directory can't say it (a checkout
+					// git no longer recognises read "" and lost its claim and PR,
+					// #259 review).
+					w.Touched, w.CommitsUnread, w.ReadAt, w.Branch = files, false, refs[i].Head, refs[i].Branch
 				}
 			}
 			// Claims by the window's own branch: for a #255 entry, br is the
@@ -753,6 +756,18 @@ func NewOnly(ranges RangeFn) DocEditsFn {
 // since its own copies carry the headings it forked with.
 func SharedSectionsAcross(base string, worktrees []string, rel, delimiter string, edits DocEditsFn) (shared []string, graded bool) {
 	return SharedSectionsAcrossWith(base, worktrees, rel, delimiter, edits, nil)
+}
+
+// PathMatchesUpstreamAt is PathMatchesUpstream for a window read at its
+// commit head (#256, #259 review): head's copy of path, from this repository,
+// stands for both its working and its staged copy.
+func PathMatchesUpstreamAt(base, head, path string) (merged, known bool) {
+	up, upOK := gitx.RefBlob("", "origin/"+base, path)
+	if !upOK {
+		up, upOK = gitx.RefBlob("", base, path)
+	}
+	h, hOK := gitx.RefBlob("", head, path)
+	return mergedVerdict(up, upOK, h, hOK, h, hOK)
 }
 
 // ReadAt is the commit the window at worktree is read at (#256), "" for a
@@ -1471,9 +1486,12 @@ func Classify(w Window, base string, maxAge time.Duration, now time.Time) Window
 	} else {
 		f.Unshipped = -1
 	}
-	age, aerr := gitx.LastCommitAge(w.Worktree, now)
+	var age time.Duration
+	var aerr error
 	if w.ReadAt != "" {
-		age, aerr = gitx.CommitAge(w.ReadAt, now) // #256: by its head, not its directory
+		age, aerr = gitx.CommitAge(w.ReadAt, now) // #256: by its head, never its directory
+	} else {
+		age, aerr = gitx.LastCommitAge(w.Worktree, now)
 	}
 	if aerr == nil {
 		f.Age = age

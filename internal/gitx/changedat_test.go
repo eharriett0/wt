@@ -59,6 +59,19 @@ func TestChangedAt_matchesTheWorktreeReads(t *testing.T) {
 	writeFile(t, main, "PLAN.md", strings.Replace(plan, "## Alpha\n", "## Alpha two\n", 1))
 	runGit(t, main, "commit", "-qam", "base moves on")
 	t.Run("behind base", check)
+	// From a subdirectory: a `-- <path>` pathspec is read from git's working
+	// directory, so the at-commit reads must run at the top (#259 review).
+	if err := os.MkdirAll(filepath.Join(main, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(filepath.Join(main, "sub"))
+	t.Run("from a subdirectory", check)
+	t.Chdir(main)
+	// Subsumed, read at the commit, answers as in its directory.
+	sa, ka := FileChangeSubsumedAt("main", head, "x.go")
+	if sd, kd := FileChangeSubsumed(lane, "main", "x.go"); sa != sd || ka != kd {
+		t.Errorf("FileChangeSubsumedAt = %v, %v; in its directory %v, %v", sa, ka, sd, kd)
+	}
 
 	missing := strings.Repeat("1", 40)
 	if files, err := CommittedFilesAt("main", missing); err == nil {
