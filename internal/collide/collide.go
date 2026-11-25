@@ -101,7 +101,16 @@ func Scan(c *config.Config) ([]Window, error) {
 			br, _ := gitx.CurrentBranchIn(p)
 			touched, terr := gitx.TouchedFiles(p, c.Base)
 			w := Window{Worktree: p, Branch: br, Touched: touched}
-			if terr != nil && !refs[i].Bare && !(refs[i].Prunable && gone(p)) {
+			switch {
+			case refs[i].Bare || refs[i].Prunable && gone(p):
+				// no work tree to read
+			case refs[i].Prunable && terr == nil:
+				// #255: its .git link is gone but its directory is there, so
+				// git status ran in the work tree around it: what it read is
+				// not this window's. Named by its own branch, nothing of it read.
+				w.Branch, w.Touched = refs[i].Branch, nil
+				w.Unread, w.CommitsUnread = ErrNoGitLink, true
+			case terr != nil:
 				markUnread(&w, terr)
 			}
 			if e, ok := byWorktree[p]; ok {
@@ -116,6 +125,11 @@ func Scan(c *config.Config) ([]Window, error) {
 	readOwnEntry(c, ws, byWorktree)
 	return ws, nil
 }
+
+// ErrNoGitLink is the unread reason of a worktree git lists as prunable
+// whose directory is still there (#255): its .git file is gone, so git
+// reads the work tree around it (or nothing) instead.
+const ErrNoGitLink = "its .git link is missing (git lists it as prunable), so git reads the work tree around it, not this one"
 
 // markUnread records TouchedFiles' error on w (#253): the reason, and what
 // of the window was not read (#254 review).

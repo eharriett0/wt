@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -104,14 +105,15 @@ var gitOutput = func(dir string, env []string, stdin []byte, args ...string) ([]
 
 // gitOutputStderr is gitOutput for a call whose stderr matters even when it
 // succeeds: `git status` exits 0 yet names there the paths it could not read
-// (#254 review). On failure the *exec.ExitError carries stderr, as from
-// gitOutput.
+// (#254 review). It runs git in the C locale, so the "warning:" prefixes and
+// the system error text statusMissed reads are not translated. On failure
+// the *exec.ExitError carries stderr, as from gitOutput.
 var gitOutputStderr = func(dir string, args ...string) (stdout, stderr []byte, err error) {
 	cmd := exec.Command("git", args...)
 	if dir != "" {
 		cmd.Dir = dir
 	}
-	cmd.Env = scopedEnv()
+	cmd.Env = append(scopedEnv(), "LC_ALL=C")
 	var eb bytes.Buffer
 	cmd.Stderr = &eb
 	stdout, err = cmd.Output()
@@ -1345,12 +1347,15 @@ func (e *UnreadError) Error() string { return e.Reason.Error() }
 func (e *UnreadError) Unwrap() error { return e.Reason }
 
 // statusMissed is what a successful `git status` says on stderr it could not
-// read, condensed; "" when it read everything (#254 review). Measured, git
-// 2.39: "warning: could not open directory 'd/': Permission denied" (a
-// directory it can't list, so its untracked files are missing) and
+// read, condensed (capLines); "" when it read everything (#254 review).
+// Measured, git 2.39: "warning: could not open directory 'd/': Permission
+// denied" (a directory it can't list, so its untracked files are missing) and
 // "d/k.txt: Permission denied" (a tracked file it can't stat, so its edit is
-// missing). Other warnings (line endings, an unreadable global config) are
-// not about missed paths.
+// missing). A "<path>: <text>" line counts only when the text after its LAST
+// ": " is exactly a system error (errnoText): other stderr on a successful
+// status (line-ending warnings, an fsmonitor hook's or a post-index-change
+// hook's output, GIT_TRACE) names no missed path, and counting it named a
+// healthy window unread on every turn (#254 review, round 5).
 func statusMissed(stderr string) string {
 	var missed []string
 	for _, ln := range strings.Split(stderr, "\n") {
@@ -1360,11 +1365,34 @@ func statusMissed(stderr string) string {
 			missed = append(missed, ln)
 		case ln == "" || strings.HasPrefix(ln, "warning:") || strings.HasPrefix(ln, "hint:") ||
 			strings.HasPrefix(ln, "error:") || strings.HasPrefix(ln, "fatal:"):
-		case strings.Contains(ln, ": "):
-			missed = append(missed, ln) // "<path>: <errno text>"
+		default:
+			if i := strings.LastIndex(ln, ": "); i > 0 && errnoText(ln[i+2:]) {
+				missed = append(missed, ln) // "<path>: <system error>"
+			}
 		}
 	}
-	return strings.Join(missed, "; ")
+	return capLines(missed, 3)
+}
+
+// errnoText reports whether s is a system error's text, as git prints
+// strerror in the C locale ("Permission denied"), matched without case.
+func errnoText(s string) bool {
+	for e := syscall.Errno(1); e < 256; e++ {
+		if t := e.Error(); !strings.HasPrefix(t, "errno ") && strings.EqualFold(t, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// capLines joins at most max of lines with "; ", then says how many more:
+// an unread reason rides on every hook and status line, and one unreadable
+// directory of tracked files gave a line per file (#254 review).
+func capLines(lines []string, max int) string {
+	if len(lines) <= max {
+		return strings.Join(lines, "; ")
+	}
+	return fmt.Sprintf("%s; and %d more", strings.Join(lines[:max], "; "), len(lines)-max)
 }
 
 // ErrGitDirOnly is TouchedFiles' error for a worktree entry that is itself a
@@ -1415,7 +1443,7 @@ func exitText(err error) string {
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
 		if msg := gitStderr(string(ee.Stderr)); msg != "" {
-			return msg
+			return capLines(strings.Split(msg, "; "), 3)
 		}
 	}
 	return err.Error()

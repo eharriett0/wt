@@ -423,6 +423,27 @@ func TestScan_worktreeStates(t *testing.T) {
 		}
 	}
 	writeT(t, spaced, "notes.txt", "spaced edit\n")
+	// Nested worktrees (#255), in an ignored directory: one healthy (the
+	// control), one whose .git file is gone, one left as an empty directory
+	// (an unmounted volume's mount point). git lists the last two as
+	// prunable, and git status there SUCCEEDS on the main checkout.
+	writeT(t, root, ".gitignore", ".wt/\n")
+	nest := map[string]string{}
+	for _, n := range []string{"ok", "nogit", "empty"} {
+		nest[n] = filepath.Join(root, ".wt", n)
+		gitT(t, root, "worktree", "add", "-q", "-b", "n-"+n, nest[n], "main")
+		writeT(t, nest[n], "n-"+n+".txt", "nested edit\n")
+	}
+	if err := os.Remove(filepath.Join(nest["nogit"], ".git")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(nest["empty"], filepath.Join(dirs, "empty-unmounted")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(nest["empty"], 0o755); err != nil {
+		t.Fatal(err)
+	}
+
 	// A worktree git reads, except for a directory it can't list: partly
 	// unread, the rest kept (#254 review).
 	partial := ""
@@ -449,6 +470,15 @@ func TestScan_worktreeStates(t *testing.T) {
 		t.Cleanup(func() { _ = os.Chmod(shut, 0o755) })
 	}
 	ws := scan(t, root)
+	if w, ok := at(ws, nest["ok"]); !ok || w.Unread != "" || !has(w.Touched, "n-ok.txt") {
+		t.Errorf("healthy nested worktree: %+v (listed %v), want read, with its edit", w, ok)
+	}
+	for _, n := range []string{"nogit", "empty"} {
+		w, ok := at(ws, nest[n])
+		if !ok || w.Unread != collide.ErrNoGitLink || len(w.Touched) != 0 || w.Branch != "n-"+n || collide.NotCompared(w) != "all" {
+			t.Errorf("nested worktree %s: %+v (listed %v), want unread (%s), nothing attributed, its own branch", n, w, ok, collide.ErrNoGitLink)
+		}
+	}
 	if partial != "" {
 		if w, ok := at(ws, partial); !ok || !w.UnreadSome || !strings.Contains(w.Unread, "could not open directory 'u/'") || !has(w.Touched, "p.txt") || collide.NotCompared(w) != "some_uncommitted" {
 			t.Errorf("worktree with a directory git can't list: %+v (listed %v), want partly unread, its readable edit kept", w, ok)

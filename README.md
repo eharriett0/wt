@@ -147,9 +147,13 @@ there (a broken branch or index), and as its working copy can't be read, an
 overlap there is indeterminate and so HIGH, like any grade wt can't compute;
 its tag then reads `working tree unread`, not `uncommitted edits`. When git
 fails before reading anything there (a directory it can't enter, a checkout
-it no longer recognises, a branch at a missing object), none of its edits are
-compared, committed or not; when `git status` works but says it could not read
-some paths, only those are missing. The note says which. In JSON it is
+it no longer recognises, a branch at a missing object), or its commits can't
+be listed (no base, an unborn branch), none of its edits are compared,
+committed or not; when `git status` works but says it could not read some
+paths, only those are missing. The note says which. A worktree whose `.git`
+file is gone while its directory is still there (an unmounted volume left as
+an empty mount point, a deleted link) is unread too: git would read the work
+tree around it instead. In JSON it is
 `unread` and `not_compared` (`uncommitted`, `some_uncommitted` or `all`) on
 the window (`wt status --json`, MCP `wt_status`), and `unread_windows`
 (`window`, `worktree`, `error`, `not_compared`) in `wt check --json` and MCP

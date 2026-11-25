@@ -2,6 +2,7 @@ package gitx
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -563,5 +564,42 @@ func TestStatusMissed(t *testing.T) {
 	}
 	if got := statusMissed("warning: in the working copy of 'a.txt', CRLF will be replaced by LF\n"); got != "" {
 		t.Errorf("a line-ending warning only: %q, want none", got)
+	}
+	// Measured in review: stderr a successful status carries that names no
+	// missed path (an fsmonitor hook without watchman, GIT_TRACE, a hook).
+	for _, noise := range []string{
+		"open2: exec of watchman -j --no-pretty failed: No such file or directory at .git/hooks/fsmonitor-watchman line 78.",
+		"15:04:05.123456 git.c:460               trace: built-in: git status --porcelain",
+		"post-index-change: index rewritten",
+		"note: Permission denied for nothing in particular",
+	} {
+		if got := statusMissed(noise + "\n"); got != "" {
+			t.Errorf("statusMissed(%q) = %q, want none", noise, got)
+		}
+	}
+	// A path holding ": " is still one path; many lines are capped.
+	if got := statusMissed("a: b.txt: Permission denied\n"); got != "a: b.txt: Permission denied" {
+		t.Errorf("a path with \": \" in it: %q", got)
+	}
+	var many strings.Builder
+	for i := 0; i < 300; i++ {
+		fmt.Fprintf(&many, "d/f%d.txt: Permission denied\n", i)
+	}
+	if got := statusMissed(many.String()); !strings.HasSuffix(got, "; and 297 more") || strings.Count(got, "Permission denied") != 3 {
+		t.Errorf("300 lines: %q, want 3 and a count", got)
+	}
+}
+
+// A failed git call's reason is capped like a partial read's (#254 review):
+// it rides on every hook and status line.
+func TestExitText_capped(t *testing.T) {
+	var stderr strings.Builder
+	for i := 0; i < 50; i++ {
+		fmt.Fprintf(&stderr, "error: d/f%d.txt: Permission denied\n", i)
+	}
+	stderr.WriteString("fatal: cannot read the index\n")
+	got := exitText(&exec.ExitError{Stderr: []byte(stderr.String())})
+	if !strings.HasSuffix(got, "; and 48 more") || strings.Count(got, "Permission denied") != 3 {
+		t.Errorf("exitText of 51 lines = %q, want 3 and a count", got)
 	}
 }

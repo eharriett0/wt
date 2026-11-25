@@ -67,7 +67,15 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   git also says prunable for a directory it can't enter) and a bare repository
   (`WorktreeRef.Bare`; `gitx.statusError` asks `--git-dir`, since a directory
   merely INSIDE a bare repo walks up into it); naming either repeated a false
-  warning on every agent turn (measured in review). A LOCKED worktree whose directory is gone is
+  warning on every agent turn (measured in review). A prunable worktree whose
+  directory EXISTS (its .git file gone: an empty mount point, a deleted link)
+  is unread (`collide.ErrNoGitLink`, #255): `git status` there walks up and
+  SUCCEEDS on the enclosing work tree, so its result is dropped, never
+  attributed to it. `statusMissed` counts a `<path>: <text>` line only when
+  the text after the last ": " is exactly a system error (`errnoText`, git run
+  with LC_ALL=C): an fsmonitor hook, GIT_TRACE or a hook's output on a
+  successful status made healthy windows unread (round 5). Reasons are capped
+  at 3 lines (`capLines`). A LOCKED worktree whose directory is gone is
   unread: its edits sit on an unmounted volume. A `--separate-git-dir`
   repo's main entry is its git dir (`gitx.ErrGitDirOnly`), and a submodule
   with linked worktrees lists its checkout as `.git/modules/<name>`: `Scan`
