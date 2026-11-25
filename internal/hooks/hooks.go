@@ -243,6 +243,10 @@ func HookPrePush(c *config.Config, stdin io.Reader) int {
 			if !gitx.BaseResolves(root, base) {
 				ui.Warn("%s", collide.NoBaseNote(base))
 			}
+			// #253: a window git can't read is named, never blocking.
+			if note := collide.UnreadNote(collide.UnreadWindows(ws, root)); note != "" {
+				ui.Warn("%s", note)
+			}
 		}
 		if pushCollisionBlocks(c, ws, root, outgoingPaths(root, base, localSHA)) {
 			code = 1
@@ -518,6 +522,9 @@ func HookPreCommit(c *config.Config) int {
 		return 0
 	}
 	root, _ := gitx.RepoRoot()
+	if note := collide.UnreadNote(collide.UnreadWindows(ws, root)); note != "" { // #253
+		ui.Warn("%s", note)
+	}
 
 	if len(stagedFiles) > 0 {
 		if conflicts := pathConflicts(ws, root, stagedFiles); len(conflicts) > 0 {

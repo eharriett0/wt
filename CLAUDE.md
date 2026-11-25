@@ -43,7 +43,73 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   only *definitively*-inert states (merged / dormant / closed-PR). A **dirty**
   worktree is NEVER suppressed — even a far-behind base checkout stays HIGH and
   is only *labelled* "likely stale" (#87). Uncomputable/offline → surfaced, not
-  hidden.
+  hidden. ⚠ **A window git can't read is named, never "no changes" (#253).**
+  `TouchedFiles` returns git status's failure (a branch holding a missing
+  object, an unreadable index; an `index.lock` does NOT fail it, measured on
+  git 2.39), `Scan` sets `Window.Unread`, and every surface names it through
+  `collide.UnreadWindows`/`UnreadNote`: `wt status` (`UNREAD`, `unread` in
+  JSON and MCP), `wt check` text/`--blocking`/JSON/MCP (`unread_windows`, the
+  clear qualified by `clearScope`), both edit hooks (`withUnreadNote`), the
+  per-turn context, pre-push (once a push) and pre-commit. Being unread NEVER
+  blocks (decided in #253): no path can be tied to it, so blocking would stop
+  every edit in every window until the worktree is repaired. A path the
+  window COMMITTED is still graded when git runs there (a broken branch or
+  index), and its unreadable working copy makes that grade indeterminate, so
+  HIGH (the fail-safe; never hidden); its tag reads `working tree unread`
+  (`WindowLiveness.Unread`), not `uncommitted edits`, and status explains the
+  indeterminate overlap by it (`indeterminateDetail`) (#254 review). When git
+  can't run in the directory at all (`gitx.ErrNoDir`), none of its edits are
+  compared, committed or not, and `collide.UnreadScope` says so. The #93 unknown-path refusal names unread windows too: one
+  may be creating that path. The committed diff
+  failing stays silent: it fails for an unborn or unrelated branch too. An
+  entry with no work tree is NOT unread: one git lists as prunable whose
+  directory is really gone (`WorktreeRef.Prunable` plus a stat in `Scan`:
+  git also says prunable for a directory it can't enter) and a bare repository
+  (`WorktreeRef.Bare`; `gitx.statusError` asks `--git-dir`, since a directory
+  merely INSIDE a bare repo walks up into it); naming either repeated a false
+  warning on every agent turn (measured in review). A prunable worktree whose
+  directory EXISTS (its .git file gone: an empty mount point, a deleted link)
+  is unread (`collide.ErrNoGitLink`, #255) under ITS OWN branch. Decided by
+  stat (`<dir>/.git` missing, linked worktrees only), not by git's prunable
+  flag: git never lists a LOCKED worktree as prunable, and a locked one on an
+  unmounted volume read the enclosing checkout as its own (round 7).
+  (`WorktreeRef.Branch`, which also keys its claim): nested, `git status`
+  there walks up into the enclosing work tree, and whatever that read or
+  failed on (it may be partly unread itself) is dropped, never attributed to
+  it; not nested, git fails there. Only a directory git can't enter keeps its
+  `ErrNoDir` reason (git calls that prunable too). `statusMissed` counts a `<path>: <text>` line only when
+  that path's first component exists in the window or in a submodule
+  `.gitmodules` lists (`pathInWindow`; git prints them relative to the work
+  tree or that submodule, run with LC_ALL=C; never under `.git`, where a
+  failing hook names itself): an fsmonitor hook, GIT_TRACE
+  or a hook's output on a successful status made healthy windows unread
+  (rounds 5, 6), and matching the error text missed musl's wording. Owner
+  pane 11-25: narrow it, then merge; a hook that prints an EXISTING path can
+  still mark a window partly unread (named, never blocking). Reasons are capped
+  at 3 lines (`capLines`). A LOCKED worktree whose directory is gone is
+  unread: its edits sit on an unmounted volume. A `--separate-git-dir`
+  repo's main entry is its git dir (`gitx.ErrGitDirOnly`), and a submodule
+  with linked worktrees lists its checkout as `.git/modules/<name>`: `Scan`
+  reads such an entry by its work tree from inside it (`readOwnEntry`, keyed
+  on `gitx.GitDir`), and other windows see it as listed. Worktree paths are
+  taken verbatim from git, and so are `RepoRoot` and `WorktreeToplevel`
+  (`runPath`): trimming a path that ends in a space read a directory that
+  doesn't exist, and a window there then graded its own edit. When git never ran
+  because of the directory, it is `ErrNoDir`: Go's start-up stat failed
+  (`chdir`) or the child could not enter it (`fork/exec` + permission denied,
+  which mode 644 also gives); any other start failure (EMFILE) keeps its text.
+  What was NOT compared is measured, not inferred from the reason:
+  `gitx.UnreadError.CommitsRead` (did the committed diff run) and `.Partial`
+  (`git status` exited 0 but named paths on stderr, `statusMissed`: it drops
+  an edit under a directory it can't search, silently, measured) feed
+  `collide.NotCompared` (`uncommitted`/`some_uncommitted`/`all`), the note,
+  status and the JSON `not_compared`.
+  `ErrGitDirOnly` also needs `--show-toplevel` to fail there: a submodule's
+  `.git/modules/<name>` is its own git dir but has a work tree
+  (core.worktree), so its failures keep git's reason.
+  Pinned by `TestUnreadWindow_namedEverywhere` (every surface, with a healthy
+  control), `TestScan_worktreeStates`, `TestWorktreeList_PrunableLockedVerbatim`
+  and `TestTouchedFiles_UnreadIsAnError`.
 - **A window's ranges are its OWN edits, in BASE line numbers (#29/#142/#184).**
   Diffed straight from base, a branch BEHIND base reads every line base inserted
   or modified after it forked as its own edit (it still holds the old text), so

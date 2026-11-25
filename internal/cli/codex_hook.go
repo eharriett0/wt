@@ -322,7 +322,14 @@ func hookOverlapMessage(c *config.Config) (string, bool) {
 	// Graded the way `wt check` grades from THIS window (#182) — the banner used
 	// to run its own all-windows grade and said HIGH where check said low.
 	overlaps, current := agentContextOverlaps(c, ws, root), collide.LabelForWorktree(ws, root)
-	return codexContextMessage(overlaps, current, labelSessionNotes(ws, current, overlaps, worktreeSessionNotes(c)))
+	msg, has := codexContextMessage(overlaps, current, labelSessionNotes(ws, current, overlaps, worktreeSessionNotes(c)))
+	if note := collide.UnreadNote(collide.UnreadWindows(ws, root)); note != "" { // #253
+		if has {
+			msg += "\n"
+		}
+		msg, has = msg+"wt: "+note, true
+	}
+	return msg, has
 }
 
 // coordLogExists reports whether this repo has a coordination log yet — the
@@ -735,7 +742,8 @@ func hookCodexEdit(r io.Reader) int {
 			high[i].entry.liveNote = note(high[i].entry.otherWorktree)
 		}
 	}
-	if out, has := codexEditDecision(high, os.Getenv("WT_CODEX_HOOK_BLOCK") == "1" && anyConfirmed); has {
+	out, has := codexEditDecision(high, os.Getenv("WT_CODEX_HOOK_BLOCK") == "1" && anyConfirmed)
+	if out, has = withUnreadNote(out, has, collide.UnreadNote(collide.UnreadWindows(ws, root))); has { // #253
 		fmt.Println(out)
 	}
 	return 0

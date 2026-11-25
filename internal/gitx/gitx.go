@@ -5,6 +5,7 @@ package gitx
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -101,6 +102,27 @@ var gitOutput = func(dir string, env []string, stdin []byte, args ...string) ([]
 	return cmd.Output()
 }
 
+// gitOutputStderr is gitOutput for a call whose stderr matters even when it
+// succeeds: `git status` exits 0 yet names there the paths it could not read
+// (#254 review). It runs git in the C locale, so the "warning:" prefix
+// statusMissed reads is not translated. On failure
+// the *exec.ExitError carries stderr, as from gitOutput.
+var gitOutputStderr = func(dir string, args ...string) (stdout, stderr []byte, err error) {
+	cmd := exec.Command("git", args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	cmd.Env = append(scopedEnv(), "LC_ALL=C")
+	var eb bytes.Buffer
+	cmd.Stderr = &eb
+	stdout, err = cmd.Output()
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		ee.Stderr = eb.Bytes()
+	}
+	return stdout, eb.Bytes(), err
+}
+
 // run executes git with args in dir ("" = current dir) and returns trimmed
 // stdout. stderr is discarded; callers branch on err.
 func run(dir string, args ...string) (string, error) {
@@ -132,7 +154,10 @@ func runReporting(dir string, args ...string) (string, error) {
 
 // gitStderr condenses git's stderr for an error message: blank lines and git's
 // "hint:" lines dropped, the rest joined with "; ". Pure.
-func gitStderr(s string) string {
+func gitStderr(s string) string { return strings.Join(gitStderrLines(s), "; ") }
+
+// gitStderrLines is gitStderr's lines before joining.
+func gitStderrLines(s string) []string {
 	var lines []string
 	for _, ln := range strings.Split(s, "\n") {
 		ln = strings.TrimSpace(ln)
@@ -141,7 +166,7 @@ func gitStderr(s string) string {
 		}
 		lines = append(lines, ln)
 	}
-	return strings.Join(lines, "; ")
+	return lines
 }
 
 // noRenames is the flag every `git diff --name-only` feeding the collision
@@ -275,8 +300,22 @@ func Present() bool {
 	return err == nil
 }
 
-// RepoRoot returns the top-level dir of the repo containing cwd.
-func RepoRoot() (string, error) { return Run("rev-parse", "--show-toplevel") }
+// RepoRoot returns the top-level dir of the repo containing cwd, whole: a
+// worktree path may end in a space, and Scan's paths are read verbatim (#254
+// review).
+func RepoRoot() (string, error) { return runPath("", "rev-parse", "--show-toplevel") }
+
+// GitDir returns the absolute git directory of the work tree containing cwd.
+func GitDir() (string, error) {
+	return runPath("", "rev-parse", "--path-format=absolute", "--git-dir")
+}
+
+// runPath is run for a command that prints one path: only the trailing
+// newline is cut, since a path may end in a space (#254 review).
+func runPath(dir string, args ...string) (string, error) {
+	out, err := runRaw(dir, args...)
+	return strings.TrimSuffix(out, "\n"), err
+}
 
 // ShowPrefix returns cwd's path relative to the top of its worktree, as git
 // sees it: "pkg/svc/" in a subdirectory, "" at the root. Used to read a path the
@@ -517,7 +556,7 @@ func pickExactRef(out, ref string) string {
 // wt tells its own worktree from a stray directory under the main checkout
 // (#198 review).
 func WorktreeToplevel(dir string) string {
-	out, err := RunDir(dir, "rev-parse", "--show-toplevel")
+	out, err := runPath(dir, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return ""
 	}
@@ -665,6 +704,9 @@ func FastForwardBranch(branch, from, to string) error {
 }
 
 // WorktreePaths lists every worktree path (primary first), via porcelain.
+//
+// Each path is taken verbatim: a worktree path may end in a space, and
+// trimming it named a directory that doesn't exist (#253 review).
 func WorktreePaths() ([]string, error) {
 	out, err := Run("worktree", "list", "--porcelain")
 	if err != nil {
@@ -673,7 +715,7 @@ func WorktreePaths() ([]string, error) {
 	var paths []string
 	for _, ln := range strings.Split(out, "\n") {
 		if strings.HasPrefix(ln, "worktree ") {
-			paths = append(paths, strings.TrimSpace(strings.TrimPrefix(ln, "worktree ")))
+			paths = append(paths, strings.TrimPrefix(ln, "worktree "))
 		}
 	}
 	return paths, nil
@@ -694,7 +736,7 @@ func WorktreeBranchesUnder(root string) ([]string, error) {
 	for _, ln := range strings.Split(out, "\n") {
 		switch {
 		case strings.HasPrefix(ln, "worktree "):
-			curPath = strings.TrimSpace(strings.TrimPrefix(ln, "worktree "))
+			curPath = strings.TrimPrefix(ln, "worktree ")
 		case strings.HasPrefix(ln, "branch "):
 			br := strings.TrimPrefix(strings.TrimSpace(strings.TrimPrefix(ln, "branch ")), "refs/heads/")
 			if br != "" && pathUnder(curPath, root) {
@@ -715,6 +757,11 @@ type WorktreeRef struct {
 	// worktrees beside or inside it): listed first, with no work tree (#201
 	// review).
 	Bare bool
+	// Prunable: git lists it as prunable: it can't reach the worktree's .git
+	// file (the directory is gone, the .git file deleted, or a directory it
+	// can't enter) and the worktree is not locked (#253 review). A locked one
+	// whose directory is gone (an unmounted volume) is not.
+	Prunable bool
 }
 
 // BareWorktreesIn lists the bare entries of `git worktree list` run in dir: a
@@ -758,7 +805,7 @@ func WorktreeListIn(dir string) ([]WorktreeRef, error) {
 		switch {
 		case strings.HasPrefix(ln, "worktree "):
 			flush()
-			cur.Path = strings.TrimSpace(strings.TrimPrefix(ln, "worktree "))
+			cur.Path = strings.TrimPrefix(ln, "worktree ")
 		case strings.HasPrefix(ln, "branch "):
 			cur.Branch = strings.TrimPrefix(strings.TrimSpace(strings.TrimPrefix(ln, "branch ")), "refs/heads/")
 		case strings.HasPrefix(ln, "HEAD "):
@@ -769,6 +816,8 @@ func WorktreeListIn(dir string) ([]WorktreeRef, error) {
 			cur.Locked = true
 		case ln == "bare":
 			cur.Bare = true
+		case ln == "prunable" || strings.HasPrefix(ln, "prunable "):
+			cur.Prunable = true
 		}
 	}
 	flush()
@@ -1220,7 +1269,18 @@ func parseMergeTreeConflictPaths(out string) []string {
 // TouchedFiles returns the union of (a) uncommitted changes in the worktree at
 // dir and (b) files this branch changed vs base (merge-base diff). This is the
 // "what is this window working on right now" set used for collision detection.
-func TouchedFiles(dir, base string) []string {
+//
+// err (an *UnreadError) is non-nil when (a) can't be read: `git status` fails,
+// as it does for a branch holding an object the repo lacks or an unreadable
+// index (an index.lock does not fail it; measured, git 2.39), or it succeeds
+// but says it could not read some paths (Partial, statusMissed). The window
+// is then unread, never "no changes" (#253); files holds what was read, and
+// CommitsRead says whether (b) was. See statusError for the reasons (ErrNoDir,
+// ErrGitDirOnly); Scan leaves out a bare repository, and a worktree git lists
+// as prunable whose directory is gone. (b) failing alone is no error: it fails
+// for a branch with no commits, with no base, or with no merge base with it,
+// and those have nothing committed to list.
+func TouchedFiles(dir, base string) (files []string, err error) {
 	set := map[string]struct{}{}
 
 	// (a) uncommitted (staged + unstaged + untracked) via porcelain, -z and
@@ -1235,29 +1295,191 @@ func TouchedFiles(dir, base string) []string {
 	// collision under a freshly-created dir goes silently undetected. -uall
 	// lists each new file at its full path. Gitignored files stay excluded, so
 	// the cost is bounded to genuinely-new files.
-	if out, err := runRaw(dir, "status", "--porcelain", nulPaths, "--untracked-files=all"); err == nil {
-		for _, p := range parsePorcelainZ(out) {
+	var unread error
+	partial := false
+	if out, stderr, serr := gitOutputStderr(dir, "status", "--porcelain", nulPaths, "--untracked-files=all"); serr == nil {
+		for _, p := range parsePorcelainZ(string(out)) {
 			set[p] = struct{}{}
 		}
+		if missed := statusMissed(dir, string(stderr)); missed != "" {
+			unread, partial = fmt.Errorf("git status: %s", missed), true
+		}
+	} else {
+		unread = statusError(dir, serr)
 	}
 
 	// (b) committed-on-branch vs base (three-dot = since merge-base). A COMMITTED
 	// move records both paths too (noRenames), like the staged one above, and
 	// every path is verbatim (nulPaths).
+	commitsRead := false
 	for _, ref := range []string{"origin/" + base, base} {
 		if out, err := runRaw(dir, "diff", "--name-only", noRenames, nulPaths, ref+"...HEAD"); err == nil {
 			for _, p := range splitNUL(out) {
 				set[p] = struct{}{}
 			}
+			commitsRead = true
 			break // first ref that resolves wins
 		}
 	}
 
-	files := make([]string, 0, len(set))
+	files = make([]string, 0, len(set))
 	for f := range set {
 		files = append(files, f)
 	}
-	return files
+	if unread != nil {
+		err = &UnreadError{Reason: unread, Partial: partial, CommitsRead: commitsRead}
+	}
+	return files, err
+}
+
+// UnreadError is TouchedFiles' error (#253): why the window's uncommitted
+// changes were not (all) read, and what of it was (#254 review).
+type UnreadError struct {
+	Reason error
+	// Partial: git status succeeded but said it could not read some paths;
+	// the rest were read.
+	Partial bool
+	// CommitsRead: the branch's committed changes were listed. When git
+	// failed before reading anything there (a directory it can't enter, a
+	// checkout git no longer recognises, a branch at a missing object), they
+	// were not.
+	CommitsRead bool
+}
+
+func (e *UnreadError) Error() string { return e.Reason.Error() }
+func (e *UnreadError) Unwrap() error { return e.Reason }
+
+// statusMissed is what a successful `git status` says on stderr it could not
+// read, condensed (capLines); "" when it read everything (#254 review).
+// Measured, git 2.39: "warning: could not open directory 'd/': Permission
+// denied" (a directory it can't list, so its untracked files are missing) and
+// "d/k.txt: Permission denied" (a tracked file it can't stat, so its edit is
+// missing). A "<path>: <text>" line counts only when its path (before the
+// LAST ": ", so a path holding ": " stays whole) is in dir: its first
+// component exists there, as git prints these relative to the work tree.
+// Other stderr on a successful status (line endings, an fsmonitor hook's or
+// a post-index-change hook's output, GIT_TRACE) names no path in the window,
+// and counting it named a healthy window unread on every turn (review rounds
+// 5, 6). The error text itself is not matched: musl words it differently
+// from glibc and macOS ("Symbolic link loop").
+func statusMissed(dir, stderr string) string {
+	var missed []string
+	for _, ln := range strings.Split(stderr, "\n") {
+		ln = strings.TrimSpace(ln)
+		switch {
+		case strings.HasPrefix(ln, "warning: could not open directory "):
+			missed = append(missed, ln)
+		case ln == "" || strings.HasPrefix(ln, "warning:") || strings.HasPrefix(ln, "hint:") ||
+			strings.HasPrefix(ln, "error:") || strings.HasPrefix(ln, "fatal:"):
+		default:
+			if i := strings.LastIndex(ln, ": "); i > 0 && pathInWindow(dir, ln[:i]) {
+				missed = append(missed, ln) // "<path>: <error>"
+			}
+		}
+	}
+	return capLines(missed, 3)
+}
+
+// pathIn reports whether p, as git prints a work tree path (relative,
+// slash-separated), names something in dir: its first component exists
+// there. The rest may not be reachable, which is why git complained. Never
+// under .git: git reports no missed read there, but a failing hook's own
+// error names `.git/hooks/<hook>` (round 7).
+func pathIn(dir, p string) bool {
+	if p == "" || filepath.IsAbs(p) {
+		return false
+	}
+	first, _, _ := strings.Cut(p, "/")
+	if first == "" || first == "." || first == ".." || first == ".git" {
+		return false
+	}
+	_, err := os.Lstat(filepath.Join(dir, first))
+	return err == nil
+}
+
+// pathInWindow is pathIn for the window at dir or any submodule
+// .gitmodules lists in it: git prints a path it could not read inside a
+// submodule relative to that submodule (round 7). .gitmodules is read only
+// here, after status printed a candidate line.
+func pathInWindow(dir, p string) bool {
+	if pathIn(dir, p) {
+		return true
+	}
+	b, err := os.ReadFile(filepath.Join(dir, ".gitmodules"))
+	if err != nil {
+		return false
+	}
+	for _, ln := range strings.Split(string(b), "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(ln), "=")
+		if ok && strings.TrimSpace(k) == "path" && pathIn(filepath.Join(dir, strings.TrimSpace(v)), p) {
+			return true
+		}
+	}
+	return false
+}
+
+// capLines joins at most max of lines with "; ", then says how many more:
+// an unread reason rides on every hook and status line, and one unreadable
+// directory of tracked files gave a line per file (#254 review).
+func capLines(lines []string, max int) string {
+	if len(lines) <= max {
+		return strings.Join(lines, "; ")
+	}
+	return fmt.Sprintf("%s; and %d more", strings.Join(lines[:max], "; "), len(lines)-max)
+}
+
+// ErrGitDirOnly is TouchedFiles' error for a worktree entry that is itself a
+// git directory: a bare repository (Scan leaves those out: no work tree), or
+// the main entry of a `--separate-git-dir` repository, whose work tree exists
+// but git does not say where (#253 review).
+var ErrGitDirOnly = errors.New("it is the repository's git directory, and git does not list where its work tree is (a --separate-git-dir layout)")
+
+// ErrNoDir is TouchedFiles' error when git could not run in the directory at
+// all (gone but locked, or one it can't enter, even one it may read): neither
+// its uncommitted nor its committed changes were read (#254 review).
+var ErrNoDir = errors.New("directory unreadable")
+
+// statusError is why `git status` failed in dir (serr). When git never ran
+// because of dir itself, it is ErrNoDir: Go's start-up stat of the directory
+// failed ("chdir", e.g. it is gone), or the child could not enter it ("fork/
+// exec" with permission denied, which a directory it may read but not enter
+// also gives). Any other start failure (too many open files) keeps its own
+// text. A dir that is itself a git directory with no work tree git knows is
+// ErrGitDirOnly. A submodule's git dir has one (core.worktree), and a
+// directory merely inside a git directory (a worktree nested in a bare
+// repository that lost its .git file) is no git directory: both are real
+// failures, with git's reason. Asked only after status fails.
+func statusError(dir string, serr error) error {
+	var ee *exec.ExitError
+	if !errors.As(serr, &ee) {
+		var pe *os.PathError
+		switch {
+		case errors.As(serr, &pe) && pe.Op == "chdir":
+			return fmt.Errorf("%w: %v", ErrNoDir, pe)
+		case errors.As(serr, &pe) && pe.Op == "fork/exec" && errors.Is(pe.Err, os.ErrPermission):
+			return fmt.Errorf("%w: can't enter %s: %v", ErrNoDir, dir, pe.Err)
+		}
+		return fmt.Errorf("git status: %v", serr)
+	}
+	if gd, err := runPath(dir, "rev-parse", "--path-format=absolute", "--git-dir"); err == nil && resolvedPath(gd) == resolvedPath(dir) {
+		if _, terr := runPath(dir, "rev-parse", "--show-toplevel"); terr != nil {
+			return ErrGitDirOnly
+		}
+	}
+	return fmt.Errorf("git status: %s", exitText(serr))
+}
+
+// exitText is a failed git call's error as git put it: the stderr an
+// *exec.ExitError from Output carries, condensed by gitStderr, else err's
+// own text.
+func exitText(err error) string {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		if lines := gitStderrLines(string(ee.Stderr)); len(lines) > 0 {
+			return capLines(lines, 3) // capped by line, never mid-path (round 6)
+		}
+	}
+	return err.Error()
 }
 
 // LineRange is a 1-based inclusive span of lines. ChangedRanges emits these in

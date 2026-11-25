@@ -135,6 +135,38 @@ prune-coord` drops marks older than a day, which `wt doctor` lists without a
 warning. One without the hooks shows only once it runs a coordination
 command.
 
+**A window wt can't read is named, never skipped.** When `git status` fails in
+another worktree (its branch holds an object the repository lacks, or its
+index can't be read; a `git add` running there does not), wt can't see that
+window's uncommitted edits. `wt status` marks it `UNREAD` with git's reason
+instead of `(no changes)`, and `wt check`, both edit hooks, the per-turn
+context, pre-push and pre-commit name it, with any clear qualified as being
+about the windows wt could read. Being unread never blocks, since no path can
+be tied to it. A file the window committed is still graded when git can run
+there (a broken branch or index), and as its working copy can't be read, an
+overlap there is indeterminate and so HIGH, like any grade wt can't compute;
+its tag then reads `working tree unread`, not `uncommitted edits`. When git
+fails before reading anything there (a directory it can't enter, a checkout
+it no longer recognises, a branch at a missing object), or its commits can't
+be listed (no base, an unborn branch), none of its edits are compared,
+committed or not; when `git status` works but says it could not read some
+paths, only those are missing. The note says which. A worktree whose `.git`
+file is gone while its directory is still there (an unmounted volume left as
+an empty mount point, a deleted link; locked or not) is unread too, under its
+own branch: git can't read it as its own work tree (nested, it would read the
+one around it). In JSON it is
+`unread` and `not_compared` (`uncommitted`, `some_uncommitted` or `all`) on
+the window (`wt status --json`, MCP `wt_status`), and `unread_windows`
+(`window`, `worktree`, `error`, `not_compared`) in `wt check --json` and MCP
+`wt_check`. When git itself failed there, run `git status` in
+that worktree to see what is wrong. Two entries are not unread, since neither has a work tree to hold
+edits: a worktree whose directory was deleted (git lists it as prunable; `git
+worktree prune` removes its record) and the bare repository of a bare-plus-worktrees
+layout. A locked worktree whose directory is gone (an unmounted volume) is
+unread: its edits still exist. In a `--separate-git-dir` repository git lists
+the main work tree by its git directory; wt reads it from inside that work
+tree, and other windows name it unread, since git does not say where it is.
+
 ### Stale branches don't count
 
 A file "collision" only matters if the other window can still *change* that

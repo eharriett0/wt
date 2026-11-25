@@ -8,6 +8,7 @@
 package collide
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -33,6 +34,14 @@ type Window struct {
 	Issue    string   // claimed issue number, or "" if unclaimed
 	Title    string   // claimed issue title, or ""
 	Touched  []string // files changed (uncommitted ∪ committed-on-branch vs base)
+	// Unread is why git could not read the window's uncommitted changes, ""
+	// when it could (#253). Touched then holds what was read, so the window
+	// is named, never shown as one with no changes.
+	Unread string
+	// UnreadSome: git read the window but said it could not read some paths
+	// (#254 review). CommitsUnread: its committed changes were not read
+	// either. See NotCompared.
+	UnreadSome, CommitsUnread bool
 }
 
 // Label is a short human identifier for a window.
@@ -49,9 +58,13 @@ func (w Window) Label() string {
 // Scan enumerates every worktree of the repo, its branch, claim info (matched
 // from the active-work file by worktree path then branch), and touched files.
 func Scan(c *config.Config) ([]Window, error) {
-	paths, err := gitx.WorktreePaths()
+	refs, err := gitx.WorktreeList()
 	if err != nil {
 		return nil, err
+	}
+	paths := make([]string, len(refs))
+	for i, r := range refs {
+		paths[i] = r.Path
 	}
 	claims := activework.Parse(activework.Read(c.ActiveWork))
 	byWorktree := map[string]activework.Entry{}
@@ -71,8 +84,11 @@ func Scan(c *config.Config) ([]Window, error) {
 	// inherited the cost since it also calls Scan. The reads are independent per
 	// worktree (separate working trees, read-only — no git-lock contention), so
 	// a bounded worker pool cuts wall time to roughly the slowest single
-	// worktree. Indexed writes preserve WorktreePaths order (stable output);
-	// per-worktree git errors stay swallowed, exactly as before.
+	// worktree. Indexed writes preserve `git worktree list` order (stable
+	// output). A window whose uncommitted changes can't be read is marked
+	// Unread (#253), except a bare repository (no work tree) and one git lists
+	// as prunable whose directory is gone (not locked, nothing to read); other
+	// per-worktree git errors stay swallowed, as before.
 	ws := make([]Window, len(paths))
 	sem := make(chan struct{}, scanWorkers())
 	var wg sync.WaitGroup
@@ -83,17 +99,107 @@ func Scan(c *config.Config) ([]Window, error) {
 			defer wg.Done()
 			defer func() { <-sem }()
 			br, _ := gitx.CurrentBranchIn(p)
-			w := Window{Worktree: p, Branch: br, Touched: gitx.TouchedFiles(p, c.Base)}
+			touched, terr := gitx.TouchedFiles(p, c.Base)
+			w := Window{Worktree: p, Branch: br, Touched: touched}
+			switch {
+			case refs[i].Bare || refs[i].Prunable && gone(p):
+				// no work tree to read
+			case i > 0 && !gone(p) && gone(filepath.Join(p, ".git")):
+				// #255: a linked worktree whose directory is there without its
+				// .git file (deleted, or an unmounted volume's empty mount
+				// point; locked or not, round 7): whatever git status read
+				// there (the work tree around it, which may itself be partly
+				// unread) or failed on is not this window's. Named by its own
+				// branch, nothing of it read.
+				w.Branch, w.Touched = refs[i].Branch, nil
+				w.Unread, w.UnreadSome, w.CommitsUnread = ErrNoGitLink, false, true
+			case terr != nil:
+				if errors.Is(terr, gitx.ErrNoDir) { // git never ran there: br is not its branch
+					w.Branch = refs[i].Branch
+				}
+				markUnread(&w, terr)
+			}
+			// Claims by the window's own branch: for a #255 entry, br is the
+			// enclosing work tree's (#254 review, round 6).
 			if e, ok := byWorktree[p]; ok {
 				w.Issue, w.Title = e.Issue, e.Title
-			} else if e, ok := byBranch[br]; ok {
+			} else if e, ok := byBranch[w.Branch]; ok {
 				w.Issue, w.Title = e.Issue, e.Title
 			}
 			ws[i] = w
 		}(i, p)
 	}
 	wg.Wait()
+	readOwnEntry(c, ws, byWorktree)
 	return ws, nil
+}
+
+// ErrNoGitLink is the unread reason of a linked worktree whose directory is
+// there without its .git file (#255): git reads the work tree around it, or
+// none. git lists it as prunable unless it is locked.
+const ErrNoGitLink = "its .git link is missing, so git can't read it as its own work tree"
+
+// markUnread records TouchedFiles' error on w (#253): the reason, and what
+// of the window was not read (#254 review).
+func markUnread(w *Window, err error) {
+	w.Unread = err.Error()
+	var ue *gitx.UnreadError
+	if errors.As(err, &ue) {
+		w.UnreadSome, w.CommitsUnread = ue.Partial, !ue.CommitsRead
+	}
+}
+
+// gone reports whether path no longer exists (a symlink is followed). git
+// lists a worktree as prunable when it can't reach the worktree's .git file,
+// which a directory it may not enter causes too (measured, git 2.39): only
+// one whose directory is gone has nothing to read (#254 review).
+func gone(path string) bool {
+	_, err := os.Stat(path)
+	return errors.Is(err, os.ErrNotExist)
+}
+
+// readOwnEntry reads, by its work tree, the window Scan runs in when git
+// lists it by its git directory instead (#254 review): the main work tree of
+// a `--separate-git-dir` repository (an entry TouchedFiles can't read,
+// gitx.ErrGitDirOnly) and the checkout of a submodule with linked worktrees
+// (an entry git reads through core.worktree). Left as listed, the window is
+// named unread to itself, or its own edits grade as another window's. Asked
+// only when no window is listed at this work tree's root (c.Root, which
+// config.Load read). From another window the entry stays as listed: git
+// does not say where that work tree is.
+func readOwnEntry(c *config.Config, ws []Window, byWorktree map[string]activework.Entry) {
+	root := c.Root
+	if root == "" {
+		r, err := gitx.RepoRoot()
+		if err != nil {
+			return
+		}
+		root = r
+	}
+	for _, w := range ws {
+		if sameWorktree(w.Worktree, root) {
+			return
+		}
+	}
+	gitDir, err := gitx.GitDir()
+	if err != nil {
+		return
+	}
+	for i := range ws {
+		if !sameWorktree(ws[i].Worktree, gitDir) {
+			continue
+		}
+		touched, terr := gitx.TouchedFiles(root, c.Base)
+		ws[i].Worktree, ws[i].Touched = root, touched
+		ws[i].Unread, ws[i].UnreadSome, ws[i].CommitsUnread = "", false, false
+		if terr != nil {
+			markUnread(&ws[i], terr)
+		}
+		if e, ok := byWorktree[root]; ok {
+			ws[i].Issue, ws[i].Title = e.Issue, e.Title
+		}
+		return
+	}
 }
 
 // scanWorkers bounds the concurrent per-worktree git reads in Scan: enough to
@@ -527,6 +633,69 @@ func IsSharedDoc(path string, shared []string) bool {
 // reads clear.
 func NoBaseNote(base string) string {
 	return fmt.Sprintf("no base branch resolves here (neither origin/%s nor %s): committed changes are not compared, so pushed commits, and a file another window only committed, read clear (`wt check` still compares uncommitted edits). Set `base` in .wt.conf to the branch windows start from.", base, base)
+}
+
+// UnreadWindows returns the windows of ws git could not read (Unread, #253),
+// in ws's order, leaving out the one whose worktree is self ("" leaves out
+// none): a window's own check says nothing about itself.
+func UnreadWindows(ws []Window, self string) []Window {
+	var out []Window
+	for _, w := range ws {
+		if w.Unread != "" && (self == "" || !sameWorktree(w.Worktree, self)) {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// UnreadNote is what every collision report says about windows git could not
+// read (#253): who, git's reason, and that their uncommitted edits are not
+// compared, so a clear is only about the windows that were read. "" for none.
+// It never blocks: an unread window can't be tied to any path.
+func UnreadNote(unread []Window) string {
+	switch len(unread) {
+	case 0:
+		return ""
+	case 1:
+		w := unread[0]
+		note := fmt.Sprintf("window %s could not be read (%s): %s.", w.Label(), w.Unread, UnreadScope(w))
+		if strings.HasPrefix(w.Unread, "git status: ") { // git's own failure, not gitx.ErrGitDirOnly
+			note += fmt.Sprintf(" Run `git status` in %s.", w.Worktree)
+		}
+		return note
+	}
+	parts := make([]string, len(unread))
+	for i, w := range unread {
+		parts[i] = fmt.Sprintf("%s at %s (%s)", w.Label(), w.Worktree, w.Unread)
+	}
+	return fmt.Sprintf("%d windows could not be read: %s. Edits wt could not read there are not compared.", len(unread), strings.Join(parts, "; "))
+}
+
+// NotCompared is what wt did not compare of an unread window (#253), as the
+// JSON says it: "some_uncommitted" (git read it but named paths it could
+// not), "all" (its commits were not read either), else "uncommitted"; "" for
+// a window that was read (#254 review).
+func NotCompared(w Window) string {
+	switch {
+	case w.Unread == "":
+		return ""
+	case w.UnreadSome:
+		return "some_uncommitted"
+	case w.CommitsUnread:
+		return "all"
+	}
+	return "uncommitted"
+}
+
+// UnreadScope is NotCompared in words, for the note and wt status.
+func UnreadScope(w Window) string {
+	switch NotCompared(w) {
+	case "some_uncommitted":
+		return "some of its uncommitted edits are not compared"
+	case "all":
+		return "none of its edits are compared, committed or not"
+	}
+	return "its uncommitted edits are not compared"
 }
 
 // RangeFn resolves the line ranges a worktree changed in a path, relative to
@@ -1018,6 +1187,10 @@ type WindowLiveness struct {
 	Dirty      bool          // the worktree also has uncommitted edits — noted on a suppressed level so a reopened-merged/closed branch is legible (#79 comment 2)
 	BehindBase int           // commits behind origin/base; >0 only computed for a dirty base checkout, enriches the LiveDirty "likely stale" label (#87)
 	Age        time.Duration // time since the branch's last commit (0 if unknown)
+	// Unread: git could not read the window's working tree (#253). IsClean
+	// failing counts it Dirty, so it is never hidden; the label says what is
+	// actually known (#254 review).
+	Unread bool
 }
 
 // Label is the plain (uncolored) liveness word, e.g. "open PR #747" or
@@ -1025,6 +1198,9 @@ type WindowLiveness struct {
 // edits note when a shipped/closed branch still has a dirty index.
 func (wl WindowLiveness) Label() string {
 	base := wl.Level.Tag()
+	if wl.Unread && wl.Level == LiveDirty { // #253: dirty only because it can't be read
+		base = "working tree unread"
+	}
 	if wl.Level == LiveOpenPR && wl.PR != "" {
 		base = "open PR #" + wl.PR
 	}
@@ -1044,8 +1220,11 @@ func (wl WindowLiveness) Label() string {
 	// #79 comment 2: when a shipped/closed branch ALSO has a leftover dirty index
 	// (the unresolvable false-HIGH case — `wt clean` won't remove the unshared
 	// index, so `check` would flag it forever), say WHY it's still only an FYI.
-	if wl.Dirty && (wl.Level == LiveStale || wl.Level == LiveClosedPR) {
+	if wl.Dirty && !wl.Unread && (wl.Level == LiveStale || wl.Level == LiveClosedPR) {
 		base += " · leftover uncommitted edits"
+	}
+	if wl.Unread && wl.Level != LiveDirty {
+		base += " · working tree unread"
 	}
 	// #168: a dirty worktree whose commits merged under another branch name stays
 	// HIGH (ClassifyFacts' tip exception). Name the PR so the reader can see the
@@ -1224,7 +1403,7 @@ func Classify(w Window, base string, maxAge time.Duration, now time.Time) Window
 			}
 		}
 	}
-	wl := WindowLiveness{Level: ClassifyFacts(f, maxAge), Age: f.Age, Dirty: f.Dirty, BehindBase: behindBase}
+	wl := WindowLiveness{Level: ClassifyFacts(f, maxAge), Age: f.Age, Dirty: f.Dirty, BehindBase: behindBase, Unread: w.Unread != ""}
 	if wl.Level == LiveOpenPR {
 		wl.PR = pr
 	}
