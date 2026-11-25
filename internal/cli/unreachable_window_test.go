@@ -188,9 +188,11 @@ func TestNestedWindowWithoutGit_gradedAtItsCommit(t *testing.T) {
 }
 
 // #259 review: work a window read at its commit already landed on base stays
-// quiet, as it does in place: a file whose copy at the commit IS base's
-// (already merged, #109) and one whose change base already holds beside base's
-// own (subsumed, #122). Both were HIGH while those checks were off for it.
+// quiet, as it does in place: a structured doc whose copy at the commit IS
+// base's (already merged, #109: the only grade that quiets a shared doc), and
+// a file whose change base already holds beside base's own (subsumed, #122),
+// in wt check, pre-push, and the Claude hook's re-grade of an edit that only
+// then overlaps. All were HIGH while those checks were off for it.
 func TestUnreachableWindow_landedWorkStaysQuiet(t *testing.T) {
 	offlineGH(t)
 	t.Setenv("HOME", t.TempDir())
@@ -206,7 +208,9 @@ func TestUnreachableWindow_landedWorkStaysQuiet(t *testing.T) {
 	for i := 1; i <= 10; i++ {
 		fmt.Fprintf(&x, "line %d\n", i)
 	}
-	writeT(t, root, "merged.txt", x.String())
+	const plan = "# Plan\n## Alpha\na1\na2\n## Beta\nb1\nb2\nb3\n"
+	writeT(t, root, ".wt.conf", "shared_docs = PLAN.md\nstructured_doc.PLAN.md = ^##\\s\n")
+	writeT(t, root, "PLAN.md", plan)
 	writeT(t, root, "subsumed.txt", x.String())
 	gitT(t, root, "add", "-A")
 	gitT(t, root, "commit", "-qm", "base")
@@ -216,45 +220,51 @@ func TestUnreachableWindow_landedWorkStaysQuiet(t *testing.T) {
 	}
 	lane := filepath.Join(dirs, "lane")
 	gitT(t, root, "worktree", "add", "-q", "-b", "lane", lane, "main")
+	landedPlan := strings.Replace(plan, "b1\n", "Lb1\n", 1)
 	landed := strings.Replace(x.String(), "line 2\n", "LANE 2\n", 1)
-	writeT(t, lane, "merged.txt", landed)
+	writeT(t, lane, "PLAN.md", landedPlan)
 	writeT(t, lane, "subsumed.txt", landed)
 	gitT(t, lane, "commit", "-qam", "lane")
-	// Base takes lane's change (a squash elsewhere): merged.txt as is,
+	// Base takes lane's change (a squash elsewhere): PLAN.md as is,
 	// subsumed.txt with base's own edit of line 9 beside it.
-	writeT(t, root, "merged.txt", landed)
-	writeT(t, root, "subsumed.txt", strings.Replace(landed, "line 9\n", "BASE 9\n", 1))
+	writeT(t, root, "PLAN.md", landedPlan)
+	onBase := strings.Replace(landed, "line 9\n", "BASE 9\n", 1)
+	writeT(t, root, "subsumed.txt", onBase)
 	gitT(t, root, "commit", "-qam", "base lands lane's change")
 	gitT(t, root, "worktree", "lock", lane)
 	me := filepath.Join(dirs, "me")
 	gitT(t, root, "worktree", "add", "-q", "-b", "me", me, "main")
-	writeT(t, me, "merged.txt", strings.Replace(landed, "LANE 2\n", "ME 2\n", 1))
-	writeT(t, me, "subsumed.txt", strings.Replace(strings.Replace(landed, "LANE 2\n", "ME 2\n", 1), "line 9\n", "BASE 9\n", 1))
 	t.Setenv("WT_CLAUDE_HOOK_BLOCK", "1")
 	type quiet struct {
-		merged, subsumed        int
-		hookDenies, pushBlocked bool
+		plan, subsumed          int
+		pushBlocked, hookDenies bool
 	}
 	measure := func() quiet {
 		var q quiet
 		t.Chdir(me)
-		captureOutputForTest(t, func() { q.merged = cmdCheck([]string{"merged.txt"}) })
+		writeT(t, me, "PLAN.md", strings.Replace(landedPlan, "b2\n", "Mb2\n", 1)) // lane's section
+		writeT(t, me, "subsumed.txt", strings.Replace(onBase, "LANE 2\n", "ME 2\n", 1))
+		captureOutputForTest(t, func() { q.plan = cmdCheck([]string{"PLAN.md"}) })
 		captureOutputForTest(t, func() { q.subsumed = cmdCheck([]string{"subsumed.txt"}) })
-		payload, _ := json.Marshal(map[string]any{"cwd": me, "tool_name": "Edit", "tool_input": map[string]string{
-			"file_path": filepath.Join(me, "subsumed.txt"), "old_string": "ME 2\n", "new_string": "ME 2b\n"}})
-		q.hookDenies = strings.Contains(runHookCapture(t, hookClaudeEdit, string(payload)), `"permissionDecision":"deny"`)
 		gitT(t, me, "commit", "-qam", "me")
 		captureOutputForTest(t, func() { q.pushBlocked = prePushRefs(t, me, "me") })
-		gitT(t, me, "reset", "-q", "--soft", "HEAD~1")
+		gitT(t, me, "reset", "-q", "--hard", "main")
+		// The hook: a disjoint edit first (line 8), then an edit of line 2,
+		// which only the re-grade sees overlap lane's (landed) change.
+		writeT(t, me, "subsumed.txt", strings.Replace(onBase, "line 8\n", "ME 8\n", 1))
+		payload, _ := json.Marshal(map[string]any{"cwd": me, "tool_name": "Edit", "tool_input": map[string]string{
+			"file_path": filepath.Join(me, "subsumed.txt"), "old_string": "LANE 2\n", "new_string": "ME 2\n"}})
+		q.hookDenies = strings.Contains(runHookCapture(t, hookClaudeEdit, string(payload)), `"permissionDecision":"deny"`)
+		gitT(t, me, "checkout", "-q", "--", "subsumed.txt")
 		return q
 	}
 	if q := measure(); q != (quiet{}) {
-		t.Fatalf("precondition, lane in place: %+v; want check 0, 0, no deny, push not blocked", q)
+		t.Fatalf("precondition, lane in place: %+v; want check 0, 0, push not blocked, no deny", q)
 	}
 	if err := os.Rename(lane, lane+"-unmounted"); err != nil {
 		t.Fatal(err)
 	}
 	if q := measure(); q != (quiet{}) {
-		t.Errorf("lane's directory gone: %+v; want check 0, 0, no deny, push not blocked, as in place", q)
+		t.Errorf("lane's directory gone: %+v; want check 0, 0, push not blocked, no deny, as in place", q)
 	}
 }
