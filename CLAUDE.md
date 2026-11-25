@@ -82,7 +82,11 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   ignored directory, its untracked read listed the window's committed file
   as the enclosing checkout's untracked one and turned a real add/add
   advisory (measured; under an ignored directory git reads nothing there). Liveness reads such a window (any fully unread one) as
-  dirty and ages it by its head. Only when the head can't be read either
+  dirty: its working tree is unknown, so it is NEVER dormant or
+  stale-by-ancestry, and an overlap with its commits stays HIGH until its
+  directory is back or the worktree is removed (owner pane 11-25, "keep the
+  fail-safe"); a merged PR still quiets it, and so does work already on base
+  (above). Its age, read from its head, only labels it. Only when the head can't be read either
   (a missing object, no base) are none of its edits compared, and
   `collide.UnreadScope` says so. An unreadable structured doc in a READABLE
   window is every section (`SharedSectionsAcrossWith`), never skipped (#256
