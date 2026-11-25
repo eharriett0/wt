@@ -152,9 +152,9 @@ be listed (no base, an unborn branch), none of its edits are compared,
 committed or not; when `git status` works but says it could not read some
 paths, only those are missing. The note says which. A worktree whose `.git`
 file is gone while its directory is still there (an unmounted volume left as
-an empty mount point, a deleted link) is unread too, under its own branch:
-git can't read it as its own work tree (nested, it would read the one around
-it). In JSON it is
+an empty mount point, a deleted link; locked or not) is unread too, under its
+own branch: git can't read it as its own work tree (nested, it would read the
+one around it). In JSON it is
 `unread` and `not_compared` (`uncommitted`, `some_uncommitted` or `all`) on
 the window (`wt status --json`, MCP `wt_status`), and `unread_windows`
 (`window`, `worktree`, `error`, `not_compared`) in `wt check --json` and MCP

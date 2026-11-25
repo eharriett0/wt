@@ -488,7 +488,7 @@ func TestScan_worktreeStates(t *testing.T) {
 		}
 	}
 	if shut != "" {
-		if w, ok := at(ws, shut); !ok || !strings.Contains(w.Unread, "permission denied") {
+		if w, ok := at(ws, shut); !ok || !strings.Contains(w.Unread, "permission denied") || w.Branch != "shut" {
 			t.Errorf("worktree git can't enter: %+v (listed %v), want unread: permission denied", w, ok)
 		}
 		if err := os.Chmod(shut, 0o755); err != nil {
@@ -498,7 +498,7 @@ func TestScan_worktreeStates(t *testing.T) {
 	if w, ok := at(ws, gone); !ok || w.Unread != "" {
 		t.Errorf("removed (prunable) worktree: %+v (listed %v), want listed, not unread", w, ok)
 	}
-	if w, ok := at(ws, locked); !ok || !strings.Contains(w.Unread, "no such file or directory") {
+	if w, ok := at(ws, locked); !ok || !strings.Contains(w.Unread, "no such file or directory") || w.Branch != "locked" {
 		t.Errorf("locked worktree, directory gone: %+v (listed %v), want unread with its reason", w, ok)
 	}
 	// git never ran there, so its commits weren't read either: wt status's
@@ -659,6 +659,18 @@ func TestScan_nestedUnderUnreadClaimedMain(t *testing.T) {
 	if err := os.Remove(filepath.Join(x, ".git")); err != nil {
 		t.Fatal(err)
 	}
+	// A LOCKED nested worktree on an unmounted volume: an empty directory,
+	// and git does not call a locked worktree prunable (round 7).
+	ln := filepath.Join(root, ".wt", "ln")
+	gitT(t, root, "worktree", "add", "-q", "-b", "l-nested", ln, "feat-7")
+	gitT(t, root, "worktree", "lock", ln)
+	writeT(t, root, filepath.Join(".git", "wt-active-work.md"), "## #7 seven\n- Branch: `feat-7`\n\n## #8 eight\n- Branch: `l-nested`\n")
+	if err := os.Rename(ln, filepath.Join(filepath.Dir(root), filepath.Base(root)+"-ln-unmounted")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(ln, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	t.Chdir(root)
 	c, err := config.Load()
 	if err != nil {
@@ -668,7 +680,7 @@ func TestScan_nestedUnderUnreadClaimedMain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var mainW, nested collide.Window
+	var mainW, nested, lockedW collide.Window
 	feat7 := 0
 	for _, w := range ws {
 		switch w.Worktree {
@@ -676,6 +688,8 @@ func TestScan_nestedUnderUnreadClaimedMain(t *testing.T) {
 			mainW = w
 		case x:
 			nested = w
+		case ln:
+			lockedW = w
 		}
 		if w.Branch == "feat-7" {
 			feat7++
@@ -686,6 +700,9 @@ func TestScan_nestedUnderUnreadClaimedMain(t *testing.T) {
 	}
 	if nested.Unread != collide.ErrNoGitLink || len(nested.Touched) != 0 || nested.Branch != "n-x" || nested.Issue != "" {
 		t.Errorf("nested worktree without its .git: %+v, want unread (%s), nothing attributed, its own branch, no claim", nested, collide.ErrNoGitLink)
+	}
+	if lockedW.Unread != collide.ErrNoGitLink || len(lockedW.Touched) != 0 || lockedW.Branch != "l-nested" || lockedW.Issue != "8" {
+		t.Errorf("locked nested worktree on an unmounted volume: %+v, want unread (%s), nothing attributed, its own branch and claim #8", lockedW, collide.ErrNoGitLink)
 	}
 	if feat7 != 1 {
 		t.Errorf("%d windows on feat-7, want 1 (the nested one took the main checkout's branch): %+v", feat7, ws)

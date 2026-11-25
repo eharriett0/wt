@@ -104,8 +104,8 @@ var gitOutput = func(dir string, env []string, stdin []byte, args ...string) ([]
 
 // gitOutputStderr is gitOutput for a call whose stderr matters even when it
 // succeeds: `git status` exits 0 yet names there the paths it could not read
-// (#254 review). It runs git in the C locale, so the "warning:" prefixes and
-// the system error text statusMissed reads are not translated. On failure
+// (#254 review). It runs git in the C locale, so the "warning:" prefix
+// statusMissed reads is not translated. On failure
 // the *exec.ExitError carries stderr, as from gitOutput.
 var gitOutputStderr = func(dir string, args ...string) (stdout, stderr []byte, err error) {
 	cmd := exec.Command("git", args...)
@@ -1372,7 +1372,7 @@ func statusMissed(dir, stderr string) string {
 		case ln == "" || strings.HasPrefix(ln, "warning:") || strings.HasPrefix(ln, "hint:") ||
 			strings.HasPrefix(ln, "error:") || strings.HasPrefix(ln, "fatal:"):
 		default:
-			if i := strings.LastIndex(ln, ": "); i > 0 && pathIn(dir, ln[:i]) {
+			if i := strings.LastIndex(ln, ": "); i > 0 && pathInWindow(dir, ln[:i]) {
 				missed = append(missed, ln) // "<path>: <error>"
 			}
 		}
@@ -1382,17 +1382,40 @@ func statusMissed(dir, stderr string) string {
 
 // pathIn reports whether p, as git prints a work tree path (relative,
 // slash-separated), names something in dir: its first component exists
-// there. The rest may not be reachable, which is why git complained.
+// there. The rest may not be reachable, which is why git complained. Never
+// under .git: git reports no missed read there, but a failing hook's own
+// error names `.git/hooks/<hook>` (round 7).
 func pathIn(dir, p string) bool {
 	if p == "" || filepath.IsAbs(p) {
 		return false
 	}
 	first, _, _ := strings.Cut(p, "/")
-	if first == "" || first == "." || first == ".." {
+	if first == "" || first == "." || first == ".." || first == ".git" {
 		return false
 	}
 	_, err := os.Lstat(filepath.Join(dir, first))
 	return err == nil
+}
+
+// pathInWindow is pathIn for the window at dir or any submodule
+// .gitmodules lists in it: git prints a path it could not read inside a
+// submodule relative to that submodule (round 7). .gitmodules is read only
+// here, after status printed a candidate line.
+func pathInWindow(dir, p string) bool {
+	if pathIn(dir, p) {
+		return true
+	}
+	b, err := os.ReadFile(filepath.Join(dir, ".gitmodules"))
+	if err != nil {
+		return false
+	}
+	for _, ln := range strings.Split(string(b), "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(ln), "=")
+		if ok && strings.TrimSpace(k) == "path" && pathIn(filepath.Join(dir, strings.TrimSpace(v)), p) {
+			return true
+		}
+	}
+	return false
 }
 
 // capLines joins at most max of lines with "; ", then says how many more:

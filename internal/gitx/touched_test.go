@@ -581,10 +581,22 @@ func TestStatusMissed(t *testing.T) {
 		"cat: " + dir + "/.git/last-sync: No such file or directory", // a hook's own error (round 6)
 		dir + "/d/k.txt: Permission denied",                          // absolute: not git's work tree form
 		"../d/k.txt: Permission denied",
+		".git/hooks/post-index-change: line 2: nosuchcmd: command not found", // a failing hook (round 7)
 	} {
 		if got := statusMissed(noise + "\n"); got != "" {
 			t.Errorf("statusMissed(%q) = %q, want none", noise, got)
 		}
+	}
+	// Inside a submodule git prints the path relative to it (round 7).
+	if err := os.MkdirAll(filepath.Join(dir, "sub", "e"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, dir, ".gitmodules", "[submodule \"sub\"]\n\tpath = sub\n\turl = ../sub\n")
+	if got := statusMissed("e/k.txt: Permission denied\n"); got != "e/k.txt: Permission denied" {
+		t.Errorf("a path inside a submodule: %q, want the line", got)
+	}
+	if got := statusMissed("nowhere/k.txt: Permission denied\n"); got != "" {
+		t.Errorf("a path in neither the window nor a submodule: %q, want none", got)
 	}
 	// musl words errors differently (round 6): the path decides, not the text.
 	if got := statusMissed("d/k.txt: Symbolic link loop\n"); got != "d/k.txt: Symbolic link loop" {

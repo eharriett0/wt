@@ -69,14 +69,19 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   merely INSIDE a bare repo walks up into it); naming either repeated a false
   warning on every agent turn (measured in review). A prunable worktree whose
   directory EXISTS (its .git file gone: an empty mount point, a deleted link)
-  is unread (`collide.ErrNoGitLink`, #255) under ITS OWN branch
+  is unread (`collide.ErrNoGitLink`, #255) under ITS OWN branch. Decided by
+  stat (`<dir>/.git` missing, linked worktrees only), not by git's prunable
+  flag: git never lists a LOCKED worktree as prunable, and a locked one on an
+  unmounted volume read the enclosing checkout as its own (round 7).
   (`WorktreeRef.Branch`, which also keys its claim): nested, `git status`
   there walks up into the enclosing work tree, and whatever that read or
   failed on (it may be partly unread itself) is dropped, never attributed to
   it; not nested, git fails there. Only a directory git can't enter keeps its
   `ErrNoDir` reason (git calls that prunable too). `statusMissed` counts a `<path>: <text>` line only when
-  that path's first component exists in the window (`pathIn`; git prints them
-  relative to the work tree, run with LC_ALL=C): an fsmonitor hook, GIT_TRACE
+  that path's first component exists in the window or in a submodule
+  `.gitmodules` lists (`pathInWindow`; git prints them relative to the work
+  tree or that submodule, run with LC_ALL=C; never under `.git`, where a
+  failing hook names itself): an fsmonitor hook, GIT_TRACE
   or a hook's output on a successful status made healthy windows unread
   (rounds 5, 6), and matching the error text missed musl's wording. Owner
   pane 11-25: narrow it, then merge; a hook that prints an EXISTING path can
