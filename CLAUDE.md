@@ -75,9 +75,12 @@ docs live in [README.md](README.md); this file is for working *on* wt.
   failed on (it may be partly unread itself) is dropped, never attributed to
   it; not nested, git fails there. Only a directory git can't enter keeps its
   `ErrNoDir` reason (git calls that prunable too). `statusMissed` counts a `<path>: <text>` line only when
-  the text after the last ": " is exactly a system error (`errnoText`, git run
-  with LC_ALL=C): an fsmonitor hook, GIT_TRACE or a hook's output on a
-  successful status made healthy windows unread (round 5). Reasons are capped
+  that path's first component exists in the window (`pathIn`; git prints them
+  relative to the work tree, run with LC_ALL=C): an fsmonitor hook, GIT_TRACE
+  or a hook's output on a successful status made healthy windows unread
+  (rounds 5, 6), and matching the error text missed musl's wording. Owner
+  pane 11-25: narrow it, then merge; a hook that prints an EXISTING path can
+  still mark a window partly unread (named, never blocking). Reasons are capped
   at 3 lines (`capLines`). A LOCKED worktree whose directory is gone is
   unread: its edits sit on an unmounted volume. A `--separate-git-dir`
   repo's main entry is its git dir (`gitx.ErrGitDirOnly`), and a submodule

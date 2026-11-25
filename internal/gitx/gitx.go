@@ -15,7 +15,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -1302,7 +1301,7 @@ func TouchedFiles(dir, base string) (files []string, err error) {
 		for _, p := range parsePorcelainZ(string(out)) {
 			set[p] = struct{}{}
 		}
-		if missed := statusMissed(string(stderr)); missed != "" {
+		if missed := statusMissed(dir, string(stderr)); missed != "" {
 			unread, partial = fmt.Errorf("git status: %s", missed), true
 		}
 	} else {
@@ -1355,12 +1354,15 @@ func (e *UnreadError) Unwrap() error { return e.Reason }
 // Measured, git 2.39: "warning: could not open directory 'd/': Permission
 // denied" (a directory it can't list, so its untracked files are missing) and
 // "d/k.txt: Permission denied" (a tracked file it can't stat, so its edit is
-// missing). A "<path>: <text>" line counts only when the text after its LAST
-// ": " is exactly a system error (errnoText): other stderr on a successful
-// status (line-ending warnings, an fsmonitor hook's or a post-index-change
-// hook's output, GIT_TRACE) names no missed path, and counting it named a
-// healthy window unread on every turn (#254 review, round 5).
-func statusMissed(stderr string) string {
+// missing). A "<path>: <text>" line counts only when its path (before the
+// LAST ": ", so a path holding ": " stays whole) is in dir: its first
+// component exists there, as git prints these relative to the work tree.
+// Other stderr on a successful status (line endings, an fsmonitor hook's or
+// a post-index-change hook's output, GIT_TRACE) names no path in the window,
+// and counting it named a healthy window unread on every turn (review rounds
+// 5, 6). The error text itself is not matched: musl words it differently
+// from glibc and macOS ("Symbolic link loop").
+func statusMissed(dir, stderr string) string {
 	var missed []string
 	for _, ln := range strings.Split(stderr, "\n") {
 		ln = strings.TrimSpace(ln)
@@ -1370,23 +1372,27 @@ func statusMissed(stderr string) string {
 		case ln == "" || strings.HasPrefix(ln, "warning:") || strings.HasPrefix(ln, "hint:") ||
 			strings.HasPrefix(ln, "error:") || strings.HasPrefix(ln, "fatal:"):
 		default:
-			if i := strings.LastIndex(ln, ": "); i > 0 && errnoText(ln[i+2:]) {
-				missed = append(missed, ln) // "<path>: <system error>"
+			if i := strings.LastIndex(ln, ": "); i > 0 && pathIn(dir, ln[:i]) {
+				missed = append(missed, ln) // "<path>: <error>"
 			}
 		}
 	}
 	return capLines(missed, 3)
 }
 
-// errnoText reports whether s is a system error's text, as git prints
-// strerror in the C locale ("Permission denied"), matched without case.
-func errnoText(s string) bool {
-	for e := syscall.Errno(1); e < 256; e++ {
-		if t := e.Error(); !strings.HasPrefix(t, "errno ") && strings.EqualFold(t, s) {
-			return true
-		}
+// pathIn reports whether p, as git prints a work tree path (relative,
+// slash-separated), names something in dir: its first component exists
+// there. The rest may not be reachable, which is why git complained.
+func pathIn(dir, p string) bool {
+	if p == "" || filepath.IsAbs(p) {
+		return false
 	}
-	return false
+	first, _, _ := strings.Cut(p, "/")
+	if first == "" || first == "." || first == ".." {
+		return false
+	}
+	_, err := os.Lstat(filepath.Join(dir, first))
+	return err == nil
 }
 
 // capLines joins at most max of lines with "; ", then says how many more:

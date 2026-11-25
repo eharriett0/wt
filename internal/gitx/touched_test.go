@@ -554,6 +554,12 @@ func TestTouchedFiles_UnreadIsAnError(t *testing.T) {
 // statusMissed keeps only what a successful git status says it could not
 // read (#254 review): measured lines kept, unrelated warnings dropped.
 func TestStatusMissed(t *testing.T) {
+	dir := t.TempDir() // the window: d/, a file "a: b.txt", and nothing else
+	if err := os.MkdirAll(filepath.Join(dir, "d"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, dir, "a: b.txt", "x\n")
+	statusMissed := func(stderr string) string { return statusMissed(dir, stderr) }
 	got := statusMissed("warning: in the working copy of 'a.txt', CRLF will be replaced by LF the next time Git touches it\n" +
 		"warning: unable to access '/home/u/.config/git/ignore': Permission denied\n" +
 		"d/k.txt: Permission denied\n" +
@@ -572,10 +578,17 @@ func TestStatusMissed(t *testing.T) {
 		"15:04:05.123456 git.c:460               trace: built-in: git status --porcelain",
 		"post-index-change: index rewritten",
 		"note: Permission denied for nothing in particular",
+		"cat: " + dir + "/.git/last-sync: No such file or directory", // a hook's own error (round 6)
+		dir + "/d/k.txt: Permission denied",                          // absolute: not git's work tree form
+		"../d/k.txt: Permission denied",
 	} {
 		if got := statusMissed(noise + "\n"); got != "" {
 			t.Errorf("statusMissed(%q) = %q, want none", noise, got)
 		}
+	}
+	// musl words errors differently (round 6): the path decides, not the text.
+	if got := statusMissed("d/k.txt: Symbolic link loop\n"); got != "d/k.txt: Symbolic link loop" {
+		t.Errorf("musl's wording: %q, want the line", got)
 	}
 	// A path holding ": " is still one path; many lines are capped.
 	if got := statusMissed("a: b.txt: Permission denied\n"); got != "a: b.txt: Permission denied" {
